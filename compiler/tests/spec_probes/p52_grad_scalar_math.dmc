@@ -1,0 +1,34 @@
+# Probe 52 — AUTODIFF.md §5 (#420): the scalar-math builtins
+# (sqrt/exp/log/sin/cos/tan) applied to a traced scalar stay on the tape.
+# sqrt(sum(w .* w)) is the Euclidean norm every SDF primitive ends in;
+# its gradient is w / ||w||. Previously the sqrt silently left the graph
+# and the body errored as not-gradient-connected.
+@grad fn norm(!w: Tensor[f32, [3]]) -> f32 {
+    sqrt(sum(w .* w))
+}
+
+fn main() -> nil {
+    let !w = forge.zeros[f32, [3]]
+    w[0] = 3.0f32
+    w[1] = 4.0f32
+    let (l, g) = norm.fwd_bwd(w)
+    print(l); print("\n")        # 5
+    print(g.w[0]); print("\n")   # 3/5 = 0.6
+    print(g.w[1]); print("\n")   # 4/5 = 0.8
+    nil
+}
+
+fn test_norm_gradient_analytic() -> bool {
+    let !w = forge.zeros[f32, [3]]
+    w[0] = 3.0f32
+    w[1] = 4.0f32
+    let (l, g) = norm.fwd_bwd(w)
+    let !ok = true
+    if l < 4.999f32 { ok = false }
+    if l > 5.001f32 { ok = false }
+    if g.w[0] < 0.599f32 { ok = false }
+    if g.w[0] > 0.601f32 { ok = false }
+    if g.w[1] < 0.799f32 { ok = false }
+    if g.w[1] > 0.801f32 { ok = false }
+    ok
+}

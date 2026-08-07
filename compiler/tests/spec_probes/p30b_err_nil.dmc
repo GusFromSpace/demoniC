@@ -1,0 +1,11 @@
+# Probe 30b — variant of p30: (T, Err) with only nil-Err returns
+# Isolates whether `nil` works as an Err while `"string"` doesn't.
+fn ok_only(x: i64) -> (i64, Err) {
+    (x * 2, nil)
+}
+
+fn main() -> nil {
+    let (a, e) = ok_only(5)
+    print(a); print("\n")
+    nil
+}

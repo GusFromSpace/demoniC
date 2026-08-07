@@ -1,0 +1,20 @@
+# Probe 27 — Spec §4.5: match on shapes (the spec's primary match use case)
+# "match on shapes lowers to a jump table"
+fn describe[N](v: Tensor[i64, [N]]) -> i64 {
+    match N {
+        0 => -1,
+        1 => 0,
+        2 => 1,
+        _ => 99,
+    }
+}
+
+fn main() -> nil {
+    let a = [1]
+    let b = [1, 2]
+    let c = [1, 2, 3, 4, 5]
+    print(describe[1](a)); print(" ")
+    print(describe[2](b)); print(" ")
+    print(describe[5](c)); print("\n")
+    nil
+}

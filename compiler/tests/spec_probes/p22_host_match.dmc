@@ -1,0 +1,14 @@
+# Probe 22 — Spec §7.3: @host match { .feature => kernel(), ... }
+fn kernel_avx() -> i64 { 1 }
+fn kernel_neon() -> i64 { 2 }
+fn kernel_default() -> i64 { 0 }
+
+fn main() -> nil {
+    let chosen = @host match {
+        .avx2 => kernel_avx(),
+        .neon => kernel_neon(),
+        _     => kernel_default(),
+    }
+    print(chosen); print("\n")
+    nil
+}

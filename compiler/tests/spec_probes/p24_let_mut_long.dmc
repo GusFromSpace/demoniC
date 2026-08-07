@@ -1,0 +1,7 @@
+# Probe 24 — Spec §3.4: `let mut x` long form (vs `let !x`)
+fn main() -> nil {
+    let mut x = 10
+    x = x + 5
+    print(x); print("\n")
+    nil
+}

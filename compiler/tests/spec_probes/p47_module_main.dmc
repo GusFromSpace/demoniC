@@ -1,0 +1,27 @@
+# Probe 47 — Spec §2.3: top-level imports and module resolution
+
+use "p47_module_math.dmc" as math
+use "p47_module_math.dmc"
+
+fn main() -> nil {
+    # Test qualified import
+    let sum = math.add(10, 20)
+    let p = math.Point { x: 5, y: 10 }
+    let scaled = math.scale(p, 2)
+    
+    # Test unqualified import
+    let sum2 = add(10, 20)
+    let p2 = Point { x: 5, y: 10 }
+    let scaled2 = scale(p2, 2)
+    
+    # Assert correctness
+    if sum != 30 || scaled.x != 10 || scaled.y != 20 {
+        panic("qualified import verification failed")
+    }
+    if sum2 != 30 || scaled2.x != 10 || scaled2.y != 20 {
+        panic("unqualified import verification failed")
+    }
+    
+    print("Run OK")
+    nil
+}

@@ -1,0 +1,9 @@
+# Probe 28 — Spec §2.5: `..=` inclusive range operator
+fn main() -> nil {
+    let mut s = 0
+    for i in 1..=5 {     # 1, 2, 3, 4, 5
+        s = s + i
+    }
+    print(s); print("\n")   # 15
+    nil
+}

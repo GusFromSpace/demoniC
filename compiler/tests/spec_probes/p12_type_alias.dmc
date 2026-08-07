@@ -1,0 +1,17 @@
+# Probe 12 — Spec §6.6: type aliases (concrete and shape-parametric)
+type Hidden     = Tensor[f32, [4]]
+type Batch[B]   = Tensor[f32, [B, 4]]
+
+fn first(h: Hidden) -> f32 {
+    h[0]
+}
+
+fn batch_first[B](b: Batch[B]) -> f32 {
+    b[0, 0]
+}
+
+fn main() -> nil {
+    let h: Hidden = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    print(first(h)); print("\n")
+    nil
+}

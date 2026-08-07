@@ -1,0 +1,6 @@
+# Probe 34 — Spec §3.7: Mesh declaration with named axes
+fn main() -> nil {
+    let mesh = Mesh[dp=2, tp=2]
+    print(42); print("\n")
+    nil
+}

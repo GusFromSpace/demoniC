@@ -1,0 +1,11 @@
+# Probe 13 — Spec §4.7: `if` as expression (last-expression value)
+fn sign(x: i64) -> i64 {
+    if x > 0 { 1 } else if x < 0 { -1 } else { 0 }
+}
+
+fn main() -> nil {
+    print(sign(7));   print(" ")
+    print(sign(-3));  print(" ")
+    print(sign(0));   print("\n")
+    nil
+}

@@ -1,0 +1,14 @@
+# Probe 33 — Spec §6.2 / AUTODIFF.md: @grad-annotated function
+# AUTODIFF.md §2: a `@grad fn` must differentiate w.r.t. at least one `!` (mut)
+# parameter — `w` here. (A `@grad fn` with no mut param has nothing for the
+# backward to produce and is a compile-time error.)
+@grad fn loss(!w: Tensor[f32, [2]]) -> f32 {
+    sum(w .* w)
+}
+
+fn main() -> nil {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 3.0f32
+    print(loss(w)); print("\n")
+    nil
+}

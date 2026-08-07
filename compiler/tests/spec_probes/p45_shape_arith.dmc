@@ -1,0 +1,10 @@
+# Probe 45 — Spec §6.4 + comptime: shape arithmetic `3*D` in type
+fn make_qkv[D]() -> Tensor[f32, [D, 3*D]] {
+    forge.zeros[f32, [D, 3*D]]
+}
+
+fn main() -> nil {
+    let q = make_qkv[4]()
+    print(q[0, 0]); print("\n")
+    nil
+}

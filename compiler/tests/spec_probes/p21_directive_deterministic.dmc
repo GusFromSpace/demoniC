@@ -1,0 +1,10 @@
+# Probe 21 — Spec §7.4: @deterministic { expr }
+fn main() -> nil {
+    let total = @deterministic {
+        let x = 1.0f32
+        let y = 2.0f32
+        x + y
+    }
+    print(total); print("\n")
+    nil
+}

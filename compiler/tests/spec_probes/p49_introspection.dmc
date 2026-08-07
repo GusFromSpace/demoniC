@@ -1,0 +1,48 @@
+# p49_introspection.dmc — runtime type introspection (#184) + safe parse (#185).
+#
+# `typeof` and the `is_*` predicates let demoniC code dispatch on a value's
+# runtime kind — the core operation of any tree-walking evaluator. `is_numeric`
+# and `try_to_*` give non-aborting string→number parsing for tokenizers.
+# Surfaced translating Norvig's lispy.py for the self-hosting corpus (#156).
+
+fn main() -> nil {
+    # Heterogeneous list: introspect each element's kind.
+    let !xs = list()
+    xs = list_push(xs, 7)
+    xs = list_push(xs, "sym")
+    xs = list_push(xs, 3.5)
+
+    let a = list_get(xs, 0)
+    let b = list_get(xs, 1)
+    let c = list_get(xs, 2)
+
+    # typeof returns a string tag.
+    print(typeof(a)); print(" "); print(typeof(b)); print(" "); print(typeof(c)); print("\n")
+
+    # is_* predicates.
+    print(is_int(a)); print(" ")
+    print(is_str(b)); print(" ")
+    print(is_float(c)); print(" ")
+    print(is_list(xs)); print(" ")
+    print(is_nil(nil)); print("\n")
+
+    # negative cases
+    print(is_int(b)); print(" "); print(is_str(a)); print("\n")
+
+    # is_numeric: true for parseable strings, false otherwise.
+    print(is_numeric("42")); print(" ")
+    print(is_numeric("-3.14")); print(" ")
+    print(is_numeric("hello")); print(" ")
+    print(is_numeric("+")); print("\n")
+
+    # try_to_int / try_to_float: (value, Err) — never abort.
+    let (n, e1) = try_to_int("100")
+    print(n); print(" "); print(is_nil(e1)); print("\n")
+
+    let (bad, e2) = try_to_int("oops")
+    print(bad); print(" "); print(is_nil(e2)); print("\n")   # 0 false (err set)
+
+    let (f, e3) = try_to_float("2.5")
+    print(f); print(" "); print(is_nil(e3)); print("\n")
+    nil
+}

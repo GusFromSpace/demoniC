@@ -1,0 +1,16 @@
+# Probe 23 — Spec §3.10: model `forward` slot desugar
+# `instance(x)` should desugar to `instance.forward(x)`
+model Linear {
+    bias: i64
+
+    fn forward(self, x: i64) -> i64 {
+        x + self.bias
+    }
+}
+
+fn main() -> nil {
+    let m = Linear { bias: 100 }
+    let y = m(5)               # should call m.forward(5) → 105
+    print(y); print("\n")
+    nil
+}

@@ -1,0 +1,13 @@
+# Probe 35 — Spec §5: `loop { ... }` keyword (vs while/for)
+fn main() -> nil {
+    let mut i = 0
+    loop {
+        if i >= 3 {
+            break
+        }
+        print(i); print(" ")
+        i = i + 1
+    }
+    print("\n")
+    nil
+}

@@ -1,0 +1,19 @@
+# Probe 30 — Spec §3.9, §4.9: error propagation `?` on (T, Err)
+fn maybe_parse(n: i64) -> (i64, Err) {
+    if n < 0 {
+        (0, "negative")
+    } else {
+        (n * 2, nil)
+    }
+}
+
+fn use_parse(n: i64) -> (i64, Err) {
+    let x = maybe_parse(n)?
+    (x + 1, nil)
+}
+
+fn main() -> nil {
+    let (a, ea) = use_parse(5)
+    print(a); print("\n")
+    nil
+}

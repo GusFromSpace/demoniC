@@ -1,0 +1,19 @@
+# Helper module for p47_module_main
+
+pub fn add(x: i64, y: i64) -> i64 {
+    x + y
+}
+
+pub model Point {
+    x: i64,
+    y: i64
+}
+
+pub fn scale(p: Point, s: i64) -> Point {
+    Point { x: p.x * s, y: p.y * s }
+}
+
+fn main() -> nil {
+    print("Run OK")
+    nil
+}

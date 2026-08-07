@@ -1,0 +1,12 @@
+# Probe 03 — Spec §2.4: hex / binary / underscored numeric literals
+fn main() -> nil {
+    let hex     = 0xff
+    let binary  = 0b1010
+    let big     = 1_000_000
+    let mixed   = 0xff_ee_dd
+    print(hex);    print(" ")
+    print(binary); print(" ")
+    print(big);    print(" ")
+    print(mixed);  print("\n")
+    nil
+}

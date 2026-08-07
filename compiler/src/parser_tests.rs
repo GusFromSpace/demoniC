@@ -1,0 +1,629 @@
+/// Parser unit tests — small fragments that hit specific grammar productions.
+/// Pre-alpha; not exhaustive. Integration verification is done by parsing all
+/// 12 files in /examples in CI.
+
+use super::ast::*;
+use super::lexer::Lexer;
+use super::parser::Parser;
+
+fn parse(src: &str) -> Program {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    Parser::new(tokens).parse_program().expect("parse failed")
+}
+
+fn parse_err(src: &str) -> String {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    Parser::new(tokens).parse_program().err().expect("expected parse failure").msg
+}
+
+#[test]
+fn empty_program() {
+    let p = parse("");
+    assert!(p.items.is_empty());
+}
+
+#[test]
+fn simple_fn() {
+    let p = parse("fn id(x: i64) -> i64 { x }");
+    assert_eq!(p.items.len(), 1);
+    match &p.items[0] {
+        Item::Fn(f) => {
+            assert_eq!(f.name, "id");
+            assert_eq!(f.params.len(), 1);
+            assert_eq!(f.params[0].name, "x");
+            assert!(f.body.tail_expr.is_some());
+        }
+        _ => panic!("expected fn"),
+    }
+}
+
+#[test]
+fn fn_with_shape_params() {
+    let p = parse("fn f[B, D](x: Tensor[f32, [B, D]]) -> nil { nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        assert_eq!(f.shape_params.len(), 2);
+        assert_eq!(f.shape_params[0].name, "B");
+    } else { panic!() }
+}
+
+#[test]
+fn fn_with_directive() {
+    let p = parse("@grad fn forward(x: f32) -> f32 { x }");
+    if let Item::Fn(f) = &p.items[0] {
+        assert_eq!(f.directives.len(), 1);
+        assert_eq!(f.directives[0].name, "grad");
+    } else { panic!() }
+}
+
+#[test]
+fn precedence_matmul_then_dotmul() {
+    // `q @ k .* s` should be `(q @ k) .* s` because matmul binds tighter than product? No —
+    // per grammar, product (which includes .*) is below matmul, so it's `(q @ k) .* s`.
+    let p = parse("fn t() -> nil { let _ = q @ k .* s; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            // top-level operator should be DotMul
+            match &l.value {
+                Expr::BinOp { op: BinOp::DotMul, .. } => {}
+                other => panic!("expected DotMul at top, got {:?}", other),
+            }
+        } else { panic!() }
+    } else { panic!() }
+}
+
+#[test]
+fn transpose_postfix() {
+    let p = parse("fn t() -> nil { let _ = k'; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            assert!(matches!(l.value, Expr::Postfix { op: PostfixOp::Transpose, .. }));
+        } else { panic!() }
+    } else { panic!() }
+}
+
+#[test]
+fn model_decl() {
+    let p = parse(r#"
+        model Block[D] {
+            ln: Tensor[f32, [D]]
+            fn forward(self, x: Tensor[f32, [D]]) -> Tensor[f32, [D]] { x }
+        }
+    "#);
+    if let Item::Model(m) = &p.items[0] {
+        assert_eq!(m.name, "Block");
+        assert_eq!(m.members.len(), 2);
+    } else { panic!() }
+}
+
+#[test]
+fn cast_expr() {
+    let p = parse("fn t() -> nil { let _ = B as f32; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            assert!(matches!(l.value, Expr::Cast { .. }));
+        } else { panic!() }
+    } else { panic!() }
+}
+
+#[test]
+fn mesh_type() {
+    let p = parse("fn t() -> Mesh[dp=8, tp=4] { nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        assert!(matches!(&f.ret_type, Some(Type::Mesh(_, _))));
+    } else { panic!() }
+}
+
+#[test]
+fn arena_block_stmt() {
+    let p = parse("fn t() -> nil { vault { let _ = 1 } nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        assert!(f.body.stmts.len() >= 1);
+    } else { panic!() }
+}
+
+#[test]
+fn arena_block_expr_in_let_binding() {
+    let p = parse(r#"
+        model Item { !x: i64 }
+        fn t() -> nil {
+            let item = vault {
+                Item { x: 11 }
+            }
+            nil
+        }
+    "#);
+    if let Item::Fn(f) = &p.items[1] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            assert!(matches!(l.value, Expr::ArenaBlock(_)));
+        } else { panic!("expected let") }
+    } else { panic!("expected fn") }
+}
+
+#[test]
+fn nested_arena_block_expr_in_let_binding() {
+    parse(r#"
+        model Item { !x: i64 }
+        fn t() -> nil {
+            let !item = vault {
+                let i = forge { Item { x: 11 } }
+                i
+            }
+            nil
+        }
+    "#);
+}
+
+#[test]
+fn match_with_shape_pat() {
+    let p = parse(r#"
+        fn t() -> nil {
+            match dims {
+                [B, S] => 1,
+                _ => 0,
+            }
+            nil
+        }
+    "#);
+    let _ = p;
+}
+
+#[test]
+fn pipe_with_underscore() {
+    let p = parse("fn t() -> nil { let _ = x |> _ .+ b; nil }");
+    let _ = p;
+}
+
+#[test]
+fn err_unterminated_paren() {
+    let e = parse_err("fn t() -> nil { let _ = (1 + 2 ; nil }");
+    assert!(e.contains("expected") || e.contains("found"));
+}
+
+#[test]
+fn else_on_new_line_parses() {
+    // `else` on its own line (after a closing brace) must parse correctly.
+    parse("fn t() -> i64 { if x > 0 {\n 1\n}\nelse {\n 2\n} }");
+}
+
+#[test]
+fn else_if_on_new_line_parses() {
+    parse("fn t() -> i64 { if x > 2 {\n 3\n}\nelse if x > 1 {\n 2\n}\nelse {\n 1\n} }");
+}
+
+// ── Bug regression tests (issue #42) ─────────────────────────────────────────
+
+/// B3: `?` wildcard inside shape literals (Spec §3.2)
+#[test]
+fn b3_dynamic_shape_wildcard() {
+    let p = parse("fn shape_of(x: Tensor[f32, [?, ?]]) -> i64 { 99 }");
+    if let Item::Fn(f) = &p.items[0] {
+        assert_eq!(f.name, "shape_of");
+        // Verify the shape spec was parsed (type annotation exists on param)
+        assert!(f.params[0].ty.is_some());
+    } else {
+        panic!("expected fn");
+    }
+}
+
+/// B4: `..` rest pattern in match arms (Spec §4.5)
+#[test]
+fn b4_dotdot_rest_pattern_in_match() {
+    // `..` parses as a distinct `Rest` pattern (not `Wildcard`), so `(a, ..)`
+    // tuples are not confused with fixed-arity `(a, _)`. Standalone it still acts
+    // as a catch-all — see interp/check tests — but the AST node is `Rest`.
+    let p = parse(r#"
+        fn t(n: i64) -> i64 {
+            match n {
+                0  => 100,
+                .. => 999,
+            }
+        }
+    "#);
+    if let Item::Fn(f) = &p.items[0] {
+        if let Some(Stmt::Match(me)) = f.body.stmts.first() {
+            assert_eq!(me.arms.len(), 2);
+            assert!(matches!(me.arms[1].pattern, Pattern::Rest(_)));
+        } else {
+            panic!("expected match stmt");
+        }
+    } else {
+        panic!("expected fn");
+    }
+}
+
+/// B2: `@host match { ... }` directive form (Spec §7.3)
+#[test]
+fn b2_directive_match_form() {
+    let p = parse(r#"
+        fn t() -> i64 {
+            let chosen = @host match {
+                .avx2 => 1,
+                .neon => 2,
+                _     => 0,
+            }
+            chosen
+        }
+    "#);
+    if let Item::Fn(f) = &p.items[0] {
+        // Should have a let stmt binding a DirectiveBlock containing a match
+        assert!(!f.body.stmts.is_empty());
+    } else {
+        panic!("expected fn");
+    }
+}
+
+/// B7: Unicode XID identifiers (Spec §2.3)
+#[test]
+fn b7_unicode_xid_identifiers() {
+    // Greek letters are valid XID_Start/XID_Continue characters
+    let p = parse(r#"
+        fn t() -> i64 {
+            let π = 3
+            let θ = 4
+            let δ = π + θ
+            δ
+        }
+    "#);
+    if let Item::Fn(f) = &p.items[0] {
+        // 3 let stmts + tail expr
+        assert!(f.body.stmts.len() >= 3);
+    } else {
+        panic!("expected fn");
+    }
+}
+
+// ── Visibility Modifier Tests ───────────────────────────────────────────────
+
+#[test]
+fn parser_pub_modifiers() {
+    let p = parse(r#"
+        pub fn test_fn() -> nil { nil }
+        pub model Point { x: i64 }
+        pub type Custom = i64
+        pub let global_val = 100
+        @pp pub fn pp_fn() -> nil { nil }
+        pub @pp fn pp_fn_2() -> nil { nil }
+    "#);
+
+    assert_eq!(p.items.len(), 6);
+    assert!(matches!(p.items[0], Item::Pub(..)));
+    assert!(matches!(p.items[1], Item::Pub(..)));
+    assert!(matches!(p.items[2], Item::Pub(..)));
+    assert!(matches!(p.items[3], Item::Pub(..)));
+
+    // Item 4: @pp pub fn -> Pub wrapping Fn which contains the directive
+    if let Item::Pub(inner) = &p.items[4] {
+        if let Item::Fn(f) = inner.as_ref() {
+            assert_eq!(f.directives.len(), 1);
+            assert_eq!(f.directives[0].name, "pp");
+        } else {
+            panic!("expected fn");
+        }
+    } else {
+        panic!("expected pub wrapping fn");
+    }
+
+    // Item 5: pub @pp fn -> Pub wrapping Fn which contains the directive
+    if let Item::Pub(inner) = &p.items[5] {
+        if let Item::Fn(f) = inner.as_ref() {
+            assert_eq!(f.directives.len(), 1);
+            assert_eq!(f.directives[0].name, "pp");
+        } else {
+            panic!("expected fn");
+        }
+    } else {
+        panic!("expected pub wrapping fn");
+    }
+}
+
+#[test]
+fn parser_pub_arena_errors() {
+    let e = parse_err("pub vault { let x = 1 }");
+    assert!(e.contains("visibility modifier not allowed on arena blocks"));
+
+    let e = parse_err("pub forge { let x = 1 }");
+    assert!(e.contains("visibility modifier not allowed on arena blocks"));
+
+    let e = parse_err("pub stream { let x = 1 }");
+    assert!(e.contains("visibility modifier not allowed on arena blocks"));
+}
+
+#[test]
+fn parser_pub_use_errors() {
+    let e = parse_err("pub use \"other.dmc\"");
+    assert!(e.contains("visibility modifier not allowed on use statements"));
+}
+
+// -- Char literal parser tests
+
+#[test]
+fn parser_char_lit_ascii() {
+    let p = parse(r#"fn main() -> u32 { c"A" }"#);
+    if let Item::Fn(f) = &p.items[0] {
+        if let Some(Expr::Literal(Literal::Char('A'), _)) = &f.body.tail_expr.as_deref() {
+            return;
+        }
+    }
+    panic!("expected Literal::Char('A')");
+}
+
+#[test]
+fn parser_char_lit_escape() {
+    let p = parse(r#"fn main() -> u32 { c"\n" }"#);
+    if let Item::Fn(f) = &p.items[0] {
+        if let Some(Expr::Literal(Literal::Char('\n'), _)) = &f.body.tail_expr.as_deref() {
+            return;
+        }
+    }
+    panic!("expected Literal::Char(newline)");
+}
+
+#[test]
+fn parser_char_lit_in_binding() {
+    let p = parse(r#"fn main() -> nil { let ch = c"Z"; nil }"#);
+    assert_eq!(p.items.len(), 1);
+}
+
+// ── Additional parser tests ──────────────────────────────────────────────────
+
+#[test]
+fn parse_let_with_type_annotation() {
+    let p = parse("fn f() -> nil { let x: i64 = 42; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        let stmt = &f.body.stmts[0];
+        if let Stmt::Let(l) = stmt {
+            assert!(l.ty.is_some());
+        } else { panic!("expected let stmt"); }
+    }
+}
+
+#[test]
+fn parse_tuple_literal() {
+    let p = parse("fn f() -> nil { let t = (1, 2, 3); nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_list_literal() {
+    let p = parse("fn f() -> nil { let xs = list(1, 2, 3); nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_if_else_chain() {
+    let p = parse(r#"
+fn classify(n: i64) -> str {
+    if n < 0 { "neg" }
+    else if n == 0 { "zero" }
+    else { "pos" }
+}
+"#);
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_for_range_loop() {
+    let p = parse("fn f() -> nil { for i in 0..10 { nil } }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_while_loop() {
+    let p = parse("fn f() -> nil { let x = 0; while x < 10 { x = x + 1 } }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_match_expr() {
+    let p = parse(r#"
+fn f(x: i64) -> str {
+    match x {
+        0 => "zero",
+        1 => "one",
+        _ => "other",
+    }
+}
+"#);
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_lambda_expr() {
+    let p = parse("fn f() -> nil { let add = fn(x: i64, y: i64) -> i64 { x + y }; nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_method_call_chain() {
+    let p = parse(r#"fn f(s: str) -> str { s.upper().trim() }"#);
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_pipe_operator() {
+    let p = parse("fn f() -> nil { let x = 5 |> to_str; nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_two_functions() {
+    let p = parse("fn a() -> nil { nil }\nfn b() -> nil { nil }");
+    assert_eq!(p.items.len(), 2);
+}
+
+#[test]
+fn parse_block_as_expression() {
+    let p = parse("fn f() -> i64 { let x = { 42 }; x }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_tuple_destructure() {
+    let p = parse("fn f() -> nil { let (a, b) = (1, 2); nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_return_statement() {
+    let p = parse("fn f() -> i64 { return 42 }");
+    if let Item::Fn(f) = &p.items[0] {
+        assert!(f.body.stmts.iter().any(|s| matches!(s, Stmt::Return { .. })));
+    }
+}
+
+#[test]
+fn parse_neg_int_literal() {
+    let p = parse("fn f() -> i64 { -42 }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_string_literal() {
+    let p = parse(r#"fn f() -> str { "hello world" }"#);
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_bool_literal() {
+    let p = parse("fn f() -> bool { true }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Some(Expr::Literal(Literal::Bool(true), _)) = f.body.tail_expr.as_deref() {}
+        else { panic!("expected bool literal"); }
+    }
+}
+
+#[test]
+fn parse_nil_literal() {
+    let p = parse("fn f() -> nil { nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_binary_arithmetic() {
+    let p = parse("fn f() -> i64 { 1 + 2 * 3 - 4 / 2 }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_index_expression() {
+    let p = parse("fn f(t: Tensor[f32, [3, 4]]) -> nil { let _ = t[0]; nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn parse_use_declaration() {
+    let p = parse(r#"use "other.dmc""#);
+    assert!(p.items.iter().any(|item| matches!(item, Item::Use(_))));
+}
+
+#[test]
+fn parse_pub_fn() {
+    let p = parse("pub fn f() -> nil { nil }");
+    assert!(p.items.iter().any(|item| matches!(item, Item::Pub(_))));
+}
+
+#[test]
+fn parse_break_continue() {
+    let p = parse("fn f() -> nil { for i in 0..10 { if i == 5 { break } else { continue } } }");
+    assert_eq!(p.items.len(), 1);
+}
+
+// ── Issue #131: binary operator as continuation-line leader ─────────────────
+
+#[test]
+fn binop_continuation_line() {
+    // Dot-ops and arithmetic ops can lead continuation lines (closes #131).
+    // The operator must still be at the END of the previous line for `@` (matmul),
+    // since `@` is also a directive prefix and cannot safely span newlines.
+    let p = parse(r#"
+        fn f(a: i64, b: i64, c: i64) -> i64 {
+            a
+            + b
+            + c
+        }
+    "#);
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn dotop_continuation_line() {
+    let p = parse(r#"
+        fn g(a: f32, b: f32, c: f32) -> f32 {
+            a
+            .+ b
+            .- c
+        }
+    "#);
+    assert_eq!(p.items.len(), 1);
+}
+
+// ─── Precedence & associativity regressions (#278, #279) ─────────────────────
+
+/// Extract the tail expression of the first fn item.
+fn tail_of(p: &Program) -> &Expr {
+    match &p.items[0] {
+        Item::Fn(f) => f.body.tail_expr.as_ref().expect("expected tail expr"),
+        _ => panic!("expected fn item"),
+    }
+}
+
+#[test]
+fn power_is_right_associative() {
+    // #278 / OPERATORS.md §1 row 16: `a ** b ** c` is `a ** (b ** c)`.
+    let p = parse("fn f(a: i64, b: i64, c: i64) -> i64 { a ** b ** c }");
+    match tail_of(&p) {
+        Expr::BinOp { op: BinOp::StarStar, lhs, rhs, .. } => {
+            assert!(matches!(**lhs, Expr::Ident(ref n, _) if n == "a"),
+                    "lhs must be the bare `a`, got: {:?}", lhs);
+            assert!(matches!(**rhs, Expr::BinOp { op: BinOp::StarStar, .. }),
+                    "rhs must be the nested `b ** c`, got: {:?}", rhs);
+        }
+        other => panic!("expected top-level `**`, got: {:?}", other),
+    }
+}
+
+#[test]
+fn dot_pow_is_right_associative() {
+    // #278: `.^` shares row 16 with `**`.
+    let p = parse("fn f(a: f32, b: f32, c: f32) -> f32 { a .^ b .^ c }");
+    match tail_of(&p) {
+        Expr::BinOp { op: BinOp::DotPow, rhs, .. } => {
+            assert!(matches!(**rhs, Expr::BinOp { op: BinOp::DotPow, .. }),
+                    "rhs must be the nested `b .^ c`, got: {:?}", rhs);
+        }
+        other => panic!("expected top-level `.^`, got: {:?}", other),
+    }
+}
+
+#[test]
+fn range_binds_looser_than_bitor() {
+    // #279 / OPERATORS.md §1, GRAMMAR.ebnf: `..` (8) is looser than `|` (9),
+    // so `a | b .. c | d` is `(a | b) .. (c | d)`.
+    let p = parse("fn f(a: i64, b: i64, c: i64, d: i64) -> i64 { a | b .. c | d }");
+    match tail_of(&p) {
+        Expr::Range { start, end, inclusive: false, .. } => {
+            assert!(matches!(start.as_deref(), Some(Expr::BinOp { op: BinOp::BitOr, .. })),
+                    "start must be `a | b`, got: {:?}", start);
+            assert!(matches!(end.as_deref(), Some(Expr::BinOp { op: BinOp::BitOr, .. })),
+                    "end must be `c | d`, got: {:?}", end);
+        }
+        other => panic!("expected top-level range, got: {:?}", other),
+    }
+}
+
+#[test]
+fn range_still_binds_tighter_than_equality() {
+    // #279: `==` (6) is looser than `..` (8): `a .. b == c .. d` keeps `==` on top.
+    let p = parse("fn f(a: i64, b: i64, c: i64, d: i64) -> bool { (a .. b) == (c .. d) }");
+    match tail_of(&p) {
+        Expr::BinOp { op: BinOp::Eq, .. } => {}
+        other => panic!("expected top-level `==`, got: {:?}", other),
+    }
+}
+
+#[test]
+fn range_over_sums_unchanged() {
+    // Re-wiring the ladder must not disturb the common `lo + 1 .. hi - 1` form.
+    let p = parse("fn f(lo: i64, hi: i64) -> nil { for i in lo + 1 .. hi - 1 { } nil }");
+    assert_eq!(p.items.len(), 1);
+}

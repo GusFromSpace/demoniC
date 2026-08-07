@@ -1,0 +1,11 @@
+# Probe 25 — Spec §4.2: tuple types and heterogeneous tuple values
+fn make_pair() -> (i64, f32) {
+    (42, 3.14f32)
+}
+
+fn main() -> nil {
+    let (a, b) = make_pair()
+    print(a); print(" ")
+    print(b); print("\n")
+    nil
+}

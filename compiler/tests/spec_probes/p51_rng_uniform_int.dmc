@@ -1,0 +1,50 @@
+# Probe 51 — SPEC §3.8 (#395): `rng.uniform_int[T, [shape]](low, high)` draws
+# integers in the half-open range [low, high) (the `rand_int` convention) and
+# returns the linear-value `(rng, tensor)` pair like the float rng ctors.
+# Previously the draw yielded a silent nil (then, after #413, a loud error).
+fn main() -> nil {
+    let rng = Rng.seed(42)
+    let (rng2, i) = rng.uniform_int[i32, [8]](0, 10)
+    let !in_range = true
+    for k in 0..8 {
+        if i[k] < 0 { in_range = false }
+        if i[k] > 9 { in_range = false }
+    }
+    print(in_range as str); print("\n")
+    # the returned rng continues the linear chain
+    let (rng3, j) = rng2.uniform_int[i32, [4]](-5, 5)
+    let !in_range2 = true
+    for k in 0..4 {
+        if j[k] < -5 { in_range2 = false }
+        if j[k] > 4 { in_range2 = false }
+    }
+    print(in_range2 as str); print("\n")
+    nil
+}
+
+fn test_uniform_int_in_range() -> bool {
+    let rng = Rng.seed(7)
+    let (rng2, i) = rng.uniform_int[i32, [64]](0, 10)
+    let !ok = true
+    for k in 0..64 {
+        if i[k] < 0 { ok = false }
+        if i[k] > 9 { ok = false }
+    }
+    ok
+}
+
+fn test_uniform_int_covers_range() -> bool {
+    # 64 draws from [0, 4): every bucket should be hit (p(miss) ~ (3/4)^64)
+    let rng = Rng.seed(123)
+    let (rng2, i) = rng.uniform_int[i32, [64]](0, 4)
+    let !hits = forge.zeros[i32, [4]]
+    for k in 0..64 {
+        let v = i[k]
+        hits[v] = 1
+    }
+    let !all = true
+    for b in 0..4 {
+        if hits[b] < 1 { all = false }
+    }
+    all
+}

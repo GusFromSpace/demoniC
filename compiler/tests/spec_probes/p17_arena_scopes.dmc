@@ -1,0 +1,12 @@
+# Probe 17 — Spec §6.3: arena scopes vault {} forge {} stream {}
+fn main() -> nil {
+    forge {
+        let x = 1
+        print(x); print("\n")
+    }
+    vault {
+        let y = 2
+        print(y); print("\n")
+    }
+    nil
+}

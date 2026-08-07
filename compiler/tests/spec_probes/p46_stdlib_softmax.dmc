@@ -1,0 +1,8 @@
+# Probe 46 — STDLIB.md: fused stdlib primitive `softmax`
+fn main() -> nil {
+    let x = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    let p = softmax(x, -1)
+    print(p[0]); print(" ")
+    print(p[3]); print("\n")
+    nil
+}

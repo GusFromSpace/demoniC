@@ -1,0 +1,37 @@
+# p48_divergence.dmc — `panic` / `return`-terminated branches are divergent (⊥).
+#
+# Spec: a function whose control paths all exit via `return` or a divergent
+# builtin (`panic`) type-checks against its declared return type even when no
+# single tail expression has that type. Surfaced while translating Norvig's
+# lispy.py for the self-hosting corpus (issue #156): recursive-descent parsers
+# are full of `if ok { return node } else { panic("syntax error") }`.
+
+# A branch ending in `panic` must unify with the `i64` return type.
+fn checked_div(a: i64, b: i64) -> i64 {
+    if b == 0 { panic("division by zero") } else { a / b }
+}
+
+# An if-chain where the non-error arms `return` and the fallthrough panics.
+fn classify(x: i64) -> i64 {
+    if x < 0 { return 0 }
+    if x == 0 { return 1 }
+    if x > 100 { panic("too big") }
+    x
+}
+
+# Tail `if` whose else-branch diverges, then-branch yields a value.
+fn first_positive(a: i64, b: i64) -> i64 {
+    if a > 0 { a } else if b > 0 { b } else { panic("none positive") }
+}
+
+fn main() -> nil {
+    print(checked_div(20, 4))      # 5
+    print(" ")
+    print(classify(-3))            # 0
+    print(" ")
+    print(classify(50))            # 50
+    print(" ")
+    print(first_positive(0, 7))    # 7
+    print("\n")
+    nil
+}

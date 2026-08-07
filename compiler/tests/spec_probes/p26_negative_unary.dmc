@@ -1,0 +1,9 @@
+# Probe 26 — Spec §2.5: unary minus on literals and identifiers
+fn main() -> nil {
+    let a = -42
+    let b = 10
+    let c = -b
+    print(a); print(" ")
+    print(c); print("\n")
+    nil
+}

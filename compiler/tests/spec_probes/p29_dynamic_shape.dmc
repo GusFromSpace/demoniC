@@ -1,0 +1,10 @@
+# Probe 29 — Spec §3.2: dynamic shape escape hatch Tensor[T, [?, ?]]
+fn shape_of(x: Tensor[f32, [?, ?]]) -> i64 {
+    99
+}
+
+fn main() -> nil {
+    print(shape_of([[1.0f32, 2.0f32], [3.0f32, 4.0f32]]))
+    print("\n")
+    nil
+}

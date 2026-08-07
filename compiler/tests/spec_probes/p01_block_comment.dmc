@@ -1,0 +1,11 @@
+# Probe 01 — Spec §2.1: nested block comments #{ ... #{ ... }# ... }#
+#{
+    outer block comment
+    #{ nested block comment }#
+    still outer
+}#
+
+fn main() -> nil {
+    print(42)
+    nil
+}

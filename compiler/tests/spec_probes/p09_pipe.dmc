@@ -1,0 +1,11 @@
+# Probe 09 — Spec §4.6: pipe / chain `|>` and `>>`
+fn double(x: i64) -> i64 { x * 2 }
+fn inc(x: i64)    -> i64 { x + 1 }
+
+fn main() -> nil {
+    let a = 5 |> double |> inc       # ((5*2)+1) = 11
+    let b = 5 >> double >> inc       # equivalent
+    print(a); print(" ")
+    print(b); print("\n")
+    nil
+}

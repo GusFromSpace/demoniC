@@ -1,0 +1,6 @@
+# Probe 44 — Spec §4.10: directive stacking
+fn main() -> nil {
+    let x = @deterministic @cast(bf16) { 3.14f32 }
+    print(x); print("\n")
+    nil
+}

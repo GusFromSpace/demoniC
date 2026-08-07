@@ -1,0 +1,17 @@
+# Probe 16 — Spec §4.5: match with guard `pat if cond` and `x @ pat`
+fn classify(n: i64) -> i64 {
+    match n {
+        x if x < 0      => -1,
+        x @ 0           => 0,
+        x if x < 10     => 1,
+        _               => 2,
+    }
+}
+
+fn main() -> nil {
+    print(classify(-5)); print(" ")
+    print(classify(0));  print(" ")
+    print(classify(5));  print(" ")
+    print(classify(99)); print("\n")
+    nil
+}

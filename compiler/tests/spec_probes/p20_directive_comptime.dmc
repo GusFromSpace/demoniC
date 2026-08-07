@@ -1,0 +1,6 @@
+# Probe 20 — Spec §7.7: @comptime { expr } compile-time eval
+fn main() -> nil {
+    let k = @comptime { 8 * 16 }
+    print(k); print("\n")
+    nil
+}

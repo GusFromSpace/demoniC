@@ -1,0 +1,10 @@
+# Probe 14 — Spec §4.7: block `{ ... }` as expression
+fn main() -> nil {
+    let x = {
+        let a = 10
+        let b = 20
+        a + b
+    }
+    print(x); print("\n")
+    nil
+}

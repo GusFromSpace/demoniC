@@ -1,0 +1,7 @@
+# Probe 32 — Spec §3.8: Rng as linear value
+fn main() -> nil {
+    let rng = Rng.seed(42u64)
+    let (rng, x) = rng.normal[f32, [4]]
+    print(x[0]); print("\n")
+    nil
+}

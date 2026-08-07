@@ -1,0 +1,9 @@
+# Probe 36 — Spec §3.1: explicit `as` cast
+fn main() -> nil {
+    let i = 42
+    let f = i as f32
+    let g = 3.7f32 as i64
+    print(f); print(" ")
+    print(g); print("\n")
+    nil
+}

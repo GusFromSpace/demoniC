@@ -1,0 +1,55 @@
+[package]
+name = "dmc"
+# Compiler version is independent of spec version (currently 0.0.4-draft).
+# The spec is the source of truth; this tracks compiler bootstrap progress.
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+description = "demoniC compiler — bootstrap phases 1-3.5 (lexer + parser + typechecker + tree-walking interpreter pre-alpha)"
+license = "Apache-2.0"
+homepage = "https://github.com/GusFromSpace/demoniC"
+repository = "https://github.com/GusFromSpace/demoniC"
+
+[[bin]]
+name = "dmc"
+path = "src/main.rs"
+
+[dependencies]
+# Pre-alpha interpreter backend. CPU-only, deterministic, easy to debug.
+# Retained as the reference path; the JIT below is the production backend.
+ndarray = "0.17"
+# Stdlib extensions
+regex = "1"
+flate2 = "1"
+ureq = "3"
+chrono = "0.4"
+crossterm = "0.29"
+# Phase 4 JIT backend (issue #15). Cranelift is the first target per
+# the BOOTSTRAP roadmap: pure Rust, no LLVM dep, x86_64 + aarch64.
+cranelift = "0.134"
+cranelift-jit = "0.134"
+cranelift-module = "0.134"
+cranelift-native = "0.134"
+zip = "8"
+
+# Unix `sysconf` for a total-RAM query, used to reject a tensor allocation that
+# cannot fit before it OOM-kills the process. Already in the tree transitively.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# #326 GPU/Metal backend — optional, macOS-only, opt-in via `--features gpu`.
+# Kept out of default builds so CI and non-macOS targets stay dependency-clean.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }
+
+[features]
+# `cargo build --features gpu` (macOS) enables the bf16 decode GEMV on the GPU,
+# selected at runtime with `dmc jit --gpu <file>`.
+gpu = ["dep:metal"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true

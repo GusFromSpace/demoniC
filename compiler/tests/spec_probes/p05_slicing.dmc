@@ -1,0 +1,13 @@
+# Probe 05 — Spec §4.3: slicing syntax (negative idx, step, ellipsis, open)
+fn main() -> nil {
+    let a = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    let neg     = a[-1]              # negative index → last elem
+    let middle  = a[2:5]             # standard slice
+    let stepped = a[0:10:2]          # step slice
+    let open_lo = a[5..]             # open upper
+    print(neg);     print(" ")
+    print(middle);  print(" ")
+    print(stepped); print(" ")
+    print(open_lo); print("\n")
+    nil
+}

@@ -1,0 +1,8 @@
+# Probe 39 — Spec §0 / §2.3: Unicode XID identifiers
+fn main() -> nil {
+    let π = 3
+    let θ = 4
+    let δ = π + θ
+    print(δ); print("\n")
+    nil
+}

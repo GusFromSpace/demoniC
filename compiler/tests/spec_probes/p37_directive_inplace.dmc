@@ -1,0 +1,15 @@
+# Probe 37 — Spec §2.6 / DIRECTIVES: @inplace directive on a function
+@inplace fn zero_out(!x: Tensor[i64, [4]]) -> nil {
+    x[0] = 0
+    x[1] = 0
+    x[2] = 0
+    x[3] = 0
+    nil
+}
+
+fn main() -> nil {
+    let mut a = [1, 2, 3, 4]
+    zero_out(a)
+    print(a[0]); print("\n")
+    nil
+}

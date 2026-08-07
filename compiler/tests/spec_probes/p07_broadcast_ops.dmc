@@ -1,0 +1,14 @@
+# Probe 07 — Spec §4.4: broadcasted elementwise .+ .- .* ./
+fn main() -> nil {
+    let a = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    let b = [10.0f32, 20.0f32, 30.0f32, 40.0f32]
+    let add = a .+ b
+    let sub = b .- a
+    let mul = a .* b
+    let div = b ./ a
+    print(add[0]); print(" ")
+    print(sub[0]); print(" ")
+    print(mul[0]); print(" ")
+    print(div[0]); print("\n")
+    nil
+}

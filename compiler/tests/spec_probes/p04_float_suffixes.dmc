@@ -1,0 +1,10 @@
+# Probe 04 — Spec §2.4: sized float literal suffixes
+fn main() -> nil {
+    let a: f32 = 3.14f32
+    let b: f64 = 3.14f64
+    let c: bf16 = 1.0bf16
+    print(a); print(" ")
+    print(b); print(" ")
+    print(c); print("\n")
+    nil
+}

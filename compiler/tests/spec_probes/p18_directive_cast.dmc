@@ -1,0 +1,7 @@
+# Probe 18 — Spec §4.10 / §7.2: @cast(dtype) { expr } block-scope cast
+fn main() -> nil {
+    let x = 3.14f32
+    let y = @cast(bf16) { x }
+    print(y); print("\n")
+    nil
+}

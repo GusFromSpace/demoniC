@@ -1,0 +1,11 @@
+# Probe 42 — Spec §6.5: @pp(stages=N) with `stage K:` statement form
+@pp(stages=2)
+fn pipeline(x: i64) -> i64 {
+    stage 0: x + 1
+    stage 1: _ * 2
+}
+
+fn main() -> nil {
+    print(pipeline(5)); print("\n")
+    nil
+}

@@ -1,0 +1,8 @@
+# Probe 19 — Spec §7.6: @fuse { expr } single-kernel block
+fn main() -> nil {
+    let a = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    let b = [10.0f32, 20.0f32, 30.0f32, 40.0f32]
+    let c = @fuse { a .+ b }
+    print(c[0]); print("\n")
+    nil
+}

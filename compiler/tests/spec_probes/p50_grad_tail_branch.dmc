@@ -1,0 +1,26 @@
+# Probe 50 — AUTODIFF.md §6.1 (#421): an `if` (or `match`) in TAIL position of
+# a @grad body must differentiate; it parses as a statement rather than the
+# block's tail expression, and previously hit the unsupported-statement error
+# while the let-bound form of the same branch worked.
+@grad fn tail_if(!w: Tensor[f32, [3]]) -> f32 {
+    let s = sum(w .* w)
+    if s > 1.0f32 { s * 2.0f32 } else { s }
+}
+
+@grad fn tail_match(!w: Tensor[f32, [3]]) -> f32 {
+    let s = sum(w .* w)
+    let k = 1
+    match k { 0 => s, _ => s * 2.0f32 }
+}
+
+fn main() -> nil {
+    let !w = forge.zeros[f32, [3]]
+    w[0] = 3.0f32
+    let (li, gi) = tail_if.fwd_bwd(w)
+    print(li); print("\n")
+    print(gi.w[0]); print("\n")
+    let (lm, gm) = tail_match.fwd_bwd(w)
+    print(lm); print("\n")
+    print(gm.w[0]); print("\n")
+    nil
+}

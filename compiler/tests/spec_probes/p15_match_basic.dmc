@@ -1,0 +1,15 @@
+# Probe 15 — Spec §4.5: match with literal + identifier + wildcard arms
+fn label(n: i64) -> i64 {
+    match n {
+        0 => 100,
+        1 => 200,
+        x => x + 1000,
+    }
+}
+
+fn main() -> nil {
+    print(label(0)); print(" ")
+    print(label(1)); print(" ")
+    print(label(5)); print("\n")
+    nil
+}

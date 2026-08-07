@@ -1,0 +1,8 @@
+# Probe 38 — Spec §2.4: string escapes (\n, \t, \\, \")
+fn main() -> nil {
+    print("line1\n")
+    print("tab\there\n")
+    print("quote\"inside\n")
+    print("backslash\\done\n")
+    nil
+}

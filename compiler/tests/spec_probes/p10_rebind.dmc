@@ -1,0 +1,8 @@
+# Probe 10 — Spec §2.5 / OPERATORS §1: `:=` rebinding operator
+# (used in demoniOS/scheduler.dmc and mem_alloc.dmc)
+fn main() -> nil {
+    let !x = 0
+    x := 42
+    print(x); print("\n")
+    nil
+}

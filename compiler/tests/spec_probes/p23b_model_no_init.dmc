@@ -1,0 +1,14 @@
+# Probe 23b — variant of p23: define a model but don't construct it.
+# Isolates whether the bug is `model {...}` decl or `Linear { ... }` ctor.
+model Linear {
+    bias: i64
+
+    fn forward(self, x: i64) -> i64 {
+        x + self.bias
+    }
+}
+
+fn main() -> nil {
+    print(42); print("\n")
+    nil
+}

@@ -1,0 +1,8 @@
+# The tree-walking interpreter spends ~100 KB of native stack per demoniC call.
+# `cargo test` runs each test on a worker thread whose default stack (~2 MB) caps
+# recursion at ~20 deep — enough to SIGABRT recursion tests. RUST_MIN_STACK raises
+# every std-spawned thread (including libtest workers) to 256 MB, matching the
+# dedicated interpreter thread in main.rs, so the MAX_CALL_DEPTH guard trips before
+# the native stack does. See issue #143.
+[env]
+RUST_MIN_STACK = "268435456"

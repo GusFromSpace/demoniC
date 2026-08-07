@@ -1,0 +1,20 @@
+# Probe 02 — Spec §2.4: sized integer literal suffixes
+fn main() -> nil {
+    let a: i8  = 42i8
+    let b: i16 = 42i16
+    let c: i32 = 42i32
+    let d: i64 = 42i64
+    let e: u8  = 42u8
+    let f: u16 = 42u16
+    let g: u32 = 42u32
+    let h: u64 = 42u64
+    print(a); print(" ")
+    print(b); print(" ")
+    print(c); print(" ")
+    print(d); print(" ")
+    print(e); print(" ")
+    print(f); print(" ")
+    print(g); print(" ")
+    print(h); print("\n")
+    nil
+}

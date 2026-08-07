@@ -1,0 +1,11 @@
+# Probe 08 — Spec §4.4 / OPERATORS §3: ReLU `\>` and GeLU `\<`
+fn main() -> nil {
+    let x = [-2.0f32, -1.0f32, 0.0f32, 1.0f32, 2.0f32]
+    let y = \>x
+    let z = \<x
+    print(y[0]); print(" ")
+    print(y[3]); print(" ")
+    print(z[0]); print(" ")
+    print(z[3]); print("\n")
+    nil
+}

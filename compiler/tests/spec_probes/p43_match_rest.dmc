@@ -1,0 +1,13 @@
+# Probe 43 — Spec §4.5: `..` rest pattern in match
+fn first_or(n: i64) -> i64 {
+    match n {
+        0  => 100,
+        .. => 999,
+    }
+}
+
+fn main() -> nil {
+    print(first_or(0)); print(" ")
+    print(first_or(7)); print("\n")
+    nil
+}
