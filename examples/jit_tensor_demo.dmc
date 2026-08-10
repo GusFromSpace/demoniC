@@ -1,0 +1,114 @@
+# jit_tensor_demo.dmc -- Phase 4 JIT tensor surface (issue #15).
+# Covers JIT slices 2–4: tensors, Forge arena, elementwise dot-ops,
+# matmul, SIMD F32X4 kernels, and basic broadcasting.
+# JIT slices 5–8 add: softmax/norms, autodiff, attn/rope/GQA, tiled SGEMM.
+#
+# Run under the JIT:
+#   dmc jit examples/jit_tensor_demo.dmc
+# Also runs under the interpreter (dmc run) for smoke-testing.
+
+# 1D dot product via elementwise multiply + reduction. Both operands must
+# share the same compile-time shape -- broadcasting lands in a later slice.
+fn dot(a: Tensor[f32, [4]], b: Tensor[f32, [4]]) -> f32 {
+    sum(a .* b)
+}
+
+# Scale-and-bias: y = a .* x + b, all same shape.
+fn affine(x: Tensor[f32, [4]], a: Tensor[f32, [4]], b: Tensor[f32, [4]]) -> f32 {
+    sum(a .* x .+ b)
+}
+
+fn main() -> i64 {
+    # ─── 1D path ─────────────────────────────────────────────────────────
+    let q = [1.0, 2.0, 3.0, 4.0]
+    let k = [5.0, 6.0, 7.0, 8.0]
+    print_tensor(q)
+    print_tensor(k)
+    print_i64(dot(q, k) as i64)          # 70
+
+    let scale = [2.0, 2.0, 2.0, 2.0]
+    let bias  = [1.0, 1.0, 1.0, 1.0]
+    print_i64(affine(q, scale, bias) as i64)   # (2*1+1)+(2*2+1)+(2*3+1)+(2*4+1) = 24
+
+    # ─── 2D path: a 2x3 @ 3x2 matmul ─────────────────────────────────────
+    let A = [[1.0, 2.0, 3.0],
+             [4.0, 5.0, 6.0]]
+    let B = [[ 7.0,  8.0],
+             [ 9.0, 10.0],
+             [11.0, 12.0]]
+    let C = A @ B
+    # C = [[58, 64], [139, 154]];  sum = 415
+    print_tensor(C)
+    print_i64(sum(C) as i64)
+
+    # ─── Mutate a tensor in place ────────────────────────────────────────
+    let mut buf = [0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < 4 {
+        buf[i] = (i * i) as f32
+        i += 1
+    }
+    print_tensor(buf)
+    sum(buf) as i64                       # 0 + 1 + 4 + 9 = 14
+}
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+
+# dot([1,2,3,4],[5,6,7,8]) = 1*5+2*6+3*7+4*8 = 5+12+21+32 = 70
+fn test_dot_known_inputs() -> bool {
+    let q = [1.0, 2.0, 3.0, 4.0]
+    let k = [5.0, 6.0, 7.0, 8.0]
+    let result = dot(q, k)
+    abs(result - 70.0) < 0.001
+}
+
+# affine(x=[1,2,3,4], a=[2,2,2,2], b=[1,1,1,1])
+# = sum(a.*x .+ b) = sum([3,5,7,9]) = 24
+fn test_affine_known_inputs() -> bool {
+    let x = [1.0, 2.0, 3.0, 4.0]
+    let a = [2.0, 2.0, 2.0, 2.0]
+    let b = [1.0, 1.0, 1.0, 1.0]
+    let result = affine(x, a, b)
+    abs(result - 24.0) < 0.001
+}
+
+# dot(x,x) == sum of squares: [3,4,0,0] -> 9+16 = 25
+fn test_dot_self_is_sum_of_squares() -> bool {
+    let v = [3.0, 4.0, 0.0, 0.0]
+    let result = dot(v, v)
+    abs(result - 25.0) < 0.001
+}
+
+# dot with zero vector must be zero
+fn test_dot_zero_vector() -> bool {
+    let v    = [1.0, 2.0, 3.0, 4.0]
+    let zero = [0.0, 0.0, 0.0, 0.0]
+    let result = dot(v, zero)
+    abs(result) < 0.001
+}
+
+# A=[2x3] @ B=[3x2] sum of result = 58+64+139+154 = 415
+# C[0,0]=1*7+2*9+3*11=58; C[0,1]=1*8+2*10+3*12=64
+# C[1,0]=4*7+5*9+6*11=139; C[1,1]=4*8+5*10+6*12=154
+fn test_matmul_sum() -> bool {
+    let A = [[1.0, 2.0, 3.0],
+             [4.0, 5.0, 6.0]]
+    let B = [[ 7.0,  8.0],
+             [ 9.0, 10.0],
+             [11.0, 12.0]]
+    let C = A @ B
+    let s = sum(C)
+    abs(s - 415.0) < 0.01
+}
+
+# squared-squares buf: i^2 for i in 0..4 -> [0,1,4,9], sum=14
+fn test_buf_squares_sum() -> bool {
+    let !buf = [0.0, 0.0, 0.0, 0.0]
+    let !i = 0
+    while i < 4 {
+        buf[i] = (i * i) as f32
+        i = i + 1
+    }
+    let s = sum(buf)
+    abs(s - 14.0) < 0.001
+}

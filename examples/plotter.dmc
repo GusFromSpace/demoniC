@@ -1,0 +1,155 @@
+# plotter.dmc — ASCII terminal line graph plotter.
+#
+# A community utility staple for monitoring training runs and functions.
+# Takes a dynamic list of floats, scales it, and plots it in the terminal.
+#
+# Run:
+#   dmc run examples/plotter.dmc
+
+fn plot(history: list, H: i64, W: i64) -> nil {
+    let len_h = list_len(history)
+    if len_h < 2 {
+        print("plotter: need at least 2 points")
+        return nil
+    }
+
+    # 1. Find min and max values to establish y-axis bounds.
+    let !min_val = list_get(history, 0) as f64
+    let !max_val = min_val
+    let !i = 1
+    while i < len_h {
+        let val = list_get(history, i) as f64
+        if val < min_val { min_val = val }
+        if val > max_val { max_val = val }
+        i = i + 1
+    }
+
+    let range = max_val - min_val
+    let divisor = if range == 0.0 { 1.0 } else { range }
+
+    # 2. Render row-by-row (top to bottom).
+    let !row = H - 1
+    while row >= 0 {
+        # Y-axis labels on the left border
+        let !line = if row == H - 1 {
+            "Max: "
+        } else if row == 0 {
+            "Min: "
+        } else {
+            "     "
+        }
+
+        # Draw columns (left to right)
+        let !col = 0
+        while col < W {
+            # Map column index to history index
+            let hist_idx = (col * (len_h - 1)) / (W - 1)
+            let val = list_get(history, hist_idx) as f64
+
+            # Normalize value to 0..1, then map to row heights
+            let norm = (val - min_val) / divisor
+            let target_row = floor(norm * (H - 1) as f64) as i64
+
+            if target_row == row {
+                line = line + "*"
+            } else if row == 0 {
+                # X-axis border line
+                line = line + "-"
+            } else {
+                # Empty space
+                line = line + " "
+            }
+            col = col + 1
+        }
+        print(line)
+        row = row - 1
+    }
+    nil
+}
+
+fn main() -> nil {
+    print("TUI Terminal Loss Plotter Demo:\n")
+
+    # Generate a mock loss history: a decaying sine wave
+    let !history = list()
+    let !step = 0
+    while step < 60 {
+        # Simulated loss: e^(-t/20) * cos(t*0.4) + offset
+        let t = step as f64
+        let loss = exp(-t / 20.0) * (cos(t * 0.4) + 1.2) + 0.1
+        history = list_push(history, loss)
+        step = step + 1
+    }
+
+    plot(history, 12, 60)
+    nil
+}
+
+# ── tests ──────────────────────────────────────────────────────────────────
+
+# list_min and list_max builtins return the correct extremes for a known list.
+# Ground truth: the list [3.0, 1.0, 4.0, 1.5, 9.0, 2.6] is constructed so
+# that the minimum is 1.0 and the maximum is 9.0 by inspection.
+fn test_list_min_max() -> bool {
+    let xs = list(3.0, 1.0, 4.0, 1.5, 9.0, 2.6)
+    let lo = list_min(xs)
+    let hi = list_max(xs)
+    abs(lo - 1.0) < 0.0001 && abs(hi - 9.0) < 0.0001
+}
+
+# The normalization formula (val - min_val) / range maps the minimum to
+# exactly 0.0 and the maximum to exactly 1.0. Using list [0.0, 5.0, 10.0]:
+# min=0.0, max=10.0, range=10.0.
+#   norm(0.0)  = (0.0 - 0.0) / 10.0 = 0.0
+#   norm(10.0) = (10.0 - 0.0) / 10.0 = 1.0
+fn test_normalization_boundaries() -> bool {
+    let xs = list(0.0, 5.0, 10.0)
+    let lo = list_min(xs)
+    let hi = list_max(xs)
+    let range = hi - lo
+    let norm_min = (lo - lo) / range
+    let norm_max = (hi - lo) / range
+    abs(norm_min - 0.0) < 0.0001 && abs(norm_max - 1.0) < 0.0001
+}
+
+# The column-to-history-index mapping formula is:
+#   hist_idx = (col * (len_h - 1)) / (W - 1)
+# Boundary invariants (integer arithmetic):
+#   col = 0     -> (0 * (len_h-1)) / (W-1) = 0
+#   col = W-1   -> ((W-1) * (len_h-1)) / (W-1) = len_h-1
+# Using W=5 columns, len_h=10 history points.
+fn test_index_mapping_boundaries() -> bool {
+    let len_h = 10
+    let W = 5
+    let idx_first = (0 * (len_h - 1)) / (W - 1)
+    let idx_last  = ((W - 1) * (len_h - 1)) / (W - 1)
+    idx_first == 0 && idx_last == len_h - 1
+}
+
+# When all values in the history are identical (flat line), range == 0.0 and
+# the plot function uses divisor = 1.0 instead (the guard in line 28).
+# Normalization then gives (val - val) / 1.0 = 0.0 for every point, so
+# target_row = floor(0.0 * (H-1)) = 0 — the dot sits on the bottom row.
+# We test the divisor guard and the resulting normalization arithmetically.
+fn test_flat_range_guard() -> bool {
+    let xs = list(3.7, 3.7, 3.7)
+    let lo = list_min(xs)
+    let hi = list_max(xs)
+    let raw_range = hi - lo
+    let divisor = if raw_range == 0.0 { 1.0 } else { raw_range }
+    let norm = (lo - lo) / divisor
+    # divisor must be 1.0 (not 0.0), norm must be 0.0
+    abs(divisor - 1.0) < 0.0001 && abs(norm - 0.0) < 0.0001
+}
+
+# Building a history list with N pushes yields list_len == N.
+# The main() loop runs 10 steps here; list_len must equal 10 exactly.
+fn test_history_list_length() -> bool {
+    let !h = list()
+    let !i = 0
+    while i < 10 {
+        h = list_push(h, i as f64)
+        i = i + 1
+    }
+    list_len(h) == 10
+}

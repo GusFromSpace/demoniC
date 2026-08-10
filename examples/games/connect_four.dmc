@@ -1,0 +1,426 @@
+# Connect Four in demoniC with depth-limited minimax AI
+
+fn print_board(board: Tensor[i64, [6, 7]]) -> nil {
+  for i in 0..6 {
+    let mut row = "|";
+    for j in 0..7 {
+      let val = board[i, j];
+      if val == 0 {
+        row = row + " ";
+      } else if val == 1 {
+        row = row + "R";
+      } else {
+        row = row + "Y";
+      }
+      row = row + "|";
+    }
+    print(row);
+  }
+  print("+--+--+--+--+--+--+--+");
+  print(" 0  1  2  3  4  5  6");
+  print("");
+  nil
+}
+
+fn drop_piece(board: Tensor[i64, [6, 7]], col: i64, player: i64) -> (Tensor[i64, [6, 7]], i64) {
+  let mut new_board = board;
+  let mut row = -1;
+  let mut i = 5;
+  while i >= 0 {
+    if new_board[i, col] == 0 {
+      row = i;
+      new_board[i, col] = player;
+      break;
+    }
+    i = i - 1;
+  }
+  (new_board, row)
+}
+
+fn check_winner(board: Tensor[i64, [6, 7]]) -> i64 {
+  # Check rows
+  for i in 0..6 {
+    for j in 0..4 {
+      let a = board[i, j];
+      let b = board[i, j + 1];
+      let c = board[i, j + 2];
+      let d = board[i, j + 3];
+      if a != 0 && a == b && b == c && c == d {
+        return a;
+      }
+    }
+  }
+
+  # Check columns
+  for j in 0..7 {
+    for i in 0..3 {
+      let a = board[i, j];
+      let b = board[i + 1, j];
+      let c = board[i + 2, j];
+      let d = board[i + 3, j];
+      if a != 0 && a == b && b == c && c == d {
+        return a;
+      }
+    }
+  }
+
+  # Check diagonal (top-left to bottom-right)
+  for i in 0..3 {
+    for j in 0..4 {
+      let a = board[i, j];
+      let b = board[i + 1, j + 1];
+      let c = board[i + 2, j + 2];
+      let d = board[i + 3, j + 3];
+      if a != 0 && a == b && b == c && c == d {
+        return a;
+      }
+    }
+  }
+
+  # Check diagonal (top-right to bottom-left)
+  for i in 0..3 {
+    for j in 3..7 {
+      let a = board[i, j];
+      let b = board[i + 1, j - 1];
+      let c = board[i + 2, j - 2];
+      let d = board[i + 3, j - 3];
+      if a != 0 && a == b && b == c && c == d {
+        return a;
+      }
+    }
+  }
+
+  0
+}
+
+fn count_line(
+  board: Tensor[i64, [6, 7]], row: i64, col: i64, dr: i64, dc: i64, player: i64
+) -> i64 {
+  let mut count = 0;
+  let mut r = row;
+  let mut c = col;
+  while r >= 0 && r < 6 && c >= 0 && c < 7 {
+    if board[r, c] == player {
+      count = count + 1;
+    }
+    r = r + dr;
+    c = c + dc;
+  }
+  count
+}
+
+fn score_position(board: Tensor[i64, [6, 7]], player: i64) -> i64 {
+  let mut score = 0;
+  let opponent = if player == 1 { 2 } else { 1 };
+
+  # Horizontal lines
+  for i in 0..6 {
+    for j in 0..7 {
+      if board[i, j] == 0 {
+        let left_count = count_line(board, i, j - 1, 0, -1, player);
+        let right_count = count_line(board, i, j + 1, 0, 1, player);
+        let total = left_count + right_count;
+        if total == 3 {
+          score = score + 100;
+        } else if total == 2 {
+          score = score + 10;
+        } else if total == 1 {
+          score = score + 1;
+        }
+        let opp_left = count_line(board, i, j - 1, 0, -1, opponent);
+        let opp_right = count_line(board, i, j + 1, 0, 1, opponent);
+        let opp_total = opp_left + opp_right;
+        if opp_total == 3 {
+          score = score - 50;
+        } else if opp_total == 2 {
+          score = score - 5;
+        }
+      }
+    }
+  }
+
+  # Vertical lines
+  for i in 0..6 {
+    for j in 0..7 {
+      if board[i, j] == 0 {
+        let up_count = count_line(board, i - 1, j, -1, 0, player);
+        let down_count = count_line(board, i + 1, j, 1, 0, player);
+        let total = up_count + down_count;
+        if total == 3 {
+          score = score + 100;
+        } else if total == 2 {
+          score = score + 10;
+        } else if total == 1 {
+          score = score + 1;
+        }
+        let opp_up = count_line(board, i - 1, j, -1, 0, opponent);
+        let opp_down = count_line(board, i + 1, j, 1, 0, opponent);
+        let opp_total = opp_up + opp_down;
+        if opp_total == 3 {
+          score = score - 50;
+        } else if opp_total == 2 {
+          score = score - 5;
+        }
+      }
+    }
+  }
+
+  score
+}
+
+fn minimax(board: Tensor[i64, [6, 7]], player: i64, depth: i64, max_depth: i64) -> i64 {
+  let winner = check_winner(board);
+
+  if winner == 1 {
+    return 1000 - depth;
+  }
+  if winner == 2 {
+    return -1000 + depth;
+  }
+
+  if depth >= max_depth {
+    return score_position(board, player);
+  }
+
+  let opponent = if player == 1 { 2 } else { 1 };
+  let mut best_score = if player == 1 { -10000 } else { 10000 };
+
+  for col in 0..7 {
+    if board[0, col] == 0 {
+      let (new_board, row) = drop_piece(board, col, player);
+      if row >= 0 {
+        let score = minimax(new_board, opponent, depth + 1, max_depth);
+
+        if player == 1 {
+          if score > best_score {
+            best_score = score;
+          }
+        } else {
+          if score < best_score {
+            best_score = score;
+          }
+        }
+      }
+    }
+  }
+
+  best_score
+}
+
+fn best_move(board: Tensor[i64, [6, 7]], player: i64, depth: i64) -> i64 {
+  let mut best_col = 0;
+  let mut best_score = if player == 1 { -10000 } else { 10000 };
+  let opponent = if player == 1 { 2 } else { 1 };
+
+  for col in 0..7 {
+    if board[0, col] == 0 {
+      let (new_board, row) = drop_piece(board, col, player);
+      if row >= 0 {
+        let score = minimax(new_board, opponent, 1, depth);
+
+        if player == 1 {
+          if score > best_score {
+            best_score = score;
+            best_col = col;
+          }
+        } else {
+          if score < best_score {
+            best_score = score;
+            best_col = col;
+          }
+        }
+      }
+    }
+  }
+
+  best_col
+}
+
+# ── Tests ──────────────────────────────────────────────────────────────────
+
+# An all-zero board has no 4-in-a-row, so check_winner must return 0.
+fn test_empty_board_no_winner() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0]];
+  check_winner(board) == 0
+}
+
+# Player 1 occupies cols 0-3 in row 5 (bottom).  The horizontal check scans
+# i in 0..6, j in 0..4 and finds board[5,0]==board[5,1]==board[5,2]==board[5,3]==1
+# with a!=0, so check_winner must return 1.
+fn test_horizontal_win_player1() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [1, 1, 1, 1, 0, 0, 0]];
+  check_winner(board) == 1
+}
+
+# Player 2 occupies rows 2-5 in col 0 (four in a column).  The vertical check
+# scans j in 0..7, i in 0..3 and finds board[2,0]==board[3,0]==board[4,0]==board[5,0]==2
+# with a!=0, so check_winner must return 2.
+fn test_vertical_win_player2() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0]];
+  check_winner(board) == 2
+}
+
+# Player 1 on the main diagonal (0,0),(1,1),(2,2),(3,3): the top-left→bottom-right
+# diagonal check covers i in 0..3, j in 0..4 and finds all four equal and nonzero.
+fn test_diagonal_win_player1() -> bool {
+  let board = [[1, 0, 0, 0, 0, 0, 0],
+               [0, 1, 0, 0, 0, 0, 0],
+               [0, 0, 1, 0, 0, 0, 0],
+               [0, 0, 0, 1, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0]];
+  check_winner(board) == 1
+}
+
+# A board with no winner returns 0 even when pieces are present but not aligned.
+fn test_no_winner_mixed() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [1, 2, 1, 2, 0, 0, 0],
+               [2, 1, 2, 1, 0, 0, 0]];
+  check_winner(board) == 0
+}
+
+# On an empty board, drop_piece into col 3 must land on row 5 (gravity: the loop
+# starts at i=5 and moves up; row 5 is the first vacant slot).
+fn test_drop_gravity_empty_board() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0]];
+  let (new_board, row) = drop_piece(board, 3, 1);
+  row == 5 && new_board[5, 3] == 1
+}
+
+# After one piece at (5,2), a second piece into col 2 must land on row 4.
+fn test_drop_stacking() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 1, 0, 0, 0, 0]];
+  let (new_board, row) = drop_piece(board, 2, 2);
+  row == 4 && new_board[4, 2] == 2
+}
+
+# A full column (all 6 rows occupied) returns row = -1 (no valid slot found).
+fn test_drop_full_column() -> bool {
+  let board = [[1, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0],
+               [1, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0],
+               [1, 0, 0, 0, 0, 0, 0],
+               [2, 0, 0, 0, 0, 0, 0]];
+  let (new_board, row) = drop_piece(board, 0, 1);
+  row == -1
+}
+
+# count_line on an empty board (all zeros) should return 0: no cell matches player.
+fn test_count_line_empty() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0]];
+  count_line(board, 5, 0, 0, 1, 1) == 0
+}
+
+# Player 1 at (5,0),(5,1),(5,2): count_line from (5,0) going right (dr=0,dc=1)
+# visits cols 0,1,2,3,4,5,6 — exactly 3 match player 1. Result must be 3.
+fn test_count_line_three() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [1, 1, 1, 0, 0, 0, 0]];
+  count_line(board, 5, 0, 0, 1, 1) == 3
+}
+
+# best_move should find the immediately winning move.
+# Player 1 has three in a row at (5,0),(5,1),(5,2); col 3 (row 5) is empty and
+# completes four-in-a-row.  Col 6 cannot win because it is not adjacent.
+# At depth >= 1, minimax explores col 3, sees check_winner returns 1, scores it
+# highest.  best_move must return 3.
+fn test_best_move_wins_immediately() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0],
+               [1, 1, 1, 0, 0, 0, 0]];
+  best_move(board, 1, 3) == 3
+}
+
+# ── End tests ───────────────────────────────────────────────────────────────
+
+fn main() -> nil {
+  let mut board = [[0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0]];
+
+  print("=== Connect Four: Red vs Yellow (both depth 4) ===");
+  print_board(board);
+
+  let mut move_count = 0;
+  let mut current_player = 1;
+
+  while true {
+    let winner = check_winner(board);
+    if winner != 0 {
+      if winner == 1 {
+        print("Red wins!");
+      } else {
+        print("Yellow wins!");
+      }
+      break;
+    }
+
+    if move_count >= 42 {
+      print("Draw! Board full.");
+      break;
+    }
+
+    let col = best_move(board, current_player, 4);
+    let (new_board, row) = drop_piece(board, col, current_player);
+
+    if row >= 0 {
+      board = new_board;
+      move_count = move_count + 1;
+
+      if current_player == 1 {
+        print("Red drops at column " + to_str(col) + " (row " + to_str(row) + ")");
+      } else {
+        print("Yellow drops at column " + to_str(col) + " (row " + to_str(row) + ")");
+      }
+
+      print_board(board);
+      current_player = if current_player == 1 { 2 } else { 1 };
+    }
+  }
+  nil
+}

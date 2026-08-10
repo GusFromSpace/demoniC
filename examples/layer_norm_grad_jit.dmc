@@ -1,0 +1,77 @@
+# layer_norm forward + reverse-mode VJP under the JIT (#368).
+#
+# layer_norm is the transformer normalizer (GPT/BERT-style); the third fused
+# tensor op to differentiate under the JIT @grad subset (after softmax and
+# rms_norm). Over the last axis the VJP flows to ALL THREE inputs — the
+# activations x, the gain, and the bias — which is what a training step needs:
+#   x̂_k     = (x_k − μ)/std,   std = sqrt(var + eps)     (per row)
+#   dx_k    = (dx̂_k − mean(dx̂) − x̂_k·mean(dx̂·x̂)) / std,   dx̂_k = g_k·gain_k
+#   dgain_k = Σ_rows g_k·x̂_k
+#   dbias_k = Σ_rows g_k
+#
+# Concrete rank-2 x + rank-1 gain/bias → the JIT monomorphizes the backward;
+# these RUN and match the interpreter under `dmc test --jit`. Bracketed values
+# were cross-checked interp-vs-JIT (all agree to f32); the interpreter VJP is
+# itself finite-diff-validated in gradcheck.dmc. Second-order falls back to interp.
+
+# ── forward parity: g=ones, b=zeros → zero-mean, unit-variance rows ──────────
+fn test_layer_norm_forward() -> bool {
+    let !x = forge.zeros[f32, [2, 2]]
+    x[0,0]=3.0  x[0,1]=4.0        # mean 3.5, std 0.5 → (−1, 1)
+    x[1,0]=0.0  x[1,1]=2.0        # mean 1.0, std 1.0 → (−1, 1)
+    let !g = forge.zeros[f32, [2]]
+    g[0]=1.0  g[1]=1.0
+    let !b = forge.zeros[f32, [2]]
+    b[0]=0.0  b[1]=0.0
+    let y = layer_norm(x, g, b, 0.0f32)
+    (y[0,0] > 0.0-1.001) && (y[0,0] < 0.0-0.999) && (y[0,1] > 0.999) && (y[0,1] < 1.001)
+        && (y[1,0] > 0.0-1.001) && (y[1,0] < 0.0-0.999) && (y[1,1] > 0.999) && (y[1,1] < 1.001)
+}
+
+# ── VJP to x, gain, and bias: loss = sum(layer_norm(x,g,b)^2) ────────────────
+@grad fn ln_loss(!x: Tensor[f32, [2, 3]], !g: Tensor[f32, [3]], !b: Tensor[f32, [3]]) -> f32 {
+    let y = layer_norm(x, g, b, 0.00001f32)
+    sum(y .* y)
+}
+
+fn test_layer_norm_grad() -> bool {
+    let !x = forge.zeros[f32, [2, 3]]
+    x[0,0]=1.0  x[0,1]=2.0  x[0,2]=3.0
+    x[1,0]=0.5  x[1,1]=0.0-1.0  x[1,2]=2.0
+    let !g = forge.zeros[f32, [3]]
+    g[0]=2.0  g[1]=0.5  g[2]=1.0
+    let !b = forge.zeros[f32, [3]]
+    b[0]=0.1  b[1]=0.0-0.2  b[2]=0.3
+    let (l, gr) = ln_loss.fwd_bwd(x, g, b)
+    # verified (interp == JIT to f32): l≈10.8796 ;
+    #   dx[0,*]≈[−1.2143, 2.4284, −1.2141] ; dgain≈[5.7550, 1.9899, 7.4696] ;
+    #   dbias≈[−4.4989, −2.0247, 6.0990]
+    (l > 10.87) && (l < 10.89)
+        && (gr.x[0,0] > 0.0-1.216) && (gr.x[0,0] < 0.0-1.212)
+        && (gr.x[0,1] > 2.426) && (gr.x[0,1] < 2.430)
+        && (gr.g[0] > 5.753) && (gr.g[0] < 5.757)
+        && (gr.g[2] > 7.467) && (gr.g[2] < 7.472)
+        && (gr.b[0] > 0.0-4.501) && (gr.b[0] < 0.0-4.497)
+        && (gr.b[2] > 6.097) && (gr.b[2] < 6.101)
+}
+
+# ── dbias sanity: for loss = sum(layer_norm(x,g,b)), dbias is all-ones ───────
+# (∂/∂b_k of Σ_ij (x̂+b) = Σ_rows 1 = rows). With 2 rows, dbias_k = 2.
+@grad fn ln_sum(!x: Tensor[f32, [2, 3]], !g: Tensor[f32, [3]], !b: Tensor[f32, [3]]) -> f32 {
+    let y = layer_norm(x, g, b, 0.00001f32)
+    sum(y)
+}
+
+fn test_layer_norm_dbias_ones() -> bool {
+    let !x = forge.zeros[f32, [2, 3]]
+    x[0,0]=1.0  x[0,1]=2.0  x[0,2]=3.0
+    x[1,0]=0.5  x[1,1]=0.0-1.0  x[1,2]=2.0
+    let !g = forge.zeros[f32, [3]]
+    g[0]=2.0  g[1]=0.5  g[2]=1.0
+    let !b = forge.zeros[f32, [3]]
+    b[0]=0.0  b[1]=0.0  b[2]=0.0
+    let (l, gr) = ln_sum.fwd_bwd(x, g, b)
+    (gr.b[0] > 1.999) && (gr.b[0] < 2.001)
+        && (gr.b[1] > 1.999) && (gr.b[1] < 2.001)
+        && (gr.b[2] > 1.999) && (gr.b[2] < 2.001)
+}

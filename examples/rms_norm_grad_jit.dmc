@@ -1,0 +1,47 @@
+# rms_norm forward + reverse-mode VJP under the JIT (#368).
+#
+# rms_norm is the normalizer in modern LLMs (Qwen, Llama, …), and the second
+# fused tensor op to differentiate under the JIT @grad subset (after softmax).
+# The VJP over the last axis flows to BOTH inputs — the activations x and the
+# gain weight — which is exactly what a training step needs:
+#   r        = sqrt(mean(x²) + eps)          (per row)
+#   dx_k     = g_k·gain_k/r − x_k·S/(D·r³),   S = Σ_i g_i·gain_i·x_i
+#   dgain_k  = Σ_rows g_k·x_k/r
+#
+# Concrete rank-2 x + rank-1 gain → the JIT monomorphizes the backward; these
+# RUN and match the interpreter under `dmc test --jit`. Bracketed values were
+# cross-checked interp-vs-JIT (both agree to f32); the interpreter VJP is itself
+# finite-diff-validated in gradcheck.dmc. Second-order falls back to interp.
+
+# ── forward parity ──────────────────────────────────────────────────────────
+fn test_rms_norm_forward() -> bool {
+    let !x = forge.zeros[f32, [2, 2]]
+    x[0,0]=3.0  x[0,1]=4.0        # rms = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.5355
+    x[1,0]=1.0  x[1,1]=1.0        # rms = 1 → row unchanged (gain 1)
+    let !g = forge.zeros[f32, [2]]
+    g[0]=1.0  g[1]=1.0
+    let y = rms_norm(x, g, 0.0f32)
+    # y[0,0]=3/3.5355≈0.8485 ; y[0,1]=4/3.5355≈1.1314 ; y[1,*]=1
+    (y[0,0] > 0.847) && (y[0,0] < 0.850) && (y[0,1] > 1.130) && (y[0,1] < 1.133)
+        && (y[1,0] > 0.999) && (y[1,0] < 1.001)
+}
+
+# ── VJP to both x and gain: loss = sum(rms_norm(x,g)^2) ─────────────────────
+@grad fn rn_loss(!x: Tensor[f32, [2, 3]], !g: Tensor[f32, [3]]) -> f32 {
+    let y = rms_norm(x, g, 0.00001f32)
+    sum(y .* y)
+}
+
+fn test_rms_norm_grad() -> bool {
+    let !x = forge.zeros[f32, [2, 3]]
+    x[0,0]=1.0  x[0,1]=2.0  x[0,2]=3.0
+    x[1,0]=0.5  x[1,1]=0.0-1.0  x[1,2]=2.0
+    let !g = forge.zeros[f32, [3]]
+    g[0]=2.0  g[1]=0.5  g[2]=1.0
+    let (l, gr) = rn_loss.fwd_bwd(x, g)
+    # verified (interp == JIT): l≈6.0 ; dx[0,0]≈1.2857 ; dgain≈[1.4286, 1.4286, 8.4285]
+    (l > 5.99) && (l < 6.01)
+        && (gr.x[0,0] > 1.284) && (gr.x[0,0] < 1.287)
+        && (gr.g[0] > 1.427) && (gr.g[0] < 1.430)
+        && (gr.g[2] > 8.426) && (gr.g[2] < 8.431)
+}

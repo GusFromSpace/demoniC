@@ -1,0 +1,51 @@
+# collatz.dmc — Collatz conjecture sequence from n=27 to 1.
+# Demonstrates: while loop, integer arithmetic, conditional 3n+1 rule.
+# No JIT needed. Run: dmc run examples/collatz.dmc
+
+# --- numeric gate: Collatz step counts are independently known ---
+# collatz_steps counts iterations to reach 1 (restatement of main's loop).
+fn collatz_steps(start: i64) -> i64 {
+    let !n = start
+    let !steps = 0
+    while n != 1 {
+        if n % 2 == 0 {
+            n = n / 2
+        } else {
+            n = 3 * n + 1
+        }
+        steps = steps + 1
+    }
+    steps
+}
+
+# Known: 1->0, 7->16, 27->111 (the value main prints).
+fn test_collatz_steps_known() -> bool {
+    collatz_steps(1) == 0 && collatz_steps(7) == 16 && collatz_steps(27) == 111
+}
+
+# 2->1, 6->8, 8->3 (8,4,2,1).
+fn test_collatz_small() -> bool {
+    collatz_steps(2) == 1 && collatz_steps(8) == 3 && collatz_steps(6) == 8
+}
+
+fn main() -> nil {
+    let !n = 27
+    let !steps = 0
+
+    print("Collatz sequence from 27:")
+    let !seq = to_str(n) + " "
+
+    while n != 1 {
+        if n % 2 == 0 {
+            n = n / 2
+        } else {
+            n = 3 * n + 1
+        }
+        steps = steps + 1
+        seq = seq + to_str(n) + " "
+    }
+
+    print(seq)
+    print("Steps: " + to_str(steps))
+    nil
+}

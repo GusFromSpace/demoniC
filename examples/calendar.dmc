@@ -1,0 +1,207 @@
+# calendar.dmc — tiny month calendar renderer.
+# Demonstrates: date arithmetic, leap years, modulo, nested loops, printing.
+
+fn is_leap(year: i64) -> bool {
+    if year % 400 == 0 {
+        true
+    } else if year % 100 == 0 {
+        false
+    } else {
+        year % 4 == 0
+    }
+}
+
+fn month_len(year: i64, month: i64) -> i64 {
+    match month {
+        1 => 31,
+        2 => if is_leap(year) { 29 } else { 28 },
+        3 => 31,
+        4 => 30,
+        5 => 31,
+        6 => 30,
+        7 => 31,
+        8 => 31,
+        9 => 30,
+        10 => 31,
+        11 => 30,
+        12 => 31,
+        _ => 0,
+    }
+}
+
+fn days_before_year(year: i64) -> i64 {
+    let !days = 0
+    for y in 1970..year {
+        if is_leap(y) {
+            days = days + 366
+        } else {
+            days = days + 365
+        }
+    }
+    days
+}
+
+fn days_before_month(year: i64, month: i64) -> i64 {
+    let !days = 0
+    for m in 1..month {
+        days = days + month_len(year, m)
+    }
+    days
+}
+
+fn weekday(year: i64, month: i64, day: i64) -> i64 {
+    # 1970-01-01 was Thursday. Sunday is 0.
+    (4 + days_before_year(year) + days_before_month(year, month) + day - 1) % 7
+}
+
+fn month_name(month: i64) -> str {
+    match month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        12 => "December",
+        _ => "Invalid",
+    }
+}
+
+fn day_str(day: i64) -> str {
+    if day < 10 {
+        " " + to_str(day)
+    } else {
+        to_str(day)
+    }
+}
+
+fn main() -> i64 {
+    let year = 2026
+    let month = 5
+    let start = weekday(year, month, 1)
+    let len = month_len(year, month)
+
+    let !out = month_name(month) + " " + to_str(year) + "\nSu Mo Tu We Th Fr Sa\n"
+
+    for _ in 0..start {
+        out = out + "   "
+    }
+
+    for day in 1..len + 1 {
+        out = out + day_str(day)
+        if weekday(year, month, day) == 6 {
+            out = out + "\n"
+        } else {
+            out = out + " "
+        }
+    }
+    # The final "\n" that the loop used to print is now supplied by print's
+    # own trailing newline.
+    print(out)
+
+    start * 100 + len
+}
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+# Justified ground truths only — no magic numbers from running the program.
+
+# is_leap: Gregorian rules — div-400 → true, div-100 → false, div-4 → true, else false.
+fn test_leap_rules() -> bool {
+    let a = is_leap(2000) == true    # 2000 % 400 == 0
+    let b = is_leap(1900) == false   # 1900 % 100 == 0, not 400
+    let c = is_leap(2024) == true    # 2024 % 4 == 0, not 100
+    let d = is_leap(2023) == false   # 2023 % 4 != 0
+    a && b && c && d
+}
+
+# month_len: most months are fixed; only Feb varies.
+# Jan/Mar/May/Jul/Aug/Oct/Dec = 31; Apr/Jun/Sep/Nov = 30.
+# Feb = 29 in leap year, 28 otherwise.
+fn test_month_len_fixed() -> bool {
+    let a = month_len(2023, 1) == 31    # January always 31
+    let b = month_len(2023, 4) == 30    # April always 30
+    let c = month_len(2023, 6) == 30    # June always 30
+    let d = month_len(2023, 7) == 31    # July always 31
+    let e = month_len(2023, 12) == 31   # December always 31
+    a && b && c && d && e
+}
+
+fn test_month_len_feb() -> bool {
+    let a = month_len(2024, 2) == 29    # 2024 is a leap year
+    let b = month_len(1900, 2) == 28    # 1900 is NOT a leap year (div 100, not 400)
+    let c = month_len(2023, 2) == 28    # 2023 is not a leap year
+    let d = month_len(2000, 2) == 29    # 2000 IS a leap year (div 400)
+    a && b && c && d
+}
+
+# days_before_month: sum of month lengths for months 1..month-1.
+# For month=1 there are no prior months → 0.
+# For month=3 in a non-leap year: Jan(31)+Feb(28)=59.
+# For month=3 in a leap year (2024): Jan(31)+Feb(29)=60.
+# For month=4 in non-leap: Jan(31)+Feb(28)+Mar(31)=90.
+fn test_days_before_month() -> bool {
+    let a = days_before_month(2023, 1) == 0     # nothing before January
+    let b = days_before_month(2023, 3) == 59    # 31+28
+    let c = days_before_month(2024, 3) == 60    # 31+29 (leap)
+    let d = days_before_month(2023, 4) == 90    # 31+28+31
+    a && b && c && d
+}
+
+# weekday: formula is (4 + days_before_year(y) + days_before_month(y,m) + d - 1) % 7
+# Anchor: 1970-01-01 was Thursday = 4 (given in source comment).
+# Sun=0 Mon=1 Tue=2 Wed=3 Thu=4 Fri=5 Sat=6.
+# weekday(1970,1,d) = (4 + 0 + 0 + d - 1) % 7 = (3 + d) % 7
+# d=1: (3+1)%7=4  Thu ✓   d=2: 5 Fri ✓   d=3: 6 Sat ✓
+# d=4: (3+4)%7=0 Sun ✓    d=5: 1 Mon ✓   d=6: 2 Tue ✓   d=7: 3 Wed ✓
+fn test_weekday_jan1970() -> bool {
+    let a = weekday(1970, 1, 1) == 4    # Thu
+    let b = weekday(1970, 1, 2) == 5    # Fri
+    let c = weekday(1970, 1, 3) == 6    # Sat
+    let d = weekday(1970, 1, 4) == 0    # Sun
+    let e = weekday(1970, 1, 5) == 1    # Mon
+    let f = weekday(1970, 1, 6) == 2    # Tue
+    let g = weekday(1970, 1, 7) == 3    # Wed
+    a && b && c && d && e && f && g
+}
+
+# The result cycles with period 7: same weekday 7 days apart (mod-7 arithmetic).
+fn test_weekday_period_7() -> bool {
+    let a = weekday(1970, 1, 1) == weekday(1970, 1, 8)
+    let b = weekday(2024, 3, 1) == weekday(2024, 3, 8)
+    let c = weekday(2025, 6, 5) == weekday(2025, 6, 12)
+    a && b && c
+}
+
+# Weekday is always in range 0..=6.
+fn test_weekday_range() -> bool {
+    let w1 = weekday(2026, 5, 1)
+    let w2 = weekday(2000, 2, 29)
+    let w3 = weekday(1970, 7, 4)
+    let ok1 = w1 >= 0 && w1 <= 6
+    let ok2 = w2 >= 0 && w2 <= 6
+    let ok3 = w3 >= 0 && w3 <= 6
+    ok1 && ok2 && ok3
+}
+
+# month_name spot checks — identity mapping, no arithmetic.
+fn test_month_name() -> bool {
+    let a = month_name(1) == "January"
+    let b = month_name(6) == "June"
+    let c = month_name(12) == "December"
+    let d = month_name(0) == "Invalid"
+    a && b && c && d
+}
+
+# day_str: single-digit days get a leading space; two-digit days are left unchanged.
+fn test_day_str() -> bool {
+    let a = day_str(1) == " 1"
+    let b = day_str(9) == " 9"
+    let c = day_str(10) == "10"
+    let d = day_str(31) == "31"
+    a && b && c && d
+}

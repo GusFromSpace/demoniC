@@ -1,0 +1,73 @@
+# sieve.dmc — Sieve of Eratosthenes.
+# Demonstrates: tensor as mutable boolean array, tensor element read/write.
+# No JIT needed. Run: dmc run examples/sieve.dmc
+
+# --- numeric gate: prime counts are independently known ---
+# count_primes_upto restates main's sieve; n must be <= 100 (tensor capacity 101).
+fn count_primes_upto(n: i64) -> i64 {
+    let !s = vault.ones[f32, [101]]
+    s[0] = 0.0
+    s[1] = 0.0
+    let !i = 2
+    while i * i <= n {
+        if s[i] > 0.5 {
+            let !j = i * i
+            while j <= n {
+                s[j] = 0.0
+                j = j + i
+            }
+        }
+        i = i + 1
+    }
+    let !k = 2
+    let !count = 0
+    while k <= n {
+        if s[k] > 0.5 { count = count + 1 }
+        k = k + 1
+    }
+    count
+}
+
+# pi(10)=4 {2,3,5,7}, pi(30)=10, pi(100)=25 (the value main prints).
+fn test_count_primes_known() -> bool {
+    count_primes_upto(10) == 4 && count_primes_upto(30) == 10 && count_primes_upto(100) == 25
+}
+
+fn test_count_primes_small() -> bool {
+    # pi(2)=1 {2}, pi(13)=6 {2,3,5,7,11,13}
+    count_primes_upto(2) == 1 && count_primes_upto(13) == 6
+}
+
+fn main() -> nil {
+    let n = 100
+    let !sieve = vault.ones[f32, [101]]
+    sieve[0] = 0.0
+    sieve[1] = 0.0
+
+    let !i = 2
+    while i * i <= n {
+        if sieve[i] > 0.5 {
+            let !j = i * i
+            while j <= n {
+                sieve[j] = 0.0
+                j = j + i
+            }
+        }
+        i = i + 1
+    }
+
+    print("Primes up to 100:")
+    let !line = ""
+    let !k = 2
+    let !count = 0
+    while k <= n {
+        if sieve[k] > 0.5 {
+            line = line + to_str(k) + " "
+            count = count + 1
+        }
+        k = k + 1
+    }
+    print(line)
+    print("Total: " + to_str(count))
+    nil
+}

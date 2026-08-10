@@ -1,0 +1,158 @@
+# autograd.dmc — `@grad` as a first-class language feature.
+# Tests appended below `fn main`. Each test_ fn derives its expected value
+# by closed-form math (documented in comments), never by running the program.
+# Compare to examples/train_step.dmc, which hand-writes every gradient.
+# Normative since spec 0.0.2. See AUTODIFF.md.
+
+@grad fn forward[B, D, H](
+    !W1: Tensor[f32, [D, H]],
+    !W2: Tensor[f32, [H, D]],
+    x:   Tensor[f32, [B, D]],
+    y:   Tensor[f32, [B, D]],
+) -> f32 {
+    let h    = \>(x @ W1)
+    let pred = h @ W2
+    let diff = pred .- y
+    sum(diff .* diff) / (B as f32)
+}
+
+fn main() -> nil {
+    vault {
+        let !W1 = vault.zeros[f32, [768, 3072]]
+        let !W2 = vault.zeros[f32, [3072, 768]]
+        let rng = Rng.seed(0xC0DE)
+
+        for step in 0..1000 {
+            let (rng, x) = rng.normal[f32, [32, 768]]
+            let (rng, y) = rng.normal[f32, [32, 768]]
+
+            # One call → forward value + every gradient we need.
+            # The JIT emitted a backward kernel at first compile.
+            let (loss, g) = forward.fwd_bwd(W1, W2, x, y)
+
+            vault {
+                W1 -= g.W1 .* 1e-3
+                W2 -= g.W2 .* 1e-3
+            }
+
+            forge.reset()
+            if step % 100 == 0 { print(("step", step, "loss", loss)) }
+        }
+    }
+    nil
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+#
+# All tests use B=1, D=1, H=1 so the full computation can be traced by hand:
+#   forward: h = relu(x @ W1)  [1,1]@[1,1]=[1,1]
+#            pred = h @ W2     [1,1]@[1,1]=[1,1]
+#            loss = sum((pred .- y).*(pred .- y)) / B
+#
+# Test 1: zero weights, zero target → loss = 0.
+#   W1=[[0]], W2=[[0]], x=[[1]], y=[[0]]
+#   h = relu([[1*0]]) = relu([[0]]) = [[0]]
+#   pred = [[0]] @ [[0]] = [[0]]
+#   diff = [[0-0]] = [[0]]
+#   loss = sum([[0]]) / 1 = 0.0
+fn test_zero_weights_zero_y() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    x[0, 0] = 1.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss, 0.0)
+}
+
+# Test 2: zero weights, y = [[1.0]] → loss = 1.0.
+#   W1=[[0]], W2=[[0]], x=[[2]], y=[[1]]
+#   h = relu([[0]]) = [[0]]
+#   pred = [[0]]
+#   diff = [[0 - 1.0]] = [[-1.0]]
+#   loss = sum([[(-1.0)^2]]) / 1 = 1.0 / 1 = 1.0
+fn test_zero_weights_unit_target() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    x[0, 0] = 2.0
+    y[0, 0] = 1.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss, 1.0)
+}
+
+# Test 3: loss is non-negative (sum of squares / B, always >= 0).
+#   Verified with arbitrary nonzero weights and input: loss >= 0.
+#   W1=[[1]], W2=[[1]], x=[[3]], y=[[0]]
+#   h = relu([[3*1]]) = relu([[3]]) = [[3]]
+#   pred = [[3*1]] = [[3]]
+#   diff = [[3-0]] = [[3]]
+#   loss = sum([[9]]) / 1 = 9.0
+fn test_loss_nonnegative() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = 1.0
+    W2[0, 0] = 1.0
+    x[0, 0]  = 3.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    loss >= 0.0
+}
+
+# Test 4: known positive input with known weights → loss = 9.0.
+#   (Same setup as test_loss_nonnegative; asserts exact value for extra coverage.)
+#   W1=[[1]], W2=[[1]], x=[[3]], y=[[0]]
+#   loss = 9.0  (derived above)
+fn test_known_loss_value() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = 1.0
+    W2[0, 0] = 1.0
+    x[0, 0]  = 3.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss, 9.0)
+}
+
+# Test 5: ReLU gate — negative pre-activation → pred = 0, loss = y^2.
+#   W1=[[−1]], x=[[1]] → h = relu([[−1]]) = [[0]]
+#   pred = [[0]] @ W2 = [[0]]  (regardless of W2)
+#   y=[[2]] → diff=[[-2]] → loss = 4.0 / 1 = 4.0
+fn test_relu_gate_blocks_negative() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = -1.0
+    W2[0, 0] =  1.0
+    x[0, 0]  =  1.0
+    y[0, 0]  =  2.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss, 4.0)
+}
+
+# Test 6: fwd_bwd gradient test — at W1=0, W2=0, y=0 the loss is 0 everywhere
+#   in a neighbourhood (pred=relu(x@0)@0=0 regardless of x), so both g.W1 and
+#   g.W2 must be zero tensors (the gradient of a constant-zero function is zero).
+#   Concretely: d_pred = 2*(0-0)/B = 0 → d_W2 = h'@0 = 0,
+#               d_h = 0@W2' = 0 → d_pre = 0.*(h.>0) = 0 → d_W1 = x'@0 = 0.
+fn test_zero_gradient_at_zero_weights() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    x[0, 0] = 1.0
+    let (loss, g) = forward.fwd_bwd(W1, W2, x, y)
+    let gW1_zero = isclose(g.W1[0, 0], 0.0)
+    let gW2_zero = isclose(g.W2[0, 0], 0.0)
+    forge.reset()
+    isclose(loss, 0.0) && gW1_zero && gW2_zero
+}

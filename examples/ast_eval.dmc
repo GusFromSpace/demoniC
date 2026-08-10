@@ -1,0 +1,61 @@
+# ast_eval.dmc — payload-carrying tagged unions, the canonical demoniC idiom for
+# translating a Rust/Python `enum` whose variants carry data (`Expr::Binary(op,
+# lhs, rhs)`), the pattern that pervades lexers/parsers/ASTs. See SPEC.md §4.5.
+#
+# Three pieces:
+#   1. a tagged `model` — a `kind` discriminant + the *union* of every variant's
+#      payload fields (only the active variant's fields are meaningful);
+#   2. a flat arena — `forge.uninit[Expr, [N]]` (a model array) — so a recursive
+#      type expresses its children by *index* rather than by an (impossible)
+#      self-embedding;
+#   3. dispatch — `match` on the discriminant, reading payloads as fields.
+#
+# Discriminants are matched as **literal ints** (a jump table), not named
+# bindings: a bare identifier in a match arm BINDS the scrutinee (catch-all), it
+# does not compare against a like-named constant. The legend below documents the
+# mapping; use a `k if k == NAME` guard if you want named arms.
+#
+#   kind 0 = Int(ival)   kind 1 = Add(lhs, rhs)   kind 2 = Mul(lhs, rhs)
+#
+# Rust    enum Expr { Int(i64), Add(Box<Expr>,Box<Expr>), Mul(Box<Expr>,Box<Expr>) }
+# becomes the model below; `match e { Expr::Add(l,r) => .. }` becomes
+# `match e.kind { 1 => f(e.lhs, e.rhs) }` walking arena indices.
+
+model Expr {
+    kind: i64    # 0 = Int, 1 = Add, 2 = Mul
+    ival: i64    # payload: the value of an Int
+    lhs:  i64    # payload: arena index of the left child  (Add / Mul)
+    rhs:  i64    # payload: arena index of the right child (Add / Mul)
+}
+
+# Recursively evaluate the node at index `i`. The destructuring a Rust `match`
+# would do on `Expr::Add(l, r)` is expressed as `match e.kind` + field reads, and
+# recursion walks child *indices* into the arena.
+fn eval(nodes: [Expr; 8], i: i64) -> i64 {
+    let e = nodes[i]
+    match e.kind {
+        0 => e.ival,                                   # Int
+        1 => eval(nodes, e.lhs) + eval(nodes, e.rhs),  # Add
+        _ => eval(nodes, e.lhs) * eval(nodes, e.rhs),  # Mul
+    }
+}
+
+# Build  (2 + 3) * 4  as a flat arena, bottom-up, and evaluate it.
+fn eval_program() -> i64 {
+    let !nodes = forge.uninit[Expr, [8]]
+    nodes[0] = Expr { kind: 0, ival: 2, lhs: 0, rhs: 0 }   # Int 2
+    nodes[1] = Expr { kind: 0, ival: 3, lhs: 0, rhs: 0 }   # Int 3
+    nodes[2] = Expr { kind: 1, ival: 0, lhs: 0, rhs: 1 }   # Add(#0, #1)
+    nodes[3] = Expr { kind: 0, ival: 4, lhs: 0, rhs: 0 }   # Int 4
+    nodes[4] = Expr { kind: 2, ival: 0, lhs: 2, rhs: 3 }   # Mul(#2, #3)
+    eval(nodes, 4)
+}
+
+fn main() -> i64 {
+    eval_program()
+}
+
+# Ground-truth gate: (2 + 3) * 4 == 20.
+fn test_eval_tree() -> bool {
+    eval_program() == 20
+}

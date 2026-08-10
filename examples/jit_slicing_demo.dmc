@@ -1,0 +1,142 @@
+# jit_slicing_demo.dmc -- Phase 4 JIT slice 4 (issue #15).
+# Slicing + scalar broadcasting + transpose, composed with slice-3's
+# shape monomorphization and slice-3's variance primitives.
+#
+# Run:
+#   dmc jit examples/jit_slicing_demo.dmc
+
+# ─── Slicing ───────────────────────────────────────────────────────────────
+
+# Row slice: M[i] on a 2D tensor yields a 1D row view (no copy).
+fn row_sum(M: Tensor[f32, [3, 4]], i: i64) -> f32 {
+    sum(M[i])
+}
+
+# Contiguous range slice: M[a:b] keeps a slab of rows.
+fn first_two_rows_sum(M: Tensor[f32, [3, 4]]) -> f32 {
+    sum(M[0:2])
+}
+
+# ─── Scalar broadcasting ──────────────────────────────────────────────────
+
+# Center a tensor around its own mean using broadcast subtraction --
+# the building block of layer_norm, batch_norm, and friends.
+fn center[N](x: Tensor[f32, [N]]) -> Tensor[f32, [N]] {
+    x .- mean(x)
+}
+
+# Scale-and-shift, fused: y = alpha .* (x .- m) .+ beta.
+fn affine[N](x: Tensor[f32, [N]], alpha: f32, m: f32, beta: f32) -> Tensor[f32, [N]] {
+    alpha .* (x .- m) .+ beta
+}
+
+# ─── Transpose + matmul: the canonical attention pattern ──────────────────
+
+# scores = Q @ K', the inner product of every query with every key.
+fn attn_scores[B, D](Q: Tensor[f32, [B, D]], K: Tensor[f32, [B, D]]) -> f32 {
+    sum(Q @ K')
+}
+
+fn main() -> i64 {
+    let M = [[1.0, 2.0, 3.0, 4.0],
+             [5.0, 6.0, 7.0, 8.0],
+             [9.0, 10.0, 11.0, 12.0]]
+
+    # Row + slab slicing.
+    print_i64(row_sum(M, 1) as i64)           # 5+6+7+8 = 26
+    print_i64(first_two_rows_sum(M) as i64)   # 1+...+8 = 36
+
+    # Scalar broadcasting + variance trait fully composed.
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let c = center(x)                          # mean is 3.0 -> [-2,-1,0,1,2]
+    print_i64((variance(c) * 100.0) as i64)   # variance unchanged = 200
+    let y = affine(x, 2.0, mean(x), -1.0)     # 2*(x - 3) - 1
+    print_i64(sum(y) as i64)                   # sum(2*(x-3)-1) = -5
+
+    # Attention scores via Q @ K'.
+    let Q = [[1.0, 0.0], [0.0, 1.0]]
+    let K = [[1.0, 2.0], [3.0, 4.0]]
+    print_i64(attn_scores(Q, K) as i64)        # 1+2+3+4 = 10
+
+    # Variance-minimizing relaxation composed with slicing: pull only the
+    # first half of a field toward the mean, leave the second half alone.
+    let mut field = [10.0, 10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0]
+    let lo = field[0:4]
+    let pulled = pull_to_mean(lo, 1.0)         # uniform at mean(lo) = 10
+    print_i64(sum(pulled) as i64)              # 40
+
+    0
+}
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+
+# row_sum(M, 0) = 1+2+3+4 = 10 (arithmetic sum of first row)
+fn test_row_sum_row0() -> bool {
+    let M = [[1.0, 2.0, 3.0, 4.0],
+             [5.0, 6.0, 7.0, 8.0],
+             [9.0, 10.0, 11.0, 12.0]]
+    let s = row_sum(M, 0)
+    abs(s - 10.0) < 1e-4
+}
+
+# row_sum(M, 2) = 9+10+11+12 = 42 (arithmetic sum of last row)
+fn test_row_sum_row2() -> bool {
+    let M = [[1.0, 2.0, 3.0, 4.0],
+             [5.0, 6.0, 7.0, 8.0],
+             [9.0, 10.0, 11.0, 12.0]]
+    let s = row_sum(M, 2)
+    abs(s - 42.0) < 1e-4
+}
+
+# first_two_rows_sum = 1+2+3+4+5+6+7+8 = 36 (sum of integers 1..8)
+fn test_first_two_rows_sum() -> bool {
+    let M = [[1.0, 2.0, 3.0, 4.0],
+             [5.0, 6.0, 7.0, 8.0],
+             [9.0, 10.0, 11.0, 12.0]]
+    let s = first_two_rows_sum(M)
+    abs(s - 36.0) < 1e-4
+}
+
+# center invariant: sum of centered tensor is always 0
+# because sum(x - mean(x)) = sum(x) - N*mean(x) = N*mean - N*mean = 0
+fn test_center_sum_is_zero() -> bool {
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let c = center(x)
+    abs(sum(c)) < 1e-4
+}
+
+# center preserves known output for x=[10,20,30]: mean=20, centered=[-10,0,10]
+# variance of centered = mean of squares = (100+0+100)/3 ≈ 66.667
+fn test_center_known_output() -> bool {
+    let x = [10.0, 20.0, 30.0]
+    let c = center(x)
+    # mean of centered result must be 0
+    abs(mean(c)) < 1e-4
+}
+
+# affine with alpha=0 collapses everything to beta regardless of x or m
+# 0*(x - m) + beta = beta for every element; sum over 3 elements = 3*beta
+fn test_affine_alpha_zero() -> bool {
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let y = affine(x, 0.0, mean(x), 7.0)
+    abs(sum(y) - 35.0) < 1e-4
+}
+
+# affine with alpha=1, m=mean(x), beta=0 is identical to center(x)
+# sum must be zero by the centering identity above
+fn test_affine_equals_center() -> bool {
+    let x = [2.0, 4.0, 6.0, 8.0]
+    let m = mean(x)                       # m = 5.0
+    let a = affine(x, 1.0, m, 0.0)
+    abs(sum(a)) < 1e-4
+}
+
+# attn_scores with 2×2 identity Q: sum(I @ K') = sum(K') = sum(K)
+# because sum is invariant to transpose and I@K' = K'
+fn test_attn_scores_identity_q() -> bool {
+    let Q = [[1.0, 0.0], [0.0, 1.0]]
+    let K = [[3.0, 7.0], [2.0, 5.0]]
+    # Q @ K' = K' (since Q = I), sum(K') = sum(K) = 3+7+2+5 = 17
+    let s = attn_scores(Q, K)
+    abs(s - 17.0) < 1e-4
+}

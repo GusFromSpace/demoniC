@@ -1,0 +1,320 @@
+# reel_to_reel.dmc -- analog reel-to-reel tape machine emulator
+#
+# Models the key artifacts of magnetic tape:
+#   - Tape saturation (magnetic hysteresis via tanh soft-clip)
+#   - Wow  (slow capstan speed drift,  ~0.9 Hz)
+#   - Flutter (fast mechanical vibration, ~12 Hz)
+#   - Playback head HF rolloff (head-gap frequency response)
+#   - Tape hiss (oxide noise at the playback head)
+#   - Record/playback head offset (physical gap = ~18 ms delay)
+#
+# Signal chain:
+#   sine --> [record HP] --> [saturation] --> [ring buffer]
+#            [ring buffer] --> [wow/flutter read] --> [playback LP] --> [DC block] --> [hiss] --> scope
+#
+# Run: dmc run examples/reel_to_reel.dmc
+
+# ── Tape machine parameters ────────────────────────────────────────────────
+
+let SAMPLE_RATE   = 48000.0    # Hz
+let TAPE_LEN      = 96000      # ring buffer: 2 seconds at 48 kHz
+let N_SAMPLES     = 48000      # render 1 second of audio
+
+# Physical head geometry: playback head trails record head
+let HEAD_GAP      = 882        # ~18.4 ms gap between record & playback heads
+
+# Saturation
+let DRIVE         = 2.8        # input gain into tanh; 1.0 = clean, 4+ = heavy
+let MAKEUP        = 0.55       # output makeup gain (compensates level loss)
+
+# Wow: slow capstan speed fluctuation (~0.5-2 Hz is realistic)
+let WOW_HZ        = 0.9
+let WOW_DEPTH     = 0.0018     # fractional speed deviation (-> peak sample offset)
+
+# Flutter: fast mechanical vibration (~10-15 Hz is realistic)
+let FLUTTER_HZ    = 12.0
+let FLUTTER_DEPTH = 0.0006
+
+# Tape hiss level (additive noise at playback head)
+let HISS_LEVEL    = 0.00040
+
+# Tape speed in IPS (inches per second) -- higher IPS = brighter, quieter
+# 7.5 IPS (home decks), 15 IPS (studio), 30 IPS (mastering)
+let IPS           = 15.0
+let HF_FC         = IPS * 1000.0        # HF rolloff freq: 15 IPS -> 15 kHz
+
+# One-pole IIR coefficients: a = exp(-2*pi*fc/sr)
+# LP filters the playback signal; HP removes DC / low-frequency rumble
+let LP_A          = exp(-6.28318530718 * HF_FC / SAMPLE_RATE)
+let HP_A          = exp(-6.28318530718 * 20.0  / SAMPLE_RATE)  # 20 Hz DC block
+
+# Input test tone
+let TONE_HZ       = 220.0      # A3, sits nicely in mid-range
+let TONE_AMP      = 0.70
+
+# Display: one scope pair every SCOPE_STRIDE samples
+let SCOPE_STRIDE  = 218        # ~1 period of 220 Hz per scope line
+
+# ── Helper functions ───────────────────────────────────────────────────────
+
+# tanh via exp -- avoids any undefined built-in; clamps at +-8 (tanh(8) > 0.9999)
+fn tanh_f(x: f64) -> f64 {
+    if x > 8.0 {
+        1.0
+    } else if x < -8.0 {
+        -1.0
+    } else {
+        let e2 = exp(2.0 * x)
+        (e2 - 1.0) / (e2 + 1.0)
+    }
+}
+
+# Magnetic tape saturation: soft-clip with makeup gain
+fn saturate(x: f64) -> f64 {
+    tanh_f(x * DRIVE) * MAKEUP
+}
+
+# Deterministic tape hiss -- same LCG trick as synth.dmc, no Rng object needed
+fn hiss(tick: i64, ch: i64) -> f64 {
+    let h = (tick * 1103515245 + ch * 22695477 + 12345) % 2147483647
+    (h as f64 / 1073741823.5) - 1.0
+}
+
+# Read the ring buffer at a fractional position via linear interpolation.
+# This is what turns wow/flutter (fractional sample offsets) into pitch drift.
+fn read_tape(tape: Tensor[f64, [2, 96000]], ch: i64, pos: f64) -> f64 {
+    let !p = pos
+    if p < 0.0       { p = p + 96000.0 }
+    if p >= 96000.0  { p = p - 96000.0 }
+    let i0   = p as i64
+    let i1   = (i0 + 1) % 96000
+    let frac = p - (i0 as f64)
+    tape[ch, i0] + (tape[ch, i1] - tape[ch, i0]) * frac
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────
+
+# tanh_f(0) must be exactly 0: the formula (e^0-1)/(e^0+1) = (1-1)/(1+1) = 0
+fn test_tanh_zero() -> bool {
+    abs(tanh_f(0.0)) < 0.000001
+}
+
+# tanh_f(x) > 8 clamps to 1.0 (hard branch in the implementation)
+fn test_tanh_clamp_pos() -> bool {
+    tanh_f(10.0) == 1.0
+}
+
+# tanh_f(x) < -8 clamps to -1.0
+fn test_tanh_clamp_neg() -> bool {
+    tanh_f(-10.0) == -1.0
+}
+
+# tanh_f(1.0): e^2 ≈ 7.38905609893065, so (7.389... - 1) / (7.389... + 1)
+# = 6.389... / 8.389... ≈ 0.7615941559557649
+fn test_tanh_one() -> bool {
+    abs(tanh_f(1.0) - 0.7615941559557649) < 0.000001
+}
+
+# tanh is odd: tanh(-x) == -tanh(x). Verify for x=2.0
+fn test_tanh_odd() -> bool {
+    abs(tanh_f(-2.0) + tanh_f(2.0)) < 0.000001
+}
+
+# saturate(0) = tanh_f(0 * DRIVE) * MAKEUP = 0 * MAKEUP = 0
+fn test_saturate_zero() -> bool {
+    abs(saturate(0.0)) < 0.000001
+}
+
+# saturate(100.0): DRIVE=2.8, so 100*2.8=280 > 8, tanh_f -> 1.0; result = 1.0 * MAKEUP = 0.55
+fn test_saturate_hard_clip() -> bool {
+    abs(saturate(100.0) - 0.55) < 0.000001
+}
+
+# saturate(-100.0): symmetrically clips to -0.55
+fn test_saturate_hard_clip_neg() -> bool {
+    abs(saturate(-100.0) + 0.55) < 0.000001
+}
+
+# hiss(0, 0): h = (0 * 1103515245 + 0 * 22695477 + 12345) % 2147483647 = 12345
+# result = 12345 / 1073741823.5 - 1.0 ≈ -0.9999884987...
+fn test_hiss_deterministic() -> bool {
+    let expected = (12345 as f64 / 1073741823.5) - 1.0
+    abs(hiss(0, 0) - expected) < 0.000001
+}
+
+# hiss is bounded in (-1, 1] by construction (h in [0, 2147483646], divisor 1073741823.5)
+# Max positive: (2147483646 / 1073741823.5) - 1 ≈ 1.0 (just under 1); min: nearly -1
+fn test_hiss_bounds() -> bool {
+    let !ok = true
+    let !i = 0
+    while i < 20 {
+        let v = hiss(i, 0)
+        if v < -1.0 { ok = false }
+        if v > 1.0  { ok = false }
+        let v2 = hiss(i, 1)
+        if v2 < -1.0 { ok = false }
+        if v2 > 1.0  { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+# read_tape on an all-zero tape returns 0 for any position and channel
+fn test_read_tape_zeros() -> bool {
+    let tape = forge.zeros[f64, [2, 96000]]
+    let v0 = read_tape(tape, 0, 0.0)
+    let v1 = read_tape(tape, 1, 500.5)
+    let v2 = read_tape(tape, 0, 95999.7)
+    abs(v0) < 0.000001 && abs(v1) < 0.000001 && abs(v2) < 0.000001
+}
+
+# read_tape linear interpolation: if tape[ch,0]=0 and tape[ch,1]=1,
+# reading at pos=0.5 should yield frac=0.5, so result = 0 + (1-0)*0.5 = 0.5
+fn test_read_tape_lerp() -> bool {
+    let !tape = forge.zeros[f64, [2, 96000]]
+    tape[0, 1] = 1.0
+    let v = read_tape(tape, 0, 0.5)
+    abs(v - 0.5) < 0.000001
+}
+
+# pad(0) should return an empty string
+fn test_pad_empty() -> bool {
+    pad(0) == ""
+}
+
+# pad(3) should return "   " (three spaces); check via concatenation roundtrip
+fn test_pad_three() -> bool {
+    pad(3) == "   "
+}
+
+# ── Scope display ──────────────────────────────────────────────────────────
+
+# A string of n spaces (formerly print_pad, which streamed spaces directly).
+fn pad(n: i64) -> str {
+    let !s = ""
+    let !i = 0
+    while i < n {
+        s = s + " "
+        i = i + 1
+    }
+    s
+}
+
+# Single-line oscilloscope -- label on left, waveform across 60 chars
+fn print_scope(v: f64, label: str) -> nil {
+    let width  = 60
+    let center = 30
+    let raw    = floor((v + 1.0) * 30.0) as i64
+    let col    = if raw < 0 { 0 } else if raw > width { width } else { raw }
+
+    let line = if col < center {
+        label + pad(col) + "*" + pad(center - col - 1) + "|"
+    } else if col == center {
+        label + pad(center) + "*"
+    } else {
+        label + pad(center) + "|" + pad(col - center - 1) + "*"
+    }
+    print(line)
+    nil
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+fn main() -> nil {
+    print("=== reel-to-reel tape emulator (demoniC) ===")
+    print("IPS=" + to_str(IPS)
+        + "  drive=" + to_str(DRIVE)
+        + "  wow=" + to_str(WOW_HZ) + " Hz"
+        + "  flutter=" + to_str(FLUTTER_HZ) + " Hz")
+    print("input: " + to_str(TONE_HZ) + " Hz sine @ amp " + to_str(TONE_AMP))
+    print("scope: 'in' = raw input   'out' = tape output (delayed, saturated, drifting)\n")
+
+    # ── Allocate tape ring buffer (stereo) and filter state ────────────────
+    let mut tape:       Tensor[f64, [2, 96000]] = forge.zeros[f64, [2, 96000]]
+    let mut rec_hp_mem: Tensor[f64, [2]]        = forge.zeros[f64, [2]]
+    let mut pb_lp_mem:  Tensor[f64, [2]]        = forge.zeros[f64, [2]]
+    let mut pb_hp_mem:  Tensor[f64, [2]]        = forge.zeros[f64, [2]]
+
+    # Mutable state carried across samples
+    let !wpos       = 0      # write cursor in the ring buffer
+    let !in_phase   = 0.0    # oscillator phase, normalized [0, 1)
+    let !wow_ph     = 0.0    # wow LFO phase [0, 2*pi)
+    let !flutter_ph = 1.05   # flutter LFO phase -- offset so they don't cancel
+
+    let !tick = 0
+    while tick < N_SAMPLES {
+
+        # ── Oscillator: 220 Hz sine ────────────────────────────────────────
+        let in_samp = sin(6.28318530718 * in_phase) * TONE_AMP
+        in_phase = in_phase + TONE_HZ / SAMPLE_RATE
+        if in_phase >= 1.0 { in_phase = in_phase - 1.0 }
+
+        # ── RECORD PATH ────────────────────────────────────────────────────
+        for c in 0..2 {
+            # Slight channel mismatch models real tape (L/R heads rarely identical)
+            let ch_trim = if c == 0 { 1.0 } else { 0.96 }
+
+            # 1. Sub-bass cut before tape -- prevents DC and rumble from
+            #    biasing the magnetic coating (same HP filter used on record)
+            let lp_rec = (1.0 - HP_A) * in_samp * ch_trim + HP_A * rec_hp_mem[c]
+            rec_hp_mem[c] = lp_rec
+            let rec_in = in_samp * ch_trim - lp_rec
+
+            # 2. Tape saturation -- tanh models the S-shaped BH curve of
+            #    ferric / chromium oxide as flux approaches saturation
+            tape[c, wpos] = saturate(rec_in)
+        }
+
+        # ── WOW / FLUTTER LFOs ─────────────────────────────────────────────
+        wow_ph     = wow_ph     + 6.28318530718 * WOW_HZ     / SAMPLE_RATE
+        flutter_ph = flutter_ph + 6.28318530718 * FLUTTER_HZ / SAMPLE_RATE
+        if wow_ph     >= 6.28318530718 { wow_ph     = wow_ph     - 6.28318530718 }
+        if flutter_ph >= 6.28318530718 { flutter_ph = flutter_ph - 6.28318530718 }
+
+        # Speed fluctuation in fractional samples (+ = faster = pitch up)
+        let wf_offset = sin(wow_ph)     * WOW_DEPTH     * SAMPLE_RATE
+                      + sin(flutter_ph) * FLUTTER_DEPTH * SAMPLE_RATE
+
+        # Playback head is HEAD_GAP samples behind the record head
+        let read_base = (wpos - HEAD_GAP + 96000) % 96000
+        let read_pos  = (read_base as f64) + wf_offset
+
+        # ── PLAYBACK PATH ──────────────────────────────────────────────────
+        let !out_L = 0.0
+
+        for c in 0..2 {
+            # 3. Read tape with fractional (linear-interpolated) position --
+            #    the fractional part is what produces wow/flutter pitch drift
+            let raw = read_tape(tape, c, read_pos)
+
+            # 4. Oxide noise at the playback gap
+            let noisy = raw + hiss(tick, c) * HISS_LEVEL
+
+            # 5. Head-gap HF rolloff: one-pole LP at HF_FC
+            #    (short gap = high cutoff = more HF; long gap = duller sound)
+            let lp_y = (1.0 - LP_A) * noisy + LP_A * pb_lp_mem[c]
+            pb_lp_mem[c] = lp_y
+
+            # 6. DC-blocking HP at 20 Hz (removes any tape magnetization bias)
+            let hp_lp = (1.0 - HP_A) * lp_y + HP_A * pb_hp_mem[c]
+            pb_hp_mem[c] = hp_lp
+            let out = lp_y - hp_lp
+
+            if c == 0 { out_L = out }
+        }
+
+        wpos = (wpos + 1) % 96000
+
+        # ── Scope: raw input vs tape output, left channel ──────────────────
+        if tick % SCOPE_STRIDE == 0 {
+            print_scope(in_samp, "in  ")
+            print_scope(out_L,   "out ")
+            print("")
+        }
+
+        tick = tick + 1
+    }
+
+    print("Done. 1 second rendered at 48 kHz.")
+    nil
+}

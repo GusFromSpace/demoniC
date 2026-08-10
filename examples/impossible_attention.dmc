@@ -1,0 +1,108 @@
+# impossible_attention.dmc
+# Demonstrates:
+# 1. Native KV cache streams with zero-allocation `<-` appends.
+# 2. Stacked directives: bit-exact (@deterministic), mixed-precision (@cast),
+#    and guaranteed single-pass execution without main memory roundtrips (@fuse).
+
+fn attention_step[B, H, D](
+    q: Tensor[f32, [B, H, 1, D]],
+    k_new: Tensor[f32, [B, H, 1, D]],
+    v_new: Tensor[f32, [B, H, 1, D]],
+    !k_cache: KV[f32, [B, H, ~, D]],
+    !v_cache: KV[f32, [B, H, ~, D]]
+) -> Tensor[f32, [B, H, 1, D]] {
+
+    # 1. Hardware-native append to the stream.
+    # Bumps the internal `~` pointer and copies `k_new` bytes into place.
+    # If it exceeds the capacity initialized in `forge.kv`, it panics instead of reallocating.
+    k_cache <- k_new
+    v_cache <- v_new
+
+    # 2. Stacked JIT Directives:
+    #   @deterministic: Guarantees bit-exact math (forces fixed reduction orders).
+    #   @cast(bf16): Automatically dequantizes inputs if needed, runs all math in bf16, casts back out.
+    #   @fuse: Refuses to compile if the JIT can't collapse this block into a single kernel pass.
+    @deterministic @cast(bf16) @fuse {
+        # `q @ k_cache'` does Batched Matmul. The `'` operator transposes the last two dims.
+        # The KV stream implicitly converts to a frozen View for this read-only math.
+        let scores = (q @ k_cache') .* (1.0 / sqrt(D as f32))
+
+        # Softmax over the sequence length axis (-1)
+        let probs = softmax(scores, -1)
+
+        # Final attention output
+        probs @ v_cache
+    }
+}
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+fn absf_ia(x: f32) -> f32 {
+    if x < 0.0f32 { 0.0f32 - x } else { x }
+}
+
+# Invariant: softmax(scores) @ 0 = 0 for any Q, K.
+# With Q=K=V=zeros, all scores are 0*scale = 0, softmax gives uniform weights,
+# and any convex combination of zero value rows is zero.
+# Test uses B=1, H=1, D=4 (small shapes) and one decode step.
+fn test_zero_v_gives_zero_output() -> bool {
+    let !kc = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !vc = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let q = forge.zeros[f32, [1, 1, 1, 4]]
+    let k = forge.zeros[f32, [1, 1, 1, 4]]
+    let v = forge.zeros[f32, [1, 1, 1, 4]]
+    let out = attention_step(q, k, v, kc, vc)
+    sum(out .* out) < 0.0001f32
+}
+
+# Invariant: when S=1, softmax over a single score is exactly 1.0,
+# so the output is exactly v (single-token passthrough).
+# With v[0,0,0,0]=5, v[0,0,0,1]=3 and Q=K=zeros, output == v values.
+fn test_single_token_passthrough() -> bool {
+    let !kc = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !vc = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let q = forge.zeros[f32, [1, 1, 1, 4]]
+    let k = forge.zeros[f32, [1, 1, 1, 4]]
+    let !v = forge.zeros[f32, [1, 1, 1, 4]]
+    v[0, 0, 0, 0] = 5.0f32
+    v[0, 0, 0, 1] = 3.0f32
+    let out = attention_step(q, k, v, kc, vc)
+    absf_ia(out[0, 0, 0, 0] - 5.0f32) < 0.0001f32 && absf_ia(out[0, 0, 0, 1] - 3.0f32) < 0.0001f32
+}
+
+# Invariant: after two steps the cache holds S=2 keys.
+# With Q=K=zeros all scores are equal, so softmax gives uniform weights [0.5, 0.5].
+# Step 1 appends v1=[1,0,0,0]; step 2 appends v2=[0,0,0,0].
+# Step 2 output = 0.5*v1 + 0.5*v2 = [0.5, 0, 0, 0].
+# So out2[0,0,0,0] == 0.5 and sum(out2) == 0.5.
+fn test_two_step_cache_growth() -> bool {
+    let !kc = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !vc = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let q = forge.zeros[f32, [1, 1, 1, 4]]
+    let k = forge.zeros[f32, [1, 1, 1, 4]]
+    let !v1 = forge.zeros[f32, [1, 1, 1, 4]]
+    v1[0, 0, 0, 0] = 1.0f32
+    let v2 = forge.zeros[f32, [1, 1, 1, 4]]
+    let _out1 = attention_step(q, k, v1, kc, vc)
+    let out2 = attention_step(q, k, v2, kc, vc)
+    absf_ia(out2[0, 0, 0, 0] - 0.5f32) < 0.001f32
+}
+
+fn main() -> nil {
+    # Initialize our caches with a maximum capacity of 128 tokens
+    let !k_cache = forge.kv[f32, [1, 4, ~, 64]](capacity = 128)
+    let !v_cache = forge.kv[f32, [1, 4, ~, 64]](capacity = 128)
+
+    # Dummy inputs for a single token
+    let q = forge.zeros[f32, [1, 4, 1, 64]]
+    let k_new = forge.zeros[f32, [1, 4, 1, 64]]
+    let v_new = forge.zeros[f32, [1, 4, 1, 64]]
+
+    # Step 1: Sequence length becomes 1
+    let out1 = attention_step(q, k_new, v_new, k_cache, v_cache)
+
+    # Step 2: Sequence length becomes 2
+    let out2 = attention_step(q, k_new, v_new, k_cache, v_cache)
+
+    nil
+}

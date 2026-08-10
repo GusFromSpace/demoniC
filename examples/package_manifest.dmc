@@ -1,0 +1,89 @@
+# package_manifest.dmc — manifest metadata without a package manager.
+# Demonstrates: maps, lists, path helpers, and JSON encoding.
+
+fn dependency(name: str, version: str) {
+    let dep = map()
+    let dep = map_set(dep, "name", name)
+    let dep = map_set(dep, "version", version)
+    dep
+}
+
+fn main() -> str {
+    let root = get_cwd()
+    let examples_dir = path_join(root, "examples")
+
+    let deps = list()
+    let deps = list_push(deps, dependency("stdlib.fs", "0.0.1"))
+    let deps = list_push(deps, dependency("stdlib.json", "0.0.1"))
+    let deps = list_push(deps, dependency("stdlib.collections", "0.0.1"))
+
+    let manifest = map()
+    let manifest = map_set(manifest, "name", "example-pack")
+    let manifest = map_set(manifest, "root", examples_dir)
+    let manifest = map_set(manifest, "dependencies", deps)
+    let manifest = map_set(manifest, "has_examples", path_is_dir(examples_dir))
+
+    let encoded = json_encode(manifest)
+    print(encoded)
+    encoded
+}
+
+# Test: dependency() sets the "name" key to the supplied argument.
+# Justified: map_set(dep, "name", name) records the exact string we pass in;
+# map_get must return it unchanged.
+fn test_dependency_name() -> bool {
+    let dep = dependency("my-lib", "2.3.4")
+    map_get(dep, "name") == "my-lib"
+}
+
+# Test: dependency() sets the "version" key to the supplied argument.
+# Justified: same reasoning as above — the second map_set records the version.
+fn test_dependency_version() -> bool {
+    let dep = dependency("my-lib", "2.3.4")
+    map_get(dep, "version") == "2.3.4"
+}
+
+# Test: the map returned by dependency() has exactly 2 keys.
+# Justified: the function calls map_set exactly twice (name, version).
+fn test_dependency_map_len() -> bool {
+    let dep = dependency("stdlib.fs", "0.0.1")
+    map_len(dep) == 2
+}
+
+# Test: the "name" and "version" keys both exist in the map.
+# Justified: map_has returns true iff the key was previously set.
+fn test_dependency_has_keys() -> bool {
+    let dep = dependency("stdlib.json", "0.0.1")
+    map_has(dep, "name") && map_has(dep, "version")
+}
+
+# Test: building a deps list with 3 items yields list_len == 3.
+# Justified: list_push adds one element per call; starting from an empty list
+# and calling push 3 times must produce a list of length 3.
+fn test_deps_list_length() -> bool {
+    let deps = list()
+    let deps = list_push(deps, dependency("stdlib.fs", "0.0.1"))
+    let deps = list_push(deps, dependency("stdlib.json", "0.0.1"))
+    let deps = list_push(deps, dependency("stdlib.collections", "0.0.1"))
+    list_len(deps) == 3
+}
+
+# Test: json_encode of a map whose "name" field is "example-pack" includes
+# that string in the output.
+# Justified: any conforming JSON encoder must include the key and value
+# verbatim; regex_match("example-pack", output) must be true.
+fn test_manifest_json_contains_name() -> bool {
+    let m = map()
+    let m = map_set(m, "name", "example-pack")
+    let encoded = json_encode(m)
+    regex_match("example-pack", encoded)
+}
+
+# Test: the manifest map tracks the "name" field set to "example-pack".
+# Justified: map_set then map_get is a round-trip that must return the
+# original value.
+fn test_manifest_name_field() -> bool {
+    let manifest = map()
+    let manifest = map_set(manifest, "name", "example-pack")
+    map_get(manifest, "name") == "example-pack"
+}

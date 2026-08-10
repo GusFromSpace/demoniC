@@ -1,0 +1,120 @@
+# calculator.dmc — standard calculator plus demoniC graphing mode.
+# Demonstrates: scalar math, memory register, scientific ops, matrices, plots.
+
+fn standard_expr() -> f64 {
+    ((42.0 + 8.0) * 3.0 - 10.0) / 5.0
+}
+
+fn memory_register() -> f64 {
+    let !mem = 0.0
+    mem = mem + 12.0
+    mem = mem * 4.0
+    mem = mem - 9.0
+    mem
+}
+
+fn scientific_panel() -> f64 {
+    sqrt(144.0) + sin(0.0) + cos(0.0) + log(exp(2.0))
+}
+
+fn quadratic_roots_sum(a: f64, b: f64, c: f64) -> f64 {
+    let disc = b * b - 4.0 * a * c
+    let r0 = (-b + sqrt(disc)) / (2.0 * a)
+    let r1 = (-b - sqrt(disc)) / (2.0 * a)
+    r0 + r1
+}
+
+fn cubic(x: f64) -> f64 {
+    x * x * x - 4.0 * x
+}
+
+fn print_bar(y: f64) -> nil {
+    let col = floor(y + 32.0) as i64
+    let clamped = if col < 0 {
+        0
+    } else if col > 64 {
+        64
+    } else {
+        col
+    }
+
+    let !bar = ""
+    for _ in 0..clamped {
+        bar = bar + " "
+    }
+    print(bar + "*")
+    nil
+}
+
+fn plot_cubic() -> f64 {
+    let !total = 0.0
+    print("demoniC mode: y = x^3 - 4x")
+    for xi in 0..17 {
+        let x = (xi - 8) as f64 / 2.0
+        let y = cubic(x)
+        total = total + abs(y)
+        print_bar(y)
+    }
+    total
+}
+
+fn matrix_panel() -> f64 {
+    let !a = vault.zeros[f32, [2, 2]]
+    let !b = vault.zeros[f32, [2, 2]]
+
+    a[0, 0] = 1.0
+    a[0, 1] = 2.0
+    a[1, 0] = 3.0
+    a[1, 1] = 4.0
+
+    b[0, 0] = 2.0
+    b[0, 1] = 0.0
+    b[1, 0] = 1.0
+    b[1, 1] = 2.0
+
+    let c = a @ b
+    sum(c)
+}
+
+# ── Tests: each expected value derived by hand from the arithmetic ──────────────
+fn test_standard_expr() -> bool {
+    # ((42+8)*3 - 10) / 5 = (150-10)/5 = 140/5 = 28
+    isclose(standard_expr(), 28.0)
+}
+fn test_memory_register() -> bool {
+    # ((0+12)*4) - 9 = 48 - 9 = 39
+    isclose(memory_register(), 39.0)
+}
+fn test_scientific_panel() -> bool {
+    # sqrt(144) + sin(0) + cos(0) + log(exp(2)) = 12 + 0 + 1 + 2 = 15
+    isclose(scientific_panel(), 15.0)
+}
+fn test_quadratic_roots_sum() -> bool {
+    # x^2 - 5x + 6 = (x-2)(x-3); roots 2 and 3 sum to 5 (= -b/a)
+    isclose(quadratic_roots_sum(1.0, -5.0, 6.0), 5.0)
+}
+fn test_cubic() -> bool {
+    # cubic(x) = x^3 - 4x ;  cubic(2) = 8 - 8 = 0 ;  cubic(3) = 27 - 12 = 15
+    isclose(cubic(2.0), 0.0) && isclose(cubic(3.0), 15.0)
+}
+fn test_matrix_panel() -> bool {
+    # A=[[1,2],[3,4]] @ B=[[2,0],[1,2]] = [[4,4],[10,8]]; sum = 4+4+10+8 = 26
+    isclose(matrix_panel(), 26.0)
+}
+
+fn main() -> f64 {
+    let basic = standard_expr()
+    let mem = memory_register()
+    let sci = scientific_panel()
+    let roots = quadratic_roots_sum(1.0, -5.0, 6.0)
+    let matrix = matrix_panel()
+    let graph_energy = plot_cubic()
+
+    print("standard: " + to_str(basic))
+    print("memory:   " + to_str(mem))
+    print("science:  " + to_str(sci))
+    print("roots:    " + to_str(roots))
+    print("matrix:   " + to_str(matrix))
+
+    basic + mem + sci + roots + matrix + floor(graph_energy)
+}

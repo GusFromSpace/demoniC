@@ -1,0 +1,121 @@
+# slice.dmc — zero-copy views.
+# None of the slice expressions below allocate. They each construct a
+# stack-resident View with adjusted strides into the same Forge bytes.
+
+fn demo[B, S](x: Tensor[f32, [B, S, 768]]) -> nil {
+    # Full first axis, scalar last → View[f32, [B, S]]
+    let first_chan = x[.., .., 0]
+
+    # Every other batch item → View[f32, [B/2, S, 768]] with stride 2 on dim 0
+    let half_batch = x[0::2, .., ..]
+
+    # Drop the leading batch axis on a single sample → View[f32, [S, 768]]
+    let one = x[0, .., ..]
+
+    # Reverse the sequence axis with negative stride → View, no copy
+    let reversed = x[.., -1..0:-1, ..]
+
+    # Inspecting shape — all stack reads, no heap, no allocator.
+    match (first_chan.shape, half_batch.shape, reversed.shape) {
+        ([B, S], [_, S, 768], [B, S, 768]) => print("shapes coherent"),
+        _                                  => panic("shape drift"),
+    }
+
+    nil
+}
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+
+# test_channel_select_element_check: x[.., .., 0] extracts channel 0 across all positions.
+# For x[i,j,k] = i*12 + j*4 + k on a [2, 3, 4] tensor, the channel-0 view is a [2,3]
+# tensor where element [i,j] = i*12 + j*4 (since k=0).
+# We verify a specific element: chan0[1,2] should equal 1*12 + 2*4 = 12 + 8 = 20.
+fn test_channel_select_element_check() -> bool {
+    let !x = forge.zeros[f32, [2, 3, 4]]
+    for i in 0..2 {
+        for j in 0..3 {
+            for k in 0..4 {
+                x[i, j, k] = (i * 12 + j * 4 + k) as f32
+            }
+        }
+    }
+    let chan0 = x[.., .., 0]
+    # chan0[1,2] = 1*12 + 2*4 + 0 = 12 + 8 = 20
+    abs(chan0[1, 2] - 20.0) < 0.0001
+}
+
+# test_channel_zero_select: x[.., .., 0] on a [2, 3, 4] tensor selects channel 0.
+# We build x so x[i, j, k] = i*12 + j*4 + k (a distinct value per element).
+# Then x[.., .., 0] gives a [2, 3] view where element [i,j] = i*12 + j*4 + 0.
+# Summing over i in 0..2, j in 0..3: sum = sum_{i,j}(i*12 + j*4)
+#   i=0: 0+4+8 = 12; i=1: 12+16+20 = 48; total = 60.
+fn test_channel_zero_select() -> bool {
+    let !x = forge.zeros[f32, [2, 3, 4]]
+    for i in 0..2 {
+        for j in 0..3 {
+            for k in 0..4 {
+                x[i, j, k] = (i * 12 + j * 4 + k) as f32
+            }
+        }
+    }
+    let chan0 = x[.., .., 0]
+    # chan0[i,j] should equal x[i,j,0] = i*12 + j*4
+    # sum = (0+4+8) + (12+16+20) = 12 + 48 = 60
+    abs(sum(chan0) - 60.0) < 0.0001
+}
+
+# test_stride2_batch: x[0::2, .., ..] on a [4, 2, 3] tensor selects batch items 0 and 2.
+# x[i, j, k] = i*6 + j*3 + k.
+# Batch 0 sum: sum_{j,k} (0 + j*3 + k) for j in 0..2, k in 0..3 = (0+1+2)+(3+4+5) = 15
+# Batch 2 sum: sum_{j,k} (12 + j*3 + k) = 12*6 + 15 = 72 + 15 = 87
+# Total of stride-2 view = 15 + 87 = 102
+fn test_stride2_batch() -> bool {
+    let !x = forge.zeros[f32, [4, 2, 3]]
+    for i in 0..4 {
+        for j in 0..2 {
+            for k in 0..3 {
+                x[i, j, k] = (i * 6 + j * 3 + k) as f32
+            }
+        }
+    }
+    let half = x[0::2, .., ..]
+    # selected batches 0 and 2; sum = 15 + 87 = 102
+    abs(sum(half) - 102.0) < 0.0001
+}
+
+# test_single_batch_drop: x[0, .., ..] on a [3, 2, 4] tensor drops the batch axis.
+# x[i, j, k] = i*8 + j*4 + k. x[0, .., ..] gives a [2, 4] view with i=0 fixed.
+# sum = sum_{j,k} (0 + j*4 + k) for j in 0..2, k in 0..4
+#   j=0: 0+1+2+3 = 6; j=1: 4+5+6+7 = 22; total = 28.
+fn test_single_batch_drop() -> bool {
+    let !x = forge.zeros[f32, [3, 2, 4]]
+    for i in 0..3 {
+        for j in 0..2 {
+            for k in 0..4 {
+                x[i, j, k] = (i * 8 + j * 4 + k) as f32
+            }
+        }
+    }
+    let one = x[0, .., ..]
+    # sum over j in 0..2, k in 0..4 of (j*4 + k) = 6 + 22 = 28
+    abs(sum(one) - 28.0) < 0.0001
+}
+
+# test_stride2_batch_odd: x[1::2, .., ..] on a [4, 2, 3] tensor selects batch items 1 and 3.
+# x[i, j, k] = i*6 + j*3 + k.
+# Batch 1 sum: sum_{j,k} (6 + j*3 + k) for j in 0..2, k in 0..3 = 6*6 + 15 = 36 + 15 = 51
+# Batch 3 sum: sum_{j,k} (18 + j*3 + k) = 18*6 + 15 = 108 + 15 = 123
+# Total of odd-stride view = 51 + 123 = 174
+fn test_stride2_batch_odd() -> bool {
+    let !x = forge.zeros[f32, [4, 2, 3]]
+    for i in 0..4 {
+        for j in 0..2 {
+            for k in 0..3 {
+                x[i, j, k] = (i * 6 + j * 3 + k) as f32
+            }
+        }
+    }
+    let odd = x[1::2, .., ..]
+    # selected batches 1 and 3; sum = 51 + 123 = 174
+    abs(sum(odd) - 174.0) < 0.0001
+}

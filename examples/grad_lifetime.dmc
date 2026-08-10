@@ -1,0 +1,47 @@
+# Gradient lifetime across forge allocations (#368, AUTODIFF.md §3).
+#
+# A `@grad fn` call automatically reclaims its activations: the JIT snapshots
+# the Forge at entry and, on return, compacts the published gradients down to
+# that watermark. The contract this file pins is the OBSERVABLE half, on both
+# backends: gradients stay valid — never dangling, never zeroed — no matter
+# what the caller allocates after the call. The interpreter satisfies it by
+# heap semantics; the JIT by grad compaction (growth bounds are pinned in the
+# Rust unit tests, jit.rs `jit_grad_*` lifetime group).
+
+@grad fn dot_loss(!w: Tensor[f32, [8]], x: Tensor[f32, [8]]) -> f32 {
+    sum(w .* x)
+}
+
+@grad fn quad_loss(!w: Tensor[f32, [16]], x: Tensor[f32, [16]]) -> f32 {
+    let a = w .* x
+    let b = a .* a
+    sum(b)
+}
+
+# d(sum(w.*x))/dw = x: the gradient must read back exactly x even after a
+# large allocation that would overwrite a dangling buffer with zeros.
+fn test_grads_survive_interleaved_alloc() -> bool {
+    let !w = forge.zeros[f32, [8]]
+    let !x = forge.zeros[f32, [8]]
+    x[3] = 7.0
+    x[5] = -2.5
+    let (l, g) = dot_loss.fwd_bwd(w, x)
+    let big = forge.zeros[f32, [65536]]
+    (l == 0.0) && (g.w[3] == 7.0) && (g.w[5] == -2.5) && (big[0] == 0.0)
+}
+
+# Two back-to-back grad calls: the second call's arena reuse must not corrupt
+# the first call's gradients, and each gradient must match its own call.
+fn test_back_to_back_grad_calls_stay_correct() -> bool {
+    let !w = forge.zeros[f32, [16]]
+    let !x = forge.zeros[f32, [16]]
+    w[0] = 3.0
+    x[0] = 1.0
+    # d(sum((w.*x)^2))/dw = 2*w*x^2 → 6.0 at [0]
+    let (l1, g1) = quad_loss.fwd_bwd(w, x)
+    let !w2 = forge.zeros[f32, [8]]
+    let !x2 = forge.zeros[f32, [8]]
+    x2[1] = 4.0
+    let (l2, g2) = dot_loss.fwd_bwd(w2, x2)
+    (l1 == 9.0) && (g1.w[0] == 6.0) && (l2 == 0.0) && (g2.w[1] == 4.0)
+}

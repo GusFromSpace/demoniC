@@ -1,0 +1,62 @@
+# xor_net.dmc — a 3→8→1 ReLU MLP that LEARNS XOR by gradient descent.
+#
+# demoniC's marquee feature: `@grad` synthesizes the backward pass, and a single
+# `fwd_bwd` call returns the loss together with every weight gradient. The bias
+# is folded into the weights via a constant-1 input column ("bias trick"), so the
+# grad function is pure matmul.
+#
+# Run:   dmc run examples/xor_net.dmc
+# Test:  dmc test examples/xor_net.dmc
+
+@grad fn loss_fn[B, H](
+    !W1: Tensor[f32, [3, H]],
+    !W2: Tensor[f32, [H, 1]],
+    x:   Tensor[f32, [B, 3]],
+    y:   Tensor[f32, [B, 1]],
+) -> f32 {
+    let h    = \>(x @ W1)          # hidden = ReLU(x · W1)
+    let pred = h @ W2
+    let diff = pred .- y
+    sum(diff .* diff) / (B as f32) # mean squared error
+}
+
+# Train on the XOR truth table and return the final predictions ([4, 1]).
+fn train_xor(verbose: bool) -> Tensor[f32, [4, 1]] {
+    let rng = Rng.seed(0xBEEF)
+    let (rng, w1_init) = rng.normal[f32, [3, 8]]
+    let (rng, w2_init) = rng.normal[f32, [8, 1]]
+    let !W1 = w1_init
+    let !W2 = w2_init
+
+    # third input column is the constant 1 (folded bias)
+    let x = [[0.0f32, 0.0f32, 1.0f32],
+             [0.0f32, 1.0f32, 1.0f32],
+             [1.0f32, 0.0f32, 1.0f32],
+             [1.0f32, 1.0f32, 1.0f32]]
+    let y = [[0.0f32], [1.0f32], [1.0f32], [0.0f32]]
+    let lr = 0.05f32
+
+    for step in 0..5000 {
+        let (loss, g) = loss_fn.fwd_bwd(W1, W2, x, y)
+        W1 -= g.W1 .* lr
+        W2 -= g.W2 .* lr
+        if verbose && (step % 1000 == 0) { print(("step", step, "loss", loss)) }
+    }
+
+    \>(x @ W1) @ W2
+}
+
+fn main() -> nil {
+    let pred = train_xor(true)
+    print(("final (want 0,1,1,0):", pred))
+    nil
+}
+
+# Ground-truth gate: after training, each prediction rounds to the XOR target.
+fn test_xor_learns() -> bool {
+    let pred = train_xor(false)
+    ((pred[0, 0] + 0.5f32) as i64 == 0) &&
+    ((pred[1, 0] + 0.5f32) as i64 == 1) &&
+    ((pred[2, 0] + 0.5f32) as i64 == 1) &&
+    ((pred[3, 0] + 0.5f32) as i64 == 0)
+}

@@ -1,0 +1,41 @@
+# JIT autodiff parity for the smooth activations silu / elu / mish (#377).
+#
+# The JIT reverse-mode tape now differentiates these (first order) via runtime
+# derivative externs (__dmc_<act>_deriv_f32), closing the gap with
+# relu/tanh/gelu/sigmoid. silu in particular is what SwiGLU-style models use, so
+# this unblocks JIT-speed training through those blocks.
+#
+# CONCRETE shapes (not shape-generic `[D]`) so the JIT can monomorphize the
+# backward — these RUN and gradient-match the interpreter under `dmc test --jit`
+# (jit parity: N ran, 0 skipped). Second-order (`@grad @grad`) for these three is
+# not JIT-lowered yet; it falls back to the interpreter (see the autodiff docs).
+
+@grad fn grad_silu(!w: Tensor[f32, [2]]) -> f32 { sum(silu(w)) }
+
+fn test_silu_grad_jit() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 1.0   w[1] = 0.0 - 1.0
+    let (l, g) = grad_silu.fwd_bwd(w)
+    # silu'(1)≈0.9278 ; silu'(-1)≈0.0723
+    (g.w[0] > 0.926) && (g.w[0] < 0.929) && (g.w[1] > 0.071) && (g.w[1] < 0.074)
+}
+
+@grad fn grad_elu(!w: Tensor[f32, [2]]) -> f32 { sum(elu(w)) }
+
+fn test_elu_grad_jit() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 2.0   w[1] = 0.0 - 1.0
+    let (l, g) = grad_elu.fwd_bwd(w)
+    # elu'(2)=1 (exact) ; elu'(-1)=e^-1≈0.3679
+    (g.w[0] == 1.0) && (g.w[1] > 0.367) && (g.w[1] < 0.369)
+}
+
+@grad fn grad_mish(!w: Tensor[f32, [2]]) -> f32 { sum(mish(w)) }
+
+fn test_mish_grad_jit() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 0.0   w[1] = 2.0
+    let (l, g) = grad_mish.fwd_bwd(w)
+    # mish'(0)=0.6 ; mish'(2)≈1.0693
+    (g.w[0] > 0.599) && (g.w[0] < 0.601) && (g.w[1] > 1.068) && (g.w[1] < 1.071)
+}

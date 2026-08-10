@@ -1,0 +1,130 @@
+# jit_variance_demo.dmc -- the statistics primitives, JIT-native.
+#
+# Three primitives over a tensor field:
+#   mean(t)          -- average of a tensor's elements
+#   variance(t)      -- population variance, the same form layer_norm uses
+#   pull_to_mean(t, alpha)
+#                    -- one relaxation pass toward the mean; out[i] = t[i] +
+#                       alpha * (mean(t) - t[i]); at alpha=1 the field
+#                       becomes uniform exactly
+#
+# examples/sim/lotka_volterra_variance.dmc hand-rolls the same relaxation
+# inside a 14-line helper; with these primitives it is a single call:
+# `pull_to_mean(R, 0.10)`.
+#
+# Run:
+#   dmc jit examples/jit_variance_demo.dmc
+
+# ---------------------------------------------------------------------------
+# Numeric gates
+# ---------------------------------------------------------------------------
+
+# field = [0,0,0,0,6,30]; sum=36, N=6 → mean = 36/6 = 6.0 (closed form)
+fn test_mean_of_field() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    isclose(mean(field) as f64, 6.0)
+}
+
+# population variance = sum((t[i]-mu)^2)/N
+# deviations: -6,-6,-6,-6,0,+24 → squares: 36,36,36,36,0,576 → sum=720 → /6 = 120
+fn test_variance_of_field() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    isclose(variance(field) as f64, 120.0)
+}
+
+# pull_to_mean conserves sum: out[i] = t[i] + alpha*(mu - t[i])
+# summing: sum(t) + alpha*(N*mu - sum(t)) = sum(t) + alpha*(36-36) = sum(t) = 36
+# f32 accumulation may leave ~1e-6 error, so use a 1e-4 tolerance manually
+fn test_sum_conservation_alpha01() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    let f1 = pull_to_mean(field, 0.1)
+    let diff = (sum(f1) as f64) - 36.0
+    diff * diff < 0.0001
+}
+
+# alpha=1.0: out[i] = t[i] + 1*(mu-t[i]) = mu = 6.0 for all i → variance = 0
+fn test_alpha1_gives_zero_variance() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    let uniform = pull_to_mean(field, 1.0)
+    isclose(variance(uniform) as f64, 0.0)
+}
+
+# alpha=1.0: sum is still conserved (36) even when uniform
+fn test_alpha1_sum_conserved() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    let uniform = pull_to_mean(field, 1.0)
+    isclose(sum(uniform) as f64, 36.0)
+}
+
+# element at the mean is unchanged by pull_to_mean (any alpha):
+# t[4]=6.0=mu → out[4] = 6 + alpha*(6-6) = 6.0 exactly
+fn test_element_at_mean_unchanged() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    let f1 = pull_to_mean(field, 0.1)
+    isclose(f1[4] as f64, 6.0)
+}
+
+# variance decreases monotonically: var(relax(...,k)) < var(relax(...,k-1))
+# proven because pull_to_mean with 0<alpha<1 contracts all deviations by (1-alpha)
+fn test_variance_decreases_with_relax() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    let v0 = variance(field) as f64
+    let f1 = relax(field, 0.1, 1)
+    let v1 = variance(f1) as f64
+    let f4 = relax(field, 0.1, 4)
+    let v4 = variance(f4) as f64
+    let f8 = relax(field, 0.1, 8)
+    let v8 = variance(f8) as f64
+    v0 > v1 && v1 > v4 && v4 > v8
+}
+
+# sum conservation through relax (8 steps): mean is invariant under pull_to_mean
+# f32 accumulation over 8 steps may leave ~1e-6 error, so use 1e-4 tolerance
+fn test_sum_conservation_after_relax8() -> bool {
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+    let f8 = relax(field, 0.1, 8)
+    let diff = (sum(f8) as f64) - 36.0
+    diff * diff < 0.0001
+}
+
+fn show(label: i64, t: Tensor[f32, [6]]) -> nil {
+    print_i64(label)
+    print_tensor(t)
+    print_i64((variance(t) * 1000.0) as i64)
+}
+
+# A shape-generic helper that applies the variance-minimizing pass
+# `steps` times. Slice-3 monomorphization specializes it per N at
+# compile time.
+fn relax[N](field: Tensor[f32, [N]], alpha: f32, steps: i64) -> Tensor[f32, [N]] {
+    let mut x = field
+    let mut s = 0
+    while s < steps {
+        x = pull_to_mean(x, alpha)
+        s += 1
+    }
+    x
+}
+
+fn main() -> i64 {
+    # Start with a clumped field: most density on the right edge.
+    let field = [0.0, 0.0, 0.0, 0.0, 6.0, 30.0]
+
+    # Step 0: maximum clumping. mean = 6, variance = (36+36+36+36+0+576)/6 = 120
+    show(0, field)
+
+    # One mild relaxation step.
+    let f1 = pull_to_mean(field, 0.10)
+    show(1, f1)
+
+    # Eight relaxation steps via the shape-generic helper -- compiled
+    # exactly once for N=6 thanks to slice-3 monomorphization.
+    let f8 = relax(field, 0.10, 8)
+    show(8, f8)
+
+    # Limit case: alpha=1 in a single step -> exact uniformity.
+    let uniform = pull_to_mean(field, 1.0)
+    show(99, uniform)
+    # variance(uniform) is exactly 0; sum is conserved (still 36).
+    sum(uniform) as i64
+}

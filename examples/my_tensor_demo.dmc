@@ -1,0 +1,87 @@
+# my_tensor_demo.dmc — A simple model and tensor operation demo
+
+model MyLayer[D, H] {
+    weights: Tensor[f32, [D, H]]
+
+    fn forward[B](self, x: Tensor[f32, [B, D]]) -> Tensor[f32, [B, H]] {
+        # Matrix multiplication using @
+        let out = x @ self.weights
+        # ReLU using the prefix `\>` activation (returns a tensor)
+        \>(out)
+    }
+}
+
+fn main() -> nil {
+    # Initialize some dummy data
+    let w = forge.zeros[f32, [128, 64]]
+    let layer = MyLayer { weights: w }
+    let x = forge.zeros[f32, [32, 128]]
+
+    # Model invocation desugars to forward
+    let y = layer(x)
+    nil
+}
+
+# Test: zeros input and zeros weights produce all-zero output.
+# Justification: 0 @ 0 = 0 elementwise, ReLU(0) = 0, sum of zeros = 0.
+fn test_zeros_in_zeros_out() -> bool {
+    let w = forge.zeros[f32, [2, 2]]
+    let layer = MyLayer { weights: w }
+    let x = forge.zeros[f32, [1, 2]]
+    let y = layer(x)
+    # sum of a zero tensor must be exactly 0.0
+    sum(y) == 0.0
+}
+
+# Test: known non-negative input through identity weights passes unchanged.
+# Justification: identity matrix I satisfies A @ I = A; ReLU leaves non-negatives unchanged.
+# x = [[3.0, 4.0]], weights = I_2x2 → y = [[3.0, 4.0]] → sum(y) = 7.0.
+fn test_identity_weights_positive_input() -> bool {
+    let !w = forge.zeros[f32, [2, 2]]
+    w[0, 0] = 1.0
+    w[1, 1] = 1.0
+    let layer = MyLayer { weights: w }
+    let !x = forge.zeros[f32, [1, 2]]
+    x[0, 0] = 3.0
+    x[0, 1] = 4.0
+    let y = layer(x)
+    # sum must equal 3.0 + 4.0 = 7.0 within tolerance
+    let diff = sum(y) - 7.0
+    abs(diff) < 0.0001
+}
+
+# Test: ReLU clamps negative pre-activations to zero.
+# Justification: identity matrix I; x = [[-1.0, 2.0]] → matmul = [[-1.0, 2.0]];
+# ReLU(-1.0)=0, ReLU(2.0)=2.0 → sum = 2.0.
+fn test_relu_clamps_negatives() -> bool {
+    let !w = forge.zeros[f32, [2, 2]]
+    w[0, 0] = 1.0
+    w[1, 1] = 1.0
+    let layer = MyLayer { weights: w }
+    let !x = forge.zeros[f32, [1, 2]]
+    x[0, 0] = -1.0
+    x[0, 1] = 2.0
+    let y = layer(x)
+    # sum = ReLU(-1) + ReLU(2) = 0 + 2 = 2.0
+    let diff = sum(y) - 2.0
+    abs(diff) < 0.0001
+}
+
+# Test: all output values are non-negative (ReLU invariant).
+# Justification: ReLU(x) = max(x, 0) >= 0 for all x by definition.
+# Use a mixed positive/negative pre-activation input to exercise the clamp.
+fn test_relu_output_nonnegative() -> bool {
+    let !w = forge.zeros[f32, [2, 2]]
+    w[0, 0] = 1.0
+    w[1, 1] = 1.0
+    let layer = MyLayer { weights: w }
+    let !x = forge.zeros[f32, [2, 2]]
+    x[0, 0] = -5.0
+    x[0, 1] = 3.0
+    x[1, 0] = 2.0
+    x[1, 1] = -4.0
+    let y = layer(x)
+    # Every element of y must be >= 0.0
+    let all_nonneg = (y[0, 0] >= 0.0) && (y[0, 1] >= 0.0) && (y[1, 0] >= 0.0) && (y[1, 1] >= 0.0)
+    all_nonneg
+}

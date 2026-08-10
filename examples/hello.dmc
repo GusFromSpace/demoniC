@@ -1,0 +1,27 @@
+# hello.dmc — lexical sanity check.
+# Every kind of literal, every kind of comment.
+# This file does nothing useful. It exists so the lexer has a fixture.
+
+#{
+    block comments nest:
+    #{ inner }#
+    still inside the outer one.
+}#
+
+fn main() -> nil {
+    let n        = 42                 # i64 by default
+    let pi       = 3.14159            # f32 by default
+    let big      = 1_000_000          # underscores allowed
+    let mask     = 0b1010_1100        # binary literal
+    let addr     = 0xdead_beef        # hex literal
+    let half     = .5f64              # leading dot, explicit dtype
+    let greeting = "demoniC"          # str literal
+    let yes      = true
+    let nothing  = nil
+
+    # Demonstrate that `\>` and `\<` lex as single tokens, not `\` `>`.
+    let probe = [1.0, -2.0, 3.0] \|> \>     # ReLU over a 1-D tensor lit
+
+    print(greeting)
+    nil
+}

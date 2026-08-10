@@ -1,0 +1,151 @@
+# rope.dmc — fused rotary position embedding from the stdlib.
+# Normative since spec 0.0.3. See STDLIB.md §3.5.
+
+# RoPE encodes absolute and relative position into query/key tensors
+# via paired-coordinate rotation per position. The stdlib's `rope`
+# emits a single bandwidth-bound SIMD pass over the input — never
+# the dense D×D rotation matrix that naive implementations build.
+
+# Precompute the cos/sin tables once and keep them in the Vault.
+# They are read-only for the life of the program.
+fn build_rope_tables[S, D](base: f32) -> nil {
+    vault {
+        let !cos = vault.uninit[f32, [S, D/2]]
+        let !sin = vault.uninit[f32, [S, D/2]]
+        # population omitted: cos[s, i] = cos(s * base^(-2i/D)), etc.
+    }
+    nil
+}
+
+# Apply RoPE to query and key tensors. Plain v is left alone.
+fn rope_qk[B, H, S, D](
+    q:   Tensor[f32, [B, H, S, D]],
+    k:   Tensor[f32, [B, H, S, D]],
+    cos: Tensor[f32, [S, D/2]],
+    sin: Tensor[f32, [S, D/2]],
+) -> (Tensor[f32, [B, H, S, D]], Tensor[f32, [B, H, S, D]]) {
+    (rope(q, cos, sin), rope(k, cos, sin))
+}
+
+# Full RoPE attention block: rotate q and k, then call the fused
+# stdlib `attn`. Two single-pass kernels back to back; no Forge
+# materialization of intermediate score matrices.
+fn rope_attn[B, H, S, D](
+    q:    Tensor[f32, [B, H, S, D]],
+    k:    Tensor[f32, [B, H, S, D]],
+    v:    Tensor[f32, [B, H, S, D]],
+    cos:  Tensor[f32, [S, D/2]],
+    sin:  Tensor[f32, [S, D/2]],
+    mask: View[bool, [S, S]],
+) -> Tensor[f32, [B, H, S, D]] {
+    let (q_rot, k_rot) = rope_qk(q, k, cos, sin)
+    attn(q_rot, k_rot, v, mask)
+}
+
+# Autoregressive decode: rope the new q against position `pos`,
+# rope the new k before appending to the KV cache.
+fn rope_decode_step[B, H, D](
+    q:        Tensor[f32, [B, H, 1, D]],
+    new_k:    Tensor[f32, [B, H, 1, D]],
+    v:        Tensor[f32, [B, H, 1, D]],
+    !cache_k: KV[f32, [B, H, ~, D]],
+    !cache_v: KV[f32, [B, H, ~, D]],
+    cos_pos:  View[f32, [1, D/2]],
+    sin_pos:  View[f32, [1, D/2]],
+) -> Tensor[f32, [B, H, 1, D]] {
+    let q_rot = rope(q,     cos_pos, sin_pos)
+    let k_rot = rope(new_k, cos_pos, sin_pos)
+    cache_k <- k_rot
+    cache_v <- v
+    attn(q_rot, cache_k, cache_v, nil)
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+fn absf_rope(x: f32) -> f32 {
+    if x < 0.0f32 { 0.0f32 - x } else { x }
+}
+
+# Invariant: when cos=1 and sin=0 everywhere the RoPE rotation is the identity.
+# For each pair (x0, x1): x0' = x0*1 - x1*0 = x0, x1' = x1*1 + x0*0 = x1.
+# rope_qk with identity tables must return (q, k) unchanged.
+# Shape: B=1, H=1, S=1, D=4 so cos/sin shape = [1, 2].
+fn test_rope_qk_identity_rotation() -> bool {
+    let !q = forge.zeros[f32, [1, 1, 1, 4]]
+    q[0, 0, 0, 0] = 3.0f32
+    q[0, 0, 0, 1] = 5.0f32
+    q[0, 0, 0, 2] = 7.0f32
+    q[0, 0, 0, 3] = 2.0f32
+    let !k = forge.zeros[f32, [1, 1, 1, 4]]
+    k[0, 0, 0, 0] = 1.0f32
+    k[0, 0, 0, 1] = 4.0f32
+    k[0, 0, 0, 2] = 6.0f32
+    k[0, 0, 0, 3] = 8.0f32
+    # cos=1, sin=0 everywhere → identity rotation
+    let !cos1 = forge.zeros[f32, [1, 2]]
+    cos1[0, 0] = 1.0f32
+    cos1[0, 1] = 1.0f32
+    let sin0 = forge.zeros[f32, [1, 2]]
+    let (q_rot, k_rot) = rope_qk(q, k, cos1, sin0)
+    # Expected: q_rot == q, k_rot == k element-wise
+    let dq = q_rot .- q
+    let dk = k_rot .- k
+    let err = sum(dq .* dq) + sum(dk .* dk)
+    err < 0.0001f32
+}
+
+# Invariant: RoPE is a rotation on each (x_{2i}, x_{2i+1}) pair.
+# For unit-circle (c,s) satisfying c^2+s^2=1, rotation preserves norms:
+#   (x0*c - x1*s)^2 + (x1*c + x0*s)^2 = (x0^2 + x1^2)*(c^2 + s^2) = x0^2+x1^2.
+# Use the 3-4-5 triple: c=0.6, s=0.8 → c^2+s^2=0.36+0.64=1.0 (unit circle).
+# Norm of rope(q) must equal norm of q.
+fn test_rope_qk_norm_preserved() -> bool {
+    let !q = forge.zeros[f32, [1, 1, 1, 4]]
+    q[0, 0, 0, 0] = 3.0f32
+    q[0, 0, 0, 1] = 4.0f32
+    q[0, 0, 0, 2] = 1.0f32
+    q[0, 0, 0, 3] = 2.0f32
+    let !k = forge.zeros[f32, [1, 1, 1, 4]]
+    k[0, 0, 0, 0] = 5.0f32
+    k[0, 0, 0, 1] = 12.0f32
+    k[0, 0, 0, 2] = 2.0f32
+    k[0, 0, 0, 3] = 1.0f32
+    # c=0.6, s=0.8 satisfies c^2+s^2=1 exactly
+    let !cos_vals = forge.zeros[f32, [1, 2]]
+    cos_vals[0, 0] = 0.6f32
+    cos_vals[0, 1] = 0.6f32
+    let !sin_vals = forge.zeros[f32, [1, 2]]
+    sin_vals[0, 0] = 0.8f32
+    sin_vals[0, 1] = 0.8f32
+    let (q_rot, k_rot) = rope_qk(q, k, cos_vals, sin_vals)
+    let norm_q_in  = sum(q .* q)
+    let norm_q_out = sum(q_rot .* q_rot)
+    let norm_k_in  = sum(k .* k)
+    let norm_k_out = sum(k_rot .* k_rot)
+    absf_rope(norm_q_out - norm_q_in) < 0.001f32 && absf_rope(norm_k_out - norm_k_in) < 0.001f32
+}
+
+# Invariant: 90-degree rotation (cos=0, sin=1) maps (x0, x1) → (-x1, x0).
+# With q = [3, 4, 1, 2] (two pairs: (3,4) and (1,2)):
+#   pair 0: (3*0 - 4*1, 4*0 + 3*1) = (-4, 3)
+#   pair 1: (1*0 - 2*1, 2*0 + 1*1) = (-2, 1)
+# Expected q_rot = [-4, 3, -2, 1].
+fn test_rope_qk_ninety_degree_rotation() -> bool {
+    let !q = forge.zeros[f32, [1, 1, 1, 4]]
+    q[0, 0, 0, 0] = 3.0f32
+    q[0, 0, 0, 1] = 4.0f32
+    q[0, 0, 0, 2] = 1.0f32
+    q[0, 0, 0, 3] = 2.0f32
+    let k = forge.zeros[f32, [1, 1, 1, 4]]
+    # cos=0, sin=1 → 90-degree rotation
+    let cos0 = forge.zeros[f32, [1, 2]]
+    let !sin1 = forge.zeros[f32, [1, 2]]
+    sin1[0, 0] = 1.0f32
+    sin1[0, 1] = 1.0f32
+    let (q_rot, _k_rot) = rope_qk(q, k, cos0, sin1)
+    # Expected: q_rot = [-4, 3, -2, 1]
+    absf_rope(q_rot[0, 0, 0, 0] - (0.0f32 - 4.0f32)) < 0.0001f32 &&
+    absf_rope(q_rot[0, 0, 0, 1] - 3.0f32) < 0.0001f32 &&
+    absf_rope(q_rot[0, 0, 0, 2] - (0.0f32 - 2.0f32)) < 0.0001f32 &&
+    absf_rope(q_rot[0, 0, 0, 3] - 1.0f32) < 0.0001f32
+}

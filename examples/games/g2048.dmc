@@ -1,0 +1,378 @@
+# 2048 Game Simulator in demoniC
+
+fn print_board(board: Tensor[i64, [4, 4]]) -> nil {
+  let mut out = ""
+  let mut row = 0
+  while row < 4 {
+    let mut col = 0
+    while col < 4 {
+      let val = board[row, col]
+      if val == 0 {
+        out = out + "    ."
+      } else {
+        out = out + "    " + to_str(val)
+      }
+      col = col + 1
+    }
+    row = row + 1
+  }
+  print(out)
+  nil
+}
+
+fn compact_row(row: Tensor[i64, [4]]) -> Tensor[i64, [4]] {
+  let mut result = [0, 0, 0, 0]
+  let mut write_pos = 0
+  let mut i = 0
+  while i < 4 {
+    if row[i] != 0 {
+      let mut result_mut = result
+      result_mut[write_pos] = row[i]
+      result = result_mut
+      write_pos = write_pos + 1
+    }
+    i = i + 1
+  }
+  result
+}
+
+fn merge_row(row: Tensor[i64, [4]]) -> (Tensor[i64, [4]], i64) {
+  let mut compacted = compact_row(row)
+  let mut merged = [0, 0, 0, 0]
+  let mut score = 0
+  let mut i = 0
+  let mut write_pos = 0
+
+  while i < 3 {
+    if compacted[i] != 0 {
+      if compacted[i] == compacted[i + 1] {
+        let mut merged_mut = merged
+        merged_mut[write_pos] = compacted[i] * 2
+        merged = merged_mut
+        score = score + compacted[i] * 2
+        i = i + 2
+      } else {
+        let mut merged_mut = merged
+        merged_mut[write_pos] = compacted[i]
+        merged = merged_mut
+        i = i + 1
+      }
+      write_pos = write_pos + 1
+    } else {
+      i = i + 1
+    }
+  }
+
+  if i == 3 {
+    if compacted[3] != 0 {
+      let mut merged_mut = merged
+      merged_mut[write_pos] = compacted[3]
+      merged = merged_mut
+    }
+  }
+
+  (merged, score)
+}
+
+fn slide_left(board: Tensor[i64, [4, 4]]) -> (Tensor[i64, [4, 4]], i64) {
+  let mut new_board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let mut total_score = 0
+  let mut row_idx = 0
+
+  while row_idx < 4 {
+    let row = [board[row_idx, 0], board[row_idx, 1], board[row_idx, 2], board[row_idx, 3]]
+    let (merged, score) = merge_row(row)
+    new_board[row_idx, 0] = merged[0]
+    new_board[row_idx, 1] = merged[1]
+    new_board[row_idx, 2] = merged[2]
+    new_board[row_idx, 3] = merged[3]
+    total_score = total_score + score
+    row_idx = row_idx + 1
+  }
+
+  (new_board, total_score)
+}
+
+fn slide_right(board: Tensor[i64, [4, 4]]) -> (Tensor[i64, [4, 4]], i64) {
+  let mut new_board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let mut total_score = 0
+  let mut row_idx = 0
+
+  while row_idx < 4 {
+    let row = [board[row_idx, 3], board[row_idx, 2], board[row_idx, 1], board[row_idx, 0]]
+    let (merged, score) = merge_row(row)
+    new_board[row_idx, 0] = merged[3]
+    new_board[row_idx, 1] = merged[2]
+    new_board[row_idx, 2] = merged[1]
+    new_board[row_idx, 3] = merged[0]
+    total_score = total_score + score
+    row_idx = row_idx + 1
+  }
+
+  (new_board, total_score)
+}
+
+fn slide_up(board: Tensor[i64, [4, 4]]) -> (Tensor[i64, [4, 4]], i64) {
+  let mut new_board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let mut total_score = 0
+  let mut col_idx = 0
+
+  while col_idx < 4 {
+    let col = [board[0, col_idx], board[1, col_idx], board[2, col_idx], board[3, col_idx]]
+    let (merged, score) = merge_row(col)
+    let mut row = 0
+    while row < 4 {
+      let mut new_board_mut = new_board
+      new_board_mut[row, col_idx] = merged[row]
+      new_board = new_board_mut
+      row = row + 1
+    }
+    total_score = total_score + score
+    col_idx = col_idx + 1
+  }
+
+  (new_board, total_score)
+}
+
+fn slide_down(board: Tensor[i64, [4, 4]]) -> (Tensor[i64, [4, 4]], i64) {
+  let mut new_board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let mut total_score = 0
+  let mut col_idx = 0
+
+  while col_idx < 4 {
+    let col = [board[3, col_idx], board[2, col_idx], board[1, col_idx], board[0, col_idx]]
+    let (merged, score) = merge_row(col)
+    let mut row = 0
+    while row < 4 {
+      let mut new_board_mut = new_board
+      new_board_mut[3 - row, col_idx] = merged[row]
+      new_board = new_board_mut
+      row = row + 1
+    }
+    total_score = total_score + score
+    col_idx = col_idx + 1
+  }
+
+  (new_board, total_score)
+}
+
+fn count_empty_cells(board: Tensor[i64, [4, 4]]) -> i64 {
+  let mut count = 0
+  let mut row = 0
+  while row < 4 {
+    let mut col = 0
+    while col < 4 {
+      if board[row, col] == 0 {
+        count = count + 1
+      }
+      col = col + 1
+    }
+    row = row + 1
+  }
+  count
+}
+
+fn add_random_tile(board: Tensor[i64, [4, 4]], seed: i64) -> (Tensor[i64, [4, 4]], i64) {
+  let empty_count = count_empty_cells(board)
+  if empty_count == 0 {
+    (board, seed)
+  } else {
+    let next_seed = seed * 1103515245 + 12345
+    let pos = (seed / 2) % empty_count
+    let tile_val = if (seed % 10) < 9 { 2 } else { 4 }
+
+    let mut new_board = board
+    let mut found = 0
+    let mut empty_idx = 0
+    let mut row = 0
+
+    while row < 4 {
+      let mut col = 0
+      while col < 4 {
+        if board[row, col] == 0 {
+          if empty_idx == pos {
+            new_board[row, col] = tile_val
+            found = 1
+          }
+          empty_idx = empty_idx + 1
+        }
+        col = col + 1
+      }
+      row = row + 1
+    }
+
+    (new_board, next_seed)
+  }
+}
+
+fn is_game_over(board: Tensor[i64, [4, 4]]) -> bool {
+  let empty = count_empty_cells(board)
+  if empty > 0 {
+    false
+  } else {
+    let mut row = 0
+    let mut has_move = false
+    while row < 4 {
+      let mut col = 0
+      while col < 4 {
+        if col < 3 {
+          if board[row, col] == board[row, col + 1] {
+            has_move = true
+          }
+        }
+        if row < 3 {
+          if board[row, col] == board[row + 1, col] {
+            has_move = true
+          }
+        }
+        col = col + 1
+      }
+      row = row + 1
+    }
+    if has_move { false } else { true }
+  }
+}
+
+fn best_direction(board: Tensor[i64, [4, 4]]) -> i64 {
+  if is_game_over(board) {
+    -1
+  } else {
+    let (board_left, score_left) = slide_left(board)
+    let (board_right, score_right) = slide_right(board)
+    let (board_up, score_up) = slide_up(board)
+    let (board_down, score_down) = slide_down(board)
+
+    let max_score = if score_left > score_right { score_left } else { score_right }
+    let max_score2 = if score_up > score_down { score_up } else { score_down }
+    let max_score3 = if max_score > max_score2 { max_score } else { max_score2 }
+
+    if score_left == max_score3 {
+      0
+    } else if score_right == max_score3 {
+      1
+    } else if score_up == max_score3 {
+      2
+    } else {
+      3
+    }
+  }
+}
+
+fn main() -> nil {
+  let mut board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let mut seed = 12345
+  let mut total_score = 0
+
+  # Add two initial tiles
+  let (board1, seed1) = add_random_tile(board, seed)
+  let (board2, seed2) = add_random_tile(board1, seed1)
+  board = board2
+  seed = seed2
+
+  # Game loop
+  let mut turn = 0
+  while turn < 100 {
+    let direction = best_direction(board)
+
+    if direction == -1 {
+      # Game over
+      turn = 100
+    } else {
+      let (new_board, score) = match direction {
+        0 => slide_left(board),
+        1 => slide_right(board),
+        2 => slide_up(board),
+        _ => slide_down(board),
+      }
+
+      # best_direction returns -1 when no move possible; we're here
+      # only when a move IS possible, so apply it unconditionally.
+      board = new_board
+      total_score = total_score + score
+      let (board_with_tile, next_seed) = add_random_tile(board, seed)
+      board = board_with_tile
+      seed = next_seed
+      turn = turn + 1
+    }
+  }
+
+  nil
+}
+
+# --- Tests ---
+
+# compact_row: zeros are removed and non-zeros shifted left
+# Input [0,2,0,4]: skip 0, place 2 at pos 0, skip 0, place 4 at pos 1 → [2,4,0,0]
+fn test_compact_basic() -> bool {
+  let row = [0, 2, 0, 4]
+  let r = compact_row(row)
+  r[0] == 2 && r[1] == 4 && r[2] == 0 && r[3] == 0
+}
+
+# merge_row: a single pair of equal adjacent tiles merges into their sum
+# [2,2,0,0] → compact=[2,2,0,0] → i=0: 2==2 → write 4, score=4, i→2
+# result=[4,0,0,0], score=4
+fn test_merge_row_single_pair() -> bool {
+  let row = [2, 2, 0, 0]
+  let (r, score) = merge_row(row)
+  r[0] == 4 && r[1] == 0 && r[2] == 0 && r[3] == 0 && score == 4
+}
+
+# merge_row: two disjoint pairs both merge in one pass
+# [4,4,2,2] → i=0: 4+4=8(score=8,i→2); i=2: 2+2=4(score=12) → [8,4,0,0], score=12
+fn test_merge_row_two_pairs() -> bool {
+  let row = [4, 4, 2, 2]
+  let (r, score) = merge_row(row)
+  r[0] == 8 && r[1] == 4 && r[2] == 0 && r[3] == 0 && score == 12
+}
+
+# merge_row: no adjacent equal tiles → no merge, score stays 0
+# [2,4,0,0] → compact=[2,4,0,0] → 2≠4, write 2; 4≠0, write 4 → [2,4,0,0], score=0
+fn test_merge_row_no_merge() -> bool {
+  let row = [2, 4, 0, 0]
+  let (r, score) = merge_row(row)
+  r[0] == 2 && r[1] == 4 && r[2] == 0 && r[3] == 0 && score == 0
+}
+
+# count_empty_cells: a completely zero board has 4*4=16 empty cells
+fn test_count_empty_all_zeros() -> bool {
+  let board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  count_empty_cells(board) == 16
+}
+
+# count_empty_cells: a board with all non-zero values has 0 empty cells
+fn test_count_empty_none() -> bool {
+  let board = [[2, 2, 2, 2], [2, 2, 2, 2], [2, 2, 2, 2], [2, 2, 2, 2]]
+  count_empty_cells(board) == 0
+}
+
+# is_game_over: an all-zero board is not game over (empty cells exist)
+fn test_game_not_over_empty_board() -> bool {
+  let board = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  is_game_over(board) == false
+}
+
+# slide_left: row [2,2,4,4] merges to [4,8,0,0] with score 12;
+# other rows are zeros and contribute 0, total score=12
+fn test_slide_left_one_row() -> bool {
+  let board = [[2, 2, 4, 4], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let (b, score) = slide_left(board)
+  b[0, 0] == 4 && b[0, 1] == 8 && b[0, 2] == 0 && b[0, 3] == 0 && score == 12
+}
+
+# slide_right: row [4,4,2,2]; slide_right reverses to [2,2,4,4], merge→[4,8,0,0],
+# then written back reversed: col3=merged[0]=4, col2=merged[1]=8, col1=0, col0=0
+# so row0=[0,0,8,4], score=12
+fn test_slide_right_one_row() -> bool {
+  let board = [[4, 4, 2, 2], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  let (b, score) = slide_right(board)
+  b[0, 0] == 0 && b[0, 1] == 0 && b[0, 2] == 8 && b[0, 3] == 4 && score == 12
+}
+
+# slide_up: col0=[2,2,4,4] (top to bottom) treated as a row and merged left→[4,8,0,0];
+# result written into rows: board[0,0]=4, board[1,0]=8, board[2,0]=0, score=12
+fn test_slide_up_one_col() -> bool {
+  let board = [[2, 0, 0, 0], [2, 0, 0, 0], [4, 0, 0, 0], [4, 0, 0, 0]]
+  let (b, score) = slide_up(board)
+  b[0, 0] == 4 && b[1, 0] == 8 && b[2, 0] == 0 && b[3, 0] == 0 && score == 12
+}

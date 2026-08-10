@@ -1,0 +1,49 @@
+# cast_int_block_boundary.dmc — the integer `@cast(...) { … }` block boundary.
+#
+# An `@cast(<ty>) { tensor }` block retags (and, for integer targets, rounds)
+# the block's tensor value. The two directions differ:
+#
+#   * float targets  (bf16/f16/tf32/f32/f64) are VALUE-PRESERVING retags — the
+#     data is already f32-backed, so this is a no-op on the numbers (#179).
+#   * integer targets (i8..i64, u8..u64, int4/int8) TRUNCATE TOWARD ZERO and
+#     retag the element type Int:  2.9 -> 2,  -2.9 -> -2  (not floor: -3).
+#
+# This file is the corpus's coverage of the *integer* case (#374). The
+# interpreter is canonical and truncates; the JIT has no elementwise-trunc
+# kernel yet, so it rejects an integer `@cast` block as unsupported rather than
+# treating it as a no-op and silently computing a different answer. Under the
+# `dmc test --jit` parity gate this file is therefore SKIPPED (outside the JIT
+# subset), which is the intended loud-refusal behaviour — before the fix the
+# JIT ran it and diverged (sum 5.8 vs 4).
+#
+# Run:
+#   dmc run  examples/cast_int_block_boundary.dmc
+#   dmc test examples/cast_int_block_boundary.dmc
+
+# Truncation toward zero, summed: 2.9 -> 2 and 2.9 -> 2, so sum == 4.
+fn test_int_cast_block_truncates() -> bool {
+    let !x = forge.zeros[f32, [2]]
+    x[0] = 2.9
+    x[1] = 2.9
+    let t = @cast(i64) { x }
+    sum(t) == 4
+}
+
+# Truncation is toward zero, NOT floor: -2.9 -> -2, +1.2 -> 1.
+fn test_int_cast_block_truncates_toward_zero() -> bool {
+    let !x = forge.zeros[f32, [3]]
+    x[0] = 2.9
+    x[1] = -2.9
+    x[2] = 1.2
+    let t = @cast(i64) { x }
+    t[0] == 2 && t[1] == -2 && t[2] == 1
+}
+
+fn main() -> nil {
+    let !x = forge.zeros[f32, [2]]
+    x[0] = 2.9
+    x[1] = 2.9
+    let t = @cast(i64) { x }
+    print(sum(t))    # 4  — truncated (interpreter); the JIT refuses this block
+    nil
+}

@@ -1,0 +1,403 @@
+# Reversi with diversity-score AI using bubble sort on flip counts
+
+fn print_board(board: Tensor[i64, [8, 8]]) -> nil {
+  let mut i = 0;
+  while i < 8 {
+    let mut row = "  ";
+    let mut j = 0;
+    while j < 8 {
+      let val = board[i, j];
+      if val == 0 {
+        row = row + ".";
+      } else if val == 1 {
+        row = row + "B";
+      } else {
+        row = row + "W";
+      }
+      if j < 7 {
+        row = row + " ";
+      }
+      j = j + 1;
+    }
+    print(row);
+    i = i + 1;
+  }
+  print("");
+  nil
+}
+
+fn count_pieces(board: Tensor[i64, [8, 8]], player: i64) -> i64 {
+  let mut count = 0;
+  let mut i = 0;
+  while i < 8 {
+    let mut j = 0;
+    while j < 8 {
+      if board[i, j] == player {
+        count = count + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  count
+}
+
+fn check_direction(
+  board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64, di: i64, dj: i64
+) -> bool {
+  let opponent = if player == 1 { 2 } else { 1 };
+  let mut r = row + di;
+  let mut c = col + dj;
+  let mut found_opponent = false;
+
+  while r >= 0 && r < 8 && c >= 0 && c < 8 {
+    let val = board[r, c];
+    if val == 0 {
+      r = 10;
+      c = 10;
+    } else if val == opponent {
+      found_opponent = true;
+      r = r + di;
+      c = c + dj;
+    } else if val == player {
+      if found_opponent {
+        r = 10;
+        c = 10;
+      } else {
+        r = 10;
+        c = 10;
+      }
+    } else {
+      r = 10;
+      c = 10;
+    }
+  }
+
+  found_opponent
+}
+
+fn count_flips_direction(
+  board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64, di: i64, dj: i64
+) -> i64 {
+  let opponent = if player == 1 { 2 } else { 1 };
+  let mut r = row + di;
+  let mut c = col + dj;
+  let mut flip_count = 0;
+
+  while r >= 0 && r < 8 && c >= 0 && c < 8 {
+    let val = board[r, c];
+    if val == 0 {
+      r = 10;
+      c = 10;
+    } else if val == opponent {
+      flip_count = flip_count + 1;
+      r = r + di;
+      c = c + dj;
+    } else if val == player {
+      r = 10;
+      c = 10;
+    } else {
+      r = 10;
+      c = 10;
+    }
+  }
+
+  flip_count
+}
+
+fn is_valid_move(board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64) -> bool {
+  if row < 0 || row >= 8 || col < 0 || col >= 8 {
+    return false;
+  }
+  if board[row, col] != 0 {
+    return false;
+  }
+
+  let v1 = check_direction(board, row, col, player, -1, 0);
+  let v2 = check_direction(board, row, col, player, 1, 0);
+  let v3 = check_direction(board, row, col, player, 0, -1);
+  let v4 = check_direction(board, row, col, player, 0, 1);
+  let v5 = check_direction(board, row, col, player, -1, -1);
+  let v6 = check_direction(board, row, col, player, -1, 1);
+  let v7 = check_direction(board, row, col, player, 1, -1);
+  let v8 = check_direction(board, row, col, player, 1, 1);
+
+  v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8
+}
+
+fn flip_direction(
+  board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64, di: i64, dj: i64
+) -> Tensor[i64, [8, 8]] {
+  let opponent = if player == 1 { 2 } else { 1 };
+  let mut result = board;
+  let mut r = row + di;
+  let mut c = col + dj;
+  let mut found_line = false;
+
+  while r >= 0 && r < 8 && c >= 0 && c < 8 {
+    let val = result[r, c];
+    if val == 0 {
+      r = 10;
+      c = 10;
+    } else if val == opponent {
+      r = r + di;
+      c = c + dj;
+    } else if val == player {
+      if r > row + di || c > col + dj || r < row + di || c < col + dj {
+        let mut tr = row + di;
+        let mut tc = col + dj;
+        while tr != r || tc != c {
+          result[tr, tc] = player;
+          tr = tr + di;
+          tc = tc + dj;
+        }
+      }
+      r = 10;
+      c = 10;
+    } else {
+      r = 10;
+      c = 10;
+    }
+  }
+
+  result
+}
+
+fn make_move(board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64) -> Tensor[i64, [8, 8]] {
+  let mut result = board;
+  result[row, col] = player;
+
+  let mut di = -1;
+  while di <= 1 {
+    let mut dj = -1;
+    while dj <= 1 {
+      if di != 0 || dj != 0 {
+        result = flip_direction(result, row, col, player, di, dj);
+      }
+      dj = dj + 1;
+    }
+    di = di + 1;
+  }
+
+  result
+}
+
+fn any_valid_move(board: Tensor[i64, [8, 8]], player: i64) -> bool {
+  let mut i = 0;
+  let mut found = false;
+  while i < 8 {
+    let mut j = 0;
+    while j < 8 {
+      if is_valid_move(board, i, j, player) {
+        found = true;
+        i = 10;
+        j = 10;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  found
+}
+
+fn bubble_sort_desc(arr: Tensor[i64, [8]]) -> Tensor[i64, [8]] {
+  let mut result = arr;
+  let n = 8;
+  let mut i = 0;
+  while i < n {
+    let mut j = 0;
+    while j < n - i - 1 {
+      if result[j] < result[j + 1] {
+        let tmp = result[j];
+        result[j] = result[j + 1];
+        result[j + 1] = tmp;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  result
+}
+
+fn compute_diversity_score(flips: Tensor[i64, [8]]) -> i64 {
+  let sorted = bubble_sort_desc(flips);
+  let score = sorted[0] + sorted[1] + sorted[2];
+  score
+}
+
+fn get_flip_counts(
+  board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64
+) -> Tensor[i64, [8]] {
+  let c0 = count_flips_direction(board, row, col, player, -1, 0);
+  let c1 = count_flips_direction(board, row, col, player, 1, 0);
+  let c2 = count_flips_direction(board, row, col, player, 0, -1);
+  let c3 = count_flips_direction(board, row, col, player, 0, 1);
+  let c4 = count_flips_direction(board, row, col, player, -1, -1);
+  let c5 = count_flips_direction(board, row, col, player, -1, 1);
+  let c6 = count_flips_direction(board, row, col, player, 1, -1);
+  let c7 = count_flips_direction(board, row, col, player, 1, 1);
+
+  let flips = [c0, c1, c2, c3, c4, c5, c6, c7];
+  flips
+}
+
+fn best_move(board: Tensor[i64, [8, 8]], player: i64) -> (i64, i64) {
+  let mut best_score = -1;
+  let mut best_row = -1;
+  let mut best_col = -1;
+
+  let mut i = 0;
+  while i < 8 {
+    let mut j = 0;
+    while j < 8 {
+      if is_valid_move(board, i, j, player) {
+        let flips = get_flip_counts(board, i, j, player);
+        let score = compute_diversity_score(flips);
+        if score > best_score {
+          best_score = score;
+          best_row = i;
+          best_col = j;
+        }
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  (best_row, best_col)
+}
+
+# Tests
+
+# bubble_sort_desc sorts descending: [3,1,4,1,5,9,2,6] -> [9,6,5,4,3,2,1,1]
+# Invariant: each element >= the next; max at index 0, min at index 7.
+fn test_bubble_sort_desc_sorted() -> bool {
+  let arr = [3, 1, 4, 1, 5, 9, 2, 6];
+  let sorted = bubble_sort_desc(arr);
+  # Check specific known values: largest=9 at [0], smallest=1 at [7]
+  let ok_max = sorted[0] == 9;
+  let ok_min = sorted[7] == 1;
+  # Check nondecreasing order (descending means each element >= next)
+  let mut ok_order = true;
+  let mut k = 0;
+  while k < 7 {
+    if sorted[k] < sorted[k + 1] {
+      ok_order = false;
+    }
+    k = k + 1;
+  }
+  ok_max && ok_min && ok_order
+}
+
+# compute_diversity_score picks top-3 from sorted: sum([9,6,5]) = 20
+fn test_compute_diversity_score_known() -> bool {
+  let flips = [3, 1, 4, 1, 5, 9, 2, 6];
+  let score = compute_diversity_score(flips);
+  score == 20
+}
+
+# Initial board: 2 blacks at (3,4) and (4,3), 2 whites at (3,3) and (4,4)
+fn test_count_pieces_initial_board() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  let blacks = count_pieces(board, 1);
+  let whites = count_pieces(board, 2);
+  blacks == 2 && whites == 2
+}
+
+# From the initial board, black can play at (2,3): sandwiches white at (3,3)
+# between the black at (4,3). (2,3) is empty, (3,3)=white, (4,3)=black -> valid.
+# Corner (0,0) is not valid since no opponent pieces are adjacent in any direction.
+fn test_is_valid_move_black_start() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  let valid_23 = is_valid_move(board, 2, 3, 1);
+  let invalid_00 = is_valid_move(board, 0, 0, 1);
+  valid_23 && !invalid_00
+}
+
+# After black plays at (2,3): places at (2,3), flips white at (3,3) to black.
+# Before: black=2, white=2. After: black gains (2,3) + flipped (3,3) = 4, white=1.
+fn test_make_move_flips_piece() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  let after = make_move(board, 2, 3, 1);
+  let blacks = count_pieces(after, 1);
+  let whites = count_pieces(after, 2);
+  # black placed at (2,3) = +1, flipped (3,3) = +1 => 2+2=4 blacks
+  # white lost (3,3) => 2-1=1 white
+  blacks == 4 && whites == 1
+}
+
+fn main() -> nil {
+  let mut board = [[0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 2, 1, 0, 0, 0],
+                    [0, 0, 0, 1, 2, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0]];
+
+  print("=== Reversi: Diversity-Score AI ===");
+  print_board(board);
+
+  let mut current_player = 1;
+  let mut passes = 0;
+
+  let mut moves_made = true;
+  while moves_made {
+    if any_valid_move(board, current_player) {
+      let (row, col) = best_move(board, current_player);
+      board = make_move(board, row, col, current_player);
+      let player_name = if current_player == 1 { "Black" } else { "White" };
+      print(player_name + " plays at (" + to_str(row) + ", " + to_str(col) + ")");
+      print_board(board);
+      current_player = if current_player == 1 { 2 } else { 1 };
+      passes = 0;
+    } else {
+      passes = passes + 1;
+      let player_name = if current_player == 1 { "Black" } else { "White" };
+      print(player_name + " has no moves, passing.");
+      current_player = if current_player == 1 { 2 } else { 1 };
+      if passes >= 2 {
+        moves_made = false;
+      }
+    }
+  }
+
+  let black_count = count_pieces(board, 1);
+  let white_count = count_pieces(board, 2);
+
+  print("=== Game Over ===");
+  print("Black: " + to_str(black_count));
+  print("White: " + to_str(white_count));
+
+  if black_count > white_count {
+    print("Black wins!");
+  } else if white_count > black_count {
+    print("White wins!");
+  } else {
+    print("Draw!");
+  }
+
+  nil
+}

@@ -1,0 +1,117 @@
+# jit_autodiff_demo.dmc -- Phase 4 JIT slice 6 (issue #15).
+#
+# `@grad fn` reverse-mode autodiff. The JIT emits TWO entry points per
+# `@grad fn`:
+#   - `loss(W, x)`          forward only -> f32       (callable here)
+#   - `loss$fwd_bwd(W, x)`  forward + backward        (host API; the
+#                           gradient of every `!` param is published to
+#                           the caller, verified by the compiler test
+#                           suite -- see jit::tests::jit_grad_*)
+#
+# The backward pass is emitted statically per shape specialization
+# (AUTODIFF.md: "Not a tape"). It walks the recorded forward graph in
+# reverse, applying the adjoint rule for each op:
+#   sum     dL/dx[i] = g                 (broadcast the scalar adjoint)
+#   mean    dL/dx[i] = g / N
+#   .*      dL/da = b.*g ; dL/db = a.*g
+#   .+      dL/da = g    ; dL/db = g
+#   @       dL/dA = g @ B' ; dL/dB = A' @ g   (matmul chain rule)
+#   '       dL/dA = g'
+#
+# Run the forward path:
+#   dmc jit examples/jit_autodiff_demo.dmc
+
+# Quadratic regularizer. Backward: dW = 2W (verified in tests).
+@grad fn reg(!W: Tensor[f32, [4]]) -> f32 {
+    sum(W .* W)
+}
+
+# A linear-layer squared-output loss. With h = x @ W,
+# loss = sum(h .* h), the backward gives dW = 2 * x' @ (x @ W).
+@grad fn layer_loss(!W: Tensor[f32, [2, 2]], x: Tensor[f32, [2, 2]]) -> f32 {
+    let h = x @ W
+    sum(h .* h)
+}
+
+# Chained elementwise: loss = sum((W .+ W) .* W) = 2*sum(W^2).
+# Backward composes .+ and .* adjoints -> dW = 4W.
+@grad fn chain(!W: Tensor[f32, [3]]) -> f32 {
+    let doubled = W .+ W
+    sum(doubled .* W)
+}
+
+fn main() -> i64 {
+    # Forward passes -- the loss values. The gradients are computed by
+    # the `$fwd_bwd` entries and exercised in the Rust test suite.
+
+    let w4 = [1.0, 2.0, 3.0, 4.0]
+    print_i64(reg(w4) as i64)          # 1+4+9+16 = 30 ; dW would be [2,4,6,8]
+
+    let W = [[1.0, 2.0], [3.0, 4.0]]
+    let x = [[1.0, 0.0], [0.0, 1.0]]   # identity
+    print_i64(layer_loss(W, x) as i64) # h=W, sum(W.*W)=30 ; dW = 2W
+
+    let w3 = [1.0, 2.0, 3.0]
+    print_i64(chain(w3) as i64)        # 2*(1+4+9) = 28 ; dW = [4,8,12]
+
+    0
+}
+
+# reg([1,2,3,4]) = sum([1,4,9,16]) = 30.  By hand: 1^2+2^2+3^2+4^2 = 30.
+fn test_reg_known_input() -> bool {
+    let w = [1.0, 2.0, 3.0, 4.0]
+    let result = reg(w)
+    abs(result - 30.0) < 0.0001
+}
+
+# reg on all-zeros must be 0: sum(0.*0) = 0.
+fn test_reg_zeros() -> bool {
+    let w = [0.0, 0.0, 0.0, 0.0]
+    let result = reg(w)
+    abs(result - 0.0) < 0.0001
+}
+
+# reg is always >= 0 (sum of squares): true for any input.
+fn test_reg_nonnegative() -> bool {
+    let w = [3.0, -1.0, 2.0, -4.0]
+    let result = reg(w)
+    result >= 0.0
+}
+
+# layer_loss(W, identity) where W=[[1,2],[3,4]].
+# h = identity @ W = W.  sum(W .* W) = 1+4+9+16 = 30.
+fn test_layer_loss_identity() -> bool {
+    let W = [[1.0, 2.0], [3.0, 4.0]]
+    let x = [[1.0, 0.0], [0.0, 1.0]]
+    let result = layer_loss(W, x)
+    abs(result - 30.0) < 0.0001
+}
+
+# layer_loss with zero input: h = zeros @ W = zeros; sum(zeros.*zeros) = 0.
+fn test_layer_loss_zero_x() -> bool {
+    let W = [[1.0, 2.0], [3.0, 4.0]]
+    let x = [[0.0, 0.0], [0.0, 0.0]]
+    let result = layer_loss(W, x)
+    abs(result - 0.0) < 0.0001
+}
+
+# chain([1,2,3]): sum((W.+W).*W) = sum(2W.*W) = 2*sum(W^2) = 2*(1+4+9) = 28.
+fn test_chain_known_input() -> bool {
+    let w = [1.0, 2.0, 3.0]
+    let result = chain(w)
+    abs(result - 28.0) < 0.0001
+}
+
+# chain on zeros: sum((0.+0).*0) = 0.
+fn test_chain_zeros() -> bool {
+    let w = [0.0, 0.0, 0.0]
+    let result = chain(w)
+    abs(result - 0.0) < 0.0001
+}
+
+# chain is always >= 0: sum(2W.*W) = 2*sum(W^2) >= 0.
+fn test_chain_nonnegative() -> bool {
+    let w = [-2.0, 3.0, -1.0]
+    let result = chain(w)
+    result >= 0.0
+}

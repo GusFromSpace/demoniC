@@ -1,0 +1,204 @@
+# snake.dmc — assemble and run the Snake cart on demoniVM-2
+#
+# usage: dmc run examples/console/snake.dmc
+
+use "asm.dmc"
+
+fn run_list(code: list, maxframes: i64) -> nil {
+    # build a u8 tensor from the assembled byte list,
+    # then hand it to the dv2 run loop
+
+    let ESC   = chr(27)
+    let CLEAR = ESC + "[2J" + ESC + "[H"
+
+    let !fb    = forge.zeros[i64, [20, 32]]
+    let !mem   = forge.zeros[i64, [16]]
+    let !stack = forge.zeros[i64, [32]]
+    let !sp = 0
+    let !pc = 0
+    let !frame = 0
+    let !running = true
+    let !last_key = 0
+    let n = list_len(code)
+
+    set_raw_mode(true)
+    while running {
+        let op = list_get(code, pc)
+        pc = pc + 1
+
+        if op == 0 { running = false }
+        if op == 1 {
+            let imm = list_get(code, pc); pc = pc + 1
+            stack[sp] = imm; sp = sp + 1
+        }
+        if op == 2 {
+            let b = stack[sp-1]; let a = stack[sp-2]; sp = sp - 2
+            stack[sp] = a + b; sp = sp + 1
+        }
+        if op == 3 {
+            let b = stack[sp-1]; let a = stack[sp-2]; sp = sp - 2
+            stack[sp] = a - b; sp = sp + 1
+        }
+        if op == 4 {
+            let b = stack[sp-1]; let a = stack[sp-2]; sp = sp - 2
+            stack[sp] = a * b; sp = sp + 1
+        }
+        if op == 5 {
+            let a = stack[sp-1]; sp = sp - 1
+            stack[sp] = 0 - a; sp = sp + 1
+        }
+        if op == 6 {
+            let b = stack[sp-1]; let a = stack[sp-2]; sp = sp - 2
+            if a == b { stack[sp] = 1 } else { stack[sp] = 0 }
+            sp = sp + 1
+        }
+        if op == 7 {
+            let b = stack[sp-1]; let a = stack[sp-2]; sp = sp - 2
+            if a < b { stack[sp] = 1 } else { stack[sp] = 0 }
+            sp = sp + 1
+        }
+        if op == 8 {
+            let b = stack[sp-1]; let a = stack[sp-2]; sp = sp - 2
+            if a > b { stack[sp] = 1 } else { stack[sp] = 0 }
+            sp = sp + 1
+        }
+        if op == 9 { pc = list_get(code, pc) }
+        if op == 10 {
+            let addr = list_get(code, pc); pc = pc + 1
+            sp = sp - 1
+            if stack[sp] == 0 { pc = addr }
+        }
+        if op == 11 {
+            let slot = list_get(code, pc); pc = pc + 1
+            stack[sp] = mem[slot]; sp = sp + 1
+        }
+        if op == 12 {
+            let slot = list_get(code, pc); pc = pc + 1
+            sp = sp - 1; mem[slot] = stack[sp]
+        }
+        if op == 13 {
+            stack[sp] = stack[sp-1]; sp = sp + 1
+        }
+        if op == 14 {
+            let c = list_get(code, pc); pc = pc + 1
+            if c == 0 {
+                fb = forge.zeros[i64, [20, 32]]
+            } else {
+                let !ry = 0
+                while ry < 20 {
+                    let !cx = 0
+                    while cx < 32 { fb[ry, cx] = c; cx = cx + 1 }
+                    ry = ry + 1
+                }
+            }
+        }
+        if op == 15 {
+            let c = stack[sp-1]; let y = stack[sp-2]; let x = stack[sp-3]
+            sp = sp - 3; fb[y, x] = c
+        }
+        if op == 16 {                      # VSYNC
+            let k = read_char_nb()
+            if len(k) > 0 { last_key = ord(k) } else { last_key = 0 }
+
+            print(CLEAR + "demoniVM-2  snake  (wasd=move  q=quit)")
+            print("+--------------------------------+")
+            let !ry = 0
+            while ry < 20 {
+                let !row = "|"
+                let !cx = 0
+                while cx < 32 {
+                    let v = fb[ry, cx]
+                    if v == 0 { row = row + " " }
+                    if v == 1 { row = row + "." }
+                    if v == 2 { row = row + "o" }
+                    if v == 3 { row = row + "O" }
+                    if v == 4 { row = row + "#" }
+                    cx = cx + 1
+                }
+                row = row + "|"
+                print(row)
+                ry = ry + 1
+            }
+            print("+--------------------------------+")
+            flush()
+            sleep_ms(120)
+            frame = frame + 1
+            if frame >= maxframes { running = false }
+            if last_key == 113 { running = false }   # q
+        }
+        if op == 18 {                      # INPUT
+            stack[sp] = last_key; sp = sp + 1
+        }
+    }
+    set_raw_mode(false)
+    print(CLEAR)
+    nil
+}
+
+fn main() -> nil {
+    let (src, _) = read_file("examples/console/snake.asm")
+    let bytes = asm_compile(src)
+    print(format("snake cart: {} bytes", list_len(bytes)))
+    run_list(bytes, 9999)
+    nil
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+# snake.dmc's run_list interprets opcodes whose numbers MUST match asm.dmc's
+# opcode table. These tests assert that cross-file contract is intact.
+
+# CLS (clear framebuffer) has opcode 14 and takes one operand byte.
+# run_list checks `op == 14` then reads the colour argument from `code[pc]`.
+# `CLS 0` must assemble to exactly 2 bytes: [14, 0].
+fn test_cls_opcode_matches_vm() -> bool {
+    let bytes = asm_compile("CLS 0")
+    asm_size(bytes) == 2 && list_get(bytes, 0) == 14 && list_get(bytes, 1) == 0
+}
+
+# PSET (set pixel) has opcode 15 and no operand byte; x/y/colour are popped
+# from the stack. run_list checks `op == 15`. Single byte: [15].
+fn test_pset_opcode_matches_vm() -> bool {
+    let bytes = asm_compile("PSET")
+    asm_size(bytes) == 1 && list_get(bytes, 0) == 15
+}
+
+# VSYNC (render frame and poll input) has opcode 16, no operand.
+# run_list checks `op == 16`. Single byte: [16].
+fn test_vsync_opcode_matches_vm() -> bool {
+    let bytes = asm_compile("VSYNC")
+    asm_size(bytes) == 1 && list_get(bytes, 0) == 16
+}
+
+# INPUT (push last key code) has opcode 18, no operand.
+# run_list checks `op == 18`. Single byte: [18].
+fn test_input_opcode_matches_vm() -> bool {
+    let bytes = asm_compile("INPUT")
+    asm_size(bytes) == 1 && list_get(bytes, 0) == 18
+}
+
+# The snake render sequence is always: PUSH x, PUSH y, PUSH color, PSET.
+# That is 3 × PUSH (2 bytes each = opcode 1 + literal) + PSET (1 byte) = 7 bytes.
+# snake.asm's `LOAD hx  LOAD hy  PUSH 3  PSET` draws the head; here we test the
+# literal equivalent to verify the encoding the VM reads from the code list.
+fn test_snake_pixel_draw_sequence() -> bool {
+    let bytes = asm_compile("PUSH 5\nPUSH 10\nPUSH 3\nPSET")
+    asm_size(bytes) == 7 &&
+    list_get(bytes, 0) == 1  && list_get(bytes, 1) == 5  &&
+    list_get(bytes, 2) == 1  && list_get(bytes, 3) == 10 &&
+    list_get(bytes, 4) == 1  && list_get(bytes, 5) == 3  &&
+    list_get(bytes, 6) == 15
+}
+
+# snake.asm checks `LOAD key  PUSH 119  EQ  JZ skip_w` to detect 'w' (ASCII 119).
+# The key codes are: w=119, s=115, a=97, d=100.
+# This test assembles that pattern with a label and verifies the key code byte.
+fn test_wasd_key_codes_in_bytecode() -> bool {
+    let src = "PUSH 119\nPUSH 115\nPUSH 97\nPUSH 100\nHALT"
+    let bytes = asm_compile(src)
+    # 4 × PUSH (2 bytes each) + HALT (1 byte) = 9 bytes
+    asm_size(bytes) == 9 &&
+    list_get(bytes, 1) == 119 &&   # w = up
+    list_get(bytes, 3) == 115 &&   # s = down
+    list_get(bytes, 5) == 97  &&   # a = left
+    list_get(bytes, 7) == 100       # d = right
+}

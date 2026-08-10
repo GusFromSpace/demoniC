@@ -1,0 +1,64 @@
+# decode_varint.dmc — protobuf base-128 varint decode, in demoniC.
+#
+# demoniC is a tensor-first language; byte-stream parsing is the kind of
+# "glue" it supposedly leaves to a host language. This shows it doesn't have
+# to. A byte buffer is just a 1-D tensor, and a varint needs no bitwise ops at
+# all — the 7-bit groups never overlap, so it's pure positional arithmetic:
+#     b & 0x7F   ->  b % 128
+#     << (7*k)   ->  * 128^k      (accumulate a multiplier)
+#     |          ->  +            (non-overlapping groups, so OR == ADD)
+#     b & 0x80   ->  b >= 128     (the continuation bit)
+#
+# Run:
+#   dmc run examples/decode_varint.dmc
+
+fn decode_varint[N](buf: Tensor[f32, [N]], start: i64) -> i64 {
+    let !result = 0
+    let !mult = 1
+    let !i = start
+    let !cont = 1
+    while cont == 1 {
+        let b = buf[i] as i64
+        result = result + (b % 128) * mult
+        mult = mult * 128
+        if b < 128 {
+            cont = 0
+        }
+        i = i + 1
+    }
+    return result
+}
+
+# --- numeric gates: varint decodings verifiable by hand ---
+# 300 = [0xAC, 0x02]: 172%128*1 + 2%128*128 = 44 + 256 = 300
+fn test_varint_300() -> bool {
+    let buf = [172.0, 2.0]
+    decode_varint(buf, 0) == 300
+}
+
+# single byte (< 128) decodes to itself
+fn test_varint_single() -> bool {
+    let one = [5.0]
+    decode_varint(one, 0) == 5
+}
+
+# 100000 = [0xA0, 0x8D, 0x06]: 32 + 13*128 + 6*16384 = 32 + 1664 + 98304
+fn test_varint_100000() -> bool {
+    let big = [160.0, 141.0, 6.0]
+    decode_varint(big, 0) == 100000
+}
+
+fn main() -> nil {
+    # 300 encodes as varint bytes [0xAC, 0x02] = [172, 2]
+    let buf = [172.0, 2.0]
+    print(decode_varint(buf, 0))
+
+    # single byte: 5 -> [5]
+    let one = [5.0]
+    print(decode_varint(one, 0))
+
+    # three bytes: 100000 -> [0xA0, 0x8D, 0x06] = [160, 141, 6]
+    let big = [160.0, 141.0, 6.0]
+    print(decode_varint(big, 0))
+    nil
+}

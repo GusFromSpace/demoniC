@@ -1,0 +1,145 @@
+# jit_training_demo.dmc -- Phase 4 JIT slice 7 (issue #15).
+#
+# A complete gradient-descent training loop in pure demoniC. No host
+# driver, no Python -- the forward pass, the backward pass, and the
+# weight update all JIT-compile to native code and run in one process.
+#
+# The `.fwd_bwd` source surface (AUTODIFF.md §1) is the key addition:
+#   let (loss, dW) = f.fwd_bwd(W, x)
+# returns the loss AND the gradient of the single `!` mut parameter, so
+# the optimizer step `W = W .- lr .* dW` closes the loop entirely inside
+# the language.
+#
+# Run:
+#   dmc jit examples/jit_training_demo.dmc
+
+# A squared-output linear layer. Minimizing this drives W toward zero
+# (the trivial optimum) -- enough to demonstrate that gradients flow and
+# the loss actually decreases step over step.
+@grad fn layer_loss(!W: Tensor[f32, [2, 2]], x: Tensor[f32, [2, 2]]) -> f32 {
+    let h = x @ W
+    sum(h .* h)
+}
+
+# An L2 regularizer used as a second, standalone objective.
+@grad fn ridge(!W: Tensor[f32, [4]]) -> f32 {
+    sum(W .* W)
+}
+
+fn main() -> i64 {
+    print_i64(7777)   # banner: "training run"
+
+    # ─── Objective 1: train the linear layer ─────────────────────────────
+    let x = [[1.0, 0.0], [0.0, 1.0]]    # identity input
+    let mut W = [[2.0, 2.0], [2.0, 2.0]]
+    let lr = 0.1
+
+    # Initial loss.
+    let (loss0, _) = layer_loss.fwd_bwd(W, x)
+    print_i64(loss0 as i64)              # 4 cells * 2^2 = 16
+
+    # 50 steps of vanilla SGD, entirely in demoniC.
+    let mut step = 0
+    let mut last = 0.0
+    while step < 50 {
+        let (loss, grads) = layer_loss.fwd_bwd(W, x)
+        W = W .- lr .* grads.W           # the optimizer step
+        last = loss
+        step += 1
+    }
+    print_i64((last * 1000.0) as i64)    # ~0 -- converged
+
+    # ─── Objective 2: ridge regression toward zero ───────────────────────
+    let mut V = [3.0, 4.0, 5.0, 6.0]
+    let mut s = 0
+    let mut rl = 0.0
+    while s < 100 {
+        let (l, grads) = ridge.fwd_bwd(V)
+        V = V .- 0.1 .* grads.W
+        rl = l
+        s += 1
+    }
+    print_i64((rl * 1000.0) as i64)      # ~0
+
+    # ─── Sanity: forward-only call still works ────────────────────────────
+    let w = [1.0, 1.0, 1.0, 1.0]
+    print_i64(ridge(w) as i64)           # 4
+
+    0
+}
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+# ridge([1,1,1,1]) = 1^2+1^2+1^2+1^2 = 4.0 by definition of L2-norm-squared.
+fn test_ridge_unit_vector() -> bool {
+    let w = [1.0, 1.0, 1.0, 1.0]
+    let r = ridge(w)
+    abs(r - 4.0) < 0.0001
+}
+
+# ridge([3,4,0,0]) = 9+16+0+0 = 25.0 (Pythagorean triple, closed-form check).
+fn test_ridge_pythagorean() -> bool {
+    let w = [3.0, 4.0, 0.0, 0.0]
+    let r = ridge(w)
+    abs(r - 25.0) < 0.0001
+}
+
+# ridge([0,0,0,0]) = 0; the minimum of the L2 objective is zero at the origin.
+fn test_ridge_zero() -> bool {
+    let w = [0.0, 0.0, 0.0, 0.0]
+    let r = ridge(w)
+    abs(r - 0.0) < 0.0001
+}
+
+# layer_loss with identity input and W=[[2,2],[2,2]]:
+#   h = I @ W = W = [[2,2],[2,2]]
+#   sum(h .* h) = 4+4+4+4 = 16.
+# This matches the comment "4 cells * 2^2 = 16" in main.
+fn test_layer_loss_initial() -> bool {
+    let x = [[1.0, 0.0], [0.0, 1.0]]
+    let W = [[2.0, 2.0], [2.0, 2.0]]
+    let (loss, _) = layer_loss.fwd_bwd(W, x)
+    abs(loss - 16.0) < 0.001
+}
+
+# layer_loss with identity input and W=identity:
+#   h = I @ I = I = [[1,0],[0,1]]
+#   sum(I .* I) = 1+0+0+1 = 2.
+fn test_layer_loss_identity_weights() -> bool {
+    let x = [[1.0, 0.0], [0.0, 1.0]]
+    let W = [[1.0, 0.0], [0.0, 1.0]]
+    let (loss, _) = layer_loss.fwd_bwd(W, x)
+    abs(loss - 2.0) < 0.001
+}
+
+# After training, loss must strictly decrease. We run 10 steps and check
+# that final_loss < initial_loss (a monotone convergence invariant for
+# vanilla SGD on this strongly-convex quadratic with lr=0.1 < 1/Lmax=0.25).
+fn test_layer_loss_decreases() -> bool {
+    let x = [[1.0, 0.0], [0.0, 1.0]]
+    let !W = [[2.0, 2.0], [2.0, 2.0]]
+    let (loss0, _) = layer_loss.fwd_bwd(W, x)
+    let !step = 0
+    while step < 10 {
+        let (loss, grads) = layer_loss.fwd_bwd(W, x)
+        W = W .- 0.1 .* grads.W
+        step += 1
+    }
+    let (loss_final, _) = layer_loss.fwd_bwd(W, x)
+    loss_final < loss0
+}
+
+# After 50 SGD steps, ridge loss on [3,4,5,6] must be < 1% of initial
+# (convergence rate: each step multiplies W by 0.8, so W^50 = 0.8^50 ≈ 1e-5).
+fn test_ridge_converges() -> bool {
+    let !V = [3.0, 4.0, 5.0, 6.0]
+    let !s = 0
+    while s < 50 {
+        let (l, grads) = ridge.fwd_bwd(V)
+        V = V .- 0.1 .* grads.W
+        s += 1
+    }
+    let r_final = ridge(V)
+    let r_initial = 9.0 + 16.0 + 25.0 + 36.0   # 3^2+4^2+5^2+6^2 = 86
+    r_final < r_initial * 0.01
+}

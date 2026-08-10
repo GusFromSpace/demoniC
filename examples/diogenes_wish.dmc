@@ -1,0 +1,34 @@
+fn identity_wish(who: str) -> str {
+    if who == "Alexander" {
+        "Diogenes"
+    } else {
+        if who == "Diogenes" {
+            "Diogenes"
+        } else {
+            who
+        }
+    }
+}
+
+fn main() -> nil {
+    print("Alexander: If I were not Alexander, I would wish to be " + identity_wish("Alexander") + ".")
+
+    print("Diogenes: If I were not Diogenes, I would still wish to be " + identity_wish("Diogenes") + ".")
+    nil
+}
+
+# Alexander maps to "Diogenes" — the famous wish ("If I were not Alexander,
+# I would wish to be Diogenes"). The function encodes this literal mapping.
+fn test_alexander_maps_to_diogenes() -> bool {
+    identity_wish("Alexander") == "Diogenes"
+}
+
+# Diogenes maps to himself — the identity/self-sufficiency branch.
+fn test_diogenes_maps_to_himself() -> bool {
+    identity_wish("Diogenes") == "Diogenes"
+}
+
+# Any other name passes through unchanged (the else/identity branch).
+fn test_other_name_is_identity() -> bool {
+    identity_wish("Socrates") == "Socrates"
+}

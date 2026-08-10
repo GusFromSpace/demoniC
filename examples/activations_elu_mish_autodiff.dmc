@@ -1,0 +1,40 @@
+# elu / mish reverse-mode autodiff (#377). First derivative runs on both
+# backends (see activations_grad_jit.dmc for concrete-shape JIT parity); the
+# second derivative below is interpreter-only. These tests use shape-generic
+# `@grad`, which the JIT skips regardless, so they run under `dmc test` (the
+# reference); the second-order case is interp-only by design.
+#
+#   elu'(x)  (α=1) = 1    for x>0,  e^x for x≤0
+#   elu''(x)       = 0    for x>0,  e^x for x≤0
+#   mish'(x)       = tanh(sp) + x·(1-tanh²(sp))·σ(x),  sp=softplus(x), σ=sigmoid
+
+@grad fn grad_elu[D](!w: Tensor[f32, [D]]) -> f32 { sum(elu(w)) }
+
+fn test_elu_grad() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 2.0   w[1] = 0.0 - 1.0
+    let (l, g) = grad_elu.fwd_bwd(w)
+    # elu'(2)=1 (exact) ; elu'(-1)=e^-1≈0.3679
+    (g.w[0] == 1.0) && (g.w[1] > 0.367) && (g.w[1] < 0.369)
+}
+
+@grad fn grad_mish[D](!w: Tensor[f32, [D]]) -> f32 { sum(mish(w)) }
+
+fn test_mish_grad() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 0.0   w[1] = 2.0
+    let (l, g) = grad_mish.fwd_bwd(w)
+    # mish'(0)=0.6 ; mish'(2)≈1.0693
+    (g.w[0] > 0.599) && (g.w[0] < 0.601) && (g.w[1] > 1.068) && (g.w[1] < 1.071)
+}
+
+# second-order (@grad @grad): elu''(x) = 0 for x>0, e^x for x≤0
+@grad @grad fn grad2_elu[D](!w: Tensor[f32, [D]]) -> f32 { sum(elu(w)) }
+
+fn test_elu_second_order() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 2.0   w[1] = 0.0 - 1.0
+    let (_l, g2) = grad2_elu.fwd_bwd_bwd(w)
+    # elu''(2)=0 ; elu''(-1)=e^-1≈0.3679
+    (g2.w[0] == 0.0) && (g2.w[1] > 0.367) && (g2.w[1] < 0.369)
+}

@@ -29,3 +29,10 @@ jobs:
         # Compiler-derived differential suite: generated programs run through
         # both backends (interpreter and JIT), diffed for divergence.
         run: compiler/target/release/dmc selftest
+      - name: dmc test examples
+        # The in-language ground-truth suite over the shipped examples.
+        run: compiler/target/release/dmc test examples
+      - name: dmc test --jit examples
+        # Every JIT-eligible example test additionally runs on both backends
+        # and the results are compared.
+        run: compiler/target/release/dmc test --jit examples

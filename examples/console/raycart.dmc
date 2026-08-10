@@ -1,0 +1,254 @@
+# raycart.dmc — demoniVM-2 + a ray-marching coprocessor (milestone M3).
+#
+# The cursed Game Boy, assembled: a CHIP-8-class bytecode VM does the game
+# logic (integer physics, in a cart), and a DRAW3D coprocessor raymarches the
+# scene each frame. The cart bounces a sphere left↔right by writing its world
+# position to memory slot 0; DRAW3D reads that, sphere-traces a lit + shadowed
+# scene into VRAM as 4-shade greys, and VSYNC blits it. Logic in bytecode, 3D
+# render per frame — the handheld running the renderer it was never meant to.
+#
+# ISA = dv2 (see console/dv2.dmc) plus one opcode:
+#   17 DRAW3D   raymarch the scene (sphere at mem[0]) into VRAM as shades 0..4
+#
+# Palette → ASCII:  0=' '(sky)  1='.'  2=':'  3='+'  4='#'
+
+# Scene SDF, sphere center parameterized by cx (from cart memory).
+fn sdf3(x: f64, y: f64, z: f64, cx: f64) -> f64 {
+    let ds = sqrt((x - cx)*(x - cx) + (y - 1.0)*(y - 1.0) + z*z) - 1.0
+    min(ds, y)
+}
+
+fn run[P](code: Tensor[u8, [P]], maxframes: i64) -> nil {
+    let !fb    = forge.zeros[i64, [20, 36]]
+    let !mem   = forge.zeros[i64, [16]]
+    let !stack = forge.zeros[i64, [32]]
+    let !sp = 0
+    let !pc = 0
+    let !frame = 0
+    let !running = true
+
+    while running {
+        let op = code[pc]
+        pc = pc + 1
+
+        if op == 1  { let imm = code[pc]; pc = pc + 1; stack[sp] = imm; sp = sp + 1 }
+        if op == 2  { let b = stack[sp-1]; let a = stack[sp-2]; sp = sp-2; stack[sp] = a + b; sp = sp+1 }
+        if op == 3  { let b = stack[sp-1]; let a = stack[sp-2]; sp = sp-2; stack[sp] = a - b; sp = sp+1 }
+        if op == 4  { let b = stack[sp-1]; let a = stack[sp-2]; sp = sp-2; stack[sp] = a * b; sp = sp+1 }
+        if op == 5  { let a = stack[sp-1]; sp = sp-1; stack[sp] = 0 - a; sp = sp+1 }
+        if op == 6  { let b = stack[sp-1]; let a = stack[sp-2]; sp = sp-2; if a == b { stack[sp]=1 } else { stack[sp]=0 }; sp = sp+1 }
+        if op == 7  { let b = stack[sp-1]; let a = stack[sp-2]; sp = sp-2; if a < b  { stack[sp]=1 } else { stack[sp]=0 }; sp = sp+1 }
+        if op == 8  { let b = stack[sp-1]; let a = stack[sp-2]; sp = sp-2; if a > b  { stack[sp]=1 } else { stack[sp]=0 }; sp = sp+1 }
+        if op == 9  { pc = code[pc] }
+        if op == 10 { let addr = code[pc]; pc = pc+1; sp = sp-1; if stack[sp] == 0 { pc = addr } }
+        if op == 11 { let slot = code[pc]; pc = pc+1; stack[sp] = mem[slot]; sp = sp+1 }
+        if op == 12 { let slot = code[pc]; pc = pc+1; sp = sp-1; mem[slot] = stack[sp] }
+        if op == 13 { stack[sp] = stack[sp-1]; sp = sp+1 }
+
+        if op == 17 {                      # DRAW3D — the coprocessor
+            # Cart position → world x. Slot 0 holds x in [0,40]; recenter to
+            # [-2.0, 2.0] so the sphere slides across the camera's view.
+            let cx = (mem[0] as f64 - 20.0) / 10.0
+
+            let rox = 0.0
+            let roy = 1.0
+            let roz = -3.2
+            let lx = 0.577
+            let ly = 0.577
+            let lz = -0.577
+
+            let !py = 0
+            while py < 20 {
+                let !px = 0
+                while px < 36 {
+                    let u = (px as f64 + 0.5) / 36.0 * 2.0 - 1.0
+                    let v = 1.0 - (py as f64 + 0.5) / 20.0 * 2.0
+                    let dl = sqrt(u*u + v*v + 1.96)
+                    let rdx = u / dl
+                    let rdy = v / dl
+                    let rdz = 1.4 / dl
+
+                    let !t = 0.0
+                    let !hit = false
+                    let !marching = true
+                    let !k = 0
+                    let !hx = 0.0
+                    let !hy = 0.0
+                    let !hz = 0.0
+                    while marching {
+                        if k >= 56 {
+                            marching = false
+                        } else {
+                            hx = rox + rdx * t
+                            hy = roy + rdy * t
+                            hz = roz + rdz * t
+                            let d = sdf3(hx, hy, hz, cx)
+                            if d < 0.003 {
+                                hit = true
+                                marching = false
+                            } else {
+                                t = t + d
+                                if t > 18.0 { marching = false }
+                                k = k + 1
+                            }
+                        }
+                    }
+
+                    let !shade = 0
+                    if hit {
+                        let e = 0.003
+                        let a = sdf3(hx + e, hy - e, hz - e, cx)
+                        let b = sdf3(hx - e, hy - e, hz + e, cx)
+                        let c = sdf3(hx - e, hy + e, hz - e, cx)
+                        let g = sdf3(hx + e, hy + e, hz + e, cx)
+                        let nx = a - b - c + g
+                        let ny = (0.0 - a) - b + c + g
+                        let nz = (0.0 - a) + b - c + g
+                        let nl = sqrt(nx*nx + ny*ny + nz*nz)
+                        let snx = nx / nl
+                        let sny = ny / nl
+                        let snz = nz / nl
+
+                        let diff = snx*lx + sny*ly + snz*lz
+                        let !bright = 0.15 + 0.85 * max(diff, 0.0)
+
+                        # Floor: checker + shadow from the sphere.
+                        let ds = sqrt((hx - cx)*(hx - cx) + (hy - 1.0)*(hy - 1.0) + hz*hz) - 1.0
+                        if hy < ds {
+                            let parity = ((floor(hx) as i64) + (floor(hz) as i64)) % 2
+                            if parity == 0 { bright = bright * 0.5 }
+                            let !st = 0.05
+                            let !shadowing = true
+                            let !sk = 0
+                            while shadowing {
+                                if sk >= 20 {
+                                    shadowing = false
+                                } else {
+                                    let qx = hx + lx * st
+                                    let qy = hy + ly * st
+                                    let qz = hz + lz * st
+                                    let so = sqrt((qx - cx)*(qx - cx) + (qy - 1.0)*(qy - 1.0) + qz*qz) - 1.0
+                                    if so < 0.01 {
+                                        bright = bright * 0.4
+                                        shadowing = false
+                                    } else {
+                                        st = st + so
+                                        if st > 6.0 { shadowing = false }
+                                        sk = sk + 1
+                                    }
+                                }
+                            }
+                        }
+
+                        if bright > 1.0 { bright = 1.0 }
+                        shade = 1 + (floor(bright * 3.999) as i64)
+                        if shade > 4 { shade = 4 }
+                        if shade < 1 { shade = 1 }
+                    }
+
+                    fb[py, px] = shade
+                    px = px + 1
+                }
+                py = py + 1
+            }
+        }
+
+        if op == 16 {                      # VSYNC — blit with the 4-shade ramp
+            print(format("+-- frame {} ------------------+", frame))
+            let !ry = 0
+            while ry < 20 {
+                let !row = "|"
+                let !cx2 = 0
+                while cx2 < 36 {
+                    let val = fb[ry, cx2]
+                    if val == 0 { row = row + " " }
+                    if val == 1 { row = row + "." }
+                    if val == 2 { row = row + ":" }
+                    if val == 3 { row = row + "+" }
+                    if val == 4 { row = row + "#" }
+                    cx2 = cx2 + 1
+                }
+                row = row + "|"
+                print(row)
+                ry = ry + 1
+            }
+            frame = frame + 1
+            if frame >= maxframes { running = false }
+        }
+
+        if op == 0 { running = false }
+    }
+    nil
+}
+
+fn main() -> nil {
+    print("demoniVM-2 // boot // cart: RAYBOUNCE // GPU: SDF coprocessor")
+
+    # RAYBOUNCE — slide the sphere's world-x back and forth in [0,40], DRAW3D,
+    #   VSYNC, repeat.  mem: 0=x  1=vx
+    #   init: x=4, vx=+4
+    #   loop@8: x+=vx ; if x<1 vx=4 (A@26) ; if x>39 vx=-4 (B@38) ; DRAW3D ; VSYNC ; JMP 8
+    let cart = [
+        1u8,4u8, 12u8,0u8,  1u8,4u8, 12u8,1u8,
+        11u8,0u8, 11u8,1u8, 2u8, 12u8,0u8,
+        11u8,0u8, 1u8,1u8, 7u8, 10u8,26u8, 1u8,4u8, 12u8,1u8,
+        11u8,0u8, 1u8,39u8, 8u8, 10u8,38u8, 1u8,4u8, 5u8, 12u8,1u8,
+        17u8,
+        16u8,
+        9u8,8u8
+    ]
+    run[42](cart, 10)
+    nil
+}
+
+# ── Tests ──────────────────────────────────────────────────────────────────────
+# sdf3(x,y,z,cx) = min(sqrt((x-cx)^2 + (y-1)^2 + z^2) - 1 , y)
+# All expected values derived by hand from that closed form.
+
+# At the sphere center (cx=0, point (0,1,0)): sphere-dist = sqrt(0)-1 = -1, y=1
+# => min(-1, 1) = -1
+fn test_sdf_center() -> bool {
+    let v = sdf3(0.0, 1.0, 0.0, 0.0)
+    v > -1.0001 && v < -0.9999
+}
+
+# On the sphere surface (cx=0, point (1,1,0)): sphere-dist = sqrt(1)-1 = 0, y=1
+# => min(0, 1) = 0
+fn test_sdf_surface() -> bool {
+    let v = sdf3(1.0, 1.0, 0.0, 0.0)
+    v > -0.0001 && v < 0.0001
+}
+
+# 2 units from center (cx=0, point (2,1,0)): sphere-dist = sqrt(4)-1 = 1, y=1
+# => min(1, 1) = 1
+fn test_sdf_outside() -> bool {
+    let v = sdf3(2.0, 1.0, 0.0, 0.0)
+    v > 0.9999 && v < 1.0001
+}
+
+# Floor plane dominates (cx=0, point (5,0,0)): sphere-dist=sqrt(25+1)-1≈4.099, y=0
+# => min(4.099, 0) = 0
+fn test_sdf_floor() -> bool {
+    let v = sdf3(5.0, 0.0, 0.0, 0.0)
+    v > -0.0001 && v < 0.0001
+}
+
+# Below floor (cx=0, point (0,-1,0)): sphere-dist=sqrt(0+4+0)-1=1, y=-1
+# => min(1, -1) = -1  (floor interior)
+fn test_sdf_below_floor() -> bool {
+    let v = sdf3(0.0, -1.0, 0.0, 0.0)
+    v > -1.0001 && v < -0.9999
+}
+
+# cx offset shifts the sphere: (3,1,0) with cx=2 is distance 1 from sphere surface
+# sphere-dist = sqrt((3-2)^2+0+0)-1 = 0, y=1 => min(0,1)=0
+fn test_sdf_cx_shift() -> bool {
+    let v = sdf3(3.0, 1.0, 0.0, 2.0)
+    v > -0.0001 && v < 0.0001
+}
+
+# z-axis point: (0,1,2) cx=0 => sphere-dist=sqrt(0+0+4)-1=1, y=1 => min(1,1)=1
+fn test_sdf_z_axis() -> bool {
+    let v = sdf3(0.0, 1.0, 2.0, 0.0)
+    v > 0.9999 && v < 1.0001
+}

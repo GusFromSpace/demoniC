@@ -1,0 +1,485 @@
+# Lotka-Volterra predator-prey field simulation, VARIANCE-MINIMIZING rabbits
+#
+# Variant of lotka_volterra.dmc with a "risk-averse" prey trait: rabbits
+# minimize the variance of their own density field rather than maximizing
+# local growth.
+#
+# Standard model:
+#   R += dt * (a*R - b*R*F)        rabbits grow, get eaten
+#   F += dt * (c*R*F - d*F)        foxes grow by eating, starve otherwise
+# Plus 5-point Laplacian diffusion (physical spread).
+#
+# New ingredient: every step, the rabbit field is ALSO pulled toward
+# spatial uniformity:
+#   R[i,j] += alpha * (mean(R) - R[i,j])
+# Rabbits actively redistribute to keep their density even across the
+# whole grid. They refuse to clump.
+#
+# Foxes get no such trait -- they hunt locally, naively.
+#
+# Hypothesis: the dramatic predator-prey overshoot from the unmodified sim
+# should damp or vanish. Foxes everywhere find thin-but-nonzero prey, so
+# no place is ever far from any other -- no wavefront, no boom-bust.
+
+# ----- grid + parameter constants -----
+
+# 12 rows x 30 cols -- tall narrow rectangle reads well in a terminal.
+# All tensors below are [12, 30].
+
+# Lotka-Volterra rates (chosen so populations oscillate, not explode).
+#   a, c > 0: prey growth, predator growth-from-prey
+#   b, d > 0: predation rate, predator decay
+# dt small enough for forward-Euler to stay stable at these magnitudes.
+fn a_rate() -> f32 { 1.2f32 }     # rabbit growth
+fn b_rate() -> f32 { 0.8f32 }     # rabbits eaten per fox per unit time
+fn c_rate() -> f32 { 0.5f32 }     # foxes born per rabbit eaten
+fn d_rate() -> f32 { 0.9f32 }     # fox starvation
+fn dt_step() -> f32 { 0.08f32 }   # timestep
+fn diffusion() -> f32 { 0.15f32 } # neighbor-share fraction per step
+fn equality_pull() -> f32 { 0.10f32 } # rabbit variance-minimization strength
+
+# ----- helpers -----
+
+# Initial rabbit field: a soft Gaussian-ish bump in the lower-right quadrant.
+# Center at (row=9, col=23). Falloff via Manhattan distance because we
+# don't have sqrt in scope and the qualitative shape is identical.
+fn init_rabbits() -> Tensor[f32, [12, 30]] {
+    let mut R: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 9
+    let cc = 23
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            # Smooth falloff: full density at center, zero beyond radius ~8.
+            if dist < 8 {
+                let val = (8 - dist) as f32
+                R[i, j] = val * 0.15f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    R
+}
+
+# Initial fox field: Gaussian-ish bump in the upper-left quadrant.
+# Center at (row=2, col=6).
+fn init_foxes() -> Tensor[f32, [12, 30]] {
+    let mut F: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 2
+    let cc = 6
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            if dist < 6 {
+                let val = (6 - dist) as f32
+                F[i, j] = val * 0.18f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    F
+}
+
+# One 5-point Laplacian diffusion step:
+#   X'[i,j] = X[i,j] + k * (avg of 4 neighbors - X[i,j])
+# Boundary cells use the cell itself as missing neighbors (no-flux BC).
+fn diffuse(X: Tensor[f32, [12, 30]]) -> Tensor[f32, [12, 30]] {
+    let mut Y: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let k = diffusion()
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let here = X[i, j]
+            let up    = if i > 0  { X[i - 1, j] } else { here }
+            let down  = if i < 11 { X[i + 1, j] } else { here }
+            let left  = if j > 0  { X[i, j - 1] } else { here }
+            let right = if j < 29 { X[i, j + 1] } else { here }
+            let neighbor_avg = (up + down + left + right) * 0.25f32
+            Y[i, j] = here + k * (neighbor_avg - here)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    Y
+}
+
+# Variance-minimizing redistribution, applied to the rabbit field only.
+# Compute global mean R, then pull every cell toward it by `equality_pull`
+# fraction. This is the discrete analog of "minimize Var(R) by descending
+# the variance gradient" -- which for a sum-preserving update is exactly
+# the same direction as "move every cell toward the mean."
+#
+# Note: this is NOT sum-preserving as written (cells near zero get nudged
+# UP toward the mean, which creates rabbits from nothing in empty regions).
+# That is intentional for this variant: the trait models redistribution
+# toward fairness, not conservation of mass. Results here are therefore
+# not directly comparable to the conservative baseline sim.
+fn variance_pull_rabbits(R: Tensor[f32, [12, 30]], mean_R: f32) -> Tensor[f32, [12, 30]] {
+    let mut Y: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let k = equality_pull()
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let here = R[i, j]
+            Y[i, j] = here + k * (mean_R - here)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    Y
+}
+
+# Forward-Euler step of the reaction-diffusion system,
+# with variance-minimizing redistribution on the rabbit field.
+# Returns (R', F') after one reaction + one diffusion + one equality pass.
+fn step(
+    R: Tensor[f32, [12, 30]], F: Tensor[f32, [12, 30]]
+) -> (Tensor[f32, [12, 30]], Tensor[f32, [12, 30]]) {
+    let a = a_rate()
+    let b = b_rate()
+    let c = c_rate()
+    let d = d_rate()
+    let h = dt_step()
+
+    # Local reaction: per-cell Lotka-Volterra. No broadcast magic --
+    # explicit loop so the math reads alongside the differential form.
+    let mut Rn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut Fn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let r = R[i, j]
+            let f = F[i, j]
+            let rf = r * f
+            let dR = a * r - b * rf
+            let dF = c * rf - d * f
+            let r_new = r + h * dR
+            let f_new = f + h * dF
+            # Clamp to zero -- populations can't go negative.
+            Rn[i, j] = if r_new > 0.0f32 { r_new } else { 0.0f32 }
+            Fn[i, j] = if f_new > 0.0f32 { f_new } else { 0.0f32 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    # Spatial spread for both species.
+    let R2 = diffuse(Rn)
+    let F2 = diffuse(Fn)
+
+    # Rabbits then apply their variance-minimizing redistribution.
+    # Compute mean from POST-diffusion state so cells inherit it from
+    # the same global pool the foxes are simultaneously sampling.
+    let H = 12.0f32
+    let W = 30.0f32
+    let mean_R = total(R2) / (H * W)
+    let R3 = variance_pull_rabbits(R2, mean_R)
+
+    (R3, F2)
+}
+
+# Render one cell as a single character.
+#   density-threshold scheme:
+#     more foxes than rabbits and high  -> 'X'
+#     more foxes than rabbits and mid   -> 'x'
+#     more rabbits than foxes and high  -> 'O'
+#     more rabbits than foxes and mid   -> 'o'
+#     both high                          -> '@'   (conflict zone)
+#     both negligible                    -> '.'
+fn render_cell(r: f32, f: f32) -> i64 {
+    let hi = 0.4f32
+    let mid = 0.1f32
+    let r_hi = r > hi
+    let f_hi = f > hi
+    let r_mid = r > mid
+    let f_mid = f > mid
+
+    if r_hi {
+        if f_hi {
+            64    # '@'  -- conflict
+        } else {
+            79    # 'O'  -- many rabbits
+        }
+    } else if f_hi {
+        88        # 'X'  -- many foxes
+    } else if r_mid {
+        if f_mid {
+            35    # '#'  -- mid both
+        } else {
+            111   # 'o'  -- mid rabbits
+        }
+    } else if f_mid {
+        120       # 'x'  -- mid foxes
+    } else {
+        46        # '.'  -- background
+    }
+}
+
+fn char_for(code: i64) -> str {
+    if code == 64 {
+        "@"
+    } else if code == 79 {
+        "O"
+    } else if code == 88 {
+        "X"
+    } else if code == 35 {
+        "#"
+    } else if code == 111 {
+        "o"
+    } else if code == 120 {
+        "x"
+    } else {
+        "."
+    }
+}
+
+fn print_frame(R: Tensor[f32, [12, 30]], F: Tensor[f32, [12, 30]], step_num: i64) -> nil {
+    print("step " + to_str(step_num) + ":")
+    let mut i = 0
+    while i < 12 {
+        let mut row = ""
+        let mut j = 0
+        while j < 30 {
+            let code = render_cell(R[i, j], F[i, j])
+            row = row + char_for(code)
+            j = j + 1
+        }
+        print(row)
+        i = i + 1
+    }
+    print("")
+    nil
+}
+
+# Sum of all cells -- crude "total population" stat.
+fn total(X: Tensor[f32, [12, 30]]) -> f32 {
+    let mut s = 0.0f32
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            s = s + X[i, j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    s
+}
+
+# ---- tests ----
+
+# render_cell: r>hi, f<=hi => 'O' (code 79)
+fn test_render_cell_many_rabbits() -> bool {
+    let code = render_cell(0.5f32, 0.0f32)
+    code == 79
+}
+
+# render_cell: r>hi AND f>hi => '@' (code 64, conflict zone)
+fn test_render_cell_conflict() -> bool {
+    let code = render_cell(0.5f32, 0.5f32)
+    code == 64
+}
+
+# render_cell: r<=mid, f>hi => 'X' (code 88, many foxes)
+fn test_render_cell_many_foxes() -> bool {
+    let code = render_cell(0.0f32, 0.5f32)
+    code == 88
+}
+
+# render_cell: both below mid threshold => '.' (code 46, empty)
+fn test_render_cell_empty() -> bool {
+    let code = render_cell(0.0f32, 0.0f32)
+    code == 46
+}
+
+# init_rabbits center cell (9,23): dist=0, val=(8-0)*0.15=1.2
+fn test_init_rabbits_center() -> bool {
+    let R = init_rabbits()
+    let v = R[9, 23]
+    let expected = 1.2f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# init_rabbits far corner (0,0): Manhattan dist from (9,23) = 9+23=32 >= 8, so value=0
+fn test_init_rabbits_far_corner_zero() -> bool {
+    let R = init_rabbits()
+    let v = R[0, 0]
+    let diff = if v > 0.0f32 { v } else { 0.0f32 - v }
+    diff < 1e-4f32
+}
+
+# init_foxes center cell (2,6): dist=0, val=(6-0)*0.18=1.08
+fn test_init_foxes_center() -> bool {
+    let F = init_foxes()
+    let v = F[2, 6]
+    let expected = 1.08f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# init_foxes far corner (11,29): dist from (2,6) = 9+23=32 >= 6, so value=0
+fn test_init_foxes_far_corner_zero() -> bool {
+    let F = init_foxes()
+    let v = F[11, 29]
+    let diff = if v > 0.0f32 { v } else { 0.0f32 - v }
+    diff < 1e-4f32
+}
+
+# total: on a uniform field of value 1.0, total = 12*30 = 360
+fn test_total_uniform() -> bool {
+    let !T: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let !i = 0
+    while i < 12 {
+        let !j = 0
+        while j < 30 {
+            T[i, j] = 1.0f32
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let s = total(T)
+    let expected = 360.0f32
+    let diff = if s > expected { s - expected } else { expected - s }
+    diff < 1e-4f32
+}
+
+# diffuse: uniform field => unchanged (no spatial gradient to diffuse)
+# If all cells = C, neighbor_avg = C, so Y[i,j] = C + k*(C-C) = C
+fn test_diffuse_uniform_field() -> bool {
+    let !T: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let !i = 0
+    while i < 12 {
+        let !j = 0
+        while j < 30 {
+            T[i, j] = 0.5f32
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let D = diffuse(T)
+    # All output cells must remain 0.5
+    let !ok = true
+    let !ii = 0
+    while ii < 12 {
+        let !jj = 0
+        while jj < 30 {
+            let v = D[ii, jj]
+            let diff = if v > 0.5f32 { v - 0.5f32 } else { 0.5f32 - v }
+            if diff > 1e-4f32 {
+                ok = false
+            }
+            jj = jj + 1
+        }
+        ii = ii + 1
+    }
+    ok
+}
+
+# variance_pull_rabbits: uniform field at its own mean => unchanged
+# Y[i,j] = here + k*(mean-here). If all cells=C and mean=C, Y[i,j]=C.
+fn test_variance_pull_uniform() -> bool {
+    let !T: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let !i = 0
+    while i < 12 {
+        let !j = 0
+        while j < 30 {
+            T[i, j] = 0.3f32
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let Y = variance_pull_rabbits(T, 0.3f32)
+    let !ok = true
+    let !ii = 0
+    while ii < 12 {
+        let !jj = 0
+        while jj < 30 {
+            let v = Y[ii, jj]
+            let diff = if v > 0.3f32 { v - 0.3f32 } else { 0.3f32 - v }
+            if diff > 1e-4f32 {
+                ok = false
+            }
+            jj = jj + 1
+        }
+        ii = ii + 1
+    }
+    ok
+}
+
+# variance_pull_rabbits: pulls cells toward mean.
+# Single cell at 0.0, mean=1.0, alpha=0.1 => Y = 0.0 + 0.1*(1.0-0.0) = 0.1
+# We verify on a uniform-0 field pulled to mean=1.0
+fn test_variance_pull_toward_mean() -> bool {
+    let !T: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    # all cells = 0, mean supplied = 1.0 => each cell becomes 0 + 0.1*(1-0) = 0.1
+    let Y = variance_pull_rabbits(T, 1.0f32)
+    let v = Y[0, 0]
+    let expected = 0.1f32  # equality_pull()=0.10 * (1.0 - 0.0)
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# step produces non-negative populations (clamped to zero internally)
+fn test_step_nonnegative() -> bool {
+    let R = init_rabbits()
+    let F = init_foxes()
+    let (R2, F2) = step(R, F)
+    let !ok = true
+    let !i = 0
+    while i < 12 {
+        let !j = 0
+        while j < 30 {
+            if R2[i, j] < 0.0f32 {
+                ok = false
+            }
+            if F2[i, j] < 0.0f32 {
+                ok = false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ok
+}
+
+fn main() -> nil {
+    print("--- predator-prey field, 12x30 grid, 64 steps ---")
+    print("legend: '.' empty   o/O rabbits   x/X foxes   @ conflict   # mixed")
+    print("")
+
+    let mut R = init_rabbits()
+    let mut F = init_foxes()
+
+    print_frame(R, F, 0)
+    print("totals: rabbits=" + to_str(total(R)) + "  foxes=" + to_str(total(F)))
+    print("")
+
+    let mut s = 1
+    while s <= 64 {
+        let (R2, F2) = step(R, F)
+        R = R2
+        F = F2
+        if s % 8 == 0 {
+            print_frame(R, F, s)
+            print("totals: rabbits=" + to_str(total(R)) + "  foxes=" + to_str(total(F)))
+            print("")
+        }
+        s = s + 1
+    }
+
+    nil
+}

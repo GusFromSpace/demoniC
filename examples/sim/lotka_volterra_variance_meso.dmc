@@ -1,0 +1,395 @@
+# Lotka-Volterra field sim — VARIANCE-MINIMIZING rabbits + a MESOPREDATOR.
+#
+# Combines two earlier variants:
+#   - the three-tier food chain  rabbits -> mesopredator -> foxes
+#   - the "egalitarian rabbits" trait: every step the rabbit field is pulled
+#     toward its global mean (variance-minimizing redistribution). Rabbits
+#     refuse to clump and even bleed into empty cells — distributed
+#     abundance, not sum-preserving.
+#
+# Reaction (forward-Euler), R -> M -> F:
+#   R += dt * ( a*R - b*R*M )
+#   M += dt * ( c*R*M - d*M - e*M*F )
+#   F += dt * ( g*M*F - k*F )
+# then 5-point Laplacian diffusion on all three, then rabbits-only variance pull.
+#
+# In the 2-species variance sim the egalitarian rabbits spread prey everywhere,
+# the foxes found food everywhere and dominated, and long runs collapsed. The
+# question here: drop a mesopredator into that evenly-fed world and run it long
+# — does the apex still win, or does the released mesopredator take it?
+
+fn a_rate() -> f32 { 1.2f32 }
+fn b_rate() -> f32 { 0.9f32 }
+fn c_rate() -> f32 { 0.6f32 }
+fn d_rate() -> f32 { 0.35f32 }
+fn e_rate() -> f32 { 0.7f32 }
+fn g_rate() -> f32 { 0.45f32 }
+fn k_rate() -> f32 { 0.5f32 }
+fn dt_step() -> f32 { 0.08f32 }
+fn diffusion() -> f32 { 0.15f32 }
+fn equality_pull() -> f32 { 0.10f32 }  # rabbit variance-minimization strength
+
+fn init_rabbits() -> Tensor[f32, [12, 30]] {
+    let mut R: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 9
+    let cc = 23
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            if dist < 8 {
+                R[i, j] = (8 - dist) as f32 * 0.15f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    R
+}
+
+fn init_meso() -> Tensor[f32, [12, 30]] {
+    let mut M: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 6
+    let cc = 15
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            if dist < 5 {
+                M[i, j] = (5 - dist) as f32 * 0.16f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    M
+}
+
+fn init_foxes() -> Tensor[f32, [12, 30]] {
+    let mut F: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 2
+    let cc = 6
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            if dist < 6 {
+                F[i, j] = (6 - dist) as f32 * 0.18f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    F
+}
+
+fn diffuse(X: Tensor[f32, [12, 30]]) -> Tensor[f32, [12, 30]] {
+    let mut Y: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let k = diffusion()
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let here = X[i, j]
+            let up    = if i > 0  { X[i - 1, j] } else { here }
+            let down  = if i < 11 { X[i + 1, j] } else { here }
+            let left  = if j > 0  { X[i, j - 1] } else { here }
+            let right = if j < 29 { X[i, j + 1] } else { here }
+            let neighbor_avg = (up + down + left + right) * 0.25f32
+            Y[i, j] = here + k * (neighbor_avg - here)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    Y
+}
+
+# Rabbits-only variance-minimizing redistribution: pull each cell toward mean.
+fn variance_pull_rabbits(R: Tensor[f32, [12, 30]], mean_R: f32) -> Tensor[f32, [12, 30]] {
+    let mut Y: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let k = equality_pull()
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let here = R[i, j]
+            Y[i, j] = here + k * (mean_R - here)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    Y
+}
+
+fn step(
+    R: Tensor[f32, [12, 30]], M: Tensor[f32, [12, 30]], F: Tensor[f32, [12, 30]]
+) -> (Tensor[f32, [12, 30]], Tensor[f32, [12, 30]], Tensor[f32, [12, 30]]) {
+    let a = a_rate()
+    let b = b_rate()
+    let c = c_rate()
+    let d = d_rate()
+    let e = e_rate()
+    let g = g_rate()
+    let k = k_rate()
+    let h = dt_step()
+
+    let mut Rn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut Mn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut Fn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let r = R[i, j]
+            let m = M[i, j]
+            let f = F[i, j]
+            let rm = r * m
+            let mf = m * f
+            let dR = a * r - b * rm
+            let dM = c * rm - d * m - e * mf
+            let dF = g * mf - k * f
+            let r_new = r + h * dR
+            let m_new = m + h * dM
+            let f_new = f + h * dF
+            Rn[i, j] = if r_new > 0.0f32 { r_new } else { 0.0f32 }
+            Mn[i, j] = if m_new > 0.0f32 { m_new } else { 0.0f32 }
+            Fn[i, j] = if f_new > 0.0f32 { f_new } else { 0.0f32 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let R2 = diffuse(Rn)
+    let M2 = diffuse(Mn)
+    let F2 = diffuse(Fn)
+
+    # Egalitarian rabbits redistribute toward the global mean (foxes & meso do not).
+    let mean_R = total(R2) / (12.0f32 * 30.0f32)
+    let R3 = variance_pull_rabbits(R2, mean_R)
+
+    (R3, M2, F2)
+}
+
+fn render_cell(r: f32, m: f32, f: f32) -> i64 {
+    let hi = 0.4f32
+    let mid = 0.1f32
+    if r >= m && r >= f {
+        if r > hi { 79 } else if r > mid { 111 } else { 46 }
+    } else if m >= f {
+        if m > hi { 77 } else if m > mid { 109 } else { 46 }
+    } else {
+        if f > hi { 88 } else if f > mid { 120 } else { 46 }
+    }
+}
+
+fn char_for(code: i64) -> str {
+    if code == 79 {
+        "O"
+    } else if code == 111 {
+        "o"
+    } else if code == 77 {
+        "M"
+    } else if code == 109 {
+        "m"
+    } else if code == 88 {
+        "X"
+    } else if code == 120 {
+        "x"
+    } else {
+        "."
+    }
+}
+
+fn print_frame(
+    R: Tensor[f32, [12, 30]], M: Tensor[f32, [12, 30]], F: Tensor[f32, [12, 30]], step_num: i64
+) -> nil {
+    print("step " + to_str(step_num) + ":")
+    let mut i = 0
+    while i < 12 {
+        let mut row = ""
+        let mut j = 0
+        while j < 30 {
+            row = row + char_for(render_cell(R[i, j], M[i, j], F[i, j]))
+            j = j + 1
+        }
+        print(row)
+        i = i + 1
+    }
+    print("")
+    nil
+}
+
+fn total(X: Tensor[f32, [12, 30]]) -> f32 {
+    let mut s = 0.0f32
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            s = s + X[i, j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    s
+}
+
+# ---- tests ----------------------------------------------------------------
+
+# init_rabbits: center cell (9,23) has dist=0, value = (8-0)*0.15 = 1.20
+fn test_rabbit_center_value() -> bool {
+    let R = init_rabbits()
+    let v = R[9, 23]
+    let expected = 1.20f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# init_rabbits: corner (0,0) has Manhattan dist = 9+23 = 32 >= 8, so stays 0.0
+fn test_rabbit_corner_zero() -> bool {
+    let R = init_rabbits()
+    let v = R[0, 0]
+    let diff = if v > 0.0f32 { v } else { 0.0f32 - v }
+    diff < 1e-4f32
+}
+
+# init_rabbits: cell (9,22) has dist=1, value = (8-1)*0.15 = 7*0.15 = 1.05
+fn test_rabbit_adjacent_value() -> bool {
+    let R = init_rabbits()
+    let v = R[9, 22]
+    let expected = 1.05f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# init_meso: center (6,15) has dist=0, value = (5-0)*0.16 = 0.80
+fn test_meso_center_value() -> bool {
+    let M = init_meso()
+    let v = M[6, 15]
+    let expected = 0.80f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# init_foxes: center (2,6) has dist=0, value = (6-0)*0.18 = 1.08
+fn test_fox_center_value() -> bool {
+    let F = init_foxes()
+    let v = F[2, 6]
+    let expected = 1.08f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 1e-4f32
+}
+
+# init_foxes: corner (0,0) has dist = 2+6 = 8 >= 6, value stays 0.0
+fn test_fox_corner_zero() -> bool {
+    let F = init_foxes()
+    let v = F[0, 0]
+    let diff = if v > 0.0f32 { v } else { 0.0f32 - v }
+    diff < 1e-4f32
+}
+
+# render_cell: dominant rabbit above hi threshold -> 79 ('O')
+fn test_render_rabbit_high() -> bool {
+    render_cell(1.0f32, 0.0f32, 0.0f32) == 79
+}
+
+# render_cell: dominant meso above hi threshold -> 77 ('M')
+fn test_render_meso_high() -> bool {
+    render_cell(0.0f32, 1.0f32, 0.0f32) == 77
+}
+
+# render_cell: dominant fox above hi threshold -> 88 ('X')
+fn test_render_fox_high() -> bool {
+    render_cell(0.0f32, 0.0f32, 1.0f32) == 88
+}
+
+# render_cell: all very low (< mid threshold) -> 46 ('.')
+fn test_render_empty_dot() -> bool {
+    render_cell(0.05f32, 0.03f32, 0.02f32) == 46
+}
+
+# render_cell: dominant meso between mid and hi thresholds -> 109 ('m')
+fn test_render_meso_mid() -> bool {
+    # r=0.2, m=0.3, f=0.1: r < m so meso wins; m > mid(0.1) but < hi(0.4) -> 109
+    render_cell(0.2f32, 0.3f32, 0.1f32) == 109
+}
+
+# variance_pull_rabbits: mathematical invariant — pull toward mean preserves total
+# Proof: total(Y) = sum(here + k*(mean - here)) = T + k*(N*mean - T)
+#   where N=360, mean=T/360, so N*mean=T => delta=0, total is conserved.
+fn test_variance_pull_preserves_total() -> bool {
+    let R = init_rabbits()
+    let t_before = total(R)
+    let mean_R = t_before / (12.0f32 * 30.0f32)
+    let R2 = variance_pull_rabbits(R, mean_R)
+    let t_after = total(R2)
+    let diff = if t_after > t_before { t_after - t_before } else { t_before - t_after }
+    diff < 1e-2f32
+}
+
+# diffuse: uniform field is a fixed point — Laplacian of a constant = 0
+# Proof: if all X[i,j]=v then neighbor_avg=v, Y[i,j] = v + k*(v-v) = v
+fn test_diffuse_uniform_fixed_point() -> bool {
+    let !U: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let !i = 0
+    while i < 12 {
+        let !j = 0
+        while j < 30 {
+            U[i, j] = 0.5f32
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let D = diffuse(U)
+    let v = D[5, 15]
+    let diff = if v > 0.5f32 { v - 0.5f32 } else { 0.5f32 - v }
+    diff < 1e-4f32
+}
+
+# After one step starting from non-trivial initial conditions, all three
+# population totals must remain non-negative (populations can't go below zero).
+fn test_step_populations_nonnegative() -> bool {
+    let R = init_rabbits()
+    let M = init_meso()
+    let F = init_foxes()
+    let (R2, M2, F2) = step(R, M, F)
+    total(R2) >= 0.0f32 && total(M2) >= 0.0f32 && total(F2) >= 0.0f32
+}
+
+fn main() -> nil {
+    print("--- egalitarian rabbits + mesopredator, 12x30 grid, 128 steps ---")
+    print("legend: '.' empty   o/O rabbits   m/M mesopredators   x/X foxes")
+    print("")
+
+    let mut R = init_rabbits()
+    let mut M = init_meso()
+    let mut F = init_foxes()
+
+    print_frame(R, M, F, 0)
+    print("totals: rabbits=" + to_str(total(R)) + "  meso=" + to_str(total(M)) + "  foxes=" + to_str(total(F)))
+    print("")
+
+    let mut s = 1
+    while s <= 128 {
+        let (R2, M2, F2) = step(R, M, F)
+        R = R2
+        M = M2
+        F = F2
+        if s % 16 == 0 {
+            print_frame(R, M, F, s)
+            print("totals: rabbits=" + to_str(total(R)) + "  meso=" + to_str(total(M)) + "  foxes=" + to_str(total(F)))
+            print("")
+        }
+        s = s + 1
+    }
+
+    nil
+}

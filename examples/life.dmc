@@ -1,0 +1,76 @@
+# life.dmc — Conway's Game of Life on a toroidal grid, rendered as ASCII.
+# Live cell with 2-3 live neighbors survives; dead cell with exactly 3 is born.
+# Edges wrap (a torus). A glider is seeded and walks diagonally across the grid.
+
+fn neighbors[H, W](g: Tensor[f32, [H, W]], i: i64, j: i64) -> i64 {
+    let !c = 0
+    for ddi in 0..3 {
+        for ddj in 0..3 {
+            let di = ddi - 1
+            let dj = ddj - 1
+            if (di != 0) || (dj != 0) {
+                let ni = (i + di + H) % H
+                let nj = (j + dj + W) % W
+                c = c + (g[ni, nj] as i64)
+            }
+        }
+    }
+    c
+}
+
+fn step[H, W](g: Tensor[f32, [H, W]]) -> Tensor[f32, [H, W]] {
+    let !next = forge.zeros[f32, [H, W]]
+    for i in 0..H {
+        for j in 0..W {
+            let n = neighbors(g, i, j)
+            let alive = (g[i, j] as i64) == 1
+            if alive && (n == 2 || n == 3) {
+                next[i, j] = 1.0f32
+            } else if (alive == false) && (n == 3) {
+                next[i, j] = 1.0f32
+            }
+        }
+    }
+    next
+}
+
+fn render[H, W](g: Tensor[f32, [H, W]]) -> nil {
+    for i in 0..H {
+        let !row = ""
+        for j in 0..W {
+            if (g[i, j] as i64) == 1 { row = row + "#" } else { row = row + "." }
+        }
+        print(row)
+    }
+    print("")
+    nil
+}
+
+fn main() -> nil {
+    let !g = forge.zeros[f32, [8, 8]]
+    g[0, 1] = 1.0f32          # a glider
+    g[1, 2] = 1.0f32
+    g[2, 0] = 1.0f32
+    g[2, 1] = 1.0f32
+    g[2, 2] = 1.0f32
+
+    for gen in 0..5 {
+        print(("generation", gen))
+        render(g)
+        g = step(g)
+    }
+    nil
+}
+
+# Ground-truth gate: a 3-cell blinker has period 2 — horizontal → vertical →
+# horizontal — so it returns to its start after two steps.
+fn test_blinker_period_2() -> bool {
+    let !g = forge.zeros[f32, [5, 5]]
+    g[2, 1] = 1.0f32
+    g[2, 2] = 1.0f32
+    g[2, 3] = 1.0f32
+    let g1 = step(g)        # should be vertical: [1,2],[2,2],[3,2]
+    let g2 = step(g1)       # back to horizontal: [2,1],[2,2],[2,3]
+    ((g1[1, 2] as i64) == 1) && ((g1[3, 2] as i64) == 1) && ((g1[2, 1] as i64) == 0) &&
+    ((g2[2, 1] as i64) == 1) && ((g2[2, 3] as i64) == 1) && ((g2[1, 2] as i64) == 0)
+}

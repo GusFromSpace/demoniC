@@ -1,0 +1,93 @@
+# text_pipeline.dmc — tiny ETL pass over mixed strings.
+# Demonstrates: lambdas, list_map/filter/reduce, string transforms.
+
+fn keep_tagged(s: str) -> bool {
+    s.starts_with("task:")
+}
+
+fn normalize(s: str) -> str {
+    s.replace("task:", "").trim().lower()
+}
+
+fn join_tasks(acc: str, item: str) -> str {
+    if acc == "" {
+        item
+    } else {
+        acc + "," + item
+    }
+}
+
+fn main() -> str {
+    let lines = list()
+    let lines = list_push(lines, "task:Build Compiler")
+    let lines = list_push(lines, "note:ignore me")
+    let lines = list_push(lines, "task:Write Examples")
+    let lines = list_push(lines, "task:Find Bugs")
+
+    let tasks = list_filter(lines, keep_tagged)
+    let normalized = list_map(tasks, normalize)
+    let summary = list_reduce(normalized, join_tasks, "")
+
+    print("tasks=" + summary)
+    summary
+}
+
+# --- tests ---
+
+# keep_tagged: must return true for strings with "task:" prefix
+fn test_keep_tagged_positive() -> bool {
+    keep_tagged("task:foo") && keep_tagged("task:Build Compiler")
+}
+
+# keep_tagged: must return false for strings without "task:" prefix
+fn test_keep_tagged_negative() -> bool {
+    !keep_tagged("note:ignore me") && !keep_tagged("") && !keep_tagged("TASK:upper")
+}
+
+# normalize: "task:Build Compiler" → strip "task:" → "Build Compiler" → trim → lower → "build compiler"
+fn test_normalize_basic() -> bool {
+    normalize("task:Build Compiler") == "build compiler"
+}
+
+# normalize: "task:  Write Examples  " → "write examples" (trims surrounding spaces)
+fn test_normalize_trim_and_lower() -> bool {
+    normalize("task:Write Examples") == "write examples"
+}
+
+# join_tasks: when acc is empty, returns item unchanged (no leading comma)
+fn test_join_tasks_empty_acc() -> bool {
+    join_tasks("", "first") == "first"
+}
+
+# join_tasks: when acc non-empty, inserts "," between acc and item
+fn test_join_tasks_join() -> bool {
+    join_tasks("a", "b") == "a,b"
+}
+
+# join_tasks: chained — accumulation builds a comma-separated list
+fn test_join_tasks_chained() -> bool {
+    let r1 = join_tasks("", "x")
+    let r2 = join_tasks(r1, "y")
+    let r3 = join_tasks(r2, "z")
+    r3 == "x,y,z"
+}
+
+# filter removes non-task lines: 4 inputs with 1 "note:" → exactly 3 tasks
+fn test_filter_count() -> bool {
+    let lines = list()
+    let lines = list_push(lines, "task:Build Compiler")
+    let lines = list_push(lines, "note:ignore me")
+    let lines = list_push(lines, "task:Write Examples")
+    let lines = list_push(lines, "task:Find Bugs")
+    let tasks = list_filter(lines, keep_tagged)
+    list_len(tasks) == 3
+}
+
+# full pipeline: 4 lines → filter → normalize → reduce → known comma-joined string
+# ground truth: normalize("task:Build Compiler")="build compiler",
+#               normalize("task:Write Examples")="write examples",
+#               normalize("task:Find Bugs")="find bugs"
+#               joined in insertion order → "build compiler,write examples,find bugs"
+fn test_full_pipeline() -> bool {
+    main() == "build compiler,write examples,find bugs"
+}

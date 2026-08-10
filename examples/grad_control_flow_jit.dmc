@@ -1,0 +1,68 @@
+# Differentiable control flow with JIT parity (#368).
+#
+# The JIT autodiff is an ahead-of-time symbolic tape, so it cannot trace
+# runtime-data-dependent control flow (that needs conditional adjoint nodes /
+# runtime activation stacking). What it CAN do — and what these examples
+# exercise — is control flow the compiler resolves at compile time:
+#
+#   * `for k in LO..HI` with compile-time-constant bounds (a literal or a shape
+#     parameter) is UNROLLED onto the static tape, exactly like the interpreter
+#     runs it concretely. Accumulator reassignment (`acc += …`) threads the AD
+#     graph across iterations.
+#
+# These use CONCRETE shapes (not shape-generic `[D]`) so the JIT can monomorphize
+# the backward. They run — and gradient-match the interpreter — under BOTH
+# `dmc test` and `dmc test --jit` (jit parity: N ran, 0 skipped).
+#
+# Runtime-data-dependent control flow (runtime `if s > 0`, `while`) stays
+# interpreter-only — see grad_control_flow.dmc.
+
+# reassignment accumulator (straight-line): acc = 2·sum(w) → grad 2·ones
+@grad fn reassign_acc(!w: Tensor[f32, [3]]) -> f32 {
+    let !acc = 0.0f32
+    acc += sum(w)
+    acc += sum(w)
+    acc
+}
+
+fn test_reassign_acc() -> bool {
+    let !w = forge.zeros[f32, [3]]
+    w[0] = 1.0   w[1] = 2.0   w[2] = 3.0
+    let (l, g) = reassign_acc.fwd_bwd(w)
+    # sum(w)=6, ×2 = 12 ; grad = 2·ones = [2, 2, 2]
+    (l == 12.0) && (g.w[0] == 2.0) && (g.w[1] == 2.0) && (g.w[2] == 2.0)
+}
+
+# for-loop UNROLLED at compile time: 4 · sum(w.*w) → grad 4·2w = 8w
+@grad fn loop_unroll(!w: Tensor[f32, [2]]) -> f32 {
+    let !acc = 0.0f32
+    for k in 0..4 {
+        acc += sum(w .* w)
+    }
+    acc
+}
+
+fn test_loop_unroll() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 1.0   w[1] = 2.0
+    let (l, g) = loop_unroll.fwd_bwd(w)
+    # sum(w.*w)=5, ×4 = 20 ; grad = 4·2w = 8w = [8, 16]
+    (l == 20.0) && (g.w[0] == 8.0) && (g.w[1] == 16.0)
+}
+
+# inclusive range unrolls too: k in 0..=2 is 3 iterations → 3·sum(w)
+@grad fn loop_inclusive(!w: Tensor[f32, [2]]) -> f32 {
+    let !acc = 0.0f32
+    for k in 0..=2 {
+        acc += sum(w)
+    }
+    acc
+}
+
+fn test_loop_inclusive() -> bool {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 3.0   w[1] = 4.0
+    let (l, g) = loop_inclusive.fwd_bwd(w)
+    # sum(w)=7, ×3 = 21 ; grad = 3·ones = [3, 3]
+    (l == 21.0) && (g.w[0] == 3.0) && (g.w[1] == 3.0)
+}

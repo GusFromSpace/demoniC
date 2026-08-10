@@ -1,0 +1,600 @@
+# gradcheck.dmc — numerical validation of demoniC's autodiff (@grad).
+#
+# For a scalar-output `@grad fn`, the analytic gradient from `fwd_bwd` is checked
+# against a central finite-difference estimate  (f(x+h) - f(x-h)) / 2h  for every
+# input element. If they disagree beyond a tolerance, the gradient is wrong.
+#
+# This is the standard "gradcheck" every autodiff library ships (cf. tinygrad's
+# gradient tests vs PyTorch). demoniC had no numerical autodiff oracle before
+# this — the broadcast-bias gradient bug (#299) was found by luck; the bias check
+# below would have caught it directly.
+#
+#   Run:   dmc run examples/gradcheck.dmc
+#   Test:  dmc test examples/gradcheck.dmc
+#
+# Note: shape-generic `@grad` runs under `dmc run` (the JIT doesn't lower it yet),
+# so this is an interpreter-side suite.
+
+fn absf(x: f32) -> f32 { if x < 0.0f32 { 0.0f32 - x } else { x } }
+
+# ── 1. L2: f(w) = ||w - x||^2 ,  grad = 2(w - x)  (elementwise .- .* + sum) ────
+@grad fn l2[D](!w: Tensor[f32, [D]], x: Tensor[f32, [D]]) -> f32 {
+    let d = w .- x
+    sum(d .* d)
+}
+fn l2_fwd(w: Tensor[f32, [4]], x: Tensor[f32, [4]]) -> f32 {
+    let (l, g) = l2.fwd_bwd(w, x)  l
+}
+fn gradcheck_l2() -> bool {
+    let w = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    let x = [0.5f32, 1.0f32, 2.0f32, 0.0f32]
+    let (loss, g) = l2.fwd_bwd(w, x)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let numeric = (l2_fwd(wp, x) - l2_fwd(wm, x)) / (2.0f32 * h)
+        if absf(numeric - g.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 1b. Division: f(w) = sum(t ./ w) ,  grad = -t / w²  (quotient VJP, #252) ───
+@grad fn div_sum[D](!w: Tensor[f32, [D]], t: Tensor[f32, [D]]) -> f32 {
+    sum(t ./ w)
+}
+fn div_fwd(w: Tensor[f32, [4]], t: Tensor[f32, [4]]) -> f32 { let (l, g) = div_sum.fwd_bwd(w, t)  l }
+fn gradcheck_div() -> bool {
+    let w = [1.0f32, 2.0f32, -1.5f32, 0.8f32]    # away from 0
+    let t = [0.5f32, 1.0f32, 2.0f32, -0.3f32]
+    let (loss, g) = div_sum.fwd_bwd(w, t)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let numeric = (div_fwd(wp, t) - div_fwd(wm, t)) / (2.0f32 * h)
+        if absf(numeric - g.w[i]) > 0.05f32 { ok = false }
+    }
+    ok
+}
+
+# ── 1c. Mean reduction: f(w) = mean(w .* w) ,  grad = 2w/N ─────────────────────
+@grad fn mean_sq[D](!w: Tensor[f32, [D]]) -> f32 { mean(w .* w) }
+fn mean_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = mean_sq.fwd_bwd(w)  l }
+fn gradcheck_mean() -> bool {
+    let w = [1.0f32, -2.0f32, 0.5f32, 3.0f32]
+    let (loss, g) = mean_sq.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let numeric = (mean_fwd(wp) - mean_fwd(wm)) / (2.0f32 * h)
+        if absf(numeric - g.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 2. ReLU: f(w) = sum(relu(w)) ,  grad = (w > 0) ────────────────────────────
+@grad fn relu_sum[D](!w: Tensor[f32, [D]]) -> f32 {
+    sum(\>(w))
+}
+fn relu_fwd(w: Tensor[f32, [5]]) -> f32 { let (l, g) = relu_sum.fwd_bwd(w)  l }
+fn gradcheck_relu() -> bool {
+    let w = [-2.0f32, 1.5f32, -0.5f32, 3.0f32, 0.7f32]   # avoid exactly 0
+    let (loss, g) = relu_sum.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..5 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let numeric = (relu_fwd(wp) - relu_fwd(wm)) / (2.0f32 * h)
+        if absf(numeric - g.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 3. Cubic: f(w) = sum(w^3) ,  grad = 3 w^2  (smooth, nonlinear) ────────────
+@grad fn cubic[D](!w: Tensor[f32, [D]]) -> f32 {
+    sum(w .* w .* w)
+}
+fn cubic_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = cubic.fwd_bwd(w)  l }
+fn gradcheck_cubic() -> bool {
+    let w = [-1.0f32, 0.5f32, 2.0f32, -0.3f32]
+    let (loss, g) = cubic.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let numeric = (cubic_fwd(wp) - cubic_fwd(wm)) / (2.0f32 * h)
+        if absf(numeric - g.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 3b. Activations: sum(act(w)) — sigmoid/tanh/gelu/silu now trace (#306) ─────
+@grad fn act_sigmoid[D](!w: Tensor[f32, [D]]) -> f32 { sum(sigmoid(w)) }
+@grad fn act_tanh[D](!w: Tensor[f32, [D]]) -> f32 { sum(tanh(w)) }
+@grad fn act_gelu[D](!w: Tensor[f32, [D]]) -> f32 { sum(gelu(w)) }
+@grad fn act_silu[D](!w: Tensor[f32, [D]]) -> f32 { sum(silu(w)) }
+fn sigmoid_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = act_sigmoid.fwd_bwd(w)  l }
+fn tanh_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = act_tanh.fwd_bwd(w)  l }
+fn gelu_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = act_gelu.fwd_bwd(w)  l }
+fn silu_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = act_silu.fwd_bwd(w)  l }
+fn gradcheck_activations() -> bool {
+    let w = [-1.5f32, 0.5f32, 2.0f32, -0.3f32]
+    let h = 0.001f32
+    let !ok = true
+    let (ls, gs) = act_sigmoid.fwd_bwd(w)
+    let (lt, gt) = act_tanh.fwd_bwd(w)
+    let (lg, gg) = act_gelu.fwd_bwd(w)
+    let (lz, gz) = act_silu.fwd_bwd(w)
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        if absf((sigmoid_fwd(wp) - sigmoid_fwd(wm)) / (2.0f32 * h) - gs.w[i]) > 0.02f32 { ok = false }
+        if absf((tanh_fwd(wp)    - tanh_fwd(wm))    / (2.0f32 * h) - gt.w[i]) > 0.02f32 { ok = false }
+        if absf((gelu_fwd(wp)    - gelu_fwd(wm))    / (2.0f32 * h) - gg.w[i]) > 0.02f32 { ok = false }
+        if absf((silu_fwd(wp)    - silu_fwd(wm))    / (2.0f32 * h) - gz.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 3b'. Second-order activations: @grad @grad sum(act(w)) gives act''(w) (#306) ─
+# Oracle: the analytic second derivative (fwd_bwd_bwd) vs a central finite
+# difference of the *first* derivative (the first-order fwd_bwd, gradchecked
+# above). Diagonal: perturbing w[i] only moves the i-th first-derivative.
+@grad @grad fn so_sigmoid[D](!w: Tensor[f32, [D]]) -> f32 { sum(sigmoid(w)) }
+@grad @grad fn so_tanh[D](!w: Tensor[f32, [D]]) -> f32 { sum(tanh(w)) }
+@grad @grad fn so_gelu[D](!w: Tensor[f32, [D]]) -> f32 { sum(gelu(w)) }
+@grad @grad fn so_silu[D](!w: Tensor[f32, [D]]) -> f32 { sum(silu(w)) }
+fn gradcheck_second_order() -> bool {
+    let w = [-1.5f32, 0.5f32, 1.0f32, -0.3f32]
+    let (_ls, g2s) = so_sigmoid.fwd_bwd_bwd(w)
+    let (_lt, g2t) = so_tanh.fwd_bwd_bwd(w)
+    let (_lg, g2g) = so_gelu.fwd_bwd_bwd(w)
+    let (_lz, g2z) = so_silu.fwd_bwd_bwd(w)
+    let h = 0.002f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        # f''(w_i) ≈ (f'(w_i+h) - f'(w_i-h)) / 2h, with f' from first-order fwd_bwd.
+        let (_a, gsp) = act_sigmoid.fwd_bwd(wp)  let (_b, gsm) = act_sigmoid.fwd_bwd(wm)
+        let (_c, gtp) = act_tanh.fwd_bwd(wp)     let (_d, gtm) = act_tanh.fwd_bwd(wm)
+        let (_e, ggp) = act_gelu.fwd_bwd(wp)     let (_f, ggm) = act_gelu.fwd_bwd(wm)
+        let (_g, gzp) = act_silu.fwd_bwd(wp)     let (_h, gzm) = act_silu.fwd_bwd(wm)
+        if absf((gsp.w[i] - gsm.w[i]) / (2.0f32 * h) - g2s.w[i]) > 0.02f32 { ok = false }
+        if absf((gtp.w[i] - gtm.w[i]) / (2.0f32 * h) - g2t.w[i]) > 0.02f32 { ok = false }
+        if absf((ggp.w[i] - ggm.w[i]) / (2.0f32 * h) - g2g.w[i]) > 0.02f32 { ok = false }
+        if absf((gzp.w[i] - gzm.w[i]) / (2.0f32 * h) - g2z.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 3c. Fused ML ops: softmax / rms_norm / layer_norm (transformer path, #307) ─
+@grad fn gc_softmax(!w: Tensor[f32, [4]], t: Tensor[f32, [4]]) -> f32 {
+    sum(softmax(w, -1) .* t)
+}
+fn gc_softmax_fwd(w: Tensor[f32, [4]], t: Tensor[f32, [4]]) -> f32 { let (l, g) = gc_softmax.fwd_bwd(w, t)  l }
+fn gradcheck_softmax() -> bool {
+    let w = [1.0f32, 2.0f32, 0.5f32, -1.0f32]
+    let t = [0.1f32, 0.7f32, 0.2f32, 0.0f32]
+    let (loss, g) = gc_softmax.fwd_bwd(w, t)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let num = (gc_softmax_fwd(wp, t) - gc_softmax_fwd(wm, t)) / (2.0f32 * h)
+        if absf(num - g.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+@grad fn gc_rms(!w: Tensor[f32, [2, 4]], gn: Tensor[f32, [4]], t: Tensor[f32, [2, 4]]) -> f32 {
+    sum(rms_norm(w, gn, 0.00001) .* t)
+}
+fn gc_rms_fwd(w: Tensor[f32, [2, 4]], gn: Tensor[f32, [4]], t: Tensor[f32, [2, 4]]) -> f32 { let (l, g) = gc_rms.fwd_bwd(w, gn, t)  l }
+fn gradcheck_rms_norm() -> bool {
+    let w = [[1.0f32, 2.0f32, 0.5f32, -1.0f32], [0.3f32, -0.7f32, 1.5f32, 2.0f32]]
+    let gn = [1.0f32, 0.5f32, 2.0f32, 1.2f32]
+    let t = [[0.1f32, 0.7f32, 0.2f32, 0.4f32], [0.5f32, 0.5f32, 0.1f32, 0.9f32]]
+    let (loss, g) = gc_rms.fwd_bwd(w, gn, t)
+    let h = 0.0005f32
+    let !ok = true
+    for i in 0..2 {
+        for j in 0..4 {
+            let !wp = w  wp[i, j] = w[i, j] + h
+            let !wm = w  wm[i, j] = w[i, j] - h
+            let num = (gc_rms_fwd(wp, gn, t) - gc_rms_fwd(wm, gn, t)) / (2.0f32 * h)
+            if absf(num - g.w[i, j]) > 0.05f32 { ok = false }
+        }
+    }
+    ok
+}
+
+@grad fn gc_ln(!w: Tensor[f32, [2, 4]], gn: Tensor[f32, [4]], bs: Tensor[f32, [4]], t: Tensor[f32, [2, 4]]) -> f32 {
+    sum(layer_norm(w, gn, bs, 0.00001) .* t)
+}
+fn gc_ln_fwd(w: Tensor[f32, [2, 4]], gn: Tensor[f32, [4]], bs: Tensor[f32, [4]], t: Tensor[f32, [2, 4]]) -> f32 {
+    let (l, g) = gc_ln.fwd_bwd(w, gn, bs, t)
+    l
+}
+fn gradcheck_layer_norm() -> bool {
+    let w = [[1.0f32, 2.0f32, 0.5f32, -1.0f32], [0.3f32, -0.7f32, 1.5f32, 2.0f32]]
+    let gn = [1.0f32, 0.5f32, 2.0f32, 1.2f32]
+    let bs = [0.1f32, -0.2f32, 0.0f32, 0.3f32]
+    let t = [[0.1f32, 0.7f32, 0.2f32, 0.4f32], [0.5f32, 0.5f32, 0.1f32, 0.9f32]]
+    let (loss, g) = gc_ln.fwd_bwd(w, gn, bs, t)
+    let h = 0.0005f32
+    let !ok = true
+    for i in 0..2 {
+        for j in 0..4 {
+            let !wp = w  wp[i, j] = w[i, j] + h
+            let !wm = w  wm[i, j] = w[i, j] - h
+            let num = (gc_ln_fwd(wp, gn, bs, t) - gc_ln_fwd(wm, gn, bs, t)) / (2.0f32 * h)
+            if absf(num - g.w[i, j]) > 0.05f32 { ok = false }
+        }
+    }
+    ok
+}
+
+# rope: per-pair rotation (#368). VJP flows only to x; cos/sin are read-only
+# tables. Uses arbitrary (non-unit-circle) cos/sin so the check exercises the
+# transpose Jacobian rather than relying on orthogonality.
+@grad fn gc_rope(!w: Tensor[f32, [2, 4]], c: Tensor[f32, [2, 2]], s: Tensor[f32, [2, 2]], t: Tensor[f32, [2, 4]]) -> f32 {
+    sum(rope(w, c, s) .* t)
+}
+fn gc_rope_fwd(w: Tensor[f32, [2, 4]], c: Tensor[f32, [2, 2]], s: Tensor[f32, [2, 2]], t: Tensor[f32, [2, 4]]) -> f32 {
+    let (l, g) = gc_rope.fwd_bwd(w, c, s, t)
+    l
+}
+fn gradcheck_rope() -> bool {
+    let w = [[1.0f32, 2.0f32, 0.5f32, -1.0f32], [0.3f32, -0.7f32, 1.5f32, 2.0f32]]
+    let c = [[0.6f32, 0.8f32], [0.2f32, 0.9f32]]
+    let s = [[0.8f32, 0.6f32], [0.9f32, 0.3f32]]
+    let t = [[0.1f32, 0.7f32, 0.2f32, 0.4f32], [0.5f32, 0.5f32, 0.1f32, 0.9f32]]
+    let (loss, g) = gc_rope.fwd_bwd(w, c, s, t)
+    let h = 0.0005f32
+    let !ok = true
+    for i in 0..2 {
+        for j in 0..4 {
+            let !wp = w  wp[i, j] = w[i, j] + h
+            let !wm = w  wm[i, j] = w[i, j] - h
+            let num = (gc_rope_fwd(wp, c, s, t) - gc_rope_fwd(wm, c, s, t)) / (2.0f32 * h)
+            if absf(num - g.w[i, j]) > 0.02f32 { ok = false }
+        }
+    }
+    ok
+}
+
+# ── 3c. attn / attn_gqa: fused scaled-dot-product attention (#368) ────────────
+# VJP flows to q, k, AND v. attn_gqa additionally accumulates dK/dV across the
+# query heads sharing a KV head (H_q=2, H_kv=1 below). The masked variant uses
+# a numeric 0/1 mask (interp form): masked positions carry softmax weight 0,
+# so no gradient crosses them.
+@grad fn gc_attn(!q: Tensor[f32, [1, 2, 2, 2]], !k: Tensor[f32, [1, 2, 2, 2]],
+                 !v: Tensor[f32, [1, 2, 2, 2]], t: Tensor[f32, [1, 2, 2, 2]]) -> f32 {
+    sum(attn(q, k, v) .* t)
+}
+fn gc_attn_fwd(q: Tensor[f32, [1, 2, 2, 2]], k: Tensor[f32, [1, 2, 2, 2]],
+               v: Tensor[f32, [1, 2, 2, 2]], t: Tensor[f32, [1, 2, 2, 2]]) -> f32 {
+    let (l, g) = gc_attn.fwd_bwd(q, k, v, t)  l
+}
+@grad fn gc_gqa(!q: Tensor[f32, [1, 2, 2, 2]], !k: Tensor[f32, [1, 1, 2, 2]],
+                !v: Tensor[f32, [1, 1, 2, 2]], t: Tensor[f32, [1, 2, 2, 2]]) -> f32 {
+    sum(attn_gqa(q, k, v) .* t)
+}
+fn gc_gqa_fwd(q: Tensor[f32, [1, 2, 2, 2]], k: Tensor[f32, [1, 1, 2, 2]],
+              v: Tensor[f32, [1, 1, 2, 2]], t: Tensor[f32, [1, 2, 2, 2]]) -> f32 {
+    let (l, g) = gc_gqa.fwd_bwd(q, k, v, t)  l
+}
+@grad fn gc_attn_m(!q: Tensor[f32, [1, 1, 2, 2]], !k: Tensor[f32, [1, 1, 2, 2]],
+                   !v: Tensor[f32, [1, 1, 2, 2]], m: Tensor[f32, [2, 2]],
+                   t: Tensor[f32, [1, 1, 2, 2]]) -> f32 {
+    sum(attn(q, k, v, m) .* t)
+}
+fn gc_attn_m_fwd(q: Tensor[f32, [1, 1, 2, 2]], k: Tensor[f32, [1, 1, 2, 2]],
+                 v: Tensor[f32, [1, 1, 2, 2]], m: Tensor[f32, [2, 2]],
+                 t: Tensor[f32, [1, 1, 2, 2]]) -> f32 {
+    let (l, g) = gc_attn_m.fwd_bwd(q, k, v, m, t)  l
+}
+fn gradcheck_attn() -> bool {
+    let q = [[[[0.5f32, -0.3f32], [1.2f32, 0.4f32]], [[-0.7f32, 0.9f32], [0.2f32, -1.1f32]]]]
+    let k = [[[[0.8f32, 0.1f32], [-0.5f32, 1.3f32]], [[0.6f32, -0.2f32], [1.0f32, 0.7f32]]]]
+    let v = [[[[1.5f32, -0.6f32], [0.3f32, 2.0f32]], [[-1.2f32, 0.8f32], [0.5f32, -0.4f32]]]]
+    let t = [[[[0.7f32, 1.1f32], [-0.9f32, 0.5f32]], [[1.3f32, -0.2f32], [0.6f32, 0.8f32]]]]
+    let (loss, g) = gc_attn.fwd_bwd(q, k, v, t)
+    let h = 0.0005f32
+    let !ok = true
+    for hi in 0..2 { for si in 0..2 { for di in 0..2 {
+        let !qp = q  qp[0,hi,si,di] = q[0,hi,si,di] + h
+        let !qm = q  qm[0,hi,si,di] = q[0,hi,si,di] - h
+        if absf((gc_attn_fwd(qp,k,v,t) - gc_attn_fwd(qm,k,v,t)) / (2.0f32*h) - g.q[0,hi,si,di]) > 0.02f32 { ok = false }
+        let !kp = k  kp[0,hi,si,di] = k[0,hi,si,di] + h
+        let !km = k  km[0,hi,si,di] = k[0,hi,si,di] - h
+        if absf((gc_attn_fwd(q,kp,v,t) - gc_attn_fwd(q,km,v,t)) / (2.0f32*h) - g.k[0,hi,si,di]) > 0.02f32 { ok = false }
+        let !vp = v  vp[0,hi,si,di] = v[0,hi,si,di] + h
+        let !vm = v  vm[0,hi,si,di] = v[0,hi,si,di] - h
+        if absf((gc_attn_fwd(q,k,vp,t) - gc_attn_fwd(q,k,vm,t)) / (2.0f32*h) - g.v[0,hi,si,di]) > 0.02f32 { ok = false }
+    }}}
+    ok
+}
+fn gradcheck_attn_gqa() -> bool {
+    let q = [[[[0.5f32, -0.3f32], [1.2f32, 0.4f32]], [[-0.7f32, 0.9f32], [0.2f32, -1.1f32]]]]
+    let k = [[[[0.8f32, 0.1f32], [-0.5f32, 1.3f32]]]]
+    let v = [[[[1.5f32, -0.6f32], [0.3f32, 2.0f32]]]]
+    let t = [[[[0.7f32, 1.1f32], [-0.9f32, 0.5f32]], [[1.3f32, -0.2f32], [0.6f32, 0.8f32]]]]
+    let (loss, g) = gc_gqa.fwd_bwd(q, k, v, t)
+    let h = 0.0005f32
+    let !ok = true
+    for si in 0..2 { for di in 0..2 {
+        # dK/dV accumulate over BOTH query heads of the group
+        let !kp = k  kp[0,0,si,di] = k[0,0,si,di] + h
+        let !km = k  km[0,0,si,di] = k[0,0,si,di] - h
+        if absf((gc_gqa_fwd(q,kp,v,t) - gc_gqa_fwd(q,km,v,t)) / (2.0f32*h) - g.k[0,0,si,di]) > 0.02f32 { ok = false }
+        let !vp = v  vp[0,0,si,di] = v[0,0,si,di] + h
+        let !vm = v  vm[0,0,si,di] = v[0,0,si,di] - h
+        if absf((gc_gqa_fwd(q,k,vp,t) - gc_gqa_fwd(q,k,vm,t)) / (2.0f32*h) - g.v[0,0,si,di]) > 0.02f32 { ok = false }
+        for hi in 0..2 {
+            let !qp = q  qp[0,hi,si,di] = q[0,hi,si,di] + h
+            let !qm = q  qm[0,hi,si,di] = q[0,hi,si,di] - h
+            if absf((gc_gqa_fwd(qp,k,v,t) - gc_gqa_fwd(qm,k,v,t)) / (2.0f32*h) - g.q[0,hi,si,di]) > 0.02f32 { ok = false }
+        }
+    }}
+    ok
+}
+fn gradcheck_attn_masked() -> bool {
+    # causal mask: row 0 attends to col 0 only; row 1 attends to both
+    let q = [[[[0.5f32, -0.3f32], [1.2f32, 0.4f32]]]]
+    let k = [[[[0.8f32, 0.1f32], [-0.5f32, 1.3f32]]]]
+    let v = [[[[1.5f32, -0.6f32], [0.3f32, 2.0f32]]]]
+    let m = [[1.0f32, 0.0f32], [1.0f32, 1.0f32]]
+    let t = [[[[0.7f32, 1.1f32], [-0.9f32, 0.5f32]]]]
+    let (loss, g) = gc_attn_m.fwd_bwd(q, k, v, m, t)
+    let h = 0.0005f32
+    let !ok = true
+    for si in 0..2 { for di in 0..2 {
+        let !qp = q  qp[0,0,si,di] = q[0,0,si,di] + h
+        let !qm = q  qm[0,0,si,di] = q[0,0,si,di] - h
+        if absf((gc_attn_m_fwd(qp,k,v,m,t) - gc_attn_m_fwd(qm,k,v,m,t)) / (2.0f32*h) - g.q[0,0,si,di]) > 0.02f32 { ok = false }
+        let !kp = k  kp[0,0,si,di] = k[0,0,si,di] + h
+        let !km = k  km[0,0,si,di] = k[0,0,si,di] - h
+        if absf((gc_attn_m_fwd(q,kp,v,m,t) - gc_attn_m_fwd(q,km,v,m,t)) / (2.0f32*h) - g.k[0,0,si,di]) > 0.02f32 { ok = false }
+        let !vp = v  vp[0,0,si,di] = v[0,0,si,di] + h
+        let !vm = v  vm[0,0,si,di] = v[0,0,si,di] - h
+        if absf((gc_attn_m_fwd(q,k,vp,m,t) - gc_attn_m_fwd(q,k,vm,m,t)) / (2.0f32*h) - g.v[0,0,si,di]) > 0.02f32 { ok = false }
+    }}
+    ok
+}
+
+# ── 4. Matmul: f(W) = ||x @ W||^2 ,  grad through @ (the marquee op) ───────────
+@grad fn mm_loss[K, M](!W: Tensor[f32, [K, M]], x: Tensor[f32, [1, K]]) -> f32 {
+    let y = x @ W
+    sum(y .* y)
+}
+fn mm_fwd(W: Tensor[f32, [2, 2]], x: Tensor[f32, [1, 2]]) -> f32 {
+    let (l, g) = mm_loss.fwd_bwd(W, x)  l
+}
+fn gradcheck_matmul() -> bool {
+    let W = [[0.5f32, -1.0f32], [2.0f32, 0.3f32]]
+    let x = [[1.5f32, -0.5f32]]
+    let (loss, g) = mm_loss.fwd_bwd(W, x)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..2 {
+        for j in 0..2 {
+            let !Wp = W  Wp[i, j] = W[i, j] + h
+            let !Wm = W  Wm[i, j] = W[i, j] - h
+            let numeric = (mm_fwd(Wp, x) - mm_fwd(Wm, x)) / (2.0f32 * h)
+            if absf(numeric - g.W[i, j]) > 0.05f32 { ok = false }
+        }
+    }
+    ok
+}
+
+# ── 4b. Tier B: reshape / sum_along / mean_along (#307) ───────────────────────
+@grad fn gc_reshape(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [6]]) -> f32 { sum(w.reshape[[6]] .* t) }
+fn gc_reshape_fwd(w: Tensor[f32, [2, 3]], t: Tensor[f32, [6]]) -> f32 { let (l, g) = gc_reshape.fwd_bwd(w, t)  l }
+@grad fn gc_sumalong(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 { sum(sum_along(w, 1) .* t) }
+fn gc_sumalong_fwd(w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 { let (l, g) = gc_sumalong.fwd_bwd(w, t)  l }
+@grad fn gc_meanalong(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 { sum(mean_along(w, 1) .* t) }
+fn gc_meanalong_fwd(w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 { let (l, g) = gc_meanalong.fwd_bwd(w, t)  l }
+fn gradcheck_tier_b() -> bool {
+    let w = [[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]
+    let t6 = [0.5f32, 1.0f32, 1.5f32, 2.0f32, 2.5f32, 3.0f32]
+    let t2 = [0.7f32, 1.3f32]
+    let (lr, gr) = gc_reshape.fwd_bwd(w, t6)
+    let (ls, gs) = gc_sumalong.fwd_bwd(w, t2)
+    let (lm, gm) = gc_meanalong.fwd_bwd(w, t2)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..2 {
+        for j in 0..3 {
+            let !wp = w  wp[i, j] = w[i, j] + h
+            let !wm = w  wm[i, j] = w[i, j] - h
+            if absf((gc_reshape_fwd(wp, t6) - gc_reshape_fwd(wm, t6)) / (2.0f32 * h) - gr.w[i, j]) > 0.02f32 { ok = false }
+            if absf((gc_sumalong_fwd(wp, t2) - gc_sumalong_fwd(wm, t2)) / (2.0f32 * h) - gs.w[i, j]) > 0.02f32 { ok = false }
+            if absf((gc_meanalong_fwd(wp, t2) - gc_meanalong_fwd(wm, t2)) / (2.0f32 * h) - gm.w[i, j]) > 0.02f32 { ok = false }
+        }
+    }
+    ok
+}
+
+# ── 4c. Tier C: variance / max / min (global reductions, #307) ────────────────
+# variance: dx = (2/N)(x - mean); max/min: subgradient routes to the extreme.
+@grad fn gc_var[D](!w: Tensor[f32, [D]]) -> f32 { variance(w) }
+fn gc_var_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = gc_var.fwd_bwd(w)  l }
+@grad fn gc_max[D](!w: Tensor[f32, [D]]) -> f32 { max(w) }
+fn gc_max_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = gc_max.fwd_bwd(w)  l }
+@grad fn gc_min[D](!w: Tensor[f32, [D]]) -> f32 { min(w) }
+fn gc_min_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = gc_min.fwd_bwd(w)  l }
+fn gradcheck_tier_c() -> bool {
+    let w = [-1.5f32, 0.5f32, 2.0f32, -0.3f32]   # distinct → unique max/min
+    let (lv, gv) = gc_var.fwd_bwd(w)
+    let (lx, gx) = gc_max.fwd_bwd(w)
+    let (ln, gn) = gc_min.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        if absf((gc_var_fwd(wp) - gc_var_fwd(wm)) / (2.0f32 * h) - gv.w[i]) > 0.02f32 { ok = false }
+        if absf((gc_max_fwd(wp) - gc_max_fwd(wm)) / (2.0f32 * h) - gx.w[i]) > 0.02f32 { ok = false }
+        if absf((gc_min_fwd(wp) - gc_min_fwd(wm)) / (2.0f32 * h) - gn.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 5. Broadcast bias: f(b) = ||x .+ b||^2 — the #299 regression guard ─────────
+# grad_b = 2 * sum_over_rows(x .+ b); the old bug left g.b at the broadcast
+# shape [B,H] instead of [H], which this finite-difference check would expose.
+@grad fn bias_loss[B, H](!b: Tensor[f32, [H]], x: Tensor[f32, [B, H]]) -> f32 {
+    let z = x .+ b
+    sum(z .* z)
+}
+fn bias_fwd(b: Tensor[f32, [3]], x: Tensor[f32, [2, 3]]) -> f32 {
+    let (l, g) = bias_loss.fwd_bwd(b, x)  l
+}
+fn gradcheck_bias_broadcast() -> bool {
+    let b = [0.5f32, -0.3f32, 1.0f32]
+    let x = [[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]
+    let (loss, g) = bias_loss.fwd_bwd(b, x)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..3 {
+        let !bp = b  bp[i] = b[i] + h
+        let !bm = b  bm[i] = b[i] - h
+        let numeric = (bias_fwd(bp, x) - bias_fwd(bm, x)) / (2.0f32 * h)
+        if absf(numeric - g.b[i]) > 0.05f32 { ok = false }
+    }
+    ok
+}
+
+# ── 6. Tail-position `if`/`match` in the differentiated body (#421) ────────────
+# A trailing block-form `if`/`match` parses as a statement, not the block's tail
+# expression; it must trace identically to the let-bound form.
+@grad fn branch_let[D](!w: Tensor[f32, [D]]) -> f32 {
+    let s = sum(w .* w)
+    let out = if s > 1.0f32 { s * 2.0f32 } else { s }
+    out
+}
+@grad fn branch_tail_if[D](!w: Tensor[f32, [D]]) -> f32 {
+    let s = sum(w .* w)
+    if s > 1.0f32 { s * 2.0f32 } else { s }
+}
+@grad fn branch_tail_match[D](!w: Tensor[f32, [D]]) -> f32 {
+    let s = sum(w .* w)
+    let k = 1
+    match k { 0 => s, _ => s * 2.0f32 }
+}
+fn gradcheck_tail_branch() -> bool {
+    let !ok = true
+    # big-norm input takes the `s > 1` (doubled) branch: analytic grad = 4w
+    let w = [3.0f32, 0.5f32, -1.0f32, 2.0f32]
+    let (la, ga) = branch_let.fwd_bwd(w)
+    let (lb, gb) = branch_tail_if.fwd_bwd(w)
+    let (lm, gm) = branch_tail_match.fwd_bwd(w)
+    if absf(la - lb) > 0.0001f32 { ok = false }
+    if absf(la - lm) > 0.0001f32 { ok = false }
+    for i in 0..4 {
+        if absf(ga.w[i] - gb.w[i]) > 0.0001f32 { ok = false }
+        if absf(gm.w[i] - 4.0f32 * w[i]) > 0.001f32 { ok = false }
+    }
+    # small-norm input takes the other branch: the tail form must follow the
+    # executed path too (define-by-run), grad = 2w
+    let v = [0.1f32, 0.2f32, -0.1f32, 0.05f32]
+    let (lc, gc) = branch_let.fwd_bwd(v)
+    let (ld, gd) = branch_tail_if.fwd_bwd(v)
+    if absf(lc - ld) > 0.0001f32 { ok = false }
+    for i in 0..4 { if absf(gc.w[i] - gd.w[i]) > 0.0001f32 { ok = false } }
+    ok
+}
+
+# ── 7. Scalar-math builtins on the tape (#420): sqrt/exp/log/sin/cos/tan ──────
+# The SDF idiom: every distance function ends in a Euclidean norm's sqrt.
+# Previously these builtins silently left the graph even on a traced scalar.
+@grad fn norm2[D](!w: Tensor[f32, [D]]) -> f32 { sqrt(sum(w .* w)) }
+fn norm2_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = norm2.fwd_bwd(w)  l }
+@grad fn scalar_chain[D](!w: Tensor[f32, [D]]) -> f32 {
+    let s = sum(w .* w)
+    exp(log(s) * 0.5f32) + sin(s) * cos(s) + tan(s * 0.05f32)
+}
+fn chain_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = scalar_chain.fwd_bwd(w)  l }
+fn gradcheck_scalar_math() -> bool {
+    let w = [1.0f32, -2.0f32, 0.5f32, 3.0f32]
+    let (l1, g1) = norm2.fwd_bwd(w)
+    let (l2, g2) = scalar_chain.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        if absf((norm2_fwd(wp) - norm2_fwd(wm)) / (2.0f32 * h) - g1.w[i]) > 0.02f32 { ok = false }
+        if absf((chain_fwd(wp) - chain_fwd(wm)) / (2.0f32 * h) - g2.w[i]) > 0.05f32 { ok = false }
+    }
+    ok
+}
+
+fn main() -> nil {
+    print("gradcheck (analytic @grad vs central finite differences):")
+    print("  l2             : " + (gradcheck_l2() as str))
+    print("  div (./)       : " + (gradcheck_div() as str))
+    print("  mean           : " + (gradcheck_mean() as str))
+    print("  relu           : " + (gradcheck_relu() as str))
+    print("  cubic          : " + (gradcheck_cubic() as str))
+    print("  activations    : " + (gradcheck_activations() as str))
+    print("  2nd-order acts : " + (gradcheck_second_order() as str))
+    print("  softmax        : " + (gradcheck_softmax() as str))
+    print("  rms_norm       : " + (gradcheck_rms_norm() as str))
+    print("  layer_norm     : " + (gradcheck_layer_norm() as str))
+    print("  rope           : " + (gradcheck_rope() as str))
+    print("  matmul         : " + (gradcheck_matmul() as str))
+    print("  tier_b (reshape/sum_along/mean_along) : " + (gradcheck_tier_b() as str))
+    print("  tier_c (variance/max/min)             : " + (gradcheck_tier_c() as str))
+    print("  bias_broadcast : " + (gradcheck_bias_broadcast() as str))
+    nil
+}
+
+# ── ground-truth gates ────────────────────────────────────────────────────────
+fn test_gradcheck_l2() -> bool { gradcheck_l2() }
+fn test_gradcheck_div() -> bool { gradcheck_div() }
+fn test_gradcheck_mean() -> bool { gradcheck_mean() }
+fn test_gradcheck_relu() -> bool { gradcheck_relu() }
+fn test_gradcheck_cubic() -> bool { gradcheck_cubic() }
+fn test_gradcheck_activations() -> bool { gradcheck_activations() }
+fn test_gradcheck_second_order() -> bool { gradcheck_second_order() }
+fn test_gradcheck_softmax() -> bool { gradcheck_softmax() }
+fn test_gradcheck_rms_norm() -> bool { gradcheck_rms_norm() }
+fn test_gradcheck_layer_norm() -> bool { gradcheck_layer_norm() }
+fn test_gradcheck_rope() -> bool { gradcheck_rope() }
+fn test_gradcheck_attn() -> bool { gradcheck_attn() }
+fn test_gradcheck_attn_gqa() -> bool { gradcheck_attn_gqa() }
+fn test_gradcheck_attn_masked() -> bool { gradcheck_attn_masked() }
+fn test_gradcheck_matmul() -> bool { gradcheck_matmul() }
+fn test_gradcheck_tier_b() -> bool { gradcheck_tier_b() }
+fn test_gradcheck_tier_c() -> bool { gradcheck_tier_c() }
+fn test_gradcheck_bias_broadcast() -> bool { gradcheck_bias_broadcast() }
+fn test_gradcheck_tail_branch() -> bool { gradcheck_tail_branch() }
+fn test_gradcheck_scalar_math() -> bool { gradcheck_scalar_math() }
+
+# Meta-test: the check must have teeth — comparing the numeric gradient against a
+# deliberately wrong (zero) analytic gradient must register a mismatch, so a
+# passing gradcheck above is meaningful and not vacuous.
+fn test_gradcheck_detects_wrong_gradient() -> bool {
+    let w = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    let x = [0.5f32, 1.0f32, 2.0f32, 0.0f32]
+    let h = 0.001f32
+    let !detected = false
+    for i in 0..4 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        let numeric = (l2_fwd(wp, x) - l2_fwd(wm, x)) / (2.0f32 * h)
+        if absf(numeric) > 0.02f32 { detected = true }   # vs deliberately wrong grad = 0
+    }
+    detected
+}

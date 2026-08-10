@@ -1,0 +1,189 @@
+# tiny_mlp.dmc — A self-contained, fast-running MLP using autodiff.
+# Demonstrates: @grad fn, RNG initialization, training loop, Forge reset.
+# Runs in milliseconds on the tree-walking interpreter!
+#
+# Run:
+#   dmc run examples/tiny_mlp.dmc
+
+@grad fn forward[B, D, H](
+    !W1: Tensor[f32, [D, H]],
+    !W2: Tensor[f32, [H, D]],
+    x:   Tensor[f32, [B, D]],
+    y:   Tensor[f32, [B, D]],
+) -> f32 {
+    # Simple two-layer network with ReLU activation
+    let h    = \>(x @ W1)
+    let pred = h @ W2
+    let diff = pred .- y
+    sum(diff .* diff) / (B as f32)
+}
+
+fn main() -> nil {
+    vault {
+        # Using tiny dimensions (B=4, D=8, H=16) so the interpreter
+        # can run the matrix multiplications instantly.
+        let !W1 = vault.zeros[f32, [8, 16]]
+        let !W2 = vault.zeros[f32, [16, 8]]
+
+        # Initialize weights with some non-zero values using Rng
+        let rng = Rng.seed(42)
+        let (rng2, W1_init) = rng.normal[f32, [8, 16]]
+        let (rng3, W2_init) = rng2.normal[f32, [16, 8]]
+        W1 = W1_init .* 0.1
+        W2 = W2_init .* 0.1
+        let !current_rng = rng3
+
+        # Generate some synthetic dummy training data
+        let (rng4, x) = current_rng.normal[f32, [4, 8]]
+        let (rng5, y) = rng4.normal[f32, [4, 8]]
+        current_rng = rng5
+
+        print("Training a tiny MLP on the tree-walking interpreter...")
+        print("Initial weights initialized. Starting SGD...\n")
+
+        for step in 0..101 {
+            # Execute one forward-backward step
+            let (loss, g) = forward.fwd_bwd(W1, W2, x, y)
+
+            # Update weights in the Vault
+            vault {
+                W1 -= g.W1 .* 0.1
+                W2 -= g.W2 .* 0.1
+            }
+
+            # Reset the Forge allocator to prevent memory leaks
+            forge.reset()
+
+            if step % 10 == 0 {
+                print("Step " + to_str(step) + "  | Loss: " + to_str(loss))
+            }
+        }
+        print("\nOptimization complete!")
+    }
+    nil
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+#
+# All tests use B=1, D=1 or D=2, H=1 or H=2 so the full computation is
+# traceable by hand. The forward function is:
+#   h    = relu(x @ W1)          shape [B,H]
+#   pred = h @ W2                shape [B,D]
+#   diff = pred .- y
+#   loss = sum(diff .* diff) / B
+#
+# Reductions span the full allocated tensor, so tensors are sized to exactly
+# their real data (no zero-padding).
+
+# Test 1: zero weights, 2-D input, 2-D target → loss = sum(y^2)/B = 25.0
+#   B=1, D=2, H=2: W1=zeros[2,2], W2=zeros[2,2], x=[[1,1]], y=[[3,4]]
+#   h    = relu([[1,1]] @ [[0,0],[0,0]]) = relu([[0,0]]) = [[0,0]]
+#   pred = [[0,0]] @ [[0,0],[0,0]] = [[0,0]]
+#   diff = [[0-3, 0-4]] = [[-3,-4]]
+#   loss = sum([9, 16]) / 1 = 25.0
+fn test_zero_weights_2d_target() -> bool {
+    let !W1 = forge.zeros[f32, [2, 2]]
+    let !W2 = forge.zeros[f32, [2, 2]]
+    let !x  = forge.zeros[f32, [1, 2]]
+    let !y  = forge.zeros[f32, [1, 2]]
+    x[0, 0] = 1.0
+    x[0, 1] = 1.0
+    y[0, 0] = 3.0
+    y[0, 1] = 4.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss as f64, 25.0)
+}
+
+# Test 2: identity-chain weights → known pass-through value
+#   B=1, D=1, H=1: W1=[[2.0]], W2=[[0.5]], x=[[3.0]], y=[[0.0]]
+#   h    = relu([[3.0 * 2.0]]) = relu([[6.0]]) = [[6.0]]
+#   pred = [[6.0 * 0.5]] = [[3.0]]
+#   diff = [[3.0 - 0.0]] = [[3.0]]
+#   loss = sum([[9.0]]) / 1 = 9.0
+fn test_known_loss_identity_chain() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = 2.0
+    W2[0, 0] = 0.5
+    x[0, 0]  = 3.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss as f64, 9.0)
+}
+
+# Test 3: loss is always non-negative (sum of squared residuals / B >= 0).
+#   Verified with W1=[[1]], W2=[[1]], x=[[5]], y=[[3]]:
+#   h = relu([[5]]) = [[5]], pred = [[5]], diff = [[2]], loss = 4.0 >= 0
+fn test_loss_nonnegative_nonzero_weights() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = 1.0
+    W2[0, 0] = 1.0
+    x[0, 0]  = 5.0
+    y[0, 0]  = 3.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    loss >= 0.0
+}
+
+# Test 4: ReLU gate blocks negative pre-activation → pred is always zero.
+#   B=1, D=1, H=1: W1=[[-1.0]], W2=[[99.0]], x=[[1.0]], y=[[2.0]]
+#   pre = [[1.0 * -1.0]] = [[-1.0]] → relu([[-1.0]]) = [[0.0]]
+#   pred = [[0.0]] @ [[99.0]] = [[0.0]]  (regardless of W2)
+#   diff = [[0.0 - 2.0]] = [[-2.0]]
+#   loss = sum([[4.0]]) / 1 = 4.0
+fn test_relu_blocks_negative_preactivation() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = -1.0
+    W2[0, 0] = 99.0
+    x[0, 0]  =  1.0
+    y[0, 0]  =  2.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss as f64, 4.0)
+}
+
+# Test 5: batch average — B=2 with identical rows, loss = mean of per-row MSE.
+#   B=2, D=1, H=1: W1=zeros, W2=zeros, x=[[0],[0]], y=[[3],[3]]
+#   pred = [[0],[0]], diff = [[-3],[-3]]
+#   loss = sum([9, 9]) / 2 = 9.0
+fn test_batch_average() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [2, 1]]
+    let !y  = forge.zeros[f32, [2, 1]]
+    y[0, 0] = 3.0
+    y[1, 0] = 3.0
+    let loss = forward(W1, W2, x, y)
+    forge.reset()
+    isclose(loss as f64, 9.0)
+}
+
+# Test 6: gradient step reduces loss — fwd_bwd then one SGD update must lower MSE.
+#   B=1, D=1, H=1: W1=[[1]], W2=[[1]], x=[[1]], y=[[0]]
+#   loss0 = 1.0 (pred=1, diff=1, MSE=1).
+#   After one gradient step with lr=0.1 the loss must strictly decrease.
+fn test_gradient_step_decreases_loss() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    W1[0, 0] = 1.0
+    W2[0, 0] = 1.0
+    x[0, 0]  = 1.0
+    let (loss0, g0) = forward.fwd_bwd(W1, W2, x, y)
+    W1 = W1 .- (g0.W1 .* 0.1)
+    W2 = W2 .- (g0.W2 .* 0.1)
+    forge.reset()
+    let loss1 = forward(W1, W2, x, y)
+    forge.reset()
+    loss1 < loss0
+}

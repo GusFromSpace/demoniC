@@ -1,0 +1,99 @@
+# char_demo.dmc -- demonstrates c"x" char literals (SPEC 2.4)
+#
+# Char literals have type u32 (the Unicode scalar value).
+# The `c` prefix is required; single-quote is taken by transpose (`'`).
+# Escape sequences are identical to str literals.
+
+fn is_ascii_digit(ch: u32) -> bool {
+  ch >= c"0" && ch <= c"9"
+}
+
+fn is_ascii_alpha(ch: u32) -> bool {
+  (ch >= c"a" && ch <= c"z") || (ch >= c"A" && ch <= c"Z")
+}
+
+fn digit_value(ch: u32) -> u32 {
+  ch - c"0"
+}
+
+# Test: c"A" has Unicode scalar value 65 (ASCII 'A' = 0x41 = 65)
+fn test_char_A_value() -> bool {
+  c"A" == 65
+}
+
+# Test: c"0" has value 48 (ASCII '0' = 0x30 = 48), c"9" has value 57 (0x39)
+fn test_digit_char_values() -> bool {
+  c"0" == 48 && c"9" == 57
+}
+
+# Test: newline is codepoint 10, tab is codepoint 9 (standard ASCII control codes)
+fn test_escape_chars() -> bool {
+  c"\n" == 10 && c"\t" == 9
+}
+
+# Test: is_ascii_digit returns true for chars in range '0'-'9'
+# c"5" = 53, which satisfies 48 <= 53 <= 57
+fn test_is_ascii_digit_true() -> bool {
+  is_ascii_digit(c"5") && is_ascii_digit(c"0") && is_ascii_digit(c"9")
+}
+
+# Test: is_ascii_digit returns false outside '0'-'9' range
+# c"A" = 65 > 57, c"/" = 47 < 48
+fn test_is_ascii_digit_false() -> bool {
+  !is_ascii_digit(c"A") && !is_ascii_digit(c"/")
+}
+
+# Test: is_ascii_alpha returns true for lowercase and uppercase letters
+# c"a"=97, c"z"=122, c"A"=65, c"Z"=90
+fn test_is_ascii_alpha_true() -> bool {
+  is_ascii_alpha(c"a") && is_ascii_alpha(c"z") && is_ascii_alpha(c"A") && is_ascii_alpha(c"Z")
+}
+
+# Test: is_ascii_alpha returns false for digits and symbols
+# c"1"=49 (not in alpha range), c" "=32 (not in alpha range)
+fn test_is_ascii_alpha_false() -> bool {
+  !is_ascii_alpha(c"1") && !is_ascii_alpha(c" ")
+}
+
+# Test: digit_value computes ch - c"0"
+# c"7" = 55, c"0" = 48, so digit_value(c"7") = 55 - 48 = 7
+fn test_digit_value() -> bool {
+  digit_value(c"7") == 7 && digit_value(c"0") == 0 && digit_value(c"9") == 9
+}
+
+# Test: char literal comparison is transitive — ordering matches ASCII order
+# 'a'=97 < 'b'=98 < 'c'=99
+fn test_char_ordering() -> bool {
+  c"a" < c"b" && c"b" < c"c" && c"A" < c"a"
+}
+
+fn main() -> nil {
+  # Basic value: c"A" == 65
+  let a = c"A"
+  print("c\"A\" = " + to_str(a))
+
+  # Escape sequences produce the expected code points
+  let newline_val = c"\n"
+  let tab_val = c"\t"
+  print("newline u32 = " + to_str(newline_val))
+  print("tab u32 = " + to_str(tab_val))
+
+  # Comparison against an integer literal
+  if a == 65 {
+    print("c\"A\" == 65: true")
+  }
+
+  # ASCII digit check via comparison
+  let d = c"7"
+  if is_ascii_digit(d) {
+    print("c\"7\" is an ASCII digit, value = " + to_str(digit_value(d)))
+  }
+
+  # Alpha check
+  let z = c"z"
+  if is_ascii_alpha(z) {
+    print("c\"z\" is ASCII alpha")
+  }
+
+  nil
+}

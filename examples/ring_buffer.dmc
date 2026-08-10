@@ -1,0 +1,67 @@
+# ring_buffer.dmc — fixed-capacity telemetry buffer.
+# Demonstrates: tensor mutation, wraparound indexing, summaries.
+
+fn push_sample(!buf: Tensor[f32, [8]], cursor: i64, value: f32) -> (Tensor[f32, [8]], i64) {
+    buf[cursor] = value
+    (buf, (cursor + 1) % 8)
+}
+
+fn average(buf: Tensor[f32, [8]]) -> f64 {
+    let !total = 0.0
+    for i in 0..8 {
+        total = total + buf[i]
+    }
+    total / 8.0
+}
+
+fn print_buffer(buf: Tensor[f32, [8]]) -> nil {
+    let !line = ""
+    for i in 0..8 {
+        line = line + to_str(buf[i])
+        if i < 7 { line = line + " " }
+    }
+    print(line)
+    nil
+}
+
+# --- numeric gates: ring buffer wraparound + average ---
+# Push i*i for i in 0..12 into an 8-slot ring (cursor wraps mod 8).
+# Slots 0..3 get overwritten by i=8..11: [64,81,100,121,16,25,36,49].
+fn filled_ring() -> Tensor[f32, [8]] {
+    let !buf = forge.zeros[f32, [8]]
+    let !cursor = 0
+    for i in 0..12 {
+        let (next_buf, next_cursor) = push_sample(buf, cursor, (i * i) as f32)
+        buf = next_buf
+        cursor = next_cursor
+    }
+    buf
+}
+
+# sum of final slots = 64+81+100+121+16+25+36+49 = 492; avg = 492/8 = 61.5
+fn test_ring_average() -> bool {
+    let !buf = filled_ring()
+    isclose(average(buf), 61.5)
+}
+
+# Wraparound: slot 0 holds 8*8=64 (last write), slot 4 holds 4*4=16.
+fn test_ring_wraparound() -> bool {
+    let !buf = filled_ring()
+    isclose(buf[0] as f64, 64.0) && isclose(buf[4] as f64, 16.0)
+}
+
+fn main() -> f64 {
+    let !samples = vault.zeros[f32, [8]]
+    let !cursor = 0
+
+    for i in 0..12 {
+        let (next_samples, next_cursor) = push_sample(samples, cursor, (i * i) as f32)
+        samples = next_samples
+        cursor = next_cursor
+    }
+
+    print_buffer(samples)
+    let avg = average(samples)
+    print("avg=" + to_str(avg))
+    avg
+}

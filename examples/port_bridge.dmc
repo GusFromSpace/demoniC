@@ -1,0 +1,86 @@
+# port_bridge.dmc -- process-port sketch using today's JSON + exec bridge.
+# Demonstrates: explicit foreign boundary without new syntax.
+# Run: dmc run examples/port_bridge.dmc
+
+fn main() -> str {
+    let payload = map()
+    let payload = map_set(payload, "system", "rabbits")
+    let payload = map_set(payload, "variance", true)
+    let payload = map_set(payload, "steps", 64)
+    let encoded = json_encode(payload)
+
+    let script = (
+        "import json,sys; x=json.loads(sys.argv[1]); "
+        + "print(json.dumps({'port':'python','heard':x['system'],"
+        + "'variance':x['variance']}))"
+    )
+    let args = list()
+    let args = list_push(args, "-c")
+    let args = list_push(args, script)
+    let args = list_push(args, encoded)
+
+    let (out, err, code) = exec_cmd("python3", args)
+    if code != 0 {
+        print("port error: " + err)
+        err
+    } else {
+        # `out` already carries python's own trailing newline; trim it so the
+        # line-oriented `print` supplies exactly one.
+        print(out.trim())
+        out
+    }
+}
+
+# --- tests ---
+# map_set then map_get returns the stored value: "rabbits" is what we set for
+# "system", so retrieving it must yield exactly that string.
+fn test_map_get_string() -> bool {
+    let m = map()
+    let m = map_set(m, "system", "rabbits")
+    map_get(m, "system") == "rabbits"
+}
+
+# map_has is true for inserted keys and false for keys never inserted.
+fn test_map_has_present_and_absent() -> bool {
+    let m = map()
+    let m = map_set(m, "system", "rabbits")
+    let m = map_set(m, "variance", true)
+    let m = map_set(m, "steps", 64)
+    map_has(m, "steps") == true && map_has(m, "missing_key") == false
+}
+
+# Three distinct keys inserted → map_len must equal 3 (no duplicates created).
+fn test_map_len_three_keys() -> bool {
+    let m = map()
+    let m = map_set(m, "system", "rabbits")
+    let m = map_set(m, "variance", true)
+    let m = map_set(m, "steps", 64)
+    map_len(m) == 3
+}
+
+# list_push appends to the back: element 0 is the first pushed item,
+# element 2 is the last. This mirrors main's arg-list construction.
+fn test_list_push_preserves_order() -> bool {
+    let args = list()
+    let args = list_push(args, "-c")
+    let args = list_push(args, "script")
+    let args = list_push(args, "encoded")
+    list_get(args, 0) == "-c" && list_get(args, 1) == "script" && list_get(args, 2) == "encoded"
+}
+
+# json_encode then json_decode is an identity on the map's string values:
+# the round-tripped map must have the same key→value as the original.
+fn test_json_encode_decode_roundtrip() -> bool {
+    let m = map()
+    let m = map_set(m, "system", "rabbits")
+    let encoded = json_encode(m)
+    let (decoded, err) = json_decode(encoded)
+    map_get(decoded, "system") == "rabbits"
+}
+
+# .trim() removes leading and trailing whitespace — this is the exact
+# operation the else-branch of main uses on Python's newline-terminated output.
+fn test_trim_strips_whitespace() -> bool {
+    let s = "  hello  "
+    s.trim() == "hello"
+}

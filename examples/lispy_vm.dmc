@@ -1,0 +1,187 @@
+# lispy_vm.dmc — a Scheme interpreter using a tagged-handle heap.
+#
+# A second translation of Norvig's lispy.py (cf. examples/lispy.dmc), exploring
+# a DIFFERENT workaround for the heterogeneous-value gap (#186). Where lispy.dmc
+# makes every value a tagged `list`, this version makes every AST node a plain
+# `i64` handle into a side "heap" — the trick real dynamic-language VMs use
+# (tagged pointers / a value heap), expressed in pure demoniC.
+#
+# THE WORKAROUND
+#   The translation gap is ONLY at function boundaries: a function needs one
+#   static type per parameter/return. So we pick `i64` as the universal type:
+#   every AST node — number, symbol, or list — is represented by an integer
+#   handle. The actual payload lives in a `map`-backed heap (maps are
+#   reference-semantic, so a single heap threads through every call by sharing).
+#
+#   heap layout (all keys stringified):
+#     "n"        -> i64   next free handle id (bump allocator)
+#     "k<id>"    -> i64   kind: 0=number, 1=symbol, 2=list
+#     "f<id>"    -> f64   payload for numbers
+#     "s<id>"    -> str   payload for symbols
+#     "l<id>"    -> list  payload for lists (a list of i64 child handles)
+#
+#   Every function is monomorphic: handles are i64, the heap and env are map,
+#   evaluated results are f64. No `any` type needed. Dispatch is an integer
+#   compare on the kind cell — no string re-parsing, O(1) per node.
+
+# ── Heap: bump-allocating tagged cells ─────────────────────────────────────────
+fn alloc_num(heap: map, v: f64) -> i64 {
+    let id = to_int(map_get(heap, "n"))
+    map_set(heap, "k" + to_str(id), 0)
+    map_set(heap, "f" + to_str(id), v)
+    map_set(heap, "n", id + 1)
+    id
+}
+fn alloc_sym(heap: map, s: str) -> i64 {
+    let id = to_int(map_get(heap, "n"))
+    map_set(heap, "k" + to_str(id), 1)
+    map_set(heap, "s" + to_str(id), s)
+    map_set(heap, "n", id + 1)
+    id
+}
+fn alloc_list(heap: map, children: list) -> i64 {
+    let id = to_int(map_get(heap, "n"))
+    map_set(heap, "k" + to_str(id), 2)
+    map_set(heap, "l" + to_str(id), children)
+    map_set(heap, "n", id + 1)
+    id
+}
+
+fn kind(heap: map, id: i64) -> i64 { to_int(map_get(heap, "k" + to_str(id))) }
+fn num_val(heap: map, id: i64) -> f64 { map_get(heap, "f" + to_str(id)) }
+fn sym_val(heap: map, id: i64) -> str { map_get(heap, "s" + to_str(id)) }
+fn list_kids(heap: map, id: i64) -> list { map_get(heap, "l" + to_str(id)) }
+
+# ── Tokenizer ──────────────────────────────────────────────────────────────────
+fn tokenize(src: str) -> list {
+    let spaced = src.replace("(", " ( ").replace(")", " ) ")
+    let raw = spaced.split(" ")
+    let !toks = list()
+    let n = list_len(raw)
+    let !i = 0
+    while i < n {
+        let t = list_get(raw, i)
+        if !(t == "") { toks = list_push(toks, t) }
+        i = i + 1
+    }
+    toks
+}
+
+# ── Atom: classify a token, allocate a cell, return its handle ──────────────────
+fn atom(heap: map, tok: str) -> i64 {
+    # is_numeric (#185) gives a non-aborting numeric test; "-" alone is a symbol.
+    if is_numeric(tok) && !(tok == "-") {
+        alloc_num(heap, to_float(tok))
+    } else {
+        alloc_sym(heap, tok)
+    }
+}
+
+# ── Parser: recursive descent, returns (handle, next_index) ─────────────────────
+fn parse_from(heap: map, toks: list, start: i64) -> (i64, i64) {
+    let tok = list_get(toks, start)
+    if tok == "(" {
+        let !kids = list()
+        let !i = start + 1
+        let n = list_len(toks)
+        while i < n {
+            let t = list_get(toks, i)
+            if t == ")" {
+                return (alloc_list(heap, kids), i + 1)
+            }
+            let (child, next) = parse_from(heap, toks, i)
+            kids = list_push(kids, child)
+            i = next
+        }
+        panic("unexpected EOF: missing )")
+    } else if tok == ")" {
+        panic("unexpected )")
+    } else {
+        (atom(heap, tok), start + 1)
+    }
+}
+
+# ── Evaluator: dispatch on the heap kind cell, return f64 ────────────────────────
+fn eval_h(heap: map, x: i64, env: map) -> f64 {
+    let k = kind(heap, x)
+    if k == 0 {
+        return num_val(heap, x)
+    }
+    if k == 1 {
+        return map_get(env, sym_val(heap, x))   # variable lookup
+    }
+    # k == 2: application / special form
+    let kids = list_kids(heap, x)
+    let op_h = list_get(kids, 0)
+    let op = sym_val(heap, op_h)
+    let nargs = list_len(kids) - 1
+
+    if op == "if" {
+        let test = eval_h(heap, list_get(kids, 1), env)
+        if test != 0.0 {
+            return eval_h(heap, list_get(kids, 2), env)
+        } else {
+            return eval_h(heap, list_get(kids, 3), env)
+        }
+    }
+    if op == "+" {
+        let !acc = 0.0
+        let !i = 0
+        while i < nargs { acc = acc + eval_h(heap, list_get(kids, i + 1), env); i = i + 1 }
+        return acc
+    }
+    if op == "*" {
+        let !acc = 1.0
+        let !i = 0
+        while i < nargs { acc = acc * eval_h(heap, list_get(kids, i + 1), env); i = i + 1 }
+        return acc
+    }
+    if op == "-" {
+        let first = eval_h(heap, list_get(kids, 1), env)
+        if nargs == 1 { return 0.0 - first }
+        let !acc = first
+        let !i = 1
+        while i < nargs { acc = acc - eval_h(heap, list_get(kids, i + 1), env); i = i + 1 }
+        return acc
+    }
+    if op == "<" {
+        let a = eval_h(heap, list_get(kids, 1), env)
+        let b = eval_h(heap, list_get(kids, 2), env)
+        if a < b { return 1.0 } else { return 0.0 }
+    }
+    panic("unknown operator")
+}
+
+fn run(src: str) -> f64 {
+    let !heap = map_new()
+    map_set(heap, "n", 0)
+    let !env = map_new()
+    let (handle, _) = parse_from(heap, tokenize(src), 0)
+    eval_h(heap, handle, env)
+}
+
+# ── Tests: ground truth is Scheme arithmetic, computable by hand ────────────────
+fn test_nested_add_mul() -> bool {
+    # (+ 1 (* 2 3)) = 1 + 6 = 7
+    isclose(run("(+ 1 (* 2 3))"), 7.0)
+}
+fn test_if_lt() -> bool {
+    # (< 2 3) is true -> 10
+    isclose(run("(if (< 2 3) 10 20)"), 10.0)
+}
+fn test_variadic_sub() -> bool {
+    # (- 10 1 2 3) = 10 - 1 - 2 - 3 = 4
+    isclose(run("(- 10 1 2 3)"), 4.0)
+}
+fn test_unary_neg_and_mul() -> bool {
+    # (* (+ 1 2) (- 8 3)) = 3 * 5 = 15  ;  (- 7) unary = -7
+    isclose(run("(* (+ 1 2) (- 8 3))"), 15.0) && isclose(run("(- 7)"), -7.0)
+}
+
+fn main() -> nil {
+    print(run("(+ 1 (* 2 3))"))       # 7
+    print(run("(if (< 2 3) 10 20)"))  # 10
+    print(run("(- 10 1 2 3)"))        # 4
+    print(run("(* (+ 1 2) (- 8 3))")) # 15
+    nil
+}

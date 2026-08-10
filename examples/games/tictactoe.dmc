@@ -1,0 +1,286 @@
+# Tic-Tac-Toe in demoniC with minimax AI
+
+fn print_board(board: Tensor[i64, [3, 3]]) -> nil {
+  for i in 0..3 {
+    let mut row = " ";
+    for j in 0..3 {
+      let val = board[i, j];
+      if val == 0 {
+        row = row + ".";
+      } else if val == 1 {
+        row = row + "X";
+      } else {
+        row = row + "O";
+      }
+      if j < 2 {
+        row = row + " | ";
+      }
+    }
+    print(row);
+    if i < 2 {
+      print("---------");
+    }
+  }
+  print("");
+  nil
+}
+
+fn check_winner(board: Tensor[i64, [3, 3]]) -> i64 {
+  # Check rows
+  for i in 0..3 {
+    let a = board[i, 0];
+    let b = board[i, 1];
+    let c = board[i, 2];
+    if a != 0 && a == b && b == c {
+      return a;
+    }
+  }
+
+  # Check columns
+  for j in 0..3 {
+    let a = board[0, j];
+    let b = board[1, j];
+    let c = board[2, j];
+    if a != 0 && a == b && b == c {
+      return a;
+    }
+  }
+
+  # Check diagonals
+  let a = board[0, 0];
+  let b = board[1, 1];
+  let c = board[2, 2];
+  if a != 0 && a == b && b == c {
+    return a;
+  }
+
+  let a = board[0, 2];
+  let b = board[1, 1];
+  let c = board[2, 0];
+  if a != 0 && a == b && b == c {
+    return a;
+  }
+
+  # Check for draw (all filled, no winner)
+  let mut filled = 0;
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] != 0 {
+        filled = filled + 1;
+      }
+    }
+  }
+
+  if filled == 9 {
+    return 3;
+  }
+
+  0
+}
+
+fn minimax(board: Tensor[i64, [3, 3]], player: i64, depth: i64) -> i64 {
+  let result = check_winner(board);
+
+  if result == 1 {
+    return 10 - depth;
+  }
+  if result == 2 {
+    return -10 + depth;
+  }
+  if result == 3 {
+    return 0;
+  }
+
+  let mut best_score = if player == 1 { -100 } else { 100 };
+
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] == 0 {
+        let mut new_board = board;
+        new_board[i, j] = player;
+        let opponent = if player == 1 { 2 } else { 1 };
+        let score = minimax(new_board, opponent, depth + 1);
+
+        if player == 1 {
+          if score > best_score {
+            best_score = score;
+          }
+        } else {
+          if score < best_score {
+            best_score = score;
+          }
+        }
+      }
+    }
+  }
+
+  best_score
+}
+
+fn best_move(board: Tensor[i64, [3, 3]], player: i64) -> (i64, i64) {
+  let mut best_score = if player == 1 { -100 } else { 100 };
+  let mut best_row = 0;
+  let mut best_col = 0;
+
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] == 0 {
+        let mut new_board = board;
+        new_board[i, j] = player;
+        let opponent = if player == 1 { 2 } else { 1 };
+        let score = minimax(new_board, opponent, 1);
+
+        if player == 1 {
+          if score > best_score {
+            best_score = score;
+            best_row = i;
+            best_col = j;
+          }
+        } else {
+          if score < best_score {
+            best_score = score;
+            best_row = i;
+            best_col = j;
+          }
+        }
+      }
+    }
+  }
+
+  (best_row, best_col)
+}
+
+fn main() -> nil {
+  let mut board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+
+  print("=== Tic-Tac-Toe: X vs O (both optimal) ===");
+  print_board(board);
+
+  let mut current_player = 1;
+
+  while true {
+    let winner = check_winner(board);
+    if winner != 0 {
+      if winner == 1 {
+        print("X wins!");
+      } else if winner == 2 {
+        print("O wins!");
+      } else {
+        print("Draw!");
+      }
+      break;
+    }
+
+    let (row, col) = best_move(board, current_player);
+    board[row, col] = current_player;
+
+    if current_player == 1 {
+      print("X plays at (" + to_str(row) + ", " + to_str(col) + ")");
+    } else {
+      print("O plays at (" + to_str(row) + ", " + to_str(col) + ")");
+    }
+
+    print_board(board);
+
+    current_player = if current_player == 1 { 2 } else { 1 };
+  }
+  nil
+}
+
+# --- Tests ---
+
+# Empty board has no winner: 0 cells filled < 9, no winning line → 0
+fn test_empty_board_no_winner() -> bool {
+  let board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  check_winner(board) == 0
+}
+
+# X fills row 0: a=1,b=1,c=1, all equal and nonzero → check_winner returns 1
+fn test_row_win_x() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 0] = 1;
+  b[0, 1] = 1;
+  b[0, 2] = 1;
+  check_winner(b) == 1
+}
+
+# O fills column 1: board[0,1]=board[1,1]=board[2,1]=2 → returns 2
+fn test_col_win_o() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 1] = 2;
+  b[1, 1] = 2;
+  b[2, 1] = 2;
+  check_winner(b) == 2
+}
+
+# X fills main diagonal (0,0),(1,1),(2,2) → diagonal check returns 1
+fn test_diag_win_x() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 0] = 1;
+  b[1, 1] = 1;
+  b[2, 2] = 1;
+  check_winner(b) == 1
+}
+
+# O fills anti-diagonal (0,2),(1,1),(2,0) → anti-diag check returns 2
+fn test_antidiag_win_o() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 2] = 2;
+  b[1, 1] = 2;
+  b[2, 0] = 2;
+  check_winner(b) == 2
+}
+
+# Full board with no winning line → filled==9 → returns 3 (draw)
+# Board: X O X / O X O / O X O  — no three-in-a-row for either player
+fn test_draw_board() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 0] = 1; b[0, 1] = 2; b[0, 2] = 1;
+  b[1, 0] = 2; b[1, 1] = 1; b[1, 2] = 2;
+  b[2, 0] = 2; b[2, 1] = 1; b[2, 2] = 2;
+  check_winner(b) == 3
+}
+
+# minimax on an X-won board at depth 0 → result==1 → returns 10 - 0 = 10
+fn test_minimax_x_won_depth0() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 0] = 1; b[0, 1] = 1; b[0, 2] = 1;
+  minimax(b, 2, 0) == 10
+}
+
+# X has two in row 0 (cols 0,1), col 2 empty → best_move must complete the row at (0,2)
+fn test_best_move_completes_row() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 0] = 1;
+  b[0, 1] = 1;
+  let (r, c) = best_move(b, 1);
+  r == 0 && c == 2
+}
+
+# O has two in col 0 (rows 0,1), row 2 empty → best_move for X must block at (2,0)
+fn test_best_move_blocks_opponent() -> bool {
+  let mut b = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  b[0, 0] = 2;
+  b[1, 0] = 2;
+  let (r, c) = best_move(b, 1);
+  r == 2 && c == 0
+}
+
+# Optimal play from empty board must end in draw: both players use best_move each turn
+fn test_optimal_play_draws() -> bool {
+  let mut board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  let mut current_player = 1;
+  let mut outcome = 0;
+  while true {
+    let winner = check_winner(board);
+    if winner != 0 {
+      outcome = winner;
+      break;
+    }
+    let (row, col) = best_move(board, current_player);
+    board[row, col] = current_player;
+    current_player = if current_player == 1 { 2 } else { 1 };
+  }
+  # With perfect play, tic-tac-toe always ends in a draw (outcome == 3)
+  outcome == 3
+}

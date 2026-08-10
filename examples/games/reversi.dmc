@@ -1,0 +1,375 @@
+# Reversi/Othello in demoniC - 8x8 board, self-play with greedy AI
+
+fn print_board(board: Tensor[i64, [8, 8]]) -> nil {
+  let mut i = 0;
+  while i < 8 {
+    let mut row = "  ";
+    let mut j = 0;
+    while j < 8 {
+      let val = board[i, j];
+      if val == 0 {
+        row = row + ".";
+      } else if val == 1 {
+        row = row + "B";
+      } else {
+        row = row + "W";
+      }
+      if j < 7 {
+        row = row + " ";
+      }
+      j = j + 1;
+    }
+    print(row);
+    i = i + 1;
+  }
+  print("");
+  nil
+}
+
+fn count_pieces(board: Tensor[i64, [8, 8]], player: i64) -> i64 {
+  let mut count = 0;
+  let mut i = 0;
+  while i < 8 {
+    let mut j = 0;
+    while j < 8 {
+      if board[i, j] == player {
+        count = count + 1;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  count
+}
+
+fn check_direction(
+  board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64, di: i64, dj: i64
+) -> bool {
+  let opponent = if player == 1 { 2 } else { 1 };
+  let mut r = row + di;
+  let mut c = col + dj;
+  let mut found_opponent = false;
+
+  while r >= 0 && r < 8 && c >= 0 && c < 8 {
+    let val = board[r, c];
+    if val == 0 {
+      r = 10;
+      c = 10;
+    } else if val == opponent {
+      found_opponent = true;
+      r = r + di;
+      c = c + dj;
+    } else if val == player {
+      if found_opponent {
+        r = 10;
+        c = 10;
+      } else {
+        r = 10;
+        c = 10;
+      }
+    } else {
+      r = 10;
+      c = 10;
+    }
+  }
+
+  found_opponent
+}
+
+fn is_valid_move(board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64) -> bool {
+  if row < 0 || row >= 8 || col < 0 || col >= 8 {
+    return false;
+  }
+  if board[row, col] != 0 {
+    return false;
+  }
+
+  let v1 = check_direction(board, row, col, player, -1, 0);
+  let v2 = check_direction(board, row, col, player, 1, 0);
+  let v3 = check_direction(board, row, col, player, 0, -1);
+  let v4 = check_direction(board, row, col, player, 0, 1);
+  let v5 = check_direction(board, row, col, player, -1, -1);
+  let v6 = check_direction(board, row, col, player, -1, 1);
+  let v7 = check_direction(board, row, col, player, 1, -1);
+  let v8 = check_direction(board, row, col, player, 1, 1);
+
+  v1 || v2 || v3 || v4 || v5 || v6 || v7 || v8
+}
+
+fn flip_direction(
+  board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64, di: i64, dj: i64
+) -> Tensor[i64, [8, 8]] {
+  let opponent = if player == 1 { 2 } else { 1 };
+  let mut result = board;
+  let mut r = row + di;
+  let mut c = col + dj;
+  let mut found_line = false;
+
+  while r >= 0 && r < 8 && c >= 0 && c < 8 {
+    let val = result[r, c];
+    if val == 0 {
+      r = 10;
+      c = 10;
+    } else if val == opponent {
+      r = r + di;
+      c = c + dj;
+    } else if val == player {
+      if r > row + di || c > col + dj || r < row + di || c < col + dj {
+        let mut tr = row + di;
+        let mut tc = col + dj;
+        while tr != r || tc != c {
+          result[tr, tc] = player;
+          tr = tr + di;
+          tc = tc + dj;
+        }
+      }
+      r = 10;
+      c = 10;
+    } else {
+      r = 10;
+      c = 10;
+    }
+  }
+
+  result
+}
+
+fn make_move(board: Tensor[i64, [8, 8]], row: i64, col: i64, player: i64) -> Tensor[i64, [8, 8]] {
+  let mut result = board;
+  result[row, col] = player;
+
+  let mut di = -1;
+  while di <= 1 {
+    let mut dj = -1;
+    while dj <= 1 {
+      if di != 0 || dj != 0 {
+        result = flip_direction(result, row, col, player, di, dj);
+      }
+      dj = dj + 1;
+    }
+    di = di + 1;
+  }
+
+  result
+}
+
+fn any_valid_move(board: Tensor[i64, [8, 8]], player: i64) -> bool {
+  let mut i = 0;
+  let mut found = false;
+  while i < 8 {
+    let mut j = 0;
+    while j < 8 {
+      if is_valid_move(board, i, j, player) {
+        found = true;
+        i = 10;
+        j = 10;
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  found
+}
+
+fn best_move(board: Tensor[i64, [8, 8]], player: i64) -> (i64, i64) {
+  let mut best_score = -1;
+  let mut best_row = -1;
+  let mut best_col = -1;
+
+  let mut i = 0;
+  while i < 8 {
+    let mut j = 0;
+    while j < 8 {
+      if is_valid_move(board, i, j, player) {
+        let new_board = make_move(board, i, j, player);
+        let score = count_pieces(new_board, player);
+        if score > best_score {
+          best_score = score;
+          best_row = i;
+          best_col = j;
+        }
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  (best_row, best_col)
+}
+
+fn main() -> nil {
+  let mut board = [[0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 2, 1, 0, 0, 0],
+                    [0, 0, 0, 1, 2, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0, 0, 0]];
+
+  print("=== Reversi: Black vs White ===");
+  print_board(board);
+
+  let mut current_player = 1;
+  let mut passes = 0;
+
+  let mut moves_made = true;
+  while moves_made {
+    if any_valid_move(board, current_player) {
+      let (row, col) = best_move(board, current_player);
+      board = make_move(board, row, col, current_player);
+      let player_name = if current_player == 1 { "Black" } else { "White" };
+      print(player_name + " plays at (" + to_str(row) + ", " + to_str(col) + ")");
+      print_board(board);
+      current_player = if current_player == 1 { 2 } else { 1 };
+      passes = 0;
+    } else {
+      passes = passes + 1;
+      let player_name = if current_player == 1 { "Black" } else { "White" };
+      print(player_name + " has no moves, passing.");
+      current_player = if current_player == 1 { 2 } else { 1 };
+      if passes >= 2 {
+        moves_made = false;
+      }
+    }
+  }
+
+  let black_count = count_pieces(board, 1);
+  let white_count = count_pieces(board, 2);
+
+  print("=== Game Over ===");
+  print("Black: " + to_str(black_count));
+  print("White: " + to_str(white_count));
+
+  if black_count > white_count {
+    print("Black wins!");
+  } else if white_count > black_count {
+    print("White wins!");
+  } else {
+    print("Draw!");
+  }
+
+  nil
+}
+
+# ---- Tests ----
+
+# The initial Reversi board has exactly 2 black (1) and 2 white (2) pieces.
+# Positions: (3,3)=2, (3,4)=1, (4,3)=1, (4,4)=2 by convention.
+fn test_count_initial() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  count_pieces(board, 1) == 2 && count_pieces(board, 2) == 2
+}
+
+# An all-zero board has zero pieces for either player.
+fn test_count_empty() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  count_pieces(board, 1) == 0 && count_pieces(board, 2) == 0
+}
+
+# In standard Reversi, (2,3) is a valid opening move for Black (player=1).
+# Justification: direction (1,0) from (2,3) finds opponent at (3,3) then
+# player at (4,3), so check_direction returns true.
+fn test_valid_move_initial_black() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  is_valid_move(board, 2, 3, 1)
+}
+
+# An occupied square is never a valid move (is_valid_move returns false when
+# board[row,col] != 0, regardless of player).
+fn test_invalid_move_occupied() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  # (3,3) holds player 2, so neither player can move there
+  !is_valid_move(board, 3, 3, 1) && !is_valid_move(board, 3, 3, 2)
+}
+
+# After Black plays (2,3) on the initial board, (3,3) is flipped from White to
+# Black.  Black gains the placed piece + the flip: 2 + 1(placed) + 1(flip) = 4.
+# White loses one flip: 2 - 1 = 1.  Total pieces = 5 (was 4, +1 placed).
+fn test_make_move_flips() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  let after = make_move(board, 2, 3, 1);
+  let black = count_pieces(after, 1);
+  let white = count_pieces(after, 2);
+  black == 4 && white == 1 && black + white == 5
+}
+
+# Black always has at least one valid move from the initial position.
+fn test_any_valid_move_initial() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  any_valid_move(board, 1) && any_valid_move(board, 2)
+}
+
+# check_direction into empty space returns false: no opponent found means no
+# valid flip line in that direction.
+fn test_check_direction_empty() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  # Direction up (-1,0) from (2,3) finds only empty squares - returns false
+  !check_direction(board, 2, 3, 1, -1, 0)
+}
+
+# best_move on the initial board for Black should return one of the four
+# symmetric opening moves: (2,3), (3,2), (4,5), (5,4).
+# All of them result in 4 black pieces (greedy pick = any valid maximiser).
+fn test_best_move_initial() -> bool {
+  let board = [[0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 2, 1, 0, 0, 0],
+               [0, 0, 0, 1, 2, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0]];
+  let (r, c) = best_move(board, 1);
+  # Whatever square best_move picks must be a valid move
+  is_valid_move(board, r, c, 1)
+}

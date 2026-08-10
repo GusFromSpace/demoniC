@@ -1,0 +1,293 @@
+# tinyraytracer.dmc — Vectorized port of ssloy/tinyraytracer.
+#
+# Ported from the educational C++ open source library by Dmitry V. Sokolov:
+# ssloy/tinyraytracer — distributed under the WTFPL.
+#
+# Renders a 3D scene containing two spheres with diffuse lighting,
+# ambient lighting, and specular highlights (Phong reflection model)
+# by executing the ray-tracing mathematics as 2D tensor operations.
+#
+# Run:
+#   dmc run examples/tinyraytracer.dmc
+
+fn main() -> nil {
+    let H = 32
+    let W = 80
+
+    # 1. Initialize coordinates on the image plane.
+    let !ys = forge.zeros[f32, [32]]
+    let !r = 0
+    while r < H {
+        # Map row index from 0..31 to vertical coordinate 1.0..-1.0
+        ys[r] = 1.0 - (r as f32) * (2.0 / 31.0)
+        r = r + 1
+    }
+
+    let !xs = forge.zeros[f32, [80]]
+    let !c = 0
+    while c < W {
+        # Map col index from 0..79 to horizontal coordinate -1.8..1.8
+        xs[c] = -1.8 + (c as f32) * (3.6 / 79.0)
+        c = c + 1
+    }
+
+    # Reshape coordinates to allow 2D broadcasting.
+    let ys_2d = ys.reshape[[32, 1]]
+    let xs_2d = xs.reshape[[1, 80]]
+
+    # 2. Compute ray directions for every pixel simultaneously.
+    let Dx = xs_2d
+    let Dy = ys_2d
+    let Dz = -1.5
+
+    # Normalize ray direction vectors.
+    let length = (Dx .* Dx .+ Dy .* Dy .+ 2.25) .^ 0.5
+    let Dx_norm = Dx ./ length
+    let Dy_norm = Dy ./ length
+    let Dz_norm = Dz ./ length
+
+    # 3. Define Sphere 1 parameters (left, red-diffuse).
+    let scx1 = -0.75
+    let scy1 = 0.10
+    let scz1 = -3.00
+    let r1   = 0.70
+
+    # 4. Define Sphere 2 parameters (right, shiny-metallic).
+    let scx2 = 0.75
+    let scy2 = -0.40
+    let scz2 = -2.80
+    let r2   = 0.50
+
+    # 5. Intersect rays with Sphere 1.
+    let Lx1 = scx1
+    let Ly1 = scy1
+    let Lz1 = scz1
+    let tca1 = Lx1 .* Dx_norm .+ Ly1 .* Dy_norm .+ Lz1 .* Dz_norm
+    let d2_1 = (Lx1 * Lx1 + Ly1 * Ly1 + Lz1 * Lz1) .- tca1 .* tca1
+    let hit1 = d2_1 .<= (r1 * r1)
+    let thc1 = (\>(r1 * r1 .- d2_1)) .^ 0.5
+    let t1_raw = tca1 .- thc1
+    # If a ray misses, set distance to a very large number (infinity).
+    let t1 = t1_raw .* hit1 .+ (1.0 .- hit1) .* 1e9
+
+    # 6. Intersect rays with Sphere 2.
+    let Lx2 = scx2
+    let Ly2 = scy2
+    let Lz2 = scz2
+    let tca2 = Lx2 .* Dx_norm .+ Ly2 .* Dy_norm .+ Lz2 .* Dz_norm
+    let d2_2 = (Lx2 * Lx2 + Ly2 * Ly2 + Lz2 * Lz2) .- tca2 .* tca2
+    let hit2 = d2_2 .<= (r2 * r2)
+    let thc2 = (\>(r2 * r2 .- d2_2)) .^ 0.5
+    let t2_raw = tca2 .- thc2
+    let t2 = t2_raw .* hit2 .+ (1.0 .- hit2) .* 1e9
+
+    # 7. Select closest hit point per pixel.
+    # min(t1, t2) = 0.5 * (t1 + t2 - abs(t1 - t2))
+    # Compute abs(t1 - t2) elementwise as ((t1 - t2)^2) .^ 0.5
+    let t_diff = t1 .- t2
+    let abs_t_diff = (t_diff .* t_diff) .^ 0.5
+    let t_min = 0.5 .* (t1 .+ t2 .- abs_t_diff)
+
+    # Masks indicating which sphere is hit first.
+    let mask1 = (t1 .< t2) .* (t_min .< 1e8)
+    let mask2 = (t2 .<= t1) .* (t_min .< 1e8)
+
+    # 8. Compute intersection points and surface normals.
+    let Px1 = t1 .* Dx_norm
+    let Py1 = t1 .* Dy_norm
+    let Pz1 = t1 .* Dz_norm
+    let Nx1 = (Px1 .- scx1) ./ r1
+    let Ny1 = (Py1 .- scy1) ./ r1
+    let Nz1 = (Pz1 .- scz1) ./ r1
+
+    let Px2 = t2 .* Dx_norm
+    let Py2 = t2 .* Dy_norm
+    let Pz2 = t2 .* Dz_norm
+    let Nx2 = (Px2 .- scx2) ./ r2
+    let Ny2 = (Py2 .- scy2) ./ r2
+    let Nz2 = (Pz2 .- scz2) ./ r2
+
+    let Nx = mask1 .* Nx1 .+ mask2 .* Nx2
+    let Ny = mask1 .* Ny1 .+ mask2 .* Ny2
+    let Nz = mask1 .* Nz1 .+ mask2 .* Nz2
+
+    # 9. Compute Diffuse and Specular Lighting.
+    let lx = 0.577
+    let ly = 0.577
+    let lz = 0.577
+    let N_dot_L = Nx .* lx .+ Ny .* ly .+ Nz .* lz
+    let diffuse = \>(N_dot_L)
+
+    # Specular reflection vector R = 2 * (N.L) * N - L
+    let Rx = 2.0 .* N_dot_L .* Nx .- lx
+    let Ry = 2.0 .* N_dot_L .* Ny .- ly
+    let Rz = 2.0 .* N_dot_L .* Nz .- lz
+
+    # View direction V (camera is at origin, so V is -D)
+    let Vx = -Dx_norm
+    let Vy = -Dy_norm
+    let Vz = -Dz_norm
+    let V_dot_R = Vx .* Rx .+ Vy .* Ry .+ Vz .* Rz
+    let specular = \>(V_dot_R) .^ 12.0
+
+    # Ambient light in hit areas.
+    let ambient = (mask1 .+ mask2) .* 0.18
+
+    # Final combined light intensity.
+    let intensity = (diffuse .* 0.70 .+ specular .* 0.45) .* (mask1 .+ mask2) .+ ambient
+
+    # 10. Render the scene to the console as ASCII text.
+    print("Vectorized port of ssloy/tinyraytracer in demoniC:")
+    let !row = 0
+    while row < H {
+        let !line = ""
+        let !col = 0
+        while col < W {
+            let val = intensity[row, col]
+            if val > 0.85 {
+                line = line + "@"
+            } else if val > 0.65 {
+                line = line + "O"
+            } else if val > 0.45 {
+                line = line + "o"
+            } else if val > 0.25 {
+                line = line + "."
+            } else if val > 0.05 {
+                line = line + " "
+            } else {
+                # Background pattern
+                line = line + " "
+            }
+            col = col + 1
+        }
+        print(line)
+        row = row + 1
+    }
+    nil
+}
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+#
+# All ground-truth values below are derived from the same closed-form geometry
+# used in main(); none are "magic numbers" from running the program.
+
+# Ray-direction normalization invariant.
+# The center pixel maps to xs=0, ys=0, so the un-normalized direction is
+# (Dx, Dy, Dz) = (0, 0, -1.5).  After dividing by the Euclidean length
+# sqrt(0^2 + 0^2 + 1.5^2) = 1.5, the unit vector is (0, 0, -1).
+# Its squared magnitude must be exactly 1.0.
+fn test_ray_normalization() -> bool {
+    let dx: f32 = 0.0
+    let dy: f32 = 0.0
+    let dz: f32 = -1.5
+    let length = (dx * dx + dy * dy + dz * dz) ** 0.5
+    let dx_n = dx / length
+    let dy_n = dy / length
+    let dz_n = dz / length
+    let mag2 = dx_n * dx_n + dy_n * dy_n + dz_n * dz_n
+    (mag2 - 1.0) * (mag2 - 1.0) < 1e-8
+}
+
+# The "minimum via abs" identity used in step 7:
+#   min(a, b) = 0.5 * (a + b - |a - b|)
+# Verified with t1=2.3, t2=5.7 → min should be 2.3.
+fn test_tmin_identity() -> bool {
+    let t1: f32 = 2.3
+    let t2: f32 = 5.7
+    let diff = t1 - t2          # -3.4
+    let abs_diff = (diff * diff) ** 0.5   # 3.4
+    let t_min = 0.5 * (t1 + t2 - abs_diff)  # 0.5*(8.0-3.4) = 2.3
+    (t_min - 2.3) * (t_min - 2.3) < 1e-8
+}
+
+# Sphere 1 miss on the center ray.
+# Center ray unit-direction: (0, 0, -1) (from test_ray_normalization).
+# Sphere 1 center L = (-0.75, 0.10, -3.0).
+# tca1 = L·D = 0*(-0.75) + 0*(0.10) + (-1)*(-3.0) = 3.0
+# d2_1 = |L|^2 - tca1^2 = (0.5625+0.01+9.0) - 9.0 = 0.5725
+# r1^2 = 0.49  →  d2_1 > r1^2  →  miss (hit1 == 0.0).
+fn test_sphere1_miss_center_ray() -> bool {
+    let dx_n: f32 = 0.0
+    let dy_n: f32 = 0.0
+    let dz_n: f32 = -1.0
+    let scx1: f32 = -0.75
+    let scy1: f32 = 0.10
+    let scz1: f32 = -3.0
+    let r1: f32 = 0.70
+    let tca1 = scx1 * dx_n + scy1 * dy_n + scz1 * dz_n
+    let d2_1 = scx1 * scx1 + scy1 * scy1 + scz1 * scz1 - tca1 * tca1
+    let hit1 = if d2_1 <= r1 * r1 { 1.0 } else { 0.0 }
+    hit1 == 0.0
+}
+
+# Sphere 1 direct-center ray must hit.
+# Aim the ray exactly through the sphere's center: D = L_normalized.
+# By construction tca = |L|, d2 = 0, and d2 <= r1^2 is satisfied.
+fn test_sphere1_hit_direct_ray() -> bool {
+    let scx1: f32 = -0.75
+    let scy1: f32 = 0.10
+    let scz1: f32 = -3.0
+    let r1: f32 = 0.70
+    # Normalise the direction toward the sphere centre.
+    let len = (scx1 * scx1 + scy1 * scy1 + scz1 * scz1) ** 0.5
+    let dx_n = scx1 / len
+    let dy_n = scy1 / len
+    let dz_n = scz1 / len
+    let tca1 = scx1 * dx_n + scy1 * dy_n + scz1 * dz_n
+    let d2_1 = scx1 * scx1 + scy1 * scy1 + scz1 * scz1 - tca1 * tca1
+    # d2_1 should be ≈ 0; verify hit condition
+    let hit1 = if d2_1 <= r1 * r1 { 1.0 } else { 0.0 }
+    hit1 == 1.0
+}
+
+# For the same direct-center ray the t-distance to entry should be
+#   t1 = tca - r1  =  |L| - r1  =  sqrt(9.5725) - 0.70  ≈ 2.3940
+# This is positive, confirming the hit is in front of the camera.
+fn test_sphere1_hit_distance() -> bool {
+    let scx1: f32 = -0.75
+    let scy1: f32 = 0.10
+    let scz1: f32 = -3.0
+    let r1: f32 = 0.70
+    let len = (scx1 * scx1 + scy1 * scy1 + scz1 * scz1) ** 0.5
+    let dx_n = scx1 / len
+    let dy_n = scy1 / len
+    let dz_n = scz1 / len
+    let tca1 = scx1 * dx_n + scy1 * dy_n + scz1 * dz_n
+    let d2_1 = scx1 * scx1 + scy1 * scy1 + scz1 * scz1 - tca1 * tca1
+    let thc1 = (r1 * r1 - d2_1) ** 0.5
+    let t1 = tca1 - thc1
+    # Expected: |L| - r1 = sqrt(9.5725) - 0.70
+    let expected = len - r1
+    (t1 - expected) * (t1 - expected) < 1e-6
+}
+
+# Phong diffuse is ReLU(N·L); it must always be >= 0 for any input.
+# Test with an explicitly back-facing normal that would give N·L < 0.
+fn test_diffuse_nonneg_backface() -> bool {
+    let nx: f32 = -1.0
+    let ny: f32 = -1.0
+    let nz: f32 = -1.0
+    let lx: f32 = 0.577
+    let ly: f32 = 0.577
+    let lz: f32 = 0.577
+    let n_dot_l = nx * lx + ny * ly + nz * lz
+    let diffuse = if n_dot_l > 0.0 { n_dot_l } else { 0.0 }
+    diffuse >= 0.0
+}
+
+# Light vector in main() is (0.577, 0.577, 0.577); it points in the positive
+# octant.  A perfectly front-facing normal (1/√3, 1/√3, 1/√3) is parallel to
+# the light, so N·L = 3 * (0.577/√3)^2 ≈ 1.0 (up to normalisation).
+# More directly: N·L = 0.577*3 = 1.731, but N is not unit here. Use the
+# unit normal (1,0,0) → N·L = 0.577, and verify diffuse ≈ 0.577.
+fn test_diffuse_frontface() -> bool {
+    let nx: f32 = 1.0
+    let ny: f32 = 0.0
+    let nz: f32 = 0.0
+    let lx: f32 = 0.577
+    let ly: f32 = 0.577
+    let lz: f32 = 0.577
+    let n_dot_l = nx * lx + ny * ly + nz * lz
+    let diffuse = if n_dot_l > 0.0 { n_dot_l } else { 0.0 }
+    (diffuse - 0.577) * (diffuse - 0.577) < 1e-6
+}

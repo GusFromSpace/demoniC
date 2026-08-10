@@ -1,0 +1,108 @@
+# enum_shape.dmc — payload-carrying enum variants (#350 Part 2): first-class
+# tagged unions with pattern binding, the language form of the tagged-`model`
+# idiom (SPEC §4.5 / examples/ast_eval.dmc).
+#
+# A variant may carry positional data — `Circle(i64)`, `Rect(i64, i64)` — and a
+# `match` arm binds that data: `Circle(r) => ...`. Tag-only variants (`Empty`,
+# the #336 form) mix freely with payload variants. Construction is qualified:
+# `Shape.Circle(2)`.
+#
+# Pattern arms come two ways, both shown below: bare `Circle(r)` (the enum is
+# resolved from the scrutinee) and qualified `Shape.Rect(w, h)`.
+#
+#   Run:   dmc run examples/enum_shape.dmc
+#   Test:  dmc test examples/enum_shape.dmc
+#   JIT:   dmc jit examples/enum_shape.dmc   (also `dmc test --jit`)
+#
+# Payload variants JIT-lower end-to-end (#350 Part 2b): a value is a forge
+# `[tag, slots…]` region (one 8-byte slot per variant-field, no sharing),
+# construction stores the tag + payload, and a `match` arm loads the slots into
+# the bound names. This file is in the JIT parity set. Scalar payloads only
+# (i32/i64/f32/f64/bool); other payload types run under `dmc run`/`dmc test`.
+
+enum Shape {
+    Circle(i64),       # radius
+    Rect(i64, i64),    # width, height
+    Empty,             # tag-only variant, no payload
+}
+
+# Integer "area" (π elided — this is about the tagged union, not geometry).
+# Exhaustive: every variant handled, no catch-all. Bare `Circle(r)` and
+# qualified `Shape.Rect(w, h)` patterns both bind their payloads.
+fn area(s: Shape) -> i64 {
+    match s {
+        Circle(r)        => 3 * r * r,
+        Shape.Rect(w, h) => w * h,
+        Empty            => 0,
+    }
+}
+
+# A perimeter, to exercise binding the same payloads differently.
+fn perimeter(s: Shape) -> i64 {
+    match s {
+        Circle(r)  => 6 * r,            # ~2πr
+        Rect(w, h) => 2 * (w + h),
+        Empty      => 0,
+    }
+}
+
+# Tag-only discrimination still works on payload-bearing enums: a catch-all `_`
+# covers everything that is not `Empty`.
+fn is_empty(s: Shape) -> bool {
+    match s {
+        Empty => true,
+        _     => false,
+    }
+}
+
+# Report one shape's metrics. (Enums aren't tensor elements, so we don't build a
+# `[...]` literal of them — that syntax makes a numeric tensor.)
+fn report(s: Shape) -> nil {
+    print("area=" + (area(s) as str) + " perim=" + (perimeter(s) as str)
+          + " empty=" + (is_empty(s) as str))
+    nil
+}
+
+fn main() -> nil {
+    report(Shape.Circle(2))
+    report(Shape.Rect(3, 4))
+    report(Shape.Empty)
+    nil
+}
+
+fn test_circle_payload() -> bool {
+    area(Shape.Circle(2)) == 12 && perimeter(Shape.Circle(2)) == 12
+}
+
+fn test_rect_payload() -> bool {
+    area(Shape.Rect(3, 4)) == 12 && perimeter(Shape.Rect(3, 4)) == 14
+}
+
+fn test_tag_only_variant() -> bool {
+    area(Shape.Empty) == 0 && is_empty(Shape.Empty) && !is_empty(Shape.Circle(1))
+}
+
+fn test_ordinals_unchanged() -> bool {
+    # `as i64` still yields the declaration-order ordinal — payloads don't shift it.
+    (Shape.Circle(9) as i64) == 0 && (Shape.Rect(1, 1) as i64) == 1 && (Shape.Empty as i64) == 2
+}
+
+# ── Float payloads ──────────────────────────────────────────────────────────
+# A second enum exercises f32 / f64 payload slots (stored bit-for-bit and
+# reloaded), the same way `ast_eval.dmc`'s i64 fields do — here under the
+# first-class form, JIT-parity-checked.
+enum Num { I(i64), F(f32), D(f64), Zero }
+
+fn to_f64(n: Num) -> f64 {
+    match n {
+        I(x) => x as f64,
+        F(x) => x as f64,
+        D(x) => x,
+        Zero => 0.0,
+    }
+}
+
+fn test_f32_payload() -> bool { to_f64(Num.F(2.5 as f32)) == 2.5 }
+fn test_f64_payload() -> bool { to_f64(Num.D(3.25)) == 3.25 }
+fn test_i64_payload() -> bool { to_f64(Num.I(7)) == 7.0 }
+fn test_num_zero() -> bool { to_f64(Num.Zero) == 0.0 && (Num.Zero as i64) == 3 }

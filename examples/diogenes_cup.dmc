@@ -1,0 +1,41 @@
+fn assess_possession(has_cup: bool, method: str) -> bool {
+    if method == "hands" {
+        print("Diogenes: A child has beaten me in simplicity of living.")
+        false
+    } else {
+        has_cup
+    }
+}
+
+fn main() -> nil {
+    let mut has_cup = true
+    print("Diogenes has a cup.")
+    has_cup = assess_possession(has_cup, "hands")
+    if !has_cup {
+        print("Diogenes throws away the cup.")
+    }
+    nil
+}
+
+# When method == "hands", the function always returns false regardless of has_cup.
+# This is the branch that executes the "child beaten me" print and returns false.
+fn test_hands_always_returns_false() -> bool {
+    let r1 = assess_possession(true, "hands")
+    let r2 = assess_possession(false, "hands")
+    !r1 && !r2
+}
+
+# When method is anything other than "hands", the function returns has_cup unchanged.
+# The else branch is simply `has_cup`, so true->true and false->false.
+fn test_other_method_returns_has_cup_unchanged() -> bool {
+    let r_true = assess_possession(true, "pocket")
+    let r_false = assess_possession(false, "pocket")
+    r_true && !r_false
+}
+
+# Confirm the exact sequence from main: start true, apply "hands", get false.
+fn test_main_sequence_loses_cup() -> bool {
+    let mut has_cup = true
+    has_cup = assess_possession(has_cup, "hands")
+    !has_cup
+}

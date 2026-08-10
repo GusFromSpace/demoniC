@@ -1,0 +1,157 @@
+# jit_transformer_demo.dmc -- Phase 4 JIT slice 5 (issue #15).
+#
+# Fused ML primitives composed into a single transformer-style block:
+# `layer_norm`, `softmax`, `rms_norm`, plus per-axis variants of the
+# variance trait. Every fused primitive is one JIT call -- no
+# intermediate tensors, no FFI to BLAS for the reduction kernels.
+#
+# Run:
+#   dmc jit examples/jit_transformer_demo.dmc
+
+# ─── Scalar math sanity ───────────────────────────────────────────────────
+
+fn show(label: i64, v: f32) -> nil {
+    print_i64(label)
+    print_i64((v * 1000.0) as i64)
+}
+
+# ─── Fused normalization primitives ───────────────────────────────────────
+
+# layer_norm + affine, all in one JIT-emitted kernel.
+fn ln_then_scale[D](
+    x: Tensor[f32, [D]],
+    g: Tensor[f32, [D]],
+    b: Tensor[f32, [D]],
+    eps: f32,
+    s: f32,
+) -> Tensor[f32, [D]] {
+    s .* layer_norm(x, g, b, eps)
+}
+
+# rms_norm output rescaled by a learnable per-channel gain.
+fn rms_then_relu[D](x: Tensor[f32, [D]], g: Tensor[f32, [D]], eps: f32) -> f32 {
+    sum(rms_norm(x, g, eps))
+}
+
+# ─── Per-axis variance trait ──────────────────────────────────────────────
+
+# Pull each row of a 2D field toward its row mean -- the "variance-
+# minimizing rabbit" trait applied per-row instead of globally.
+fn per_row_relax[M, N](field: Tensor[f32, [M, N]], alpha: f32) -> Tensor[f32, [M, N]] {
+    pull_to_mean_along(field, 1, alpha)
+}
+
+fn main() -> i64 {
+    # ─── Softmax: probability simplex test ────────────────────────────────
+    let logits = [1.0, 2.0, 3.0, 4.0]
+    let probs = softmax(logits)
+    print_i64((sum(probs) * 1000.0) as i64)   # 1000 (sums to 1)
+
+    # ─── layer_norm: zero-mean, unit-variance after normalization ─────────
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let g = [1.0, 1.0, 1.0, 1.0, 1.0]
+    let b = [0.0, 0.0, 0.0, 0.0, 0.0]
+    let xn = layer_norm(x, g, b, 0.0001)
+    print_i64((mean(xn) * 1000.0) as i64)      # ≈ 0
+    print_i64((variance(xn) * 1000.0) as i64)  # ≈ 1000 (unit variance)
+
+    # ─── rms_norm: scaled to unit-RMS ─────────────────────────────────────
+    show(3, rms_then_relu(x, g, 0.0001))
+
+    # ─── Per-axis variance trait: row-wise relaxation ────────────────────
+    let M = [[1.0, 2.0, 3.0, 4.0],
+             [10.0, 20.0, 30.0, 40.0],
+             [100.0, 100.0, 100.0, 100.0]]
+    # alpha=1 along axis 1 -> each row becomes its row mean.
+    let M_uniform = per_row_relax(M, 1.0)
+    # variance along axis 1 should be 0 everywhere -> sum = 0
+    print_i64(sum(variance_along(M_uniform, 1)) as i64)
+
+    # Per-column relaxation (axis=0): each column becomes its column mean
+    let M_cols = pull_to_mean_along(M, 0, 1.0)
+    print_i64(sum(variance_along(M_cols, 0)) as i64)
+
+    # ─── Transformer-block-sized chunk in 6 lines ─────────────────────────
+    # x' = layer_norm(x) * scale + bias_via_softmax_weighting
+    let attn_w = softmax([0.5, 0.5, 0.0, 0.0, 0.0])    # 5-element attn dist
+    print_i64((attn_w[0] * 10000.0) as i64)             # ≈ 3318 (~e^0.5 weighting)
+
+    0
+}
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+
+# Invariant: softmax outputs form a probability distribution summing to 1.
+fn test_softmax_sums_to_one() -> bool {
+    let logits = [1.0, 2.0, 3.0, 4.0]
+    let probs = softmax(logits)
+    let s = sum(probs)
+    abs(s - 1.0) < 0.0001
+}
+
+# Invariant: softmax is order-preserving (larger input → larger output).
+# With inputs [1,2,3,4], the last element (index 3) has the highest
+# softmax value, and the first (index 0) has the lowest.
+fn test_softmax_order_preserving() -> bool {
+    let logits = [1.0, 2.0, 3.0, 4.0]
+    let probs = softmax(logits)
+    probs[3] > probs[0]
+}
+
+# Invariant: layer_norm centers the output — mean should be ≈ 0.
+# With g=ones, b=zeros, layer_norm(x) = (x - mean(x)) / std(x).
+# By construction the mean of the output is 0.
+fn test_layer_norm_zero_mean() -> bool {
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let g = [1.0, 1.0, 1.0, 1.0, 1.0]
+    let b = [0.0, 0.0, 0.0, 0.0, 0.0]
+    let xn = layer_norm(x, g, b, 0.0001)
+    let m = mean(xn)
+    abs(m) < 0.0001
+}
+
+# Invariant: layer_norm produces unit-variance output.
+# After normalizing x = [1..5] with all-ones gain and zero bias,
+# population variance = 1 (the normalization target).
+fn test_layer_norm_unit_variance() -> bool {
+    let x = [1.0, 2.0, 3.0, 4.0, 5.0]
+    let g = [1.0, 1.0, 1.0, 1.0, 1.0]
+    let b = [0.0, 0.0, 0.0, 0.0, 0.0]
+    let xn = layer_norm(x, g, b, 0.0001)
+    let v = variance(xn)
+    abs(v - 1.0) < 0.001
+}
+
+# Invariant: pull_to_mean_along with alpha=1 makes each row uniform,
+# so the row-variance (variance_along axis 1) is 0 for every row,
+# and the total sum is 0.
+fn test_per_row_relax_zero_variance() -> bool {
+    let M = [[1.0, 2.0, 3.0, 4.0],
+             [10.0, 20.0, 30.0, 40.0],
+             [100.0, 100.0, 100.0, 100.0]]
+    let M_uniform = per_row_relax(M, 1.0)
+    let total_var = sum(variance_along(M_uniform, 1))
+    abs(total_var) < 0.0001
+}
+
+# Justified closed-form: softmax([0.5, 0.5, 0, 0, 0])[0].
+# exp(0.5) ≈ 1.64872, exp(0) = 1.
+# sum = 2 * 1.64872 + 3 * 1 = 6.29744
+# softmax[0] = 1.64872 / 6.29744 ≈ 0.26181
+fn test_softmax_attn_weight() -> bool {
+    let attn_w = softmax([0.5, 0.5, 0.0, 0.0, 0.0])
+    let got = attn_w[0]
+    abs(got - 0.26181) < 0.001
+}
+
+# Invariant: ln_then_scale with scale=1 preserves layer_norm output up to
+# mean/variance — the scaled output should still have mean ≈ 0 and variance ≈ 1.
+fn test_ln_then_scale_identity() -> bool {
+    let x = [2.0, 4.0, 6.0, 8.0]
+    let g = [1.0, 1.0, 1.0, 1.0]
+    let b = [0.0, 0.0, 0.0, 0.0]
+    let out = ln_then_scale(x, g, b, 0.0001, 1.0)
+    let m = mean(out)
+    let v = variance(out)
+    abs(m) < 0.0001 && abs(v - 1.0) < 0.001
+}

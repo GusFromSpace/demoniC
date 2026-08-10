@@ -1,0 +1,104 @@
+# fused_attn.dmc — stdlib `attn` and the `@fuse` contract.
+# Normative since spec 0.0.3. See STDLIB.md §3.1 and SPEC.md §7.6.
+
+# `attn` from the stdlib computes softmax((q @ k') / sqrt(D)) @ v in
+# a single FlashAttention-style fused kernel. The [B, H, S, S] score
+# matrix never lives in the Forge — it exists only in registers,
+# tile by tile.
+
+fn attn_block[B, H, S, D](
+    q: Tensor[f32, [B, H, S, D]],
+    k: Tensor[f32, [B, H, S, D]],
+    v: Tensor[f32, [B, H, S, D]],
+    mask: View[bool, [S, S]],
+) -> Tensor[f32, [B, H, S, D]] {
+    attn(q, k, v, mask)
+}
+
+# `@fuse` extends the same single-kernel guarantee to user code.
+# Use it when you want stdlib-grade fusion for a hand-written variant
+# the JIT's heuristic wouldn't otherwise collapse.
+
+fn manual_attn[B, H, S, D](
+    q: Tensor[f32, [B, H, S, D]],
+    k: Tensor[f32, [B, H, S, D]],
+    v: Tensor[f32, [B, H, S, D]],
+) -> Tensor[f32, [B, H, S, D]] {
+    @fuse {
+        softmax((q @ k') .* (1.0 / sqrt(D as f32)), -1) @ v
+    }
+}
+
+# Autoregressive decode: KV operands carry the streaming axis `~`,
+# letting attn read the live cache extent at entry with no shape
+# recomputation per call.
+
+fn decode_step[B, H, D](
+    q:       Tensor[f32, [B, H, 1, D]],
+    cache_k: KV[f32, [B, H, ~, D]],
+    cache_v: KV[f32, [B, H, ~, D]],
+) -> Tensor[f32, [B, H, 1, D]] {
+    attn(q, cache_k, cache_v, nil)
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+fn absf_fa(x: f32) -> f32 {
+    if x < 0.0f32 { 0.0f32 - x } else { x }
+}
+
+# Invariant: softmax(scores) @ 0 = 0 for any Q, K.
+# With V = zeros, the output of manual_attn must be the zero tensor,
+# because any convex combination (attention weights) of zero rows is zero.
+fn test_manual_attn_zeros_v() -> bool {
+    let q = forge.zeros[f32, [1, 1, 2, 4]]
+    let k = forge.zeros[f32, [1, 1, 2, 4]]
+    let v = forge.zeros[f32, [1, 1, 2, 4]]
+    let out = manual_attn(q, k, v)
+    sum(out .* out) < 0.0001f32
+}
+
+# Invariant: when S=1 the softmax over a single key is [1.0],
+# so the output is exactly V (single-token passthrough).
+# With v[0,0,0,0]=2 and v[0,0,0,1]=3, output == v.
+fn test_manual_attn_s1_passthrough() -> bool {
+    let q = forge.zeros[f32, [1, 1, 1, 4]]
+    let k = forge.zeros[f32, [1, 1, 1, 4]]
+    let !v = forge.zeros[f32, [1, 1, 1, 4]]
+    v[0, 0, 0, 0] = 2.0f32
+    v[0, 0, 0, 1] = 3.0f32
+    let out = manual_attn(q, k, v)
+    absf_fa(out[0, 0, 0, 0] - 2.0f32) < 0.0001f32 && absf_fa(out[0, 0, 0, 1] - 3.0f32) < 0.0001f32
+}
+
+# Invariant: when Q=K=zeros (all scores equal), softmax yields uniform
+# weights 1/S = 0.5 over S=2 keys. With V=ones the output is
+# sum(uniform_weights .* ones_rows) = mean of V rows = ones.
+# sum(output) = B*H*S*D = 1*1*2*4 = 8.0.
+fn test_manual_attn_uniform_weights_ones_v() -> bool {
+    let q = forge.zeros[f32, [1, 1, 2, 4]]
+    let k = forge.zeros[f32, [1, 1, 2, 4]]
+    let !v = forge.zeros[f32, [1, 1, 2, 4]]
+    v[0, 0, 0, 0] = 1.0f32  v[0, 0, 0, 1] = 1.0f32  v[0, 0, 0, 2] = 1.0f32  v[0, 0, 0, 3] = 1.0f32
+    v[0, 0, 1, 0] = 1.0f32  v[0, 0, 1, 1] = 1.0f32  v[0, 0, 1, 2] = 1.0f32  v[0, 0, 1, 3] = 1.0f32
+    let out = manual_attn(q, k, v)
+    absf_fa(sum(out) - 8.0f32) < 0.001f32
+}
+
+# Invariant: when all Q-rows and K-rows are identical, the scores matrix
+# is uniform (all entries equal), so softmax gives equal weights across
+# keys. With V = [[1,0,0,0],[0,0,0,0]] (only row 0 is nonzero),
+# each output row = 0.5*[1,0,0,0] + 0.5*[0,0,0,0] = [0.5,0,0,0].
+# Check: sum(out) = B*H*S * 0.5 = 1*1*2 * 0.5 = 1.0.
+fn test_manual_attn_uniform_qk_mixed_v() -> bool {
+    let !q = forge.zeros[f32, [1, 1, 2, 4]]
+    q[0, 0, 0, 0] = 1.0f32  q[0, 0, 0, 1] = 1.0f32
+    q[0, 0, 1, 0] = 1.0f32  q[0, 0, 1, 1] = 1.0f32
+    let !k = forge.zeros[f32, [1, 1, 2, 4]]
+    k[0, 0, 0, 0] = 1.0f32  k[0, 0, 0, 1] = 1.0f32
+    k[0, 0, 1, 0] = 1.0f32  k[0, 0, 1, 1] = 1.0f32
+    let !v = forge.zeros[f32, [1, 1, 2, 4]]
+    v[0, 0, 0, 0] = 1.0f32
+    let out = manual_attn(q, k, v)
+    absf_fa(sum(out) - 1.0f32) < 0.001f32
+}

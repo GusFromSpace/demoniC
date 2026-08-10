@@ -1,0 +1,395 @@
+# demonivm.dmc — a tiny stack-based bytecode virtual machine ("demoniVM").
+#
+# A program is a flat u8 tensor of bytecode. The VM fetch-decode-executes it
+# against an integer operand stack plus a small memory, both held in the Forge.
+# Because opcodes, operands, and jump targets are read out of an integer tensor,
+# every fetch round-trips as a real integer — so arithmetic, comparisons, and
+# branch addresses behave exactly as written (see #125). Showcases: integer
+# tensor element reads, indexed stack/memory mutation, and a fetch-decode-
+# execute loop with backward jumps (a real loop running as bytecode).
+#
+# Instruction set (one byte each; ops marked * carry a one-byte operand):
+#   0 HALT            stop
+#   1 PUSH  * imm     push the next byte
+#   2 ADD             pop b, pop a, push a + b
+#   3 SUB             pop b, pop a, push a - b
+#   4 MUL             pop b, pop a, push a * b
+#   5 PRINT           pop and print
+#   6 JMP   * addr    jump to addr (absolute byte offset)
+#   7 JZ    * addr    pop; if zero, jump to addr
+#   8 LOAD  * slot    push mem[slot]
+#   9 STORE * slot    pop into mem[slot]
+
+fn run[P](code: Tensor[u8, [P]]) -> nil {
+    let !stack = forge.zeros[i64, [32]]
+    let !mem   = forge.zeros[i64, [8]]
+    let !sp = 0
+    let !pc = 0
+    let !running = true
+
+    while running {
+        let op = code[pc]
+        pc = pc + 1
+
+        if op == 0 {           # HALT
+            running = false
+        }
+        if op == 1 {           # PUSH imm
+            let imm = code[pc]
+            pc = pc + 1
+            stack[sp] = imm
+            sp = sp + 1
+        }
+        if op == 2 {           # ADD
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a + b
+            sp = sp + 1
+        }
+        if op == 3 {           # SUB
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a - b
+            sp = sp + 1
+        }
+        if op == 4 {           # MUL
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a * b
+            sp = sp + 1
+        }
+        if op == 5 {           # PRINT
+            sp = sp - 1
+            print(format("  => {}", stack[sp]))
+        }
+        if op == 6 {           # JMP addr
+            pc = code[pc]
+        }
+        if op == 7 {           # JZ addr
+            let addr = code[pc]
+            pc = pc + 1
+            sp = sp - 1
+            if stack[sp] == 0 {
+                pc = addr
+            }
+        }
+        if op == 8 {           # LOAD slot
+            let slot = code[pc]
+            pc = pc + 1
+            stack[sp] = mem[slot]
+            sp = sp + 1
+        }
+        if op == 9 {           # STORE slot
+            let slot = code[pc]
+            pc = pc + 1
+            sp = sp - 1
+            mem[slot] = stack[sp]
+        }
+    }
+    nil
+}
+
+# run_ret: identical VM but returns the top-of-stack value at HALT
+# instead of printing, so test functions can assert on results.
+fn run_ret[P](code: Tensor[u8, [P]]) -> i64 {
+    let !stack = forge.zeros[i64, [32]]
+    let !mem   = forge.zeros[i64, [8]]
+    let !sp = 0
+    let !pc = 0
+    let !running = true
+    let !result = 0i64
+
+    while running {
+        let op = code[pc]
+        pc = pc + 1
+
+        if op == 0 {           # HALT
+            running = false
+            if sp > 0 {
+                result = stack[sp - 1]
+            }
+        }
+        if op == 1 {           # PUSH imm
+            let imm = code[pc]
+            pc = pc + 1
+            stack[sp] = imm
+            sp = sp + 1
+        }
+        if op == 2 {           # ADD
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a + b
+            sp = sp + 1
+        }
+        if op == 3 {           # SUB
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a - b
+            sp = sp + 1
+        }
+        if op == 4 {           # MUL
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a * b
+            sp = sp + 1
+        }
+        if op == 5 {           # PRINT (no-op in run_ret)
+            sp = sp - 1
+        }
+        if op == 6 {           # JMP addr
+            pc = code[pc]
+        }
+        if op == 7 {           # JZ addr
+            let addr = code[pc]
+            pc = pc + 1
+            sp = sp - 1
+            if stack[sp] == 0 {
+                pc = addr
+            }
+        }
+        if op == 8 {           # LOAD slot
+            let slot = code[pc]
+            pc = pc + 1
+            stack[sp] = mem[slot]
+            sp = sp + 1
+        }
+        if op == 9 {           # STORE slot
+            let slot = code[pc]
+            pc = pc + 1
+            sp = sp - 1
+            mem[slot] = stack[sp]
+        }
+    }
+    result
+}
+
+# run_ret_mem: like run_ret but returns mem[slot] at HALT (for loop programs)
+fn run_ret_mem[P](code: Tensor[u8, [P]], slot: i64) -> i64 {
+    let !stack = forge.zeros[i64, [32]]
+    let !mem   = forge.zeros[i64, [8]]
+    let !sp = 0
+    let !pc = 0
+    let !running = true
+    let !result = 0i64
+
+    while running {
+        let op = code[pc]
+        pc = pc + 1
+
+        if op == 0 {           # HALT
+            running = false
+            result = mem[slot]
+        }
+        if op == 1 {           # PUSH imm
+            let imm = code[pc]
+            pc = pc + 1
+            stack[sp] = imm
+            sp = sp + 1
+        }
+        if op == 2 {           # ADD
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a + b
+            sp = sp + 1
+        }
+        if op == 3 {           # SUB
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a - b
+            sp = sp + 1
+        }
+        if op == 4 {           # MUL
+            let b = stack[sp - 1]
+            let a = stack[sp - 2]
+            sp = sp - 2
+            stack[sp] = a * b
+            sp = sp + 1
+        }
+        if op == 5 {           # PRINT (no-op in run_ret_mem)
+            sp = sp - 1
+        }
+        if op == 6 {           # JMP addr
+            pc = code[pc]
+        }
+        if op == 7 {           # JZ addr
+            let addr = code[pc]
+            pc = pc + 1
+            sp = sp - 1
+            if stack[sp] == 0 {
+                pc = addr
+            }
+        }
+        if op == 8 {           # LOAD slot
+            let slot2 = code[pc]
+            pc = pc + 1
+            stack[sp] = mem[slot2]
+            sp = sp + 1
+        }
+        if op == 9 {           # STORE slot
+            let slot2 = code[pc]
+            pc = pc + 1
+            sp = sp - 1
+            mem[slot2] = stack[sp]
+        }
+    }
+    result
+}
+
+# test_push_halt: PUSH 42, HALT — simplest program; result must be 42.
+# Justification: opcode 1 (PUSH) copies the immediate byte onto the stack;
+# opcode 0 (HALT) snapshots stack[sp-1]. 42 is the literal byte pushed.
+fn test_push_halt() -> bool {
+    let prog = [1u8, 42u8, 0u8]
+    let got = run_ret[3](prog)
+    got == 42
+}
+
+# test_add: PUSH 7, PUSH 5, ADD, HALT → 7 + 5 = 12.
+# Justification: ADD pops b=5 and a=7, pushes a+b=12.
+fn test_add() -> bool {
+    let prog = [1u8, 7u8, 1u8, 5u8, 2u8, 0u8]
+    let got = run_ret[6](prog)
+    got == 12
+}
+
+# test_sub: PUSH 100, PUSH 58, SUB, HALT → 100 - 58 = 42.
+# Justification: SUB pops b=58 and a=100, pushes a-b=42.
+# This mirrors prog2 from main (documented result 42).
+fn test_sub() -> bool {
+    let prog = [1u8, 100u8, 1u8, 58u8, 3u8, 0u8]
+    let got = run_ret[6](prog)
+    got == 42
+}
+
+# test_mul: PUSH 6, PUSH 7, MUL, HALT → 6 * 7 = 42.
+# Justification: MUL pops b=7 and a=6, pushes a*b=42.
+fn test_mul() -> bool {
+    let prog = [1u8, 6u8, 1u8, 7u8, 4u8, 0u8]
+    let got = run_ret[6](prog)
+    got == 42
+}
+
+# test_mul_chain: (7 + 5) * 3 = 36.
+# Justification: 7+5=12, 12*3=36. Mirrors prog1 from main (documented result 36).
+# Bytecode: PUSH 7, PUSH 5, ADD, PUSH 3, MUL, HALT
+fn test_mul_chain() -> bool {
+    let prog = [1u8, 7u8, 1u8, 5u8, 2u8, 1u8, 3u8, 4u8, 0u8]
+    let got = run_ret[9](prog)
+    got == 36
+}
+
+# test_store_load: PUSH 99, STORE 0, LOAD 0, HALT → mem[0]=99, stack top=99.
+# Justification: STORE pops 99 into mem[0]; LOAD pushes mem[0]=99 back.
+# Round-trip through memory slot must be identity.
+fn test_store_load() -> bool {
+    let prog = [1u8, 99u8, 9u8, 0u8, 8u8, 0u8, 0u8]
+    let got = run_ret[7](prog)
+    got == 99
+}
+
+# test_loop_sum: sum 1+2+3+4+5 = 15 via backward-jumping bytecode loop.
+# Justification: closed-form sum = n*(n+1)/2 = 5*6/2 = 15.
+# Program mirrors prog3 from main (documented result 15), result in mem[0].
+# Bytecode layout (see main comments for offsets):
+#   0:  PUSH 0 / STORE 0  (acc=0)
+#   4:  PUSH 5 / STORE 1  (i=5)
+#   8:  LOAD 1 / JZ 28    (while i != 0)
+#   12: LOAD 0 / LOAD 1 / ADD / STORE 0  (acc += i)
+#   19: LOAD 1 / PUSH 1 / SUB / STORE 1  (i -= 1)
+#   26: JMP 8
+#   28: HALT
+fn test_loop_sum() -> bool {
+    let prog = [
+        1u8, 0u8, 9u8, 0u8,
+        1u8, 5u8, 9u8, 1u8,
+        8u8, 1u8, 7u8, 28u8,
+        8u8, 0u8, 8u8, 1u8, 2u8, 9u8, 0u8,
+        8u8, 1u8, 1u8, 1u8, 3u8, 9u8, 1u8,
+        6u8, 8u8,
+        0u8
+    ]
+    let got = run_ret_mem[29](prog, 0i64)
+    got == 15
+}
+
+# test_jz_taken: PUSH 0, JZ 5, PUSH 99, HALT (JZ taken → skip PUSH 99).
+# Then PUSH 7, HALT at offset 5. Result should be 7.
+# Justification: JZ pops 0 (zero), so jumps to offset 5.
+# At offset 5: PUSH 7, HALT → stack top = 7.
+# If JZ NOT taken, we'd fall through to PUSH 99 and get 99.
+# Bytecode: [PUSH,0, JZ,5, PUSH,99, HALT=0 at 6, PUSH,7, HALT=0]
+fn test_jz_taken() -> bool {
+    # off 0: PUSH 0        -> [1,0]
+    # off 2: JZ 7          -> [7,7]   (jump to offset 7 when zero)
+    # off 4: PUSH 99       -> [1,99]
+    # off 6: HALT          -> [0]
+    # off 7: PUSH 7        -> [1,7]
+    # off 9: HALT          -> [0]
+    let prog = [1u8, 0u8, 7u8, 7u8, 1u8, 99u8, 0u8, 1u8, 7u8, 0u8]
+    let got = run_ret[10](prog)
+    got == 7
+}
+
+# test_jz_not_taken: PUSH 1, JZ (skip), PUSH 55, HALT → 55.
+# Justification: JZ pops 1 (nonzero), does NOT jump → falls through to PUSH 55.
+fn test_jz_not_taken() -> bool {
+    # off 0: PUSH 1        -> [1,1]
+    # off 2: JZ 7          -> [7,7]   (no jump because popped value = 1)
+    # off 4: PUSH 55       -> [1,55]
+    # off 6: HALT          -> [0]
+    # off 7 (dead): PUSH 0 -> [1,0]
+    # off 9: HALT          -> [0]
+    let prog = [1u8, 1u8, 7u8, 7u8, 1u8, 55u8, 0u8, 1u8, 0u8, 0u8]
+    let got = run_ret[10](prog)
+    got == 55
+}
+
+fn main() -> nil {
+    print("demoniVM — tiny bytecode stack machine")
+
+    # prog1: (7 + 5) * 3 = 36
+    print("prog1: (7 + 5) * 3")
+    let prog1 = [1u8, 7u8, 1u8, 5u8, 2u8, 1u8, 3u8, 4u8, 5u8, 0u8]
+    run[10](prog1)
+
+    # prog2: 100 - 58 = 42
+    print("prog2: 100 - 58")
+    let prog2 = [1u8, 100u8, 1u8, 58u8, 3u8, 5u8, 0u8]
+    run[7](prog2)
+
+    # prog3: sum i for i = 5..1, via a backward-jumping loop.
+    #   mem[0] = acc, mem[1] = i
+    #   acc = 0; i = 5
+    #   while i != 0 { acc += i; i -= 1 }
+    #   print acc            -> 5+4+3+2+1 = 15
+    #
+    #   off  instr            bytes
+    #   0    PUSH 0 / STORE 0   1,0, 9,0
+    #   4    PUSH 5 / STORE 1   1,5, 9,1
+    #   8    LOAD 1 / JZ 28     8,1, 7,28      <- loop top = 8
+    #   12   LOAD 0 LOAD 1 ADD STORE 0   8,0, 8,1, 2, 9,0
+    #   19   LOAD 1 PUSH 1 SUB STORE 1   8,1, 1,1, 3, 9,1
+    #   26   JMP 8             6,8
+    #   28   LOAD 0 PRINT HALT  8,0, 5, 0     <- end = 28
+    print("prog3: sum 5+4+3+2+1 (looped in bytecode)")
+    let prog3 = [
+        1u8, 0u8, 9u8, 0u8,
+        1u8, 5u8, 9u8, 1u8,
+        8u8, 1u8, 7u8, 28u8,
+        8u8, 0u8, 8u8, 1u8, 2u8, 9u8, 0u8,
+        8u8, 1u8, 1u8, 1u8, 3u8, 9u8, 1u8,
+        6u8, 8u8,
+        8u8, 0u8, 5u8, 0u8
+    ]
+    run[32](prog3)
+
+    nil
+}

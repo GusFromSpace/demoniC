@@ -1,0 +1,157 @@
+# doom_fire.dmc — the legendary DOOM fire effect, ported to demoniC.
+#
+# This is the classic 1993 visual effect from the title screen and behind
+# the status bar. Pure cellular automata on a heat field. Rises, flickers,
+# dies out at the top.
+#
+# No assets. No external libs. Runs under `dmc run`.
+# Uses Forge for the buffer (brutalist allocation).
+# Renders as ASCII in the terminal (clear + home via ESC).
+#
+# Usage:
+#   dmc run examples/doom_fire.dmc
+#
+# Controls in this demo: runs for a while then stops.
+# Tweak HEIGHT, WIDTH, FRAMES, DELAY for your terminal.
+
+# Palette chars, dark (cool) to bright (hot). Classic feel.
+let PALETTE = " .:-=+*#%@"
+
+fn heat_to_char(h: i64) -> str {
+    let n = len(PALETTE)
+    # map 0..36 heat into palette range
+    let scaled = if h <= 0 { 0 } else if h >= 36 { n - 1 } else { (h * (n - 1)) / 36 }
+    let b = PALETTE[scaled] as i64
+    chr(b)
+}
+
+fn main() -> nil {
+    let WIDTH  = 64
+    let HEIGHT = 32
+    let FRAMES = 120
+    let DELAY  = 25   # ms per frame, tune for speed
+
+    # Heat buffer in Forge. 0 = cold/black, ~36 = white/hot
+    let !fire = forge.zeros[i64, [HEIGHT, WIDTH]]
+
+    # Seed the bottom row with high heat + a little variation
+    let !x = 0
+    while x < WIDTH {
+        let base = 32
+        let jitter = if (x % 3 == 0) { 4 } else { 0 }
+        fire[HEIGHT - 1, x] = base + jitter
+        x = x + 1
+    }
+
+    let ESC = chr(27)
+    let CLEAR_HOME = ESC + "[2J" + ESC + "[H"
+
+    let !frame = 0
+    while frame < FRAMES {
+        # --- update fire ---
+        # Classic DOOM-style: each cell takes heat from below (with slight
+        # horizontal offset for wind) and decays by a small random amount.
+        let !y = 0
+        while y < HEIGHT - 1 {
+            let !x = 0
+            while x < WIDTH {
+                # pick a source slightly left/center/right on the row below
+                let offset = rand_int(0, 3) - 1   # -1, 0, +1
+                let src_x  = (x + offset + WIDTH) % WIDTH
+                let src    = fire[y + 1, src_x]
+
+                let decay  = rand_int(0, 4)       # 0-3
+                let new_h  = src - decay
+                fire[y, x] = if new_h < 0 { 0 } else { new_h }
+
+                x = x + 1
+            }
+            y = y + 1
+        }
+
+        # Occasionally re-heat the very bottom for sustained fire
+        if (frame % 4 == 0) {
+            let !xx = 0
+            while xx < WIDTH {
+                if (rand_int(0, 5) == 0) {
+                    fire[HEIGHT - 1, xx] = 35 + rand_int(0, 2)
+                }
+                xx = xx + 1
+            }
+        }
+
+        # --- render ---
+        print(CLEAR_HOME)
+        print("DOOM fire in demoniC  —  frame " + to_str(frame))
+
+        let !row = 0
+        while row < HEIGHT {
+            let !line = ""
+            let !col = 0
+            while col < WIDTH {
+                let h = fire[row, col]
+                line = line + heat_to_char(h)
+                col = col + 1
+            }
+            print(line)
+            row = row + 1
+        }
+
+        sleep_ms(DELAY)
+        frame = frame + 1
+    }
+
+    print("fire extinguished.")
+    nil
+}
+
+# Honest test: seed the bottom, run the REAL propagation, and assert the
+# defining structure of fire — heat enters at the bottom, rises, and decays
+# upward. (The original test allocated a buffer and did one manual decay step;
+# it never exercised the effect, so it "passed" while testing nothing.)
+fn test_fire_rises_and_decays() -> bool {
+    let H = 8
+    let W = 16
+    let !fire = forge.zeros[i64, [H, W]]
+    # Seed the bottom row hot. main never updates this row, so it stays maximal.
+    let !sx = 0
+    while sx < W { fire[H - 1, sx] = 36; sx = sx + 1 }
+
+    # Propagate upward for enough frames that heat reaches the top — the same
+    # offset-wind + random-decay update main runs.
+    let !frame = 0
+    while frame < H * 2 {
+        let !y = 0
+        while y < H - 1 {
+            let !x = 0
+            while x < W {
+                let offset = rand_int(0, 3) - 1
+                let src_x  = (x + offset + W) % W
+                let src    = fire[y + 1, src_x]
+                let decay  = rand_int(0, 4)
+                let new_h  = src - decay
+                fire[y, x] = if new_h < 0 { 0 } else { new_h }
+                x = x + 1
+            }
+            y = y + 1
+        }
+        frame = frame + 1
+    }
+
+    let !bottom = 0
+    let !justabove = 0
+    let !top = 0
+    let !cx = 0
+    while cx < W {
+        bottom    = bottom + fire[H - 1, cx]
+        justabove = justabove + fire[H - 2, cx]
+        top       = top + fire[0, cx]
+        cx = cx + 1
+    }
+    # Invariants that hold for EVERY random outcome (non-flaky):
+    #  - the seeded bottom is untouched and maximal (36 per cell)
+    #  - heat propagated up at least one row, so the fire is alive
+    #  - the field is bottom-heavy: a cell can never exceed the seed heat,
+    #    so the top row sum can never exceed the bottom row sum
+    bottom == 36 * W && justabove > 0 && bottom >= top
+}

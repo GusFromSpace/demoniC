@@ -1,0 +1,85 @@
+# tiny_transformer_step.dmc — one self-contained autoregressive step.
+# Exercises RoPE, KV append, fused attention, projection, and a checksum.
+
+fn tiny_step() -> f32 {
+    let q = vault.ones[f32, [1, 1, 1, 4]]
+    let k = vault.ones[f32, [1, 1, 1, 4]]
+    let v = vault.ones[f32, [1, 1, 1, 4]]
+
+    # Position zero is identity rotation. The point is the shape contract.
+    let cos = vault.ones[f32, [1, 2]]
+    let sin = vault.zeros[f32, [1, 2]]
+    let q_rot = rope(q, cos, sin)
+    let k_rot = rope(k, cos, sin)
+
+    # Seed the cache with one previous token, then append the current token.
+    let cache_k: KV[f32, [1, 1, ~, 4]] = forge.ones[f32, [1, 1, 1, 4]]
+    let cache_v: KV[f32, [1, 1, ~, 4]] = forge.ones[f32, [1, 1, 1, 4]]
+    cache_k <- k_rot
+    cache_v <- v
+
+    let ctx = attn(q_rot, cache_k, cache_v, nil)
+    let head = vault.ones[f32, [4, 8]]
+    let logits = ctx @ head
+
+    sum(logits)
+}
+
+fn main() -> f32 {
+    tiny_step()
+}
+
+# Test 1: verify the full step returns 32.
+#
+# Derivation (first principles, no magic numbers):
+#   - rope with cos=1/sin=0 is the identity rotation, so q_rot=q=ones[1,1,1,4]
+#     and k_rot=k=ones[1,1,1,4].
+#   - KV cache starts with 1 token of all-ones, then appends current token →
+#     cache_k and cache_v each have seq_len=2, all ones.
+#   - Scaled dot-product attention: all Q·K dot products are equal (all-ones),
+#     so softmax gives a uniform distribution [0.5, 0.5] over 2 positions.
+#   - Weighted sum over V (all ones): each output head value = 0.5*1 + 0.5*1 = 1,
+#     so ctx = ones[1,1,1,4].
+#   - logits = ctx @ head, shape [1,1,1,8]: each of 8 outputs is
+#     dot([1,1,1,1], [1,1,1,1]) = 4.
+#   - sum(logits) = 8 elements * 4 = 32.
+fn test_tiny_step_result() -> bool {
+    let result = tiny_step()
+    abs(result - 32.0) < 0.001
+}
+
+# Test 2: rope with identity rotation (cos=1, sin=0) is a no-op.
+#
+# RoPE formula for a pair (x0, x1):
+#   rotated = (x0*cos - x1*sin, x0*sin + x1*cos)
+# With cos=1, sin=0: rotated = (x0, x1) — exactly the original.
+# Input: q = ones[1,1,1,4], so every element = 1.0.
+# After identity RoPE, every element must still be 1.0.
+fn test_rope_identity_rotation() -> bool {
+    let q   = vault.ones[f32, [1, 1, 1, 4]]
+    let cos = vault.ones[f32, [1, 2]]
+    let sin = vault.zeros[f32, [1, 2]]
+    let q_rot = rope(q, cos, sin)
+    # sum of all 4 elements should equal 4 (each element = 1)
+    let s = sum(q_rot)
+    abs(s - 4.0) < 0.001
+}
+
+# Test 3: attention over 2 uniform tokens averages to V.
+#
+# When Q, K, V are all ones and seq_len=2:
+#   - all attention logits are equal → softmax → uniform weights [0.5, 0.5]
+#   - weighted sum of V: 0.5 * 1 + 0.5 * 1 = 1.0 per element
+#   - output ctx has every element = 1.0 → sum over [1,1,1,4] = 4.0
+# Embedding the ctx into a head of ones [4,8] and summing should give 32.
+fn test_attn_uniform_averages_v() -> bool {
+    let q       = vault.ones[f32, [1, 1, 1, 4]]
+    let cache_k: KV[f32, [1, 1, ~, 4]] = forge.ones[f32, [1, 1, 1, 4]]
+    let cache_v: KV[f32, [1, 1, ~, 4]] = forge.ones[f32, [1, 1, 1, 4]]
+    cache_k <- q
+    cache_v <- q
+    let ctx   = attn(q, cache_k, cache_v, nil)
+    # ctx should be all-ones [1,1,1,4]; sum = 4
+    let s = sum(ctx)
+    abs(s - 4.0) < 0.001
+}

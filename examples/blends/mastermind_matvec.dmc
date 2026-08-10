@@ -1,0 +1,316 @@
+# Mastermind solver with matrix-vector multiplication scoring
+# Secret code: 4 positions, colors 1-6.
+# Candidate guesses encoded as 4x6 one-hot matrices.
+# Compatibility matrix scores candidates via matvec multiplication.
+
+fn score_guess(secret: Tensor[i64, [4]], guess: Tensor[i64, [4]]) -> (i64, i64) {
+    # Black: exact position match. White: color match minus blacks (per-peg).
+    let mut black = 0
+    let mut secret_used = [0, 0, 0, 0]
+    let mut guess_used = [0, 0, 0, 0]
+
+    # First pass: count blacks, mark used.
+    let mut i = 0
+    while i < 4 {
+        if secret[i] == guess[i] {
+            black = black + 1
+            secret_used[i] = 1
+            guess_used[i] = 1
+        }
+        i = i + 1
+    }
+
+    # Second pass: for each unused guess position, find an unused secret
+    # position with matching color. Counts whites.
+    let mut white = 0
+    i = 0
+    while i < 4 {
+        if guess_used[i] == 0 {
+            let mut j = 0
+            let mut found = 0
+            while j < 4 {
+                if found == 0 {
+                    if secret_used[j] == 0 {
+                        if secret[j] == guess[i] {
+                            secret_used[j] = 1
+                            white = white + 1
+                            found = 1
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    (black, white)
+}
+
+# Build compatibility matrix: 6x6 where M[i,j] = 1 if color i+1
+# at a position where secret has color j+1 contributes to score.
+fn build_compat_matrix(secret: Tensor[i64, [4]]) -> Tensor[f32, [6, 6]] {
+    let mut M = forge.uninit[f32, [6, 6]]
+
+    let mut i = 0
+    while i < 6 {
+        let mut j = 0
+        while j < 6 {
+            M[i, j] = 0.0
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    # For each position in secret, mark compatibility.
+    let mut pos = 0
+    while pos < 4 {
+        let secret_color = secret[pos] as i64
+        # If secret[pos] = secret_color, any guess of color k at this position
+        # (k ranges 1..6) contributes. Set M[k-1, secret_color-1] = 1.
+        let mut k = 1
+        while k <= 6 {
+            M[k - 1, secret_color - 1] = 1.0
+            k = k + 1
+        }
+        pos = pos + 1
+    }
+
+    M
+}
+
+# Encode a guess as a 4x6 one-hot matrix: row i has 1 at column = guess[i]-1.
+fn encode_guess(guess: Tensor[i64, [4]]) -> Tensor[f32, [4, 6]] {
+    let mut G = forge.uninit[f32, [4, 6]]
+
+    let mut i = 0
+    while i < 4 {
+        let mut j = 0
+        while j < 6 {
+            G[i, j] = 0.0
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let mut i = 0
+    while i < 4 {
+        let col = guess[i] as i64 - 1
+        G[i, col] = 1.0
+        i = i + 1
+    }
+
+    G
+}
+
+# Heuristic score via matrix-vector multiplication.
+# For each row of encoded guess, multiply by compat matrix columns,
+# sum all contributions.
+fn heuristic_score(guess: Tensor[i64, [4]], compat: Tensor[f32, [6, 6]]) -> f32 {
+    let !G = encode_guess(guess)
+
+    # Compute G @ compat.T by summing over all elements.
+    let mut score: f32 = 0.0
+    let mut i = 0
+    while i < 4 {
+        let mut j = 0
+        while j < 6 {
+            let mut k = 0
+            while k < 6 {
+                score = score + (G[i, k] * compat[k, j])
+                k = k + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    score
+}
+
+# Test a candidate against all prior guess/feedback tuples.
+fn is_consistent(
+    candidate: Tensor[i64, [4]],
+    h_guess: Tensor[i64, [10, 4]],
+    h_black: Tensor[i64, [10]],
+    h_white: Tensor[i64, [10]],
+    attempt: i64,
+) -> bool {
+    let mut i = 0
+    let mut ok = true
+    while i < attempt {
+        if ok {
+            let prior = [h_guess[i, 0], h_guess[i, 1], h_guess[i, 2], h_guess[i, 3]]
+            let (b, w) = score_guess(candidate, prior)
+            if b != h_black[i] {
+                ok = false
+            }
+            if w != h_white[i] {
+                ok = false
+            }
+        }
+        i = i + 1
+    }
+    ok
+}
+
+# Find next guess using heuristic matvec scoring.
+fn next_guess(
+    h_guess: Tensor[i64, [10, 4]],
+    h_black: Tensor[i64, [10]],
+    h_white: Tensor[i64, [10]],
+    attempt: i64,
+    compat: Tensor[f32, [6, 6]],
+) -> Tensor[i64, [4]] {
+    let mut result = [1, 1, 1, 1]
+    let mut best_score = -1.0
+    let mut a = 1
+    while a <= 6 {
+        let mut b = 1
+        while b <= 6 {
+            let mut c = 1
+            while c <= 6 {
+                let mut d = 1
+                while d <= 6 {
+                    let cand = [a, b, c, d]
+                    if is_consistent(cand, h_guess, h_black, h_white, attempt) {
+                        let s = heuristic_score(cand, compat)
+                        if s > best_score {
+                            result = cand
+                            best_score = s
+                        }
+                    }
+                    d = d + 1
+                }
+                c = c + 1
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    result
+}
+
+fn format_code(code: Tensor[i64, [4]]) -> str {
+    "[" + to_str(code[0]) + " " + to_str(code[1]) + " " + to_str(code[2]) + " " + to_str(code[3]) + "]"
+}
+
+fn main() -> nil {
+    let !secret = [3, 1, 4, 6]
+
+    print("=== Mastermind solver with matvec scoring ===")
+    print("Secret: " + format_code(secret))
+    print("")
+
+    let compat = build_compat_matrix(secret)
+
+    let mut h_guess: Tensor[i64, [10, 4]] = [
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+    ]
+    let mut h_black = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut h_white = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    let mut attempt = 0
+    let mut done = false
+    while attempt < 10 {
+        if !done {
+            let guess = next_guess(h_guess, h_black, h_white, attempt, compat)
+            let (b, w) = score_guess(secret, guess)
+
+            print("Turn " + to_str(attempt + 1) + ": " + format_code(guess) + "  -> " + to_str(b) + " black, " + to_str(w) + " white")
+
+            h_guess[attempt, 0] = guess[0]
+            h_guess[attempt, 1] = guess[1]
+            h_guess[attempt, 2] = guess[2]
+            h_guess[attempt, 3] = guess[3]
+            h_black[attempt] = b
+            h_white[attempt] = w
+
+            if b == 4 {
+                print("")
+                print("Cracked in " + to_str(attempt + 1) + "!")
+                done = true
+            }
+        }
+        attempt = attempt + 1
+    }
+
+    if !done {
+        print("")
+        print("Failed to crack in 10 attempts.")
+    }
+    nil
+}
+
+fn test_score_perfect_match() -> bool {
+    # All 4 positions match → 4 black, 0 white.
+    let secret = [1, 2, 3, 4]
+    let guess = [1, 2, 3, 4]
+    let (b, w) = score_guess(secret, guess)
+    b == 4 && w == 0
+}
+
+fn test_score_no_match() -> bool {
+    # secret=[1,1,1,1], guess=[2,2,2,2]: no position equals and no color overlap → (0,0).
+    let secret = [1, 1, 1, 1]
+    let guess = [2, 2, 2, 2]
+    let (b, w) = score_guess(secret, guess)
+    b == 0 && w == 0
+}
+
+fn test_score_all_white() -> bool {
+    # secret=[1,2,3,4], guess=[2,1,4,3]: colors are a permutation with no position match.
+    # black=0; each of the 4 guess colors finds its partner in a different position → white=4.
+    let secret = [1, 2, 3, 4]
+    let guess = [2, 1, 4, 3]
+    let (b, w) = score_guess(secret, guess)
+    b == 0 && w == 4
+}
+
+fn test_score_mixed() -> bool {
+    # secret=[1,2,3,4], guess=[1,3,2,5].
+    # Blacks: pos0 1==1 → black=1. Pos1 2!=3, pos2 3!=2, pos3 4!=5.
+    # White pass: guess[1]=3 finds secret[2]=3 → white++; guess[2]=2 finds secret[1]=2 → white++; guess[3]=5 not in secret.
+    # Expected: (1, 2).
+    let secret = [1, 2, 3, 4]
+    let guess = [1, 3, 2, 5]
+    let (b, w) = score_guess(secret, guess)
+    b == 1 && w == 2
+}
+
+fn test_encode_guess_one_hot() -> bool {
+    # guess=[1,2,3,4]: row i has 1.0 at column guess[i]-1, 0.0 elsewhere.
+    # Row0→col0, Row1→col1, Row2→col2, Row3→col3.
+    let guess = [1, 2, 3, 4]
+    let G = encode_guess(guess)
+    # Diagonal entries are 1.0, some off-diagonal entries are 0.0.
+    let ok_diag = G[0, 0] == 1.0 && G[1, 1] == 1.0 && G[2, 2] == 1.0 && G[3, 3] == 1.0
+    # Off-diagonal in row 0 should be 0.0
+    let ok_zero = G[0, 1] == 0.0 && G[0, 5] == 0.0 && G[3, 4] == 0.0
+    ok_diag && ok_zero
+}
+
+fn test_build_compat_uniform_secret() -> bool {
+    # secret=[1,1,1,1]: every position has color 1, so only column 0 is set.
+    # All 6 rows of column 0 get 1.0 (k=1..6); columns 1-5 stay 0.0.
+    let secret = [1, 1, 1, 1]
+    let M = build_compat_matrix(secret)
+    # Column 0: all rows should be 1.0
+    let col0_ok = M[0, 0] == 1.0 && M[5, 0] == 1.0 && M[3, 0] == 1.0
+    # Column 1: all rows should be 0.0 (no position has color 2)
+    let col1_ok = M[0, 1] == 0.0 && M[5, 1] == 0.0
+    col0_ok && col1_ok
+}
+
+fn test_is_consistent_no_history() -> bool {
+    # With attempt=0, there are no prior guesses, so any candidate is consistent.
+    let candidate = [3, 1, 4, 6]
+    let h_guess: Tensor[i64, [10, 4]] = [
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+    ]
+    let h_black = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let h_white = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    is_consistent(candidate, h_guess, h_black, h_white, 0)
+}

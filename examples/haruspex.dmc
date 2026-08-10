@@ -1,0 +1,167 @@
+# haruspex.dmc — byte divination through an `any`-typed stack machine.
+#
+# A haruspex read the future in the entrails of a sacrifice. This one slits
+# open a *file* and reads its raw bytes (read_bytes, #197), interpreting each
+# byte as an opcode for a tiny stack machine. The catch: the stack mingles
+# numbers and words on the same altar — a heterogeneous stack that only holds
+# together because omens cross function boundaries as `any` (#186).
+#
+# Point it at anything. With no argument it reads its own entrails.
+#
+#   dmc run examples/haruspex.dmc                 # autopsy on itself
+#   dmc run examples/haruspex.dmc some/file.bin   # divine another file
+
+# The sixteen glyphs every omen is spoken in.
+fn glyph(n: i64) -> str {
+    let words = list(
+        "ash", "tide", "ember", "hollow", "crown", "veil", "thorn", "glass",
+        "moth", "rust", "salt", "wren", "dusk", "iron", "myrrh", "echo")
+    list_get(words, n % 16)
+}
+
+# Bind two omens into one. Two numbers fuse by sum; if either is a word, they
+# braid into a phrase. `a` and `b` arrive as `any` — their true kind is known
+# only here, recovered with the runtime predicates.
+fn bind(a: any, b: any) -> any {
+    if is_str(a) { return to_str(b) + "-" + to_str(a) }
+    if is_str(b) { return to_str(b) + "-" + to_str(a) }
+    a + b
+}
+
+# Render any omen as one line of the reading.
+fn speak(omen: any) -> str {
+    if is_str(omen) { return "  · the sign of " + to_str(omen) }
+    "  · a count of " + to_str(omen)
+}
+
+fn main() -> nil {
+    let cli = argv()
+    let path = if list_len(cli) > 0 { list_get(cli, 0) } else { "examples/haruspex.dmc" }
+
+    let (entrails, err) = read_bytes(path)
+    if !is_nil(err) {
+        print("the altar is cold — " + to_str(err))
+        return nil
+    }
+
+    let n = len(entrails)
+    print("✶ HARUSPEX slits open '" + path + "' — " + to_str(n) + " entrails ✶")
+    print("")
+
+    let !stack = list()
+    let !reading = ""
+    let !spoken = 0
+
+    for i in 0..n {
+        let b = entrails[i]
+        let op = b % 6
+
+        if op == 0 {
+            # PUSH a number drawn from the byte
+            stack = list_push(stack, b % 100)
+        } else if op == 1 {
+            # PUSH a glyph
+            stack = list_push(stack, glyph(b))
+        } else if op == 2 {
+            # BIND the top two omens
+            if list_len(stack) >= 2 {
+                let (s1, x) = list_pop(stack)
+                let (s2, y) = list_pop(s1)
+                stack = list_push(s2, bind(x, y))
+            }
+        } else if op == 3 {
+            # ECHO the top omen into the reading (first nine only)
+            if list_len(stack) >= 1 {
+                let (s1, top) = list_pop(stack)
+                if spoken < 9 {
+                    reading = reading + (if spoken > 0 { "\n" } else { "" }) + speak(top)
+                    spoken = spoken + 1
+                }
+                stack = s1
+            }
+        } else if op == 4 {
+            # MIRROR: the top omen doubles
+            if list_len(stack) >= 1 {
+                stack = list_push(stack, list_get(stack, -1))
+            }
+        } else {
+            # TWIST: the top two omens change places
+            if list_len(stack) >= 2 {
+                let (s1, x) = list_pop(stack)
+                let (s2, y) = list_pop(s1)
+                stack = list_push(list_push(s2, x), y)
+            }
+        }
+    }
+
+    if spoken == 0 {
+        print("  · the entrails are silent")
+    } else {
+        print(reading)
+    }
+
+    # Whatever is left on the altar is the verdict.
+    let !verdict = ""
+    for _ in 0..3 {
+        if list_len(stack) >= 1 {
+            let (s1, top) = list_pop(stack)
+            verdict = verdict + to_str(top) + "  "
+            stack = s1
+        }
+    }
+    if len(verdict) > 0 {
+        print("")
+        print("  the residue on the altar: " + verdict)
+    }
+    nil
+}
+
+# --- tests ---
+
+# glyph(0) = "ash" (first word in the fixed list, 0 % 16 = 0)
+fn test_glyph_first() -> bool {
+    glyph(0) == "ash"
+}
+
+# glyph(16) = "ash" because 16 % 16 = 0 — wrap-around identity
+fn test_glyph_wrap() -> bool {
+    glyph(16) == "ash"
+}
+
+# glyph(1) = "tide" (second word) and glyph(17) = "tide" (17 % 16 = 1)
+fn test_glyph_second() -> bool {
+    glyph(1) == "tide" && glyph(17) == "tide"
+}
+
+# glyph(15) = "echo" (last word, index 15)
+fn test_glyph_last() -> bool {
+    glyph(15) == "echo"
+}
+
+# bind(i64, i64): neither is str so the branch is a + b
+fn test_bind_numbers() -> bool {
+    let result = bind(3, 5)
+    to_str(result) == "8"
+}
+
+# bind(str, i64): a is str → return to_str(b) + "-" + to_str(a) = "5-hello"
+fn test_bind_str_a() -> bool {
+    let result = bind("hello", 5)
+    to_str(result) == "5-hello"
+}
+
+# bind(i64, str): b is str (a is not) → return to_str(b) + "-" + to_str(a) = "world-3"
+fn test_bind_str_b() -> bool {
+    let result = bind(3, "world")
+    to_str(result) == "world-3"
+}
+
+# speak with a number produces "  · a count of N"
+fn test_speak_number() -> bool {
+    speak(42) == "  · a count of 42"
+}
+
+# speak with a str produces "  · the sign of <word>"
+fn test_speak_str() -> bool {
+    speak("ember") == "  · the sign of ember"
+}

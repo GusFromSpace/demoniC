@@ -1,0 +1,154 @@
+# train_step.dmc — end-to-end Vault + Forge usage.
+# One training step from arena setup through reset. The point of this
+# example is the memory dance, not the math.
+
+fn loss[B, D](pred: Tensor[f32, [B, D]], y: Tensor[f32, [B, D]]) -> f32 {
+    let diff = pred .- y
+    sum(diff .* diff) / (B as f32)
+}
+
+fn step[B, D, H](
+    !W1: Tensor[f32, [D, H]],
+    !W2: Tensor[f32, [H, D]],
+    x:   Tensor[f32, [B, D]],
+    y:   Tensor[f32, [B, D]],
+    lr:  f32,
+) -> f32 {
+    # All intermediates live in the Forge. None outlive this function.
+    let h    = \>(x @ W1)
+    let pred = h @ W2
+    let l    = loss(pred, y)
+
+    # Hand-written backward pass. (Autodiff lands in 0.1; for now the
+    # programmer writes the gradients themselves — brutalist by design.)
+    let d_pred = (pred .- y) .* (2.0 / (B as f32))
+    let d_W2   = h' @ d_pred
+    let d_h    = d_pred @ W2'
+    let d_pre  = d_h .* (h .> 0.0 as f32)   # ReLU derivative
+    let d_W1   = x' @ d_pre
+
+    # Cross-arena writes: W1 and W2 live in the Vault, so the SGD update
+    # must be inside a `vault {}` block. Forge-resident gradients are
+    # read freely.
+    vault {
+        W1 -= d_W1 .* lr
+        W2 -= d_W2 .* lr
+    }
+
+    l
+}
+
+fn main() -> nil {
+    # Vault holds parameters for the life of the process.
+    vault {
+        let !W1 = vault.zeros[f32, [768, 3072]]
+        let !W2 = vault.zeros[f32, [3072, 768]]
+
+        for epoch in 0..10 {
+            for (x, y) in data_iter() {
+                let l = step(W1, W2, x, y, 1e-3)
+
+                # Critical: wipe the Forge at every step boundary.
+                # Single bump-pointer reset, no per-allocation bookkeeping.
+                forge.reset()
+                print(("epoch", epoch, "loss", l))
+            }
+        }
+    }
+    nil
+}
+
+# ── Tests ──────────────────────────────────────────────────────────────────────
+#
+# All tests use B=1, D=1 (and H=1 for step tests) so the computation is
+# traceable by hand. Forge allocations are used directly (no vault needed).
+#
+# loss formula: sum((pred .- y) .* (pred .- y)) / B
+#
+# Test 1: pred=[[0]], y=[[0]] → diff=[[0]] → sum([[0]])/1 = 0.0
+fn test_loss_zero_inputs() -> bool {
+    let !pred = forge.zeros[f32, [1, 1]]
+    let !y    = forge.zeros[f32, [1, 1]]
+    let l = loss(pred, y)
+    forge.reset()
+    isclose(l, 0.0)
+}
+
+# Test 2: pred=[[2]], y=[[1]] → diff=[[1]] → sum([[1.0]])/1 = 1.0
+fn test_loss_unit_difference() -> bool {
+    let !pred = forge.zeros[f32, [1, 1]]
+    let !y    = forge.zeros[f32, [1, 1]]
+    pred[0, 0] = 2.0
+    y[0, 0]    = 1.0
+    let l = loss(pred, y)
+    forge.reset()
+    isclose(l, 1.0)
+}
+
+# Test 3: loss is always non-negative (sum of squares, divided by positive B).
+#   pred=[[5]], y=[[2]] → diff=[[3]] → sum([[9]])/1 = 9.0 >= 0
+fn test_loss_nonneg() -> bool {
+    let !pred = forge.zeros[f32, [1, 1]]
+    let !y    = forge.zeros[f32, [1, 1]]
+    pred[0, 0] = 5.0
+    y[0, 0]    = 2.0
+    let l = loss(pred, y)
+    forge.reset()
+    l >= 0.0
+}
+
+# Test 4: pred=[[5]], y=[[2]] → diff=[[3]] → sum([[9]])/1 = 9.0
+fn test_loss_known_value() -> bool {
+    let !pred = forge.zeros[f32, [1, 1]]
+    let !y    = forge.zeros[f32, [1, 1]]
+    pred[0, 0] = 5.0
+    y[0, 0]    = 2.0
+    let l = loss(pred, y)
+    forge.reset()
+    isclose(l, 9.0)
+}
+
+# Test 5: B=2, D=1 batch MSE.
+#   pred=[[3],[1]], y=[[1],[1]] → diff=[[2],[0]] → sum([[4],[0]])/2 = 2.0
+fn test_loss_batch_two() -> bool {
+    let !pred = forge.zeros[f32, [2, 1]]
+    let !y    = forge.zeros[f32, [2, 1]]
+    pred[0, 0] = 3.0
+    pred[1, 0] = 1.0
+    y[0, 0]    = 1.0
+    y[1, 0]    = 1.0
+    let l = loss(pred, y)
+    forge.reset()
+    isclose(l, 2.0)
+}
+
+# Test 6: step with all-zero weights returns loss = sum(y^2)/B.
+#   B=1, D=1, H=1: x=[[1]], y=[[2]], W1=[[0]], W2=[[0]]
+#   h = relu([[1*0]]) = relu([[0]]) = [[0]]
+#   pred = [[0]] @ [[0]] = [[0]]
+#   loss = sum(([[0]]-[[2]])^2)/1 = sum([[4]])/1 = 4.0
+fn test_step_zero_weights_loss() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    x[0, 0] = 1.0
+    y[0, 0] = 2.0
+    let l = step(W1, W2, x, y, 0.001)
+    forge.reset()
+    isclose(l, 4.0)
+}
+
+# Test 7: step with zero weights and zero target → loss = 0.0.
+#   B=1, D=1, H=1: x=[[1]], y=[[0]], W1=[[0]], W2=[[0]]
+#   h = relu(0) = 0, pred = 0, loss = 0.0
+fn test_step_zero_loss() -> bool {
+    let !W1 = forge.zeros[f32, [1, 1]]
+    let !W2 = forge.zeros[f32, [1, 1]]
+    let !x  = forge.zeros[f32, [1, 1]]
+    let !y  = forge.zeros[f32, [1, 1]]
+    x[0, 0] = 1.0
+    let l = step(W1, W2, x, y, 0.001)
+    forge.reset()
+    isclose(l, 0.0)
+}

@@ -1,0 +1,180 @@
+# spreadsheet.dmc — tiny fixed-grid spreadsheet recalculation.
+# Demonstrates: tensor-backed cells, cell addressing, formulas, and printing.
+
+fn cell(row: i64, col: i64) -> i64 {
+    row * 4 + col
+}
+
+fn add_cell(sheet: Tensor[f32, [16]], a: i64, b: i64) -> f32 {
+    sheet[a] + sheet[b]
+}
+
+fn mul_cell(sheet: Tensor[f32, [16]], a: i64, b: i64) -> f32 {
+    sheet[a] * sheet[b]
+}
+
+fn sub_cell(sheet: Tensor[f32, [16]], a: i64, b: i64) -> f32 {
+    sheet[a] - sheet[b]
+}
+
+fn sum_row(sheet: Tensor[f32, [16]], row: i64) -> f32 {
+    let !total: f32 = 0.0
+    for col in 0..4 {
+        total = total + sheet[cell(row, col)]
+    }
+    total
+}
+
+fn print_row(sheet: Tensor[f32, [16]], row: i64) -> nil {
+    let !line = ""
+    for col in 0..4 {
+        line = line + to_str(sheet[cell(row, col)])
+        if col < 3 { line = line + "\t" }
+    }
+    print(line)
+    nil
+}
+
+fn main() -> f32 {
+    let !sheet = vault.zeros[f32, [16]]
+
+    # Row 0: units, price, revenue, tax.
+    sheet[cell(0, 0)] = 12.0
+    sheet[cell(0, 1)] = 7.0
+    sheet[cell(0, 2)] = mul_cell(sheet, cell(0, 0), cell(0, 1))
+    sheet[cell(0, 3)] = sheet[cell(0, 2)] * 0.25
+
+    # Row 1: another line item.
+    sheet[cell(1, 0)] = 5.0
+    sheet[cell(1, 1)] = 9.0
+    sheet[cell(1, 2)] = mul_cell(sheet, cell(1, 0), cell(1, 1))
+    sheet[cell(1, 3)] = sheet[cell(1, 2)] * 0.25
+
+    # Row 2: totals across rows 0 and 1.
+    sheet[cell(2, 0)] = add_cell(sheet, cell(0, 0), cell(1, 0))
+    sheet[cell(2, 1)] = add_cell(sheet, cell(0, 1), cell(1, 1))
+    sheet[cell(2, 2)] = add_cell(sheet, cell(0, 2), cell(1, 2))
+    sheet[cell(2, 3)] = add_cell(sheet, cell(0, 3), cell(1, 3))
+
+    # Row 3: summary formulas.
+    sheet[cell(3, 0)] = sum_row(sheet, 0)
+    sheet[cell(3, 1)] = sum_row(sheet, 1)
+    sheet[cell(3, 2)] = sub_cell(sheet, cell(2, 2), cell(2, 3))
+    sheet[cell(3, 3)] = add_cell(sheet, cell(3, 0), cell(3, 1))
+
+    print("units\tprice\trevenue\ttax")
+    for row in 0..4 {
+        print_row(sheet, row)
+    }
+
+    sheet[cell(3, 2)] + sheet[cell(3, 3)]
+}
+
+# ── tests ──────────────────────────────────────────────────────────────────────
+
+# cell(row,col) = row*4+col (pure arithmetic)
+fn test_cell_addressing() -> bool {
+    cell(0, 0) == 0 &&
+    cell(0, 3) == 3 &&
+    cell(1, 0) == 4 &&
+    cell(2, 1) == 9 &&
+    cell(3, 3) == 15
+}
+
+# mul_cell: 12.0 * 7.0 = 84.0  (row 0 revenue)
+fn test_mul_cell_revenue_row0() -> bool {
+    let !s = forge.zeros[f32, [16]]
+    s[0] = 12.0
+    s[1] = 7.0
+    let rev = mul_cell(s, 0, 1)
+    abs(rev - 84.0) < 0.001
+}
+
+# add_cell: 12.0 + 5.0 = 17.0  (total units across row 0 and row 1)
+fn test_add_cell_units() -> bool {
+    let !s = forge.zeros[f32, [16]]
+    s[cell(0, 0)] = 12.0
+    s[cell(1, 0)] = 5.0
+    let tot = add_cell(s, cell(0, 0), cell(1, 0))
+    abs(tot - 17.0) < 0.001
+}
+
+# sub_cell: 129.0 - 32.25 = 96.75  (net revenue = total_revenue - total_tax)
+fn test_sub_cell_net_revenue() -> bool {
+    let !s = forge.zeros[f32, [16]]
+    s[cell(2, 2)] = 129.0
+    s[cell(2, 3)] = 32.25
+    let net = sub_cell(s, cell(2, 2), cell(2, 3))
+    abs(net - 96.75) < 0.001
+}
+
+# sum_row over row 0: 12 + 7 + 84 + 21 = 124
+# Row 0: units=12, price=7, revenue=12*7=84, tax=84*0.25=21
+fn test_sum_row0() -> bool {
+    let !s = forge.zeros[f32, [16]]
+    s[cell(0, 0)] = 12.0
+    s[cell(0, 1)] = 7.0
+    s[cell(0, 2)] = 84.0
+    s[cell(0, 3)] = 21.0
+    let tot = sum_row(s, 0)
+    abs(tot - 124.0) < 0.001
+}
+
+# sum_row over row 1: 5 + 9 + 45 + 11.25 = 70.25
+# Row 1: units=5, price=9, revenue=5*9=45, tax=45*0.25=11.25
+fn test_sum_row1() -> bool {
+    let !s = forge.zeros[f32, [16]]
+    s[cell(1, 0)] = 5.0
+    s[cell(1, 1)] = 9.0
+    s[cell(1, 2)] = 45.0
+    s[cell(1, 3)] = 11.25
+    let tot = sum_row(s, 1)
+    abs(tot - 70.25) < 0.001
+}
+
+# Full sheet recalculation: verifies the complete formula chain matches
+# hand-derived values.
+#   row0: units=12, price=7, rev=84, tax=21
+#   row1: units=5,  price=9, rev=45, tax=11.25
+#   row2: units=17, price=16, rev=129, tax=32.25
+#   row3[0]=sum_row0=124, row3[1]=sum_row1=70.25,
+#         row3[2]=rev-tax=96.75, row3[3]=124+70.25=194.25
+fn test_spreadsheet_full_recalc() -> bool {
+    let !s = forge.zeros[f32, [16]]
+
+    # row 0
+    s[cell(0, 0)] = 12.0
+    s[cell(0, 1)] = 7.0
+    s[cell(0, 2)] = mul_cell(s, cell(0, 0), cell(0, 1))
+    s[cell(0, 3)] = s[cell(0, 2)] * 0.25
+
+    # row 1
+    s[cell(1, 0)] = 5.0
+    s[cell(1, 1)] = 9.0
+    s[cell(1, 2)] = mul_cell(s, cell(1, 0), cell(1, 1))
+    s[cell(1, 3)] = s[cell(1, 2)] * 0.25
+
+    # row 2 totals
+    s[cell(2, 0)] = add_cell(s, cell(0, 0), cell(1, 0))
+    s[cell(2, 1)] = add_cell(s, cell(0, 1), cell(1, 1))
+    s[cell(2, 2)] = add_cell(s, cell(0, 2), cell(1, 2))
+    s[cell(2, 3)] = add_cell(s, cell(0, 3), cell(1, 3))
+
+    # row 3 summary
+    s[cell(3, 0)] = sum_row(s, 0)
+    s[cell(3, 1)] = sum_row(s, 1)
+    s[cell(3, 2)] = sub_cell(s, cell(2, 2), cell(2, 3))
+    s[cell(3, 3)] = add_cell(s, cell(3, 0), cell(3, 1))
+
+    abs(s[cell(0, 2)] - 84.0)    < 0.001 &&
+    abs(s[cell(0, 3)] - 21.0)    < 0.001 &&
+    abs(s[cell(1, 2)] - 45.0)    < 0.001 &&
+    abs(s[cell(1, 3)] - 11.25)   < 0.001 &&
+    abs(s[cell(2, 0)] - 17.0)    < 0.001 &&
+    abs(s[cell(2, 2)] - 129.0)   < 0.001 &&
+    abs(s[cell(2, 3)] - 32.25)   < 0.001 &&
+    abs(s[cell(3, 0)] - 124.0)   < 0.001 &&
+    abs(s[cell(3, 1)] - 70.25)   < 0.001 &&
+    abs(s[cell(3, 2)] - 96.75)   < 0.001 &&
+    abs(s[cell(3, 3)] - 194.25)  < 0.001
+}

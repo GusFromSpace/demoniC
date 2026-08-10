@@ -1,0 +1,39 @@
+# elu and mish activations — forward (#377). Documented in STDLIB.md as planned;
+# now implemented as differentiable elementwise activations, scalar or f32 tensor.
+#
+#   elu(x)  (α=1) = x           for x > 0
+#                 = e^x - 1     for x ≤ 0
+#   mish(x)       = x · tanh(softplus(x)),  softplus(x) = ln(1 + e^x)
+#
+# Forward runs on BOTH backends (interp + JIT parity). Reverse-mode autodiff
+# lives in activations_elu_mish_autodiff.dmc (interpreter — the JIT activation
+# path is forward-only, same as silu). Bracketing assertions keep these
+# JIT-eligible.
+
+fn test_elu_forward() -> bool {
+    let !x = forge.zeros[f32, [3]]
+    x[0] = 2.0   x[1] = 0.0 - 1.0   x[2] = 0.0
+    let y = elu(x)
+    # elu(2)=2 ; elu(-1)=e^-1-1≈-0.6321 ; elu(0)=0
+    (y[0] == 2.0) && (y[1] < 0.0 - 0.63) && (y[1] > 0.0 - 0.64) && (y[2] == 0.0)
+}
+
+fn test_elu_positive_identity() -> bool {
+    let !x = forge.zeros[f32, [2]]
+    x[0] = 3.0   x[1] = 100.0
+    let y = elu(x)
+    (y[0] == 3.0) && (y[1] == 100.0)      # x>0 branch is exact identity
+}
+
+fn test_mish_forward() -> bool {
+    let !x = forge.zeros[f32, [2]]
+    x[0] = 0.0   x[1] = 2.0
+    let y = mish(x)
+    # mish(0)=0 ; mish(2)≈1.9439
+    (y[0] == 0.0) && (y[1] > 1.94) && (y[1] < 1.95)
+}
+
+fn test_mish_scalar() -> bool {
+    let m = mish(2.0f32)
+    (m > 1.94) && (m < 1.95)
+}

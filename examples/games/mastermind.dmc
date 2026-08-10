@@ -1,0 +1,252 @@
+# Mastermind in demoniC
+# Secret code: 4 positions, colors 1-6, repeats allowed.
+# Solver: brute-force scan over all 1296 candidates, return first consistent
+# with all prior feedback. Converges in <= 5 guesses on average.
+
+fn score_guess(secret: Tensor[i64, [4]], guess: Tensor[i64, [4]]) -> (i64, i64) {
+    # Black: exact position match. White: color match minus blacks (per-peg).
+    let mut black = 0
+    let mut secret_used = [0, 0, 0, 0]
+    let mut guess_used = [0, 0, 0, 0]
+
+    # First pass: count blacks, mark used.
+    let mut i = 0
+    while i < 4 {
+        if secret[i] == guess[i] {
+            black = black + 1
+            secret_used[i] = 1
+            guess_used[i] = 1
+        }
+        i = i + 1
+    }
+
+    # Second pass: for each unused guess position, find an unused secret
+    # position with matching color. Counts whites.
+    let mut white = 0
+    i = 0
+    while i < 4 {
+        if guess_used[i] == 0 {
+            let mut j = 0
+            let mut found = 0
+            while j < 4 {
+                if found == 0 {
+                    if secret_used[j] == 0 {
+                        if secret[j] == guess[i] {
+                            secret_used[j] = 1
+                            white = white + 1
+                            found = 1
+                        }
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    (black, white)
+}
+
+# Test a candidate against all prior guess/feedback tuples.
+# Returns true iff scoring candidate against each prior guess
+# reproduces the same (black, white) feedback.
+fn is_consistent(
+    candidate: Tensor[i64, [4]],
+    h_guess: Tensor[i64, [10, 4]],
+    h_black: Tensor[i64, [10]],
+    h_white: Tensor[i64, [10]],
+    attempt: i64,
+) -> bool {
+    let mut i = 0
+    let mut ok = true
+    while i < attempt {
+        if ok {
+            let prior = [h_guess[i, 0], h_guess[i, 1], h_guess[i, 2], h_guess[i, 3]]
+            let (b, w) = score_guess(candidate, prior)
+            if b != h_black[i] {
+                ok = false
+            }
+            if w != h_white[i] {
+                ok = false
+            }
+        }
+        i = i + 1
+    }
+    ok
+}
+
+# Try all 6^4 = 1296 candidates; return the first one consistent
+# with history. Returns [0,0,0,0] if (impossibly) none consistent.
+fn next_guess(
+    h_guess: Tensor[i64, [10, 4]],
+    h_black: Tensor[i64, [10]],
+    h_white: Tensor[i64, [10]],
+    attempt: i64,
+) -> Tensor[i64, [4]] {
+    let mut result = [1, 1, 1, 1]
+    let mut found = false
+    let mut a = 1
+    while a <= 6 {
+        let mut b = 1
+        while b <= 6 {
+            let mut c = 1
+            while c <= 6 {
+                let mut d = 1
+                while d <= 6 {
+                    if !found {
+                        let cand = [a, b, c, d]
+                        if is_consistent(cand, h_guess, h_black, h_white, attempt) {
+                            result = cand
+                            found = true
+                        }
+                    }
+                    d = d + 1
+                }
+                c = c + 1
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    result
+}
+
+fn code_str(code: Tensor[i64, [4]]) -> str {
+    "[" + to_str(code[0]) + " " + to_str(code[1]) + " " + to_str(code[2]) + " " + to_str(code[3]) + "]"
+}
+
+fn main() -> nil {
+    let secret = [3, 1, 4, 6]
+
+    print("=== Mastermind solver ===")
+    print("Secret: " + code_str(secret))
+    print("")
+
+    let mut h_guess: Tensor[i64, [10, 4]] = [
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+    ]
+    let mut h_black = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut h_white = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+    let mut attempt = 0
+    let mut done = false
+    while attempt < 10 {
+        if !done {
+            let guess = next_guess(h_guess, h_black, h_white, attempt)
+            let (b, w) = score_guess(secret, guess)
+
+            print("Turn " + to_str(attempt + 1) + ": " + code_str(guess) + "  -> " + to_str(b) + " black, " + to_str(w) + " white")
+
+            h_guess[attempt, 0] = guess[0]
+            h_guess[attempt, 1] = guess[1]
+            h_guess[attempt, 2] = guess[2]
+            h_guess[attempt, 3] = guess[3]
+            h_black[attempt] = b
+            h_white[attempt] = w
+
+            if b == 4 {
+                print("")
+                print("Cracked in " + to_str(attempt + 1) + "!")
+                done = true
+            }
+        }
+        attempt = attempt + 1
+    }
+
+    if !done {
+        print("")
+        print("Failed to crack in 10 attempts.")
+    }
+    nil
+}
+
+# Tests
+
+# Perfect match: all 4 positions correct → 4 blacks, 0 whites.
+fn test_score_perfect_match() -> bool {
+    let secret = [1, 2, 3, 4]
+    let guess  = [1, 2, 3, 4]
+    let (b, w) = score_guess(secret, guess)
+    b == 4 && w == 0
+}
+
+# Completely wrong colors: no position hit, no color hit → 0 blacks, 0 whites.
+fn test_score_all_miss() -> bool {
+    let secret = [1, 1, 1, 1]
+    let guess  = [2, 2, 2, 2]
+    let (b, w) = score_guess(secret, guess)
+    b == 0 && w == 0
+}
+
+# All right colors but all wrong positions → 0 blacks, 4 whites.
+# secret=[1,2,3,4] guess=[2,1,4,3]: each color is present in secret at a
+# different slot (1↔0, 0↔1, 3↔2, 2↔3), no position aligns.
+fn test_score_all_white() -> bool {
+    let secret = [1, 2, 3, 4]
+    let guess  = [2, 1, 4, 3]
+    let (b, w) = score_guess(secret, guess)
+    b == 0 && w == 4
+}
+
+# Mixed: secret=[1,2,3,4] guess=[1,3,2,5].
+# Black at pos 0 (1==1). Unused guess: pos 1=3 (matches secret pos 2=3, white),
+# pos 2=2 (matches secret pos 1=2, white), pos 3=5 (no match).
+# → 1 black, 2 whites.
+fn test_score_mixed() -> bool {
+    let secret = [1, 2, 3, 4]
+    let guess  = [1, 3, 2, 5]
+    let (b, w) = score_guess(secret, guess)
+    b == 1 && w == 2
+}
+
+# secret=[3,1,4,6] guess=[1,1,1,1].
+# Black only at pos 1 (secret[1]=1==guess[1]=1).
+# Unused guess: pos 0,2,3 all value 1; unused secret pos 0=3,2=4,3=6 — none is 1.
+# → 1 black, 0 whites.
+fn test_score_main_secret() -> bool {
+    let secret = [3, 1, 4, 6]
+    let guess  = [1, 1, 1, 1]
+    let (b, w) = score_guess(secret, guess)
+    b == 1 && w == 0
+}
+
+# is_consistent with empty history (attempt=0): every candidate is trivially
+# consistent because the while loop body never executes.
+fn test_consistent_empty_history() -> bool {
+    let mut h_guess: Tensor[i64, [10, 4]] = [
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+    ]
+    let h_black = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let h_white = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let cand = [3, 5, 2, 6]
+    is_consistent(cand, h_guess, h_black, h_white, 0)
+}
+
+# After recording one guess [1,1,1,1] against secret [3,1,4,6] which gives
+# (1 black, 0 white), [3,1,4,6] itself must score consistently (1 black, 0 white
+# vs [1,1,1,1]) so it should be consistent with the history.
+fn test_consistent_with_history() -> bool {
+    let mut h_guess: Tensor[i64, [10, 4]] = [
+        [1,1,1,1],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+    ]
+    let mut h_black = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut h_white = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let cand = [3, 1, 4, 6]
+    is_consistent(cand, h_guess, h_black, h_white, 1)
+}
+
+# With history ([1,1,1,1] → 1 black 0 white), the candidate [2,2,2,2] scores
+# (0 black, 0 white) against [1,1,1,1] but history says 1 black — inconsistent.
+fn test_inconsistent_with_history() -> bool {
+    let mut h_guess: Tensor[i64, [10, 4]] = [
+        [1,1,1,1],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],
+        [0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0],[0,0,0,0]
+    ]
+    let mut h_black = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut h_white = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let cand = [2, 2, 2, 2]
+    !is_consistent(cand, h_guess, h_black, h_white, 1)
+}

@@ -1,0 +1,66 @@
+fn search_honesty(person: str, is_honest: bool) -> bool {
+    print("Diogenes inspects " + person + " with his lantern.")
+    if is_honest {
+        print("Diogenes: I have found an honest man.")
+        true
+    } else {
+        print("Diogenes: I only see crowds.")
+        false
+    }
+}
+
+fn main() -> nil {
+    print("Diogenes lights a lantern in broad daylight.")
+    let mut found = false
+    found = search_honesty("Athenian", false)
+    if !found {
+        found = search_honesty("Socrates", true)
+    }
+    nil
+}
+
+# search_honesty is a pure bool pass-through: it returns exactly
+# the `is_honest` argument it receives (the print is a side effect).
+
+fn test_honest_person_returns_true() -> bool {
+    # Justified: search_honesty("Socrates", true) follows the `if is_honest`
+    # branch and returns `true`.  The return value is the literal `true`
+    # expression in that branch — no computation needed.
+    let result = search_honesty("Socrates", true)
+    result == true
+}
+
+fn test_dishonest_person_returns_false() -> bool {
+    # Justified: search_honesty("Athenian", false) follows the else branch
+    # and returns `false`.  The return value is the literal `false`
+    # expression in that branch.
+    let result = search_honesty("Athenian", false)
+    result == false
+}
+
+fn test_search_is_identity_on_bool_true() -> bool {
+    # Justified: for any bool b, search_honesty(_, b) == b because both
+    # branches return their respective literal that matches the branch
+    # condition.  Here b = true.
+    let b = true
+    let result = search_honesty("Test", b)
+    result == b
+}
+
+fn test_search_is_identity_on_bool_false() -> bool {
+    # Justified: same invariant as above with b = false.
+    let b = false
+    let result = search_honesty("Test", b)
+    result == b
+}
+
+fn test_two_calls_second_honest() -> bool {
+    # Justified: mirroring main() — first call returns false (dishonest),
+    # second call returns true (honest).  The combined `found` must be true
+    # after the second call.
+    let !found = search_honesty("Crowd", false)
+    if !found {
+        found = search_honesty("Honest one", true)
+    }
+    found == true
+}

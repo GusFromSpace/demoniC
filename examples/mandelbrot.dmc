@@ -1,0 +1,110 @@
+# mandelbrot.dmc — ASCII Mandelbrot renderer.
+# Demonstrates: nested for/while loops, float arithmetic, print without newline.
+# No JIT needed. Run: dmc run examples/mandelbrot.dmc
+
+fn main() -> nil {
+    let rows     = 24
+    let cols     = 72
+    let max_iter = 48
+
+    for row in 0..rows {
+        let cy = (row as f64 - rows as f64 * 0.5) / (rows as f64 * 0.25)
+        let !line = ""
+        for col in 0..cols {
+            let cx = (col as f64 - cols as f64 * 0.45) / (cols as f64 * 0.18)
+            let !zx = 0.0
+            let !zy = 0.0
+            let !i  = 0
+            while i < max_iter {
+                let zx2 = zx * zx
+                let zy2 = zy * zy
+                if zx2 + zy2 > 4.0 { break }
+                zy = 2.0 * zx * zy + cy
+                zx = zx2 - zy2 + cx
+                i = i + 1
+            }
+            # i < max_iter → escaped (outside set); i == max_iter → inside set
+            if i >= max_iter {
+                line = line + "@"
+            } else if i > max_iter * 3 / 4 {
+                line = line + "+"
+            } else if i > max_iter / 2 {
+                line = line + "."
+            } else if i > max_iter / 4 {
+                line = line + ","
+            } else {
+                line = line + " "
+            }
+        }
+        print(line)
+    }
+    nil
+}
+
+# Helper: run the same escape iteration as main() for a single point (cx, cy).
+# Returns the iteration count i at exit (0..=max_iter).
+fn mandel_iters(cx: f64, cy: f64, max_iter: i64) -> i64 {
+    let !zx = 0.0
+    let !zy = 0.0
+    let !i  = 0
+    while i < max_iter {
+        let zx2 = zx * zx
+        let zy2 = zy * zy
+        if zx2 + zy2 > 4.0 { break }
+        zy = 2.0 * zx * zy + cy
+        zx = zx2 - zy2 + cx
+        i = i + 1
+    }
+    i
+}
+
+# Test 1: origin (0,0) is inside the Mandelbrot set.
+# c=0 → z stays at 0 every iteration → never escapes → i == max_iter.
+fn test_origin_inside() -> bool {
+    let iters = mandel_iters(0.0, 0.0, 48)
+    iters == 48
+}
+
+# Test 2: a clearly-outside point escapes in exactly 1 iteration.
+# cx=2.5, cy=0: first step produces zx=2.5, then zx2=6.25>4 → break at i=1.
+fn test_far_outside_escapes_quickly() -> bool {
+    let iters = mandel_iters(2.5, 0.0, 48)
+    iters == 1
+}
+
+# Test 3: real-axis point c=(0.5, 0) escapes at i=5 (verified by hand trace).
+# Trace: z0=0 → z1=0.5 → z2=0.75 → z3=1.0625 → z4≈1.6289 → z5: |z5|²≈9.94>4 → break.
+fn test_half_escapes_at_5() -> bool {
+    let iters = mandel_iters(0.5, 0.0, 48)
+    iters == 5
+}
+
+# Test 4: c=(-2.0, 0) lies on the real-axis boundary of the bulb (period-1 fixed point
+# at -2). The orbit: z0=0→-2→2→2… escapes at i=2 (|2|²=4 is NOT >4, so it continues one
+# more step: z=2²-2=2, loops; actually 4 is not strictly > 4).
+# Hand trace: z0=0; step→zx=-2; i=1. zx2=4,zy2=0 sum=4 NOT >4 → step: zy=0,zx=4-2=2; i=2.
+# zx2=4, sum=4 NOT >4 → step: zy=0, zx=4-0-2=2; repeats forever → i == max_iter.
+fn test_minus2_boundary() -> bool {
+    let iters = mandel_iters(-2.0, 0.0, 48)
+    iters == 48
+}
+
+# Test 5: c=(0, 1) — purely imaginary point escapes (it lies outside the Mandelbrot set).
+# Hand trace (real, imag):
+#   z0 = (0,0)
+#   step: zy = 2*0*0+1=1, zx=0-0+0=0  → z1=(0,1); |z1|²=1 ≤ 4; i=1
+#   step: zy = 2*0*1+1=1, zx=0-1+0=-1 → z2=(-1,1); |z2|²=2 ≤ 4; i=2
+#   step: zy = 2*(-1)*1+1=-1, zx=1-1+0=0 → z3=(0,-1); |z3|²=1 ≤ 4; i=3
+#   step: zy = 2*0*(-1)+1=1, zx=0-1+0=-1 → z4=(-1,1); same as z2 → cycle, never escapes
+# So c=(0,1) is actually INSIDE (periodic orbit) → i == max_iter.
+fn test_purely_imaginary_unit_inside() -> bool {
+    let iters = mandel_iters(0.0, 1.0, 48)
+    iters == 48
+}
+
+# Test 6: max_iter parameter is respected — with max_iter=1 any point returns at most 1.
+fn test_max_iter_respected() -> bool {
+    let inside = mandel_iters(0.0, 0.0, 1)
+    let outside = mandel_iters(2.5, 0.0, 1)
+    inside == 1 && outside == 1
+}

@@ -1,0 +1,101 @@
+# abacus_anim.dmc — the tensor-bead soroban, ANIMATED in the terminal. Each
+# frame clears the screen (ANSI ESC[2J/ESC[H, built with chr(27)) and re-renders
+# the bead tensor, with sleep_ms pacing. Watch the units rod fill, the heaven
+# bead drop at 5, and carries cascade up the rods.
+#
+# Runs on BOTH backends: chr / sleep_ms / flush are now wired into the JIT too,
+# so the animation works under `dmc jit` as well as `dmc run`. For the
+# (non-animated) cursed-math version, see abacus.dmc.
+#
+#   Run: dmc run examples/abacus_anim.dmc
+#   JIT: dmc jit examples/abacus_anim.dmc
+
+fn pow10(k: i64) -> i64 {
+    let !p = 1
+    for i in 0..k { p = p * 10 }
+    p
+}
+
+fn encode(n: i64) -> Tensor[f32, [6, 5]] {
+    let !A = forge.zeros[f32, [6, 5]]
+    for i in 0..6 {
+        let digit = (n / pow10(5 - i)) % 10
+        if (digit / 5) == 1 { A[i, 0] = 1.0f32 }
+        let e = digit % 5
+        for k in 0..e { A[i, 1 + k] = 1.0f32 }
+    }
+    A
+}
+
+fn value(A: Tensor[f32, [6, 5]]) -> i64 {
+    let bead_w = [[5.0f32], [1.0f32], [1.0f32], [1.0f32], [1.0f32]]
+    let d = A @ bead_w
+    let !total = 0
+    for i in 0..6 { total = total + (d[i, 0] as i64) * pow10(5 - i) }
+    total
+}
+
+fn earth_count(A: Tensor[f32, [6, 5]], i: i64) -> i64 {
+    let !e = 0
+    for k in 0..4 { e = e + (A[i, 1 + k] as i64) }
+    e
+}
+
+fn cell(A: Tensor[f32, [6, 5]], i: i64, row: i64) -> str {
+    if row == 2 {
+        "═══"
+    } else if row < 2 {
+        let active = (A[i, 0] as i64) == 1
+        let here   = if row == 0 { active == false } else { active }
+        if here { " O " } else { " | " }
+    } else {
+        let c = row - 3
+        let e = earth_count(A, i)
+        if c < e { " O " } else if c == e { " | " } else { " O " }
+    }
+}
+
+# One animation frame: clear+home, caption, then the rods.
+fn frame(n: i64, caption: str) -> nil {
+    let esc = chr(27)
+    let A = encode(n)
+    print(esc + "[2J" + esc + "[H" + "  ╔═ tensor-bead soroban ═╗  " + caption)
+    print("")
+    for row in 0..8 {
+        let !line = "      "
+        for i in 0..6 { line = line + cell(A, i, row) }
+        print(line)
+    }
+    print("       1e5 1e4 1e3 1e2 1e1 1e0")
+    print("       value = " + (value(A) as str))
+    flush()
+    sleep_ms(150.0)
+    nil
+}
+
+fn main() -> nil {
+    # 1. count up: watch the units rod fill, the 5-bead drop at 5, carry at 10
+    for n in 0..14 { frame(n, "counting up") }
+
+    # 2. leap by 137: cascading carries climb the rods
+    let !v = 0
+    for s in 0..12 {
+        frame(v, "leaping by 137")
+        v = v + 137
+    }
+
+    # 3. powers of two rolling up to 32768
+    let !p = 1
+    for s in 0..16 {
+        frame(p, "powers of two")
+        p = p * 2
+    }
+
+    print("done.")
+    nil
+}
+
+# Gate (animation aside): the beads still round-trip.
+fn test_anim_roundtrip() -> bool {
+    (value(encode(0)) == 0) && (value(encode(13)) == 13) && (value(encode(32768)) == 32768)
+}

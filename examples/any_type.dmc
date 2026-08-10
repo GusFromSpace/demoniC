@@ -1,0 +1,73 @@
+# any_type.dmc — the `any` dynamic escape hatch (issue #186).
+#
+# `any` is the one type whose kind is not fixed at compile time. It is
+# compatible with every other type in both directions, so a value whose type
+# varies at runtime can cross a function boundary — the central pattern of a
+# dynamically-typed atom() / eval(). Recover the concrete kind at the use site
+# with the introspection predicates (is_int / is_float / is_str / ...).
+#
+# `any` is interpreter-only: run with `dmc run`, not `dmc jit`.
+
+# A token becomes a number if it parses as one, otherwise it stays a symbol.
+# The two return paths have different types (f64 vs str) — legal under `-> any`.
+fn atom(tok: str) -> any {
+    if is_numeric(tok) { return to_float(tok) }
+    tok
+}
+
+# Dispatch on the runtime kind of an `any` value.
+fn describe(x: any) -> str {
+    if is_float(x) { return "number" }
+    if is_str(x)   { return "symbol" }
+    "unknown"
+}
+
+fn main() -> nil {
+    let a = atom("42.5")     # -> f64 2.5
+    let b = atom("lambda")   # -> str
+
+    print(describe(a) + describe(b))   # numbersymbol
+    nil
+}
+
+# atom("42.5") calls to_float("42.5") and returns an f64 value.
+# is_float must be true because the -> any return carries the f64 kind.
+fn test_atom_numeric_is_float() -> bool {
+    let v = atom("42.5")
+    is_float(v)
+}
+
+# atom("lambda") cannot parse as numeric, so it returns the string itself.
+# is_str must be true because the -> any return carries the str kind.
+fn test_atom_symbol_is_str() -> bool {
+    let v = atom("lambda")
+    is_str(v)
+}
+
+# describe dispatches on the runtime kind.
+# atom("42.5") yields an f64 -> describe returns "number".
+fn test_describe_number() -> bool {
+    describe(atom("42.5")) == "number"
+}
+
+# atom("lambda") yields a str -> describe returns "symbol".
+fn test_describe_symbol() -> bool {
+    describe(atom("lambda")) == "symbol"
+}
+
+# The full output of main is the concatenation "numbersymbol".
+fn test_describe_combined() -> bool {
+    let a = atom("42.5")
+    let b = atom("lambda")
+    describe(a) + describe(b) == "numbersymbol"
+}
+
+# A non-numeric, non-string any value should make describe return "unknown".
+# Pass an integer (i64) wrapped in any: is_float will be false, is_str false.
+fn wrap_int_as_any() -> any {
+    42
+}
+
+fn test_describe_unknown() -> bool {
+    describe(wrap_int_as_any()) == "unknown"
+}

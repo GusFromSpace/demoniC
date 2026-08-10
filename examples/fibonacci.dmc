@@ -1,0 +1,61 @@
+# fibonacci.dmc — First 15 Fibonacci numbers, two implementations.
+# Demonstrates: recursion, iterative state, function definitions, assertion via print.
+# No JIT needed. Run: dmc run examples/fibonacci.dmc
+
+fn fib_recursive(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else if n == 1 {
+        1
+    } else {
+        fib_recursive(n - 1) + fib_recursive(n - 2)
+    }
+}
+
+fn fib_iter(n: i64) -> i64 {
+    if n <= 0 {
+        0
+    } else {
+        let !a = 0
+        let !b = 1
+        let !i = 1
+        while i < n {
+            let tmp = a + b
+            a = b
+            b = tmp
+            i = i + 1
+        }
+        b
+    }
+}
+
+# --- numeric gates: Fibonacci values are independently known ---
+# fib(0..10) = 0,1,1,2,3,5,8,13,21,34,55 ; fib(15)=610 ; fib(20)=6765
+fn test_fib_recursive_known() -> bool {
+    fib_recursive(10) == 55 && fib_recursive(15) == 610 && fib_recursive(0) == 0
+}
+
+fn test_fib_iter_known() -> bool {
+    fib_iter(10) == 55 && fib_iter(20) == 6765 && fib_iter(1) == 1
+}
+
+# the two implementations must agree across the demonstrated range
+fn test_fib_impls_agree() -> bool {
+    let !ok = true
+    for i in 0..15 {
+        if fib_recursive(i) != fib_iter(i) { ok = false }
+    }
+    ok
+}
+
+fn main() -> nil {
+    print("n   recursive  iterative  match?")
+    for i in 0..15 {
+        let r = fib_recursive(i)
+        let it = fib_iter(i)
+        let !ok = "yes"
+        if r != it { ok = "NO" }
+        print(to_str(i) + "\t" + to_str(r) + "\t\t" + to_str(it) + "\t\t" + ok)
+    }
+    nil
+}

@@ -1,0 +1,208 @@
+# dmg_raymarch.dmc — the cursed DMG.
+#
+# In the timeline where the Game Boy's boot ROM was written in demoniC, someone
+# pointed the 4-shade DMG "PPU" at a job it was never meant to do: signed-
+# distance ray marching. No tiles. No sprites. Just a unit sphere on a checkered
+# floor, marched per-pixel on the CPU, quantized to the four sacred greys, and
+# blitted to the dot-matrix screen as ASCII.
+#
+# (A sibling branch builds the "real" ray marcher. This is the one that runs on
+# the handheld that should not be able to run it.)
+#
+# DMG palette → ASCII ramp:  0=' '(off)  1='.'  2=':'  3='+'  4='#'(darkest ink)
+
+# Scene SDF: unit sphere centered at (0,1,0), union ground plane y=0.
+fn sdf(x: f64, y: f64, z: f64) -> f64 {
+    let ds = sqrt(x*x + (y - 1.0)*(y - 1.0) + z*z) - 1.0
+    min(ds, y)
+}
+
+fn main() -> nil {
+    print("== DMG-01 // demoniC core // PPU raymarch override ==")
+
+    # 56x28 dot-matrix screen (≈2:1 char aspect makes the sphere read round).
+    let !fb = forge.zeros[u8, [28, 56]]
+
+    # Camera: just behind and above the origin, staring down +z at the sphere.
+    let rox = 0.0
+    let roy = 1.0
+    let roz = -3.2
+
+    # Key light, pre-normalized: upper-right, toward the screen.
+    let lx = 0.577
+    let ly = 0.577
+    let lz = -0.577
+
+    for py in 0..28 {
+        for px in 0..56 {
+            # Screen UV in [-1,1]; flip Y so row 0 is the top.
+            let u = (px as f64 + 0.5) / 56.0 * 2.0 - 1.0
+            let v = 1.0 - (py as f64 + 0.5) / 28.0 * 2.0
+
+            # Ray direction (normalized), 1.4 = focal length / zoom.
+            let dl = sqrt(u*u + v*v + 1.96)
+            let rdx = u / dl
+            let rdy = v / dl
+            let rdz = 1.4 / dl
+
+            # March.
+            let !t = 0.0
+            let !hit = false
+            let !marching = true
+            let !k = 0
+            let !hx = 0.0
+            let !hy = 0.0
+            let !hz = 0.0
+            while marching {
+                if k >= 64 {
+                    marching = false
+                } else {
+                    hx = rox + rdx * t
+                    hy = roy + rdy * t
+                    hz = roz + rdz * t
+                    let d = sdf(hx, hy, hz)
+                    if d < 0.002 {
+                        hit = true
+                        marching = false
+                    } else {
+                        t = t + d
+                        if t > 20.0 { marching = false }
+                        k = k + 1
+                    }
+                }
+            }
+
+            let !shade = 0
+            if hit {
+                # Surface normal via the tetrahedron finite-difference trick.
+                let e = 0.002
+                let a = sdf(hx + e, hy - e, hz - e)
+                let b = sdf(hx - e, hy - e, hz + e)
+                let c = sdf(hx - e, hy + e, hz - e)
+                let g = sdf(hx + e, hy + e, hz + e)
+                let nx = a - b - c + g
+                let ny = (0.0 - a) - b + c + g
+                let nz = (0.0 - a) + b - c + g
+                let nl = sqrt(nx*nx + ny*ny + nz*nz)
+                let snx = nx / nl
+                let sny = ny / nl
+                let snz = nz / nl
+
+                # Lambert + ambient.
+                let diff = snx*lx + sny*ly + snz*lz
+                let !bright = 0.15 + 0.85 * max(diff, 0.0)
+
+                # Checkered floor: if the plane is the nearer surface here, darken
+                # alternating 1x1 tiles. (Cursed tilemap nostalgia.)
+                let ds = sqrt(hx*hx + (hy - 1.0)*(hy - 1.0) + hz*hz) - 1.0
+                if hy < ds {
+                    let parity = ((floor(hx) as i64) + (floor(hz) as i64)) % 2
+                    if parity == 0 { bright = bright * 0.5 }
+
+                    # Shadow ray: march from the floor toward the light; if the
+                    # sphere (occluder only) blocks it, we're in shadow.
+                    let !st = 0.05
+                    let !shadowing = true
+                    let !sk = 0
+                    while shadowing {
+                        if sk >= 24 {
+                            shadowing = false
+                        } else {
+                            let sx = hx + lx * st
+                            let sy = hy + ly * st
+                            let sz = hz + lz * st
+                            let so = sqrt(sx*sx + (sy - 1.0)*(sy - 1.0) + sz*sz) - 1.0
+                            if so < 0.01 {
+                                bright = bright * 0.4
+                                shadowing = false
+                            } else {
+                                st = st + so
+                                if st > 6.0 { shadowing = false }
+                                sk = sk + 1
+                            }
+                        }
+                    }
+                }
+
+                if bright > 1.0 { bright = 1.0 }
+                shade = 1 + (floor(bright * 3.999) as i64)
+                if shade > 4 { shade = 4 }
+                if shade < 1 { shade = 1 }
+            }
+
+            fb[py, px] = shade as u8
+        }
+    }
+
+    # Blit VRAM → screen.
+    for py in 0..28 {
+        let !row = ""
+        for px in 0..56 {
+            let s = fb[py, px]
+            if s == 0 { row = row + " " }
+            if s == 1 { row = row + "." }
+            if s == 2 { row = row + ":" }
+            if s == 3 { row = row + "+" }
+            if s == 4 { row = row + "#" }
+        }
+        print(row)
+    }
+    nil
+}
+
+# Tests for the SDF and scene geometry.
+#
+# sdf(x,y,z) = min(sphere_sdf, floor_sdf)
+#   sphere_sdf = sqrt(x^2 + (y-1)^2 + z^2) - 1.0   (unit sphere at (0,1,0))
+#   floor_sdf  = y                                    (plane y=0)
+#
+# All expected values are derived analytically; NO magic numbers from runs.
+
+# Center of sphere (0,1,0): sphere_sdf = sqrt(0) - 1 = -1; floor_sdf = 1; min = -1.
+fn test_sdf_sphere_interior() -> bool {
+    let v = sdf(0.0, 1.0, 0.0)
+    abs(v - (0.0 - 1.0)) < 0.0001
+}
+
+# On sphere surface, top pole (0,2,0): sphere_sdf = sqrt(0+1+0)-1 = 0; floor_sdf = 2; min = 0.
+fn test_sdf_sphere_surface_top() -> bool {
+    let v = sdf(0.0, 2.0, 0.0)
+    abs(v) < 0.0001
+}
+
+# On floor at origin (0,0,0): sphere_sdf = sqrt(0+1+0)-1 = 0; floor_sdf = 0; min = 0.
+fn test_sdf_floor_at_origin() -> bool {
+    let v = sdf(0.0, 0.0, 0.0)
+    abs(v) < 0.0001
+}
+
+# Well below the floor (0,-1,0): sphere_sdf = sqrt(0+4+0)-1 = 1; floor_sdf = -1; min = -1.
+fn test_sdf_below_floor() -> bool {
+    let v = sdf(0.0, 0.0 - 1.0, 0.0)
+    abs(v - (0.0 - 1.0)) < 0.0001
+}
+
+# Far point (10,1,0): sphere_sdf = sqrt(81+0+0)-1 = 9-1 = 8 (approx); floor_sdf=1; min=1 (floor wins).
+# floor_sdf=1, sphere_sdf=9-1=8 => min=1; SDF must equal 1.0 exactly (floor_sdf=y=1).
+fn test_sdf_far_point_floor_wins() -> bool {
+    let v = sdf(10.0, 1.0, 0.0)
+    abs(v - 1.0) < 0.0001
+}
+
+# Invariant: SDF < 0 inside sphere. Point (0,1.5,0): sphere_sdf = 0.5-1 = -0.5; floor=1.5 => min=-0.5.
+fn test_sdf_inside_sphere_negative() -> bool {
+    let v = sdf(0.0, 1.5, 0.0)
+    v < 0.0
+}
+
+# Invariant: SDF > 0 outside all objects. (3,3,0): sphere_sdf=sqrt(9+4+0)-1=sqrt(13)-1~2.6; floor=3 => positive.
+fn test_sdf_outside_positive() -> bool {
+    let v = sdf(3.0, 3.0, 0.0)
+    v > 0.0
+}
+
+# Sphere surface equator point (1,1,0): sphere_sdf = sqrt(1+0+0)-1 = 0; floor=1; min=0.
+fn test_sdf_sphere_surface_equator() -> bool {
+    let v = sdf(1.0, 1.0, 0.0)
+    abs(v) < 0.0001
+}

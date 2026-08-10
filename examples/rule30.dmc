@@ -1,0 +1,162 @@
+# rule30.dmc — Wolfram Rule 30 cellular automaton
+#
+# A 1D grid evolves one generation at a time. Each cell's next state
+# is determined by itself and its two neighbours:
+#
+#   new(l, c, r) = l XOR (c OR r)
+#
+# Starting from a single live cell this rule generates a pattern
+# that is provably aperiodic — and is used as Mathematica's built-in PRNG.
+#
+# Run: dmc run examples/rule30.dmc
+
+fn rule30(l: i64, c: i64, r: i64) -> i64 {
+    l ^ (c | r)
+}
+
+fn main() -> nil {
+    let W    = 79   # row width (odd, so centre is exact)
+    let gens = 36   # generations to evolve
+
+    let !row = vault.zeros[f32, [79]]
+    row[39] = 1.0   # single seed cell at centre
+
+    let !g = 0
+    while g < gens {
+        # ── print this generation ──────────────────────────────────────────
+        let !line = ""
+        let !k = 0
+        while k < W {
+            if row[k] > 0.5 { line = line + "█" } else { line = line + " " }
+            k = k + 1
+        }
+        print(line)
+
+        # ── compute next generation ────────────────────────────────────────
+        let !next = vault.zeros[f32, [79]]
+        let !j = 1
+        while j < W - 1 {
+            let l = row[j - 1] as i64
+            let c = row[j]     as i64
+            let r = row[j + 1] as i64
+            next[j] = rule30(l, c, r) as f32
+            j = j + 1
+        }
+        row = next
+        g = g + 1
+    }
+    nil
+}
+
+# ── tests ─────────────────────────────────────────────────────────────────────
+#
+# rule30(l, c, r) = l XOR (c OR r)
+#
+# Hand-derived truth table for all 8 (l,c,r) ∈ {0,1}³:
+#   (0,0,0) → 0 XOR 0 = 0
+#   (0,0,1) → 0 XOR 1 = 1
+#   (0,1,0) → 0 XOR 1 = 1
+#   (0,1,1) → 0 XOR 1 = 1
+#   (1,0,0) → 1 XOR 0 = 1
+#   (1,0,1) → 1 XOR 1 = 0
+#   (1,1,0) → 1 XOR 1 = 0
+#   (1,1,1) → 1 XOR 1 = 0
+# Reading patterns 7→0: 00011110 = 30 in decimal — confirms this is Rule 30.
+
+fn test_rule30_truth_table() -> bool {
+    rule30(0, 0, 0) == 0 &&
+    rule30(0, 0, 1) == 1 &&
+    rule30(0, 1, 0) == 1 &&
+    rule30(0, 1, 1) == 1 &&
+    rule30(1, 0, 0) == 1 &&
+    rule30(1, 0, 1) == 0 &&
+    rule30(1, 1, 0) == 0 &&
+    rule30(1, 1, 1) == 0
+}
+
+# Invariant: for all {0,1} inputs, rule30 returns only 0 or 1.
+# Proof: l XOR (c OR r) — XOR of two bits is a bit.
+fn test_rule30_output_is_bit() -> bool {
+    let !all_bits = true
+    let !l = 0
+    while l < 2 {
+        let !c = 0
+        while c < 2 {
+            let !r = 0
+            while r < 2 {
+                let v = rule30(l, c, r)
+                if v != 0 && v != 1 { all_bits = false }
+                r = r + 1
+            }
+            c = c + 1
+        }
+        l = l + 1
+    }
+    all_bits
+}
+
+# One step from a single seed at index 39 (width 79).
+# After step 1, only cells 38, 39, 40 are alive.
+# Derivation:
+#   cell 38: rule30(row[37]=0, row[38]=0, row[39]=1) = rule30(0,0,1) = 1
+#   cell 39: rule30(row[38]=0, row[39]=1, row[40]=0) = rule30(0,1,0) = 1
+#   cell 40: rule30(row[39]=1, row[40]=0, row[41]=0) = rule30(1,0,0) = 1
+#   all others: rule30(0,0,0) = 0
+fn test_one_step_center_seed() -> bool {
+    let W = 79
+    let !row = forge.zeros[f32, [79]]
+    row[39] = 1.0
+
+    let !next = forge.zeros[f32, [79]]
+    let !j = 1
+    while j < W - 1 {
+        let l = row[j - 1] as i64
+        let c = row[j]     as i64
+        let r = row[j + 1] as i64
+        next[j] = rule30(l, c, r) as f32
+        j = j + 1
+    }
+
+    next[37] == 0.0 &&
+    next[38] == 1.0 &&
+    next[39] == 1.0 &&
+    next[40] == 1.0 &&
+    next[41] == 0.0
+}
+
+# Two steps from a single seed.
+# After step 2, live cells are at 37, 38, 41; dead at 39, 40.
+# Derivation (using gen1: cells 38,39,40 are 1):
+#   cell 37: rule30(0, 0, 1) = 1
+#   cell 38: rule30(0, 1, 1) = 1
+#   cell 39: rule30(1, 1, 1) = 0
+#   cell 40: rule30(1, 1, 0) = 0   (wait: l=row[39]=1, c=row[40]=1, r=row[41]=0 → rule30(1,1,0)=0)
+#   cell 41: rule30(1, 0, 0) = 1   (l=row[40]=1, c=row[41]=0, r=row[42]=0)
+fn test_two_steps() -> bool {
+    let W = 79
+    let !row = forge.zeros[f32, [79]]
+    row[39] = 1.0
+
+    let !step = 0
+    while step < 2 {
+        let !next = forge.zeros[f32, [79]]
+        let !j = 1
+        while j < W - 1 {
+            let l = row[j - 1] as i64
+            let c = row[j]     as i64
+            let r = row[j + 1] as i64
+            next[j] = rule30(l, c, r) as f32
+            j = j + 1
+        }
+        row = next
+        step = step + 1
+    }
+
+    row[36] == 0.0 &&
+    row[37] == 1.0 &&
+    row[38] == 1.0 &&
+    row[39] == 0.0 &&
+    row[40] == 0.0 &&
+    row[41] == 1.0 &&
+    row[42] == 0.0
+}

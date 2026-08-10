@@ -1,0 +1,226 @@
+# Tic-Tac-Toe with Ackermann-bounded minimax depth
+
+fn ack(m: i64, n: i64) -> i64 {
+    if m == 0 {
+        n + 1
+    } else if n == 0 {
+        ack(m - 1, 1)
+    } else {
+        ack(m - 1, ack(m, n - 1))
+    }
+}
+
+fn print_board(board: Tensor[i64, [3, 3]]) -> nil {
+  for i in 0..3 {
+    let mut row = " ";
+    for j in 0..3 {
+      let val = board[i, j];
+      if val == 0 {
+        row = row + ".";
+      } else if val == 1 {
+        row = row + "X";
+      } else {
+        row = row + "O";
+      }
+      if j < 2 {
+        row = row + " | ";
+      }
+    }
+    print(row);
+    if i < 2 {
+      print("---------");
+    }
+  }
+  print("");
+  nil
+}
+
+fn check_winner(board: Tensor[i64, [3, 3]]) -> i64 {
+  # Check rows
+  for i in 0..3 {
+    let a = board[i, 0];
+    let b = board[i, 1];
+    let c = board[i, 2];
+    if a != 0 && a == b && b == c {
+      return a;
+    }
+  }
+
+  # Check columns
+  for j in 0..3 {
+    let a = board[0, j];
+    let b = board[1, j];
+    let c = board[2, j];
+    if a != 0 && a == b && b == c {
+      return a;
+    }
+  }
+
+  # Check diagonals
+  let a = board[0, 0];
+  let b = board[1, 1];
+  let c = board[2, 2];
+  if a != 0 && a == b && b == c {
+    return a;
+  }
+
+  let a = board[0, 2];
+  let b = board[1, 1];
+  let c = board[2, 0];
+  if a != 0 && a == b && b == c {
+    return a;
+  }
+
+  # Check for draw (all filled, no winner)
+  let mut filled = 0;
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] != 0 {
+        filled = filled + 1;
+      }
+    }
+  }
+
+  if filled == 9 {
+    return 3;
+  }
+
+  0
+}
+
+fn count_pieces(board: Tensor[i64, [3, 3]], player: i64) -> i64 {
+  let mut count = 0;
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] == player {
+        count = count + 1;
+      }
+    }
+  }
+  count
+}
+
+fn minimax_bounded(board: Tensor[i64, [3, 3]], player: i64, depth: i64, depth_param: i64) -> i64 {
+  let result = check_winner(board);
+
+  if result == 1 {
+    return 10 - depth;
+  }
+  if result == 2 {
+    return -10 + depth;
+  }
+  if result == 3 {
+    return 0;
+  }
+
+  # Depth limit check: stop recursing when depth >= ackermann(2, depth_param)
+  let max_depth = ack(2, depth_param);
+  if depth >= max_depth {
+    # Return heuristic: player 1 pieces minus player 2 pieces
+    let p1_count = count_pieces(board, 1);
+    let p2_count = count_pieces(board, 2);
+    return p1_count - p2_count;
+  }
+
+  let mut best_score = if player == 1 { -100 } else { 100 };
+
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] == 0 {
+        let mut new_board = board;
+        new_board[i, j] = player;
+        let opponent = if player == 1 { 2 } else { 1 };
+        let score = minimax_bounded(new_board, opponent, depth + 1, depth_param);
+
+        if player == 1 {
+          if score > best_score {
+            best_score = score;
+          }
+        } else {
+          if score < best_score {
+            best_score = score;
+          }
+        }
+      }
+    }
+  }
+
+  best_score
+}
+
+fn best_move_bounded(board: Tensor[i64, [3, 3]], player: i64, depth_param: i64) -> (i64, i64) {
+  let mut best_score = if player == 1 { -100 } else { 100 };
+  let mut best_row = 0;
+  let mut best_col = 0;
+
+  for i in 0..3 {
+    for j in 0..3 {
+      if board[i, j] == 0 {
+        let mut new_board = board;
+        new_board[i, j] = player;
+        let opponent = if player == 1 { 2 } else { 1 };
+        let score = minimax_bounded(new_board, opponent, 1, depth_param);
+
+        if player == 1 {
+          if score > best_score {
+            best_score = score;
+            best_row = i;
+            best_col = j;
+          }
+        } else {
+          if score < best_score {
+            best_score = score;
+            best_row = i;
+            best_col = j;
+          }
+        }
+      }
+    }
+  }
+
+  (best_row, best_col)
+}
+
+fn main() -> nil {
+  let mut board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+
+  let depth_param = 2;
+  let max_depth = ack(2, depth_param);
+
+  print("=== Tic-Tac-Toe: X vs O (Ackermann-bounded minimax) ===");
+  print("Depth parameter: " + to_str(depth_param));
+  print("Max recursion depth (ack(2, " + to_str(depth_param) + ")): " + to_str(max_depth));
+  print("");
+
+  print_board(board);
+
+  let mut current_player = 1;
+
+  while true {
+    let winner = check_winner(board);
+    if winner != 0 {
+      if winner == 1 {
+        print("X wins!");
+      } else if winner == 2 {
+        print("O wins!");
+      } else {
+        print("Draw!");
+      }
+      break;
+    }
+
+    let (row, col) = best_move_bounded(board, current_player, depth_param);
+    board[row, col] = current_player;
+
+    if current_player == 1 {
+      print("X plays at (" + to_str(row) + ", " + to_str(col) + ")");
+    } else {
+      print("O plays at (" + to_str(row) + ", " + to_str(col) + ")");
+    }
+
+    print_board(board);
+
+    current_player = if current_player == 1 { 2 } else { 1 };
+  }
+  nil
+}

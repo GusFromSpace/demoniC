@@ -1,0 +1,306 @@
+# Battleship with Newton-Raphson adaptive step search
+
+fn newton_sqrt(x: f64) -> f64 {
+  let mut guess = x
+  let mut i = 0
+  while i < 20 {
+    guess = (guess + x / guess) / 2.0
+    i = i + 1
+  }
+  guess
+}
+
+fn place_ships() -> Tensor[i64, [10, 10]] {
+  let mut board = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+
+  # Carrier: row 0, cols 0-4 (5 cells)
+  board[0, 0] = 1;
+  board[0, 1] = 1;
+  board[0, 2] = 1;
+  board[0, 3] = 1;
+  board[0, 4] = 1;
+
+  # Battleship: col 9, rows 0-3 (4 cells, vertical)
+  board[0, 9] = 1;
+  board[1, 9] = 1;
+  board[2, 9] = 1;
+  board[3, 9] = 1;
+
+  # Cruiser: row 5, cols 3-5 (3 cells)
+  board[5, 3] = 1;
+  board[5, 4] = 1;
+  board[5, 5] = 1;
+
+  # Submarine: col 0, rows 5-7 (3 cells, vertical)
+  board[5, 0] = 1;
+  board[6, 0] = 1;
+  board[7, 0] = 1;
+
+  # Destroyer: row 9, cols 7-8 (2 cells)
+  board[9, 7] = 1;
+  board[9, 8] = 1;
+
+  board
+}
+
+fn count_unshot_cells(shots: Tensor[i64, [10, 10]]) -> i64 {
+  let mut count = 0;
+  for i in 0..10 {
+    for j in 0..10 {
+      if shots[i, j] == 0 {
+        count = count + 1;
+      }
+    }
+  }
+  count
+}
+
+fn print_shots(shots: Tensor[i64, [10, 10]]) -> nil {
+  print("");
+  for i in 0..10 {
+    let mut row = " ";
+    for j in 0..10 {
+      let val = shots[i, j];
+      if val == 0 {
+        row = row + ".";
+      } else if val == 1 {
+        row = row + "~";
+      } else {
+        row = row + "X";
+      }
+      if j < 9 {
+        row = row + " ";
+      }
+    }
+    print(row);
+  }
+  nil
+}
+
+fn ships_remaining(ships: Tensor[i64, [10, 10]], shots: Tensor[i64, [10, 10]]) -> i64 {
+  let mut count = 0;
+  for i in 0..10 {
+    for j in 0..10 {
+      if ships[i, j] == 1 && shots[i, j] != 2 {
+        count = count + 1;
+      }
+    }
+  }
+  count
+}
+
+fn has_adjacent_hit(shots: Tensor[i64, [10, 10]], r: i64, c: i64) -> bool {
+  let up = if r > 0 { shots[r - 1, c] == 2 } else { false };
+  let down = if r < 9 { shots[r + 1, c] == 2 } else { false };
+  let left = if c > 0 { shots[r, c - 1] == 2 } else { false };
+  let right = if c < 9 { shots[r, c + 1] == 2 } else { false };
+
+  up || down || left || right
+}
+
+fn pick_next_shot(shots: Tensor[i64, [10, 10]]) -> (i64, i64) {
+  # Phase 1: Hunt mode - find unshot cells adjacent to a hit
+  for i in 0..10 {
+    for j in 0..10 {
+      if shots[i, j] == 2 {
+        if i > 0 {
+          if shots[i - 1, j] == 0 {
+            return (i - 1, j)
+          }
+        }
+        if i < 9 {
+          if shots[i + 1, j] == 0 {
+            return (i + 1, j)
+          }
+        }
+        if j > 0 {
+          if shots[i, j - 1] == 0 {
+            return (i, j - 1)
+          }
+        }
+        if j < 9 {
+          if shots[i, j + 1] == 0 {
+            return (i, j + 1)
+          }
+        }
+      }
+    }
+  }
+
+  # Phase 2: Adaptive sqrt search - spacing based on remaining cells
+  let unshot = count_unshot_cells(shots);
+  let step_f = newton_sqrt(unshot as f64);
+  let step = (step_f + 0.5) as i64;
+  let clamped_step = if step < 1 { 1 } else { step };
+
+  for i in 0..10 {
+    for j in 0..10 {
+      if i % clamped_step == 0 {
+        if j % clamped_step == 0 {
+          if shots[i, j] == 0 {
+            return (i, j)
+          }
+        }
+      }
+    }
+  }
+
+  # Phase 3: Fallback - any unshot cell
+  for i in 0..10 {
+    for j in 0..10 {
+      if shots[i, j] == 0 {
+        return (i, j)
+      }
+    }
+  }
+
+  (-1, -1)
+}
+
+# Tests
+
+fn test_newton_sqrt_perfect_squares() -> bool {
+  # Heron's method: 20 iterations from guess=x converges exactly on perfect squares
+  # sqrt(4)=2, sqrt(9)=3, sqrt(16)=4 — closed-form values
+  let a = newton_sqrt(4.0);
+  let b = newton_sqrt(9.0);
+  let c = newton_sqrt(16.0);
+  let ok_a = if a - 2.0 < 0.0 { 2.0 - a < 1e-9 } else { a - 2.0 < 1e-9 };
+  let ok_b = if b - 3.0 < 0.0 { 3.0 - b < 1e-9 } else { b - 3.0 < 1e-9 };
+  let ok_c = if c - 4.0 < 0.0 { 4.0 - c < 1e-9 } else { c - 4.0 < 1e-9 };
+  ok_a && ok_b && ok_c
+}
+
+fn test_newton_sqrt_identity() -> bool {
+  # sqrt(x)^2 == x (up to floating-point): invariant holds for any positive x
+  # Use x=25.0 (known: sqrt(25)=5) and x=2.0 (irrational, verify self-consistency)
+  let s25 = newton_sqrt(25.0);
+  let roundtrip = s25 * s25;
+  let diff = if roundtrip - 25.0 < 0.0 { 25.0 - roundtrip } else { roundtrip - 25.0 };
+  diff < 1e-9
+}
+
+fn test_place_ships_total_cells() -> bool {
+  # Fleet: Carrier=5, Battleship=4, Cruiser=3, Submarine=3, Destroyer=2 => 17 total ship cells
+  let ships = place_ships();
+  let mut count = 0;
+  for i in 0..10 {
+    for j in 0..10 {
+      if ships[i, j] == 1 {
+        count = count + 1;
+      }
+    }
+  }
+  count == 17
+}
+
+fn test_place_ships_known_positions() -> bool {
+  # Carrier row 0 cols 0-4; Battleship col 9 rows 0-3; spot-check these
+  let ships = place_ships();
+  let carrier_ok = ships[0, 0] == 1 && ships[0, 4] == 1 && ships[0, 5] == 0;
+  let battleship_ok = ships[3, 9] == 1 && ships[4, 9] == 0;
+  let destroyer_ok = ships[9, 7] == 1 && ships[9, 8] == 1 && ships[9, 6] == 0;
+  carrier_ok && battleship_ok && destroyer_ok
+}
+
+fn test_count_unshot_all_zero() -> bool {
+  # A fresh all-zero shots board has 10*10 = 100 unshot cells
+  let shots = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+  count_unshot_cells(shots) == 100
+}
+
+fn test_ships_remaining_fresh_board() -> bool {
+  # With no hits (shots all 0, never 2), all 17 ship cells remain
+  let ships = place_ships();
+  let shots = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+  ships_remaining(ships, shots) == 17
+}
+
+fn test_has_adjacent_hit_empty_board() -> bool {
+  # On an all-zero shots board, no cell has an adjacent hit (value==2)
+  let shots = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+               [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+  !has_adjacent_hit(shots, 5, 5)
+}
+
+fn main() -> nil {
+  let ships = place_ships();
+  let mut shots = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+
+  print("=== Battleship: Adaptive Newton-Raphson AI ===");
+  print("Fleet placed. Starting hunt...");
+
+  let mut turn = 0;
+
+  while true {
+    let remaining = ships_remaining(ships, shots);
+
+    if remaining == 0 {
+      print("Fleet sunk in " + to_str(turn) + " shots!");
+      print_shots(shots);
+      break;
+    }
+
+    let (row, col) = pick_next_shot(shots);
+
+    if ships[row, col] == 1 {
+      shots[row, col] = 2;
+      print("Turn " + to_str(turn) + ": Hit at (" + to_str(row) + ", " + to_str(col) + ")");
+    } else {
+      shots[row, col] = 1;
+      print("Turn " + to_str(turn) + ": Miss at (" + to_str(row) + ", " + to_str(col) + ")");
+    }
+
+    if turn % 5 == 0 {
+      print_shots(shots);
+    }
+
+    turn = turn + 1;
+  }
+
+  nil
+}

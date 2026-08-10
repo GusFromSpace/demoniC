@@ -1,0 +1,143 @@
+# pagerank.dmc — JIT-compiled PageRank solver.
+#
+# Ported from the educational PageRank reference algorithm.
+#
+# Models a 4-page network:
+#   - Page 0 links to 1, 2
+#   - Page 1 links to 2
+#   - Page 2 links to 0
+#   - Page 3 links to 2
+#
+# Computes the stationary probability distribution (PageRank scores)
+# using power iteration: v = d * (M @ v) + (1 - d)/N
+#
+# Run under JIT:
+#   dmc jit examples/pagerank.dmc
+
+fn show_ranks(v: Tensor[f32, [4, 1]]) -> nil {
+    print_f64(v[0, 0] as f64)
+    print_f64(v[1, 0] as f64)
+    print_f64(v[2, 0] as f64)
+    print_f64(v[3, 0] as f64)
+    nil
+}
+
+fn main() -> i64 {
+    # 1. Setup the link transition matrix M of shape [4, 4].
+    # Column j represents outgoing links from Page j.
+    let M = [[0.0, 0.0, 1.0, 0.0],
+             [0.5, 0.0, 0.0, 0.0],
+             [0.5, 1.0, 0.0, 1.0],
+             [0.0, 0.0, 0.0, 0.0]]
+
+    # 2. Damping factor d and network size N.
+    let d = 0.85
+    let N = 4.0
+
+    # 3. Initialize uniform rank vector v of shape [4, 1].
+    let !v = [[0.25],
+              [0.25],
+              [0.25],
+              [0.25]]
+
+    let tele = (1.0 - d) / N
+
+    # 4. Power iteration.
+    let !step = 0
+    while step < 40 {
+        # Matrix multiply transition matrix with rank vector,
+        # scale by damping factor, and add the teleportation probability.
+        v = d .* (M @ v) .+ tele
+        step = step + 1
+    }
+
+    # 5. Display the converged ranks.
+    show_ranks(v)
+    0
+}
+
+# Helper: run 40 iterations of PageRank and return the converged [4,1] rank vector.
+fn run_pagerank() -> Tensor[f32, [4, 1]] {
+    let M = [[0.0, 0.0, 1.0, 0.0],
+             [0.5, 0.0, 0.0, 0.0],
+             [0.5, 1.0, 0.0, 1.0],
+             [0.0, 0.0, 0.0, 0.0]]
+    let d = 0.85
+    let N = 4.0
+    let !v = [[0.25],
+              [0.25],
+              [0.25],
+              [0.25]]
+    let tele = (1.0 - d) / N
+    let !step = 0
+    while step < 40 {
+        v = d .* (M @ v) .+ tele
+        step = step + 1
+    }
+    v
+}
+
+# Test 1: PageRank scores must sum to 1.0 (probability distribution axiom).
+# By construction, v is initialized summing to 1 and the update
+# v = d*(M@v) + (1-d)/N preserves the sum when M's columns sum to 1:
+# sum(v') = d*sum(M@v) + (1-d) = d*sum(v) + (1-d) = 1 for any v summing to 1.
+# Page 3's column is all zeros (dangling node), so sum(M@v) < 1 and the
+# actual column-sum shrinks by the dangling mass — but the teleportation still
+# drags the total back each iteration; after 40 steps the error is < 1e-4.
+fn test_scores_sum_to_one() -> bool {
+    let v = run_pagerank()
+    let s = v[0, 0] + v[1, 0] + v[2, 0] + v[3, 0]
+    abs(s - 1.0) < 0.01
+}
+
+# Test 2: All PageRank scores are non-negative (probability values).
+# Each iteration: v_new = d*(M@v) + tele with tele = 0.0375 > 0 and d>=0,
+# so every entry is bounded below by tele > 0.
+fn test_scores_nonnegative() -> bool {
+    let v = run_pagerank()
+    v[0, 0] >= 0.0 && v[1, 0] >= 0.0 && v[2, 0] >= 0.0 && v[3, 0] >= 0.0
+}
+
+# Test 3: Page 3 (index 3) gets only teleportation — its stationary rank is exactly
+# (1-d)/N = 0.15/4 = 0.0375, because no page links to page 3 (column 3 of M is
+# all zeros except row 2 which is 0.0 in the last column — wait, M[2,3]=1.0 means
+# page 3 LINKS TO page 2, not that page 2 links to page 3).  Re-checking: columns
+# of M represent outgoing links from a page.  Column 3 = [0,0,1,0] meaning page 3
+# links to page 2.  ROW 3 of M = [0,0,0,0] meaning no page links to page 3.
+# So at convergence: v[3] = d*0 + tele = 0.0375.
+fn test_page3_equals_teleport() -> bool {
+    let v = run_pagerank()
+    let tele = (1.0 - 0.85) / 4.0
+    abs(v[3, 0] - tele) < 0.001
+}
+
+# Test 4: Page 2 (index 2) has the highest rank.
+# Page 2 receives links from pages 0 (weight 0.5), 1 (weight 1.0), and 3 (weight 1.0).
+# It is the most-linked-to page in the graph and must beat pages 0, 1, and 3.
+fn test_page2_is_highest() -> bool {
+    let v = run_pagerank()
+    let r0 = v[0, 0]
+    let r1 = v[1, 0]
+    let r2 = v[2, 0]
+    let r3 = v[3, 0]
+    r2 > r0 && r2 > r1 && r2 > r3
+}
+
+# Test 5: Stationarity — the converged v must satisfy v ≈ 0.85*(M@v) + 0.0375
+# element-wise (the fixed-point condition).  After 40 iterations the residual
+# per component should be below 1e-3.
+fn test_stationarity() -> bool {
+    let M = [[0.0, 0.0, 1.0, 0.0],
+             [0.5, 0.0, 0.0, 0.0],
+             [0.5, 1.0, 0.0, 1.0],
+             [0.0, 0.0, 0.0, 0.0]]
+    let d = 0.85
+    let tele = (1.0 - d) / 4.0
+    let v = run_pagerank()
+    let rhs = d .* (M @ v) .+ tele
+    let e0 = abs(v[0, 0] - rhs[0, 0])
+    let e1 = abs(v[1, 0] - rhs[1, 0])
+    let e2 = abs(v[2, 0] - rhs[2, 0])
+    let e3 = abs(v[3, 0] - rhs[3, 0])
+    e0 < 0.001 && e1 < 0.001 && e2 < 0.001 && e3 < 0.001
+}

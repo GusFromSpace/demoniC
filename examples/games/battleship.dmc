@@ -1,0 +1,291 @@
+# Battleship in demoniC: AI hunting pre-placed fleet
+
+fn place_ships() -> Tensor[i64, [10, 10]] {
+  let mut board = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+
+  # Carrier: row 0, cols 0-4 (5 cells)
+  board[0, 0] = 1;
+  board[0, 1] = 1;
+  board[0, 2] = 1;
+  board[0, 3] = 1;
+  board[0, 4] = 1;
+
+  # Battleship: col 9, rows 0-3 (4 cells, vertical)
+  board[0, 9] = 1;
+  board[1, 9] = 1;
+  board[2, 9] = 1;
+  board[3, 9] = 1;
+
+  # Cruiser: row 5, cols 3-5 (3 cells)
+  board[5, 3] = 1;
+  board[5, 4] = 1;
+  board[5, 5] = 1;
+
+  # Submarine: col 0, rows 5-7 (3 cells, vertical)
+  board[5, 0] = 1;
+  board[6, 0] = 1;
+  board[7, 0] = 1;
+
+  # Destroyer: row 9, cols 7-8 (2 cells)
+  board[9, 7] = 1;
+  board[9, 8] = 1;
+
+  board
+}
+
+fn print_shots(shots: Tensor[i64, [10, 10]]) -> nil {
+  print("");
+  for i in 0..10 {
+    let mut row = " ";
+    for j in 0..10 {
+      let val = shots[i, j];
+      if val == 0 {
+        row = row + ".";
+      } else if val == 1 {
+        row = row + "~";
+      } else {
+        row = row + "X";
+      }
+      if j < 9 {
+        row = row + " ";
+      }
+    }
+    print(row);
+  }
+  nil
+}
+
+fn ships_remaining(ships: Tensor[i64, [10, 10]], shots: Tensor[i64, [10, 10]]) -> i64 {
+  let mut count = 0;
+  for i in 0..10 {
+    for j in 0..10 {
+      if ships[i, j] == 1 && shots[i, j] != 2 {
+        count = count + 1;
+      }
+    }
+  }
+  count
+}
+
+fn has_adjacent_hit(shots: Tensor[i64, [10, 10]], r: i64, c: i64) -> bool {
+  let up = if r > 0 { shots[r - 1, c] == 2 } else { false };
+  let down = if r < 9 { shots[r + 1, c] == 2 } else { false };
+  let left = if c > 0 { shots[r, c - 1] == 2 } else { false };
+  let right = if c < 9 { shots[r, c + 1] == 2 } else { false };
+
+  up || down || left || right
+}
+
+fn pick_next_shot(shots: Tensor[i64, [10, 10]]) -> (i64, i64) {
+  # Phase 1: Hunt mode - find unshot cells adjacent to a hit
+  for i in 0..10 {
+    for j in 0..10 {
+      if shots[i, j] == 2 {
+        if i > 0 {
+          if shots[i - 1, j] == 0 {
+            return (i - 1, j)
+          }
+        }
+        if i < 9 {
+          if shots[i + 1, j] == 0 {
+            return (i + 1, j)
+          }
+        }
+        if j > 0 {
+          if shots[i, j - 1] == 0 {
+            return (i, j - 1)
+          }
+        }
+        if j < 9 {
+          if shots[i, j + 1] == 0 {
+            return (i, j + 1)
+          }
+        }
+      }
+    }
+  }
+
+  # Phase 2: Parity search (checkerboard - even sum)
+  for i in 0..10 {
+    for j in 0..10 {
+      if (i + j) % 2 == 0 {
+        if shots[i, j] == 0 {
+          return (i, j)
+        }
+      }
+    }
+  }
+
+  # Phase 3: Fallback - any unshot cell
+  for i in 0..10 {
+    for j in 0..10 {
+      if shots[i, j] == 0 {
+        return (i, j)
+      }
+    }
+  }
+
+  (-1, -1)
+}
+
+fn main() -> nil {
+  let ships = place_ships();
+  let mut shots = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]];
+
+  print("=== Battleship: AI vs Pre-placed Fleet ===");
+  print("Fleet placed. Starting hunt...");
+
+  let mut turn = 0;
+
+  while true {
+    let remaining = ships_remaining(ships, shots);
+
+    if remaining == 0 {
+      print("Fleet sunk in " + to_str(turn) + " shots!");
+      print_shots(shots);
+      break;
+    }
+
+    let (row, col) = pick_next_shot(shots);
+
+    if ships[row, col] == 1 {
+      shots[row, col] = 2;
+      print("Turn " + to_str(turn) + ": Hit at (" + to_str(row) + ", " + to_str(col) + ")");
+    } else {
+      shots[row, col] = 1;
+      print("Turn " + to_str(turn) + ": Miss at (" + to_str(row) + ", " + to_str(col) + ")");
+    }
+
+    if turn % 5 == 0 {
+      print_shots(shots);
+    }
+
+    turn = turn + 1;
+  }
+
+  nil
+}
+
+# ---- Tests ----
+
+# Helper: create all-zero 10x10 shots board
+fn zero_shots() -> Tensor[i64, [10, 10]] {
+  [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+   [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]
+}
+
+# place_ships puts exactly 17 ship cells:
+# Carrier(5) + Battleship(4) + Cruiser(3) + Submarine(3) + Destroyer(2) = 17
+fn test_place_ships_total() -> bool {
+  let board = place_ships()
+  let !count = 0
+  for i in 0..10 {
+    for j in 0..10 {
+      if board[i, j] == 1 {
+        count = count + 1
+      }
+    }
+  }
+  count == 17
+}
+
+# Verify specific known ship positions from place_ships()
+fn test_place_ships_positions() -> bool {
+  let board = place_ships()
+  # Carrier row 0, cols 0-4
+  let carrier_ok = board[0, 0] == 1 && board[0, 4] == 1 && board[0, 5] == 0
+  # Battleship col 9, rows 0-3
+  let bship_ok = board[0, 9] == 1 && board[3, 9] == 1 && board[4, 9] == 0
+  # Destroyer row 9, cols 7-8
+  let dest_ok = board[9, 7] == 1 && board[9, 8] == 1 && board[9, 6] == 0
+  carrier_ok && bship_ok && dest_ok
+}
+
+# ships_remaining on a fresh (all-zero) shots board equals total ship cells = 17
+fn test_ships_remaining_full() -> bool {
+  let ships = place_ships()
+  let shots = zero_shots()
+  ships_remaining(ships, shots) == 17
+}
+
+# ships_remaining drops by 1 for each cell marked as hit (value 2)
+# Marking all 5 carrier cells (row 0, cols 0-4) as hit leaves 17-5 = 12
+fn test_ships_remaining_partial() -> bool {
+  let ships = place_ships()
+  let !shots = zero_shots()
+  shots[0, 0] = 2
+  shots[0, 1] = 2
+  shots[0, 2] = 2
+  shots[0, 3] = 2
+  shots[0, 4] = 2
+  ships_remaining(ships, shots) == 12
+}
+
+# has_adjacent_hit returns false when shots board is all zero (no hits anywhere)
+fn test_has_adjacent_hit_false() -> bool {
+  let shots = zero_shots()
+  # center cell (5,5): no neighbors are hits
+  let r1 = has_adjacent_hit(shots, 5, 5)
+  # corner (0,0): same
+  let r2 = has_adjacent_hit(shots, 0, 0)
+  r1 == false && r2 == false
+}
+
+# has_adjacent_hit returns true when a direct neighbor has value 2
+# Place hit at (3,3); cell (3,4) is to its right so has_adjacent_hit(shots,3,4)==true
+fn test_has_adjacent_hit_true() -> bool {
+  let !shots = zero_shots()
+  shots[3, 3] = 2
+  # (3,4): left neighbor is (3,3) which is 2 -> true
+  let yes = has_adjacent_hit(shots, 3, 4)
+  # (3,2): right neighbor is (3,3) which is 2 -> true
+  let yes2 = has_adjacent_hit(shots, 3, 2)
+  # (2,3): down neighbor is (3,3) -> true
+  let yes3 = has_adjacent_hit(shots, 2, 3)
+  # (5,5): no neighbor is 2 -> false
+  let no = has_adjacent_hit(shots, 5, 5)
+  yes && yes2 && yes3 && (no == false)
+}
+
+# pick_next_shot on an empty board: no hits, so parity search fires.
+# First cell with (i+j)%2==0 and shots[i,j]==0 is (0,0) -> returns (0,0)
+fn test_pick_next_shot_empty() -> bool {
+  let shots = zero_shots()
+  let (r, c) = pick_next_shot(shots)
+  r == 0 && c == 0
+}
+
+# pick_next_shot hunt mode: with a hit at (5,5), the first adjacent unshot cell
+# scanned is (4,5) (i-1 from row 5 when i>0 and shots[4,5]==0)
+fn test_pick_next_shot_hunt() -> bool {
+  let !shots = zero_shots()
+  shots[5, 5] = 2
+  let (r, c) = pick_next_shot(shots)
+  r == 4 && c == 5
+}

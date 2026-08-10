@@ -1,0 +1,134 @@
+# kvcache.dmc — growable shape axis `~` for autoregressive inference.
+# Normative since spec 0.0.2. See SPEC.md §3.6, §4.8 and MEMORY.md §9.
+
+# `~` declares a streaming axis. The Forge reserves trailing capacity for it.
+# `<-` is the append operator: one bump-pointer advance, one hardware copy,
+# zero reallocation.
+
+fn decode_step[B, H, D](
+    !cache_k: KV[f32, [B, H, ~, D]],
+    !cache_v: KV[f32, [B, H, ~, D]],
+    x:        Tensor[f32, [B, D]],
+    Wq: Tensor[f32, [D, H*D]],
+    Wk: Tensor[f32, [D, H*D]],
+    Wv: Tensor[f32, [D, H*D]],
+    Wo: Tensor[f32, [H*D, D]],
+) -> Tensor[f32, [B, D]] {
+    let q = (x @ Wq).reshape[[B, H, 1, D]]
+    let k = (x @ Wk).reshape[[B, H, 1, D]]
+    let v = (x @ Wv).reshape[[B, H, 1, D]]
+
+    cache_k <- k          # O(1) append along the `~` axis
+    cache_v <- v
+
+    let scores = @cast(bf16) {
+        (q @ cache_k') .* (1.0 / sqrt(D as f32))
+    }
+    let attn = softmax(scores, -1) @ cache_v
+    attn.reshape[[B, H*D]] @ Wo
+}
+
+fn generate[B, H, D](
+    model_weights: Weights,
+    prompt: Tensor[i32, [B, S]],
+    max_new: i64,
+) -> Tensor[i32, [B, ~]] {
+    let !cache_k = forge.kv[f32, [B, H, ~, D]](capacity = S + max_new)
+    let !cache_v = forge.kv[f32, [B, H, ~, D]](capacity = S + max_new)
+    let !out:    Tensor[i32, [B, ~]] = forge.kv[i32, [B, ~]](capacity = max_new)
+
+    # Prefill from the prompt.
+    for t in 0..S { let _ = decode_step(cache_k, cache_v, embed(model_weights.embed, prompt[.., t]), ...) }
+
+    # Generate.
+    let mut tok = prompt[.., -1]
+    for _ in 0..max_new {
+        let h = decode_step(cache_k, cache_v, embed(model_weights.embed, tok), ...)
+        tok   = argmax(h, -1)
+        out  <- tok
+    }
+    out
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+fn absf_kv(x: f32) -> f32 {
+    if x < 0.0f32 { 0.0f32 - x } else { x }
+}
+
+# Invariant: when Wo is the zero matrix the output of decode_step is zero
+# regardless of Q, K, V, because the final projection is
+# attn.reshape[B, H*D] @ Wo and anything @ 0 == 0.
+# Parameters: B=1, H=1, D=4, H*D=4. All weight matrices zero.
+# x = [1,0,0,0] (arbitrary non-zero input to ensure the path is exercised).
+fn test_zero_wo_gives_zero_output() -> bool {
+    let !ck = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !cv = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !x  = forge.zeros[f32, [1, 4]]
+    x[0, 0] = 1.0f32
+    let wq = forge.zeros[f32, [4, 4]]
+    let wk = forge.zeros[f32, [4, 4]]
+    let wv = forge.zeros[f32, [4, 4]]
+    let wo = forge.zeros[f32, [4, 4]]
+    let out = decode_step(ck, cv, x, wq, wk, wv, wo)
+    sum(out .* out) < 0.0001f32
+}
+
+# Invariant: with Wq=Wk=zeros, all attention scores are 0.
+# With Wv set as the 4x4 identity and Wo as the 4x4 identity:
+#   v = x @ I = x, so the single cached V is x.
+# Softmax over a single score [0] = [1.0] (trivially).
+# attn = 1.0 * v = v, reshape to [1,4], then @ Wo = @ I = v.
+# Output should equal x. With x = [2, 0, 0, 0]: out[0,0] == 2.0.
+fn test_identity_projection_single_step_passthrough() -> bool {
+    let !ck = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !cv = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !x  = forge.zeros[f32, [1, 4]]
+    x[0, 0] = 2.0f32
+    let wq = forge.zeros[f32, [4, 4]]
+    let wk = forge.zeros[f32, [4, 4]]
+    # Wv = 4x4 identity
+    let !wv = forge.zeros[f32, [4, 4]]
+    wv[0, 0] = 1.0f32
+    wv[1, 1] = 1.0f32
+    wv[2, 2] = 1.0f32
+    wv[3, 3] = 1.0f32
+    # Wo = 4x4 identity
+    let !wo = forge.zeros[f32, [4, 4]]
+    wo[0, 0] = 1.0f32
+    wo[1, 1] = 1.0f32
+    wo[2, 2] = 1.0f32
+    wo[3, 3] = 1.0f32
+    let out = decode_step(ck, cv, x, wq, wk, wv, wo)
+    absf_kv(out[0, 0] - 2.0f32) < 0.01f32 && absf_kv(out[0, 1]) < 0.01f32
+}
+
+# Invariant: two-step cache growth with uniform attention.
+# Setup: Wq=Wk=zeros so all scores are 0; Wv=Wo=identity.
+# Step 1: x1=[1,0,0,0] → v1=x1. Cache=[[v1]]. Softmax([0])=[1]. out1=v1=[1,0,0,0].
+# Step 2: x2=[0,1,0,0] → v2=x2. Cache=[[v1,v2]]. Softmax([0,0])=[0.5,0.5].
+#   attn = 0.5*v1 + 0.5*v2 = [0.5, 0.5, 0, 0]. @Wo=@I → [0.5, 0.5, 0, 0].
+# Check: out2[0,0] ≈ 0.5 and out2[0,1] ≈ 0.5.
+fn test_two_step_uniform_cache() -> bool {
+    let !ck = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let !cv = forge.kv[f32, [1, 1, ~, 4]](capacity = 8)
+    let wq = forge.zeros[f32, [4, 4]]
+    let wk = forge.zeros[f32, [4, 4]]
+    let !wv = forge.zeros[f32, [4, 4]]
+    wv[0, 0] = 1.0f32
+    wv[1, 1] = 1.0f32
+    wv[2, 2] = 1.0f32
+    wv[3, 3] = 1.0f32
+    let !wo = forge.zeros[f32, [4, 4]]
+    wo[0, 0] = 1.0f32
+    wo[1, 1] = 1.0f32
+    wo[2, 2] = 1.0f32
+    wo[3, 3] = 1.0f32
+    let !x1 = forge.zeros[f32, [1, 4]]
+    x1[0, 0] = 1.0f32
+    let !x2 = forge.zeros[f32, [1, 4]]
+    x2[0, 1] = 1.0f32
+    let _out1 = decode_step(ck, cv, x1, wq, wk, wv, wo)
+    let out2  = decode_step(ck, cv, x2, wq, wk, wv, wo)
+    absf_kv(out2[0, 0] - 0.5f32) < 0.02f32 && absf_kv(out2[0, 1] - 0.5f32) < 0.02f32
+}

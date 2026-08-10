@@ -1,0 +1,86 @@
+# stats.dmc — Basic descriptive statistics on a small dataset.
+# Demonstrates: tensor population, min/max/mean/variance, f32 arithmetic.
+# No JIT needed. Run: dmc run examples/stats.dmc
+
+# --- numeric gates: descriptive stats on [4,7,13,2,1,9,15,6] ---
+# Independent restatement of main's math (main keeps logic inline).
+fn sample_data() -> Tensor[f32, [8]] {
+    let !d = forge.zeros[f32, [8]]
+    d[0] = 4.0   d[1] = 7.0   d[2] = 13.0   d[3] = 2.0
+    d[4] = 1.0   d[5] = 9.0   d[6] = 15.0   d[7] = 6.0
+    d
+}
+
+# sum = 57, mean = 57/8 = 7.125
+fn test_mean() -> bool {
+    let !d = sample_data()
+    let mean = sum(d) as f64 / 8.0
+    isclose(mean, 7.125)
+}
+
+# population variance: mean of squared deviations = 174.875/8 = 21.859375
+fn test_variance() -> bool {
+    let !d = sample_data()
+    let mean = sum(d) as f64 / 8.0
+    let !v = 0.0
+    for i in 0..8 {
+        let diff = d[i] as f64 - mean
+        v = v + diff * diff
+    }
+    v = v / 8.0
+    isclose(v, 21.859375)
+}
+
+# min = 1, max = 15
+fn test_min_max() -> bool {
+    let !d = sample_data()
+    let !mn = d[0]
+    let !mx = d[0]
+    for i in 0..8 {
+        if d[i] < mn { mn = d[i] }
+        if d[i] > mx { mx = d[i] }
+    }
+    isclose(mn as f64, 1.0) && isclose(mx as f64, 15.0)
+}
+
+fn main() -> nil {
+    let !data = vault.zeros[f32, [8]]
+    data[0] = 4.0
+    data[1] = 7.0
+    data[2] = 13.0
+    data[3] = 2.0
+    data[4] = 1.0
+    data[5] = 9.0
+    data[6] = 15.0
+    data[7] = 6.0
+
+    let n = 8
+
+    let !mn = data[0]
+    let !mx = data[0]
+    let !total = 0.0
+    for i in 0..n {
+        if data[i] < mn { mn = data[i] }
+        if data[i] > mx { mx = data[i] }
+        total = total + data[i]
+    }
+    let mean = total / n as f64
+
+    let !variance = 0.0
+    for i in 0..n {
+        let diff = data[i] as f64 - mean
+        variance = variance + diff * diff
+    }
+    variance = variance / n as f64
+
+    let !row = "Dataset: "
+    for i in 0..n {
+        row = row + to_str(data[i]) + " "
+    }
+    print(row)
+    print("Min:      " + to_str(mn))
+    print("Max:      " + to_str(mx))
+    print("Mean:     " + to_str(mean))
+    print("Variance: " + to_str(variance))
+    nil
+}

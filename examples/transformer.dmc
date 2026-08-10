@@ -1,0 +1,138 @@
+# transformer.dmc — `model` decls and `@cast` scopes on a real block.
+# Normative since spec 0.0.2. See SPEC.md §3.10, §6.4, §7.2.
+
+model Block[D, H] {
+    ln1: Tensor[f32, [D]]
+    qkv: Tensor[f32, [D, 3*D]]
+    out: Tensor[f32, [D, D]]
+    ln2: Tensor[f32, [D]]
+    fc1: Tensor[f32, [D, 4*D]]
+    fc2: Tensor[f32, [4*D, D]]
+
+    fn forward[B, S](self, x: Tensor[f32, [B, S, D]]) -> Tensor[f32, [B, S, D]] {
+        let h = @cast(bf16) {
+            let qkv = rms_norm(x, self.ln1, 1e-6) @ self.qkv
+            let (q, k, v) = qkv.split[3, axis=-1]
+            let attn = softmax((q @ k') .* (1.0 / sqrt(D as f32)), -1) @ v
+            x .+ attn @ self.out
+        }
+        @cast(bf16) {
+            h .+ (\>(rms_norm(h, self.ln2, 1e-6) @ self.fc1)) @ self.fc2
+        }
+    }
+}
+
+model Transformer[L, D, H, V] {
+    embed:  Tensor[f32, [V, D]]
+    blocks: [Block[D, H]; L]
+    head:   Tensor[f32, [D, V]]
+
+    fn forward[B, S](self, x: Tensor[i32, [B, S]]) -> Tensor[f32, [B, S, V]] {
+        let !h = self.embed[x]                  # gather, zero-copy view
+        for blk in self.blocks { h = blk(h) }
+        h @ self.head'
+    }
+}
+
+fn main() -> nil {
+    vault {
+        let !net = Transformer[L=24, D=2048, H=16, V=50257].load("model.dmcpt")
+        let input_ids = forge.uninit[i32, [2, 64]]   # [B, S] — illustrative shape
+        let logits = net.forward(input_ids)
+    }
+    nil
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+#
+# These test the mathematical building blocks that Block.forward and
+# Transformer.forward rely on.  They do not call main() (which needs a
+# checkpoint file) but they DO exercise every primitive the code touches:
+# rms_norm, softmax, scaled matmul attention, and ReLU masking.
+
+fn absf_tr(x: f32) -> f32 {
+    if x < 0.0f32 { 0.0f32 - x } else { x }
+}
+
+# Invariant: rms_norm(x, ones, eps) has unit RMS.
+# Proof: rms_norm normalises each element as y_i = x_i / rms(x) * g_i.
+# With g = ones: mean(y^2) = mean(x^2) / rms(x)^2 = rms(x)^2 / rms(x)^2 = 1.
+# So mean(y .* y) == 1.0 regardless of the input.
+fn test_rms_norm_unit_rms() -> bool {
+    let x = [3.0f32, 1.0f32, 4.0f32, 1.0f32, 5.0f32, 9.0f32, 2.0f32, 6.0f32]
+    let g = [1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32]
+    let y = rms_norm(x, g, 0.000001f32)
+    let rms_sq = mean(y .* y)
+    absf_tr(rms_sq - 1.0f32) < 0.0001f32
+}
+
+# Invariant: rms_norm gain is a linear multiplier.
+# rms_norm(x, 2*ones, eps) = 2 * rms_norm(x, ones, eps) element-wise,
+# because gain scales the normalised output linearly.
+# Check: sum of 2*g output == 2 * sum of 1*g output.
+fn test_rms_norm_gain_doubling() -> bool {
+    let x = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+    let g1 = [1.0f32, 1.0f32, 1.0f32, 1.0f32]
+    let g2 = [2.0f32, 2.0f32, 2.0f32, 2.0f32]
+    let y1 = rms_norm(x, g1, 0.000001f32)
+    let y2 = rms_norm(x, g2, 0.000001f32)
+    absf_tr(sum(y2) - 2.0f32 * sum(y1)) < 0.0001f32
+}
+
+# Invariant: softmax outputs sum to 1.
+# The transformer attention uses softmax((q @ k') .* scale, -1) to
+# produce attention weights.  Those weights must form a probability
+# distribution — this invariant is the correctness foundation for the
+# attention mechanism.
+fn test_softmax_sums_to_one_tr() -> bool {
+    let logits = [2.0f32, 0.0f32, 1.0f32, 3.0f32]
+    let probs = softmax(logits, -1)
+    absf_tr(sum(probs) - 1.0f32) < 0.0001f32
+}
+
+# Invariant: softmax is monotone-preserving (larger input → larger output).
+# The attention head's ability to "focus" depends on this: the key with the
+# highest dot-product score should receive the highest weight.
+# With inputs [1,4,2,3], index 1 has the max score and must have max weight.
+fn test_softmax_order_preserving_tr() -> bool {
+    let logits = [1.0f32, 4.0f32, 2.0f32, 3.0f32]
+    let probs = softmax(logits, -1)
+    probs[1] > probs[0] && probs[1] > probs[2] && probs[1] > probs[3]
+}
+
+# Invariant: attention with V=zeros yields zeros regardless of Q, K.
+# Block.forward computes: softmax(scores) @ v.
+# Any convex combination (weights ≥ 0, sum=1) of zero rows is zero.
+# sum(out .* out) must be 0.
+# Shape mirrors transformer usage: [B=1, S=2, D=4] (rank-3 @ rank-3).
+fn test_attn_zero_v_gives_zero_tr() -> bool {
+    let q = forge.zeros[f32, [1, 2, 4]]
+    let k = forge.zeros[f32, [1, 2, 4]]
+    let v = forge.zeros[f32, [1, 2, 4]]
+    let scale = 1.0f32 / sqrt(4.0f32)   # D=4 → scale = 0.5
+    let scores = (q @ k') .* scale
+    let weights = softmax(scores, -1)
+    let out = weights @ v
+    sum(out .* out) < 0.0001f32
+}
+
+# Closed-form: attention scale for D=4 is exactly 0.5.
+# Block.forward uses (1.0 / sqrt(D as f32)) to scale scores.
+# For D=4: sqrt(4) = 2, so 1/sqrt(4) = 0.5 exactly.
+# This verifies the scale produces the expected numerical constant.
+fn test_attn_scale_d4() -> bool {
+    let scale = 1.0f32 / sqrt(4.0f32)
+    absf_tr(scale - 0.5f32) < 0.0001f32
+}
+
+# Invariant: ReLU (used in FFN sublayer: \> rms_norm(h, ln2, eps) @ fc1)
+# produces non-negative outputs.
+# For any input, \>(x) = max(x, 0) ≥ 0 elementwise.
+# Test: relu of a mixed-sign vector has no negative elements,
+# i.e. sum of (relu(x) .< 0) mask == 0.
+fn test_relu_nonneg_tr() -> bool {
+    let x = [-3.0f32, 0.0f32, 2.0f32, -1.5f32, 4.0f32, -0.1f32, 1.0f32, 0.5f32]
+    let r = \>(x)
+    let neg_mask = r .< 0.0f32
+    sum(neg_mask) < 0.0001f32
+}

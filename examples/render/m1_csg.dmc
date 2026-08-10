@@ -1,0 +1,408 @@
+# m1_csg.dmc — SDF raymarcher, milestone M1: the combinator algebra.
+#
+# Builds on m0_sphere.dmc. The new idea is DESIGN.md §3: a scene is
+# multiple primitive SDFs combined with branchless operators —
+#   union        smin(a,b) = 0.5*(a + b - |a-b|)   (nearest surface)
+#   intersection smax(a,b) = 0.5*(a + b + |a-b|)
+#   subtraction  a - b     = smax(a, -b)
+# — and per-object materials selected with 0/1 comparison masks.
+#
+# Scene: a carved box (box minus a sphere) and a separate sphere, both
+# sitting on an infinite ground plane, under one directional light.
+#
+# Run:  dmc run examples/render/m1_csg.dmc
+# View: any viewer opens m1_out.ppm
+
+# ── SDF primitives (each returns a whole-frame [H,W] distance field) ──
+
+fn abs_t[H, W](x: Tensor[f32,[H,W]]) -> Tensor[f32,[H,W]] {
+    (x .* x) .^ 0.5
+}
+
+fn sdf_sphere[H, W](
+    px: Tensor[f32,[H,W]], py: Tensor[f32,[H,W]], pz: Tensor[f32,[H,W]],
+    cx: f32, cy: f32, cz: f32, r: f32
+) -> Tensor[f32,[H,W]] {
+    let dx = px .- cx
+    let dy = py .- cy
+    let dz = pz .- cz
+    (dx .* dx .+ dy .* dy .+ dz .* dz) .^ 0.5 .- r
+}
+
+# Axis-aligned box of half-extents (bx,by,bz) centered at (cx,cy,cz).
+# Exact SDF: length(max(q,0)) + min(max(qx,qy,qz),0), q = |p-c| - b.
+fn sdf_box[H, W](
+    px: Tensor[f32,[H,W]], py: Tensor[f32,[H,W]], pz: Tensor[f32,[H,W]],
+    cx: f32, cy: f32, cz: f32, bx: f32, by: f32, bz: f32
+) -> Tensor[f32,[H,W]] {
+    let qx = abs_t[H,W](px .- cx) .- bx
+    let qy = abs_t[H,W](py .- cy) .- by
+    let qz = abs_t[H,W](pz .- cz) .- bz
+    let ox = \>qx
+    let oy = \>qy
+    let oz = \>qz
+    let outside = (ox .* ox .+ oy .* oy .+ oz .* oz) .^ 0.5
+    # max(qx,qy,qz) via nested smax, then min(.,0).
+    # NB: `\<` is GeLU in demoniC (OPERATORS.md §3) — so min(x,0) is
+    # written branchlessly as `x .- \>x`.
+    let m2 = 0.5 .* (qy .+ qz .+ abs_t[H,W](qy .- qz))
+    let mx = 0.5 .* (qx .+ m2 .+ abs_t[H,W](qx .- m2))
+    let inside = mx .- \>mx
+    outside .+ inside
+}
+
+# ── Combinators (DESIGN.md §3) ────────────────────────────────────────
+
+fn op_union[H, W](a: Tensor[f32,[H,W]], b: Tensor[f32,[H,W]]) -> Tensor[f32,[H,W]] {
+    0.5 .* (a .+ b .- abs_t[H,W](a .- b))
+}
+
+fn op_inter[H, W](a: Tensor[f32,[H,W]], b: Tensor[f32,[H,W]]) -> Tensor[f32,[H,W]] {
+    0.5 .* (a .+ b .+ abs_t[H,W](a .- b))
+}
+
+fn op_sub[H, W](a: Tensor[f32,[H,W]], b: Tensor[f32,[H,W]]) -> Tensor[f32,[H,W]] {
+    op_inter[H,W](a, 0.0 .- b)
+}
+
+# ── The scene: one combined distance field ────────────────────────────
+# A carved box (box MINUS a sphere) unioned with a free sphere, all
+# unioned with a ground plane at y = -1.2.
+
+fn scene[H, W](
+    px: Tensor[f32,[H,W]], py: Tensor[f32,[H,W]], pz: Tensor[f32,[H,W]]
+) -> Tensor[f32,[H,W]] {
+    let d_plane = py .+ 1.2
+    let d_box   = sdf_box[H,W](px,py,pz, -0.85,-0.45,-3.1, 0.6,0.6,0.6)
+    let d_cut   = sdf_sphere[H,W](px,py,pz, -0.45,0.05,-2.65, 0.6)
+    let d_carve = op_sub[H,W](d_box, d_cut)
+    let d_ball  = sdf_sphere[H,W](px,py,pz, 1.0,-0.5,-2.9, 0.7)
+    op_union[H,W](d_plane, op_union[H,W](d_carve, d_ball))
+}
+
+fn main() -> nil {
+    let H = 120
+    let W = 160
+
+    # ── Ray generation (pinhole at origin, looking down -z) ──
+    let !ys = forge.zeros[f32, [120]]
+    let !ri = 0
+    while ri < H { ys[ri] = 1.0 - (ri as f32) * (2.0 / 119.0); ri = ri + 1 }
+    let !xs = forge.zeros[f32, [160]]
+    let !ci = 0
+    while ci < W { xs[ci] = -1.333 + (ci as f32) * (2.666 / 159.0); ci = ci + 1 }
+
+    let ys2 = ys.reshape[[120, 1]]
+    let xs2 = xs.reshape[[1, 160]]
+
+    let rx = xs2
+    let ry = ys2
+    let rz = -1.5
+    let rl = (rx .* rx .+ ry .* ry .+ 2.25) .^ 0.5
+    let dx = rx ./ rl
+    let dy = ry ./ rl
+    let dz = rz ./ rl
+
+    # ── March (DESIGN.md §4), now over the combined scene ──
+    let !t    = forge.zeros[f32, [120, 160]]
+    let !done = forge.zeros[f32, [120, 160]]
+
+    let !k = 0
+    while k < 110 {
+        let px = t .* dx
+        let py = t .* dy
+        let pz = t .* dz
+        let d  = scene[120, 160](px, py, pz)
+        let absd = (d .* d) .^ 0.5
+        let hit  = absd .< 0.004
+        let miss = t .> 22.0
+        done = (done .+ hit .+ miss) .> 0.5
+        t = t .+ d .* (1.0 .- done)
+        k = k + 1
+    }
+
+    let px = t .* dx
+    let py = t .* dy
+    let pz = t .* dz
+    # Hit mask gated on *convergence*, not merely "didn't escape": a ray
+    # still mid-march at the step budget (grazing the box silhouette) has
+    # a large residual |scene| and must read as background, or the
+    # silhouette goes ragged. EPS here is looser than the march EPS so
+    # genuinely-converged surface pixels survive.
+    let d_at  = scene[120,160](px, py, pz)
+    let hitmask = ((d_at .* d_at) .^ 0.5) .< 0.04
+
+    # ── Normals from the combined SDF gradient (§5) ──
+    let e = 0.0015
+    let sx1 = scene[120,160](px .+ e, py, pz)
+    let sx0 = scene[120,160](px .- e, py, pz)
+    let sy1 = scene[120,160](px, py .+ e, pz)
+    let sy0 = scene[120,160](px, py .- e, pz)
+    let sz1 = scene[120,160](px, py, pz .+ e)
+    let sz0 = scene[120,160](px, py, pz .- e)
+    let nx = sx1 .- sx0
+    let ny = sy1 .- sy0
+    let nz = sz1 .- sz0
+    let nl = (nx .* nx .+ ny .* ny .+ nz .* nz) .^ 0.5 .+ 0.000001
+    let Nx = nx ./ nl
+    let Ny = ny ./ nl
+    let Nz = nz ./ nl
+
+    # ── Shading: one directional light, Lambert + ambient ──
+    let lx = 0.40
+    let ly = 0.72
+    let lz = 0.57
+    let diffuse = \>(Nx .* lx .+ Ny .* ly .+ Nz .* lz)
+    let shade   = 0.18 .+ 0.82 .* diffuse
+
+    # ── Per-object materials by nearest-primitive masks (§3 select) ──
+    # Re-evaluate each object's distance at the hit point and pick the
+    # smallest. Comparison ops yield the 0/1 masks; they are mutually
+    # exclusive (float ties are vanishingly unlikely).
+    let d_plane = py .+ 1.2
+    let d_box   = sdf_box[120,160](px,py,pz, -0.85,-0.45,-3.1, 0.6,0.6,0.6)
+    let d_cut   = sdf_sphere[120,160](px,py,pz, -0.45,0.05,-2.65, 0.6)
+    let d_carve = op_sub[120,160](d_box, d_cut)
+    let d_ball  = sdf_sphere[120,160](px,py,pz, 1.0,-0.5,-2.9, 0.7)
+
+    let mC = (d_carve .<= d_plane) .* (d_carve .<= d_ball)
+    let mB = (d_ball  .<  d_carve) .* (d_ball  .<= d_plane)
+    let mP = (d_plane .<  d_carve) .* (d_plane .<  d_ball)
+
+    # albedos: carved box = warm orange, ball = teal, plane = slate
+    let albR = mC .* 0.92 .+ mB .* 0.15 .+ mP .* 0.40
+    let albG = mC .* 0.45 .+ mB .* 0.62 .+ mP .* 0.45
+    let albB = mC .* 0.22 .+ mB .* 0.60 .+ mP .* 0.52
+
+    # ── Sky-gradient background for escaped rays ──
+    let !rf = forge.zeros[f32, [120]]
+    let !rj = 0
+    while rj < H { rf[rj] = (rj as f32) / 119.0; rj = rj + 1 }
+    let rfc = rf.reshape[[120, 1]]
+    let bgR = 0.45 .+ 0.45 .* rfc
+    let bgG = 0.62 .+ 0.30 .* rfc
+    let bgB = 0.95 .- 0.10 .* rfc
+
+    let R = hitmask .* (albR .* shade) .+ (1.0 .- hitmask) .* bgR
+    let G = hitmask .* (albG .* shade) .+ (1.0 .- hitmask) .* bgG
+    let B = hitmask .* (albB .* shade) .+ (1.0 .- hitmask) .* bgB
+
+    # ── Serialize to a P3 PPM (per-row build; DESIGN.md §7.B, §8.1) ──
+    let !ppm = "P3\n" + to_str(W) + " " + to_str(H) + "\n255\n"
+    let !r0 = 0
+    while r0 < H {
+        let !row = ""
+        let !c0 = 0
+        while c0 < W {
+            let qr = clamp(floor(R[r0,c0] * 255.0), 0.0, 255.0) as i64
+            let qg = clamp(floor(G[r0,c0] * 255.0), 0.0, 255.0) as i64
+            let qb = clamp(floor(B[r0,c0] * 255.0), 0.0, 255.0) as i64
+            row = row + to_str(qr) + " " + to_str(qg) + " " + to_str(qb) + "  "
+            c0 = c0 + 1
+        }
+        ppm = ppm + row + "\n"
+        r0 = r0 + 1
+    }
+    let werr = write_file("m1_out.ppm", ppm)
+    print("wrote m1_out.ppm (" + to_str(W) + "x" + to_str(H) + " P3 PPM)")
+
+    # ── Coarse ASCII preview (debug sink, §7.A) ──
+    let sr = H / 30
+    let sc = W / 70
+    print("preview:")
+    let !pr = 0
+    while pr < H {
+        let !line = ""
+        let !pc = 0
+        while pc < W {
+            let v = (R[pr,pc] + G[pr,pc] + B[pr,pc]) / 3.0
+            if v > 0.80 { line = line + "@" }
+            else if v > 0.62 { line = line + "O" }
+            else if v > 0.45 { line = line + "o" }
+            else if v > 0.28 { line = line + ":" }
+            else if v > 0.12 { line = line + "." }
+            else { line = line + " " }
+            pc = pc + sc
+        }
+        print(line)
+        pr = pr + sr
+    }
+    nil
+}
+
+# ── Tests ─────────────────────────────────────────────────────────────
+
+# abs_t(x) = sqrt(x^2) which equals |x|.
+# For x = -3.0, abs_t should return 3.0.
+fn test_abs_t_negative() -> bool {
+    let !t = forge.zeros[f32, [1, 1]]
+    t[0, 0] = -3.0
+    let r = abs_t[1, 1](t)
+    let diff = r[0, 0] - 3.0
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# abs_t of a positive value is unchanged.
+# For x = 4.5, abs_t should return 4.5.
+fn test_abs_t_positive() -> bool {
+    let !t = forge.zeros[f32, [1, 1]]
+    t[0, 0] = 4.5
+    let r = abs_t[1, 1](t)
+    let diff = r[0, 0] - 4.5
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# op_union implements min(a, b) = 0.5*(a+b - |a-b|).
+# With a=2.0, b=5.0 the result must be 2.0 (the smaller).
+fn test_op_union_picks_smaller() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = 2.0
+    b[0, 0] = 5.0
+    let r = op_union[1, 1](a, b)
+    let diff = r[0, 0] - 2.0
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# op_union is commutative: union(a,b) == union(b,a).
+fn test_op_union_commutative() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = -1.5
+    b[0, 0] = 3.7
+    let r1 = op_union[1, 1](a, b)
+    let r2 = op_union[1, 1](b, a)
+    let diff = r1[0, 0] - r2[0, 0]
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# op_inter implements max(a, b) = 0.5*(a+b + |a-b|).
+# With a=2.0, b=5.0 the result must be 5.0 (the larger).
+fn test_op_inter_picks_larger() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = 2.0
+    b[0, 0] = 5.0
+    let r = op_inter[1, 1](a, b)
+    let diff = r[0, 0] - 5.0
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# op_inter is commutative: inter(a,b) == inter(b,a).
+fn test_op_inter_commutative() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = -1.5
+    b[0, 0] = 3.7
+    let r1 = op_inter[1, 1](a, b)
+    let r2 = op_inter[1, 1](b, a)
+    let diff = r1[0, 0] - r2[0, 0]
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# op_sub(a,b) = inter(a,-b) = max(a,-b) >= a.
+# When a=-1.0, b=2.0: max(-1, -2) = -1.0.
+fn test_op_sub_value() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = -1.0
+    b[0, 0] = 2.0
+    let r = op_sub[1, 1](a, b)
+    # max(-1.0, -2.0) = -1.0
+    let diff = r[0, 0] - (-1.0)
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# sdf_sphere at its own center has distance = -r.
+# Center at (0,0,0), radius=1.5; point at (0,0,0) => distance = -1.5.
+fn test_sdf_sphere_center() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 0.0
+    py[0, 0] = 0.0
+    pz[0, 0] = 0.0
+    let r = sdf_sphere[1, 1](px, py, pz, 0.0, 0.0, 0.0, 1.5)
+    # distance = sqrt(0) - 1.5 = -1.5
+    let diff = r[0, 0] - (-1.5)
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# sdf_sphere at exactly radius distance from center should give ~0.
+# Center at (1,2,3), radius=2.0; point at (1, 2, 5) is 2.0 away.
+fn test_sdf_sphere_surface() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 1.0
+    py[0, 0] = 2.0
+    pz[0, 0] = 5.0
+    # center=(1,2,3), r=2.0; distance from (1,2,5) = sqrt(0+0+4) = 2.0; SDF = 0
+    let r = sdf_sphere[1, 1](px, py, pz, 1.0, 2.0, 3.0, 2.0)
+    let diff = r[0, 0] - 0.0
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# sdf_box at its center: the exact SDF is -min(bx,by,bz).
+# Center=(0,0,0), half-extents=(1,2,3); point at center => SDF = -1.0.
+fn test_sdf_box_center() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 0.0
+    py[0, 0] = 0.0
+    pz[0, 0] = 0.0
+    let r = sdf_box[1, 1](px, py, pz, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0)
+    # At center: q = (0,0,0) - (1,2,3) = (-1,-2,-3); max(q,0)=(0,0,0);
+    # outside = 0; inside = max(-1,-2,-3) + min(0,...) = -1 + 0 = -1
+    # Actual: m2 = max(qy,qz)=max(-2,-3)=-2; mx=max(-1,-2)=-1; inside=-1-max(-1,0)=-1-0=-1
+    let diff = r[0, 0] - (-1.0)
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# sdf_box outside the box: a point 1 unit past the +x face.
+# Center=(0,0,0), half-extents=(1,1,1); point=(3,0,0) => SDF = 2.0.
+fn test_sdf_box_outside() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 3.0
+    py[0, 0] = 0.0
+    pz[0, 0] = 0.0
+    let r = sdf_box[1, 1](px, py, pz, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+    # qx=|3|-1=2, qy=-1, qz=-1; outside=sqrt(4+0+0)=2; inside=max(2,-1,-1)+min(0)=2-2=0
+    # total = 2.0
+    let diff = r[0, 0] - 2.0
+    let absdiff = if diff < 0.0 { 0.0 - diff } else { diff }
+    absdiff < 0.0001
+}
+
+# Union is always <= both operands: union(a,b) <= a AND union(a,b) <= b.
+fn test_op_union_is_le_both() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = -0.5
+    b[0, 0] = 1.3
+    let r = op_union[1, 1](a, b)
+    r[0, 0] <= a[0, 0] + 0.0001 && r[0, 0] <= b[0, 0] + 0.0001
+}
+
+# Intersection is always >= both operands: inter(a,b) >= a AND inter(a,b) >= b.
+fn test_op_inter_is_ge_both() -> bool {
+    let !a = forge.zeros[f32, [1, 1]]
+    let !b = forge.zeros[f32, [1, 1]]
+    a[0, 0] = -0.5
+    b[0, 0] = 1.3
+    let r = op_inter[1, 1](a, b)
+    r[0, 0] >= a[0, 0] - 0.0001 && r[0, 0] >= b[0, 0] - 0.0001
+}

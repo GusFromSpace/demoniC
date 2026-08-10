@@ -1,0 +1,262 @@
+# m0_sphere.dmc — SDF raymarcher, milestone M0.
+#
+# A single sphere, sphere-traced as whole-frame tensor ops, lit by one
+# directional light, written to a real 24-bit-color PPM image. A coarse
+# ASCII preview prints to the terminal for a quick sanity check.
+#
+# This is the substrate the rest of examples/render/ builds on. See
+# examples/render/DESIGN.md (§3 combinators, §4 march, §5 normals,
+# §6 shading, §7.B PPM output). Unlike tinyraytracer.dmc (a single
+# analytic ray-sphere solve), this *marches* the SDF and takes the
+# surface normal from the field gradient — the method that generalizes
+# to arbitrary scenes.
+#
+# Run:    dmc run examples/render/m0_sphere.dmc
+# View:   any image viewer opens m0_out.ppm, or: convert m0_out.ppm out.png
+
+# Signed distance to a sphere, evaluated for every pixel at once.
+# The whole renderer queries the scene only through functions like this.
+fn sdf_sphere[H, W](
+    px: Tensor[f32,[H,W]], py: Tensor[f32,[H,W]], pz: Tensor[f32,[H,W]],
+    cx: f32, cy: f32, cz: f32, r: f32
+) -> Tensor[f32,[H,W]] {
+    let dx = px .- cx
+    let dy = py .- cy
+    let dz = pz .- cz
+    (dx .* dx .+ dy .* dy .+ dz .* dz) .^ 0.5 .- r
+}
+
+fn main() -> nil {
+    let H = 120
+    let W = 160
+
+    # Scene: one sphere.
+    let scx = 0.0
+    let scy = 0.0
+    let scz = -3.0
+    let rad = 1.0
+
+    # ── 1. Ray generation (pinhole camera at origin, looking down -z) ──
+    # Vertical coords 1.0..-1.0, horizontal -aspect..aspect.
+    let !ys = forge.zeros[f32, [120]]
+    let !ri = 0
+    while ri < H { ys[ri] = 1.0 - (ri as f32) * (2.0 / 119.0); ri = ri + 1 }
+    let !xs = forge.zeros[f32, [160]]
+    let !ci = 0
+    while ci < W { xs[ci] = -1.333 + (ci as f32) * (2.666 / 159.0); ci = ci + 1 }
+
+    let ys2 = ys.reshape[[120, 1]]   # broadcasts down columns
+    let xs2 = xs.reshape[[1, 160]]   # broadcasts across rows
+
+    # Ray directions, normalized. Camera origin is (0,0,0).
+    let rx = xs2
+    let ry = ys2
+    let rz = -1.5
+    let rl = (rx .* rx .+ ry .* ry .+ 2.25) .^ 0.5
+    let dx = rx ./ rl
+    let dy = ry ./ rl
+    let dz = rz ./ rl
+
+    # ── 2. Sphere-trace march (DESIGN.md §4) ──────────────────────────
+    # Accumulators allocated before the loop so they survive each step.
+    let !t    = forge.zeros[f32, [120, 160]]
+    let !done = forge.zeros[f32, [120, 160]]
+
+    let !k = 0
+    while k < 64 {
+        let px = t .* dx
+        let py = t .* dy
+        let pz = t .* dz
+        let d  = sdf_sphere[120, 160](px, py, pz, scx, scy, scz, rad)
+        let absd = (d .* d) .^ 0.5            # |d|, lane-wise
+        let hit  = absd .< 0.005              # converged onto a surface
+        let miss = t .> 12.0                  # escaped to infinity
+        done = (done .+ hit .+ miss) .> 0.5   # collapse to a 0/1 mask
+        t = t .+ d .* (1.0 .- done)           # frozen rays stop advancing
+        k = k + 1
+    }
+
+    # Final hit point and hit mask.
+    let px = t .* dx
+    let py = t .* dy
+    let pz = t .* dz
+    let dfin    = sdf_sphere[120, 160](px, py, pz, scx, scy, scz, rad)
+    let escaped = t .> 12.0
+    let hitmask = 1.0 .- escaped              # 1 where a surface was reached
+
+    # ── 3. Normals from the SDF gradient via central differences (§5) ──
+    let e = 0.0015
+    let sx1 = sdf_sphere[120,160](px .+ e, py, pz, scx,scy,scz,rad)
+    let sx0 = sdf_sphere[120,160](px .- e, py, pz, scx,scy,scz,rad)
+    let sy1 = sdf_sphere[120,160](px, py .+ e, pz, scx,scy,scz,rad)
+    let sy0 = sdf_sphere[120,160](px, py .- e, pz, scx,scy,scz,rad)
+    let sz1 = sdf_sphere[120,160](px, py, pz .+ e, scx,scy,scz,rad)
+    let sz0 = sdf_sphere[120,160](px, py, pz .- e, scx,scy,scz,rad)
+    let nx = sx1 .- sx0
+    let ny = sy1 .- sy0
+    let nz = sz1 .- sz0
+    let nl = (nx .* nx .+ ny .* ny .+ nz .* nz) .^ 0.5 .+ 0.000001
+    let Nx = nx ./ nl
+    let Ny = ny ./ nl
+    let Nz = nz ./ nl
+
+    # ── 4. Shading: one directional light, Lambert diffuse + ambient ──
+    let lx = 0.577
+    let ly = 0.577
+    let lz = 0.577
+    let diffuse = \>(Nx .* lx .+ Ny .* ly .+ Nz .* lz)   # max(N·L, 0)
+    let shade   = 0.15 .+ 0.85 .* diffuse                # ambient + diffuse
+
+    # Albedo (warm orange sphere) over a vertical sky gradient background.
+    let !rf = forge.zeros[f32, [120]]
+    let !rj = 0
+    while rj < H { rf[rj] = (rj as f32) / 119.0; rj = rj + 1 }
+    let rfc = rf.reshape[[120, 1]]
+    let bgR = 0.45 .+ 0.45 .* rfc
+    let bgG = 0.62 .+ 0.30 .* rfc
+    let bgB = 0.95 .- 0.10 .* rfc
+
+    let R = hitmask .* (0.95 .* shade) .+ (1.0 .- hitmask) .* bgR
+    let G = hitmask .* (0.45 .* shade) .+ (1.0 .- hitmask) .* bgG
+    let B = hitmask .* (0.30 .* shade) .+ (1.0 .- hitmask) .* bgB
+
+    # ── 5. Serialize to a P3 (text) PPM (DESIGN.md §7.B) ──────────────
+    # Accumulate one row at a time: the growing buffer is touched once
+    # per row, not once per pixel, to keep string building near-linear.
+    let !ppm = "P3\n" + to_str(W) + " " + to_str(H) + "\n255\n"
+    let !r0 = 0
+    while r0 < H {
+        let !row = ""
+        let !c0 = 0
+        while c0 < W {
+            let qr = clamp(floor(R[r0,c0] * 255.0), 0.0, 255.0) as i64
+            let qg = clamp(floor(G[r0,c0] * 255.0), 0.0, 255.0) as i64
+            let qb = clamp(floor(B[r0,c0] * 255.0), 0.0, 255.0) as i64
+            row = row + to_str(qr) + " " + to_str(qg) + " " + to_str(qb) + "  "
+            c0 = c0 + 1
+        }
+        ppm = ppm + row + "\n"
+        r0 = r0 + 1
+    }
+    let werr = write_file("m0_out.ppm", ppm)
+    print("wrote m0_out.ppm (" + to_str(W) + "x" + to_str(H) + " P3 PPM)")
+
+    # ── 6. Coarse ASCII preview — debug sink only (DESIGN.md §7.A) ─────
+    # Stride the framebuffer so the preview fits a terminal at any res.
+    let sr = H / 30
+    let sc = W / 70
+    print("preview:")
+    let !pr = 0
+    while pr < H {
+        let !line = ""
+        let !pc = 0
+        while pc < W {
+            let v = (R[pr,pc] + G[pr,pc] + B[pr,pc]) / 3.0
+            if v > 0.80 { line = line + "@" }
+            else if v > 0.62 { line = line + "O" }
+            else if v > 0.45 { line = line + "o" }
+            else if v > 0.28 { line = line + ":" }
+            else if v > 0.12 { line = line + "." }
+            else { line = line + " " }
+            pc = pc + sc
+        }
+        print(line)
+        pr = pr + sr
+    }
+    nil
+}
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+# A point AT the sphere center has distance 0, so SDF = 0 - r = -r = -1.0.
+# Sphere: center (0,0,-3), radius 1. Query point (0,0,-3) → dist=0 → SDF=-1.
+fn test_sdf_center_is_negative_radius() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    pz[0, 0] = -3.0
+    let d = sdf_sphere[1, 1](px, py, pz, 0.0, 0.0, -3.0, 1.0)
+    let v = d[0, 0]
+    (v - (-1.0)) * (v - (-1.0)) < 0.0001
+}
+
+# A point exactly on the sphere surface has SDF = 0.
+# Point (1,0,-3), sphere center (0,0,-3), r=1: dist = sqrt(1+0+0) = 1, SDF = 1-1 = 0.
+fn test_sdf_surface_is_zero() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 1.0
+    pz[0, 0] = -3.0
+    let d = sdf_sphere[1, 1](px, py, pz, 0.0, 0.0, -3.0, 1.0)
+    let v = d[0, 0]
+    v * v < 0.0001
+}
+
+# A point clearly outside the sphere (2 units from center, r=1) has SDF = +1.
+# Point (2,0,-3), sphere (0,0,-3) r=1: dist=2, SDF=2-1=1.0.
+fn test_sdf_outside_is_positive() -> bool {
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 2.0
+    pz[0, 0] = -3.0
+    let d = sdf_sphere[1, 1](px, py, pz, 0.0, 0.0, -3.0, 1.0)
+    let v = d[0, 0]
+    (v - 1.0) * (v - 1.0) < 0.0001
+}
+
+# The sphere SDF is symmetric: opposite points (dx, 0, 0) and (-dx, 0, 0)
+# relative to center are equidistant, so they must return the same SDF value.
+fn test_sdf_symmetry() -> bool {
+    let !px1 = forge.zeros[f32, [1, 1]]
+    let !py1 = forge.zeros[f32, [1, 1]]
+    let !pz1 = forge.zeros[f32, [1, 1]]
+    px1[0, 0] = 0.7
+    pz1[0, 0] = -3.0
+    let !px2 = forge.zeros[f32, [1, 1]]
+    let !py2 = forge.zeros[f32, [1, 1]]
+    let !pz2 = forge.zeros[f32, [1, 1]]
+    px2[0, 0] = -0.7
+    pz2[0, 0] = -3.0
+    let d1 = sdf_sphere[1, 1](px1, py1, pz1, 0.0, 0.0, -3.0, 1.0)
+    let d2 = sdf_sphere[1, 1](px2, py2, pz2, 0.0, 0.0, -3.0, 1.0)
+    let diff = d1[0, 0] - d2[0, 0]
+    diff * diff < 0.0001
+}
+
+# Central-difference normal estimation at (1,0,-3) (on the sphere surface):
+# the outward normal should point in the +x direction, so nx >> ny and nx >> nz.
+# Specifically, for a sphere at (0,0,-3) and the query point at (1,0,-3),
+# the analytic normal is (1,0,0); central differences at epsilon=0.0015 should
+# closely match: nx/|n| ≈ 1.0, ny/|n| ≈ 0.0, nz/|n| ≈ 0.0.
+fn test_surface_normal_points_outward() -> bool {
+    let e = 0.0015
+    let cx = 0.0
+    let cy = 0.0
+    let cz = -3.0
+    let r  = 1.0
+
+    # query point on surface: (1,0,-3)
+    let !px = forge.zeros[f32, [1, 1]]
+    let !py = forge.zeros[f32, [1, 1]]
+    let !pz = forge.zeros[f32, [1, 1]]
+    px[0, 0] = 1.0
+    pz[0, 0] = -3.0
+
+    let sx1 = sdf_sphere[1,1](px .+ e, py, pz, cx, cy, cz, r)
+    let sx0 = sdf_sphere[1,1](px .- e, py, pz, cx, cy, cz, r)
+    let sy1 = sdf_sphere[1,1](px, py .+ e, pz, cx, cy, cz, r)
+    let sy0 = sdf_sphere[1,1](px, py .- e, pz, cx, cy, cz, r)
+    let sz1 = sdf_sphere[1,1](px, py, pz .+ e, cx, cy, cz, r)
+    let sz0 = sdf_sphere[1,1](px, py, pz .- e, cx, cy, cz, r)
+    let nx = (sx1 .- sx0)[0, 0]
+    let ny = (sy1 .- sy0)[0, 0]
+    let nz = (sz1 .- sz0)[0, 0]
+    let nl = (nx * nx + ny * ny + nz * nz) .^ 0.5
+    let nnx = nx / nl
+    let nny = ny / nl
+    let nnz = nz / nl
+    # nnx should be ≈ 1.0, nny ≈ 0.0, nnz ≈ 0.0
+    (nnx - 1.0) * (nnx - 1.0) < 0.001 && nny * nny < 0.001 && nnz * nnz < 0.001
+}

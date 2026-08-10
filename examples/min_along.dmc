@@ -1,0 +1,29 @@
+# min_along(t, axis) — per-axis minimum, the counterpart to max_along (#377).
+# The `*_along` reduction family (sum/mean/variance/max) shipped max_along
+# without its min; this completes the pair. Interp + JIT parity.
+
+fn test_min_along_axis0() -> bool {
+    let !t = forge.zeros[f32, [2, 3]]
+    t[0,0] = 5.0   t[0,1] = 1.0   t[0,2] = 3.0
+    t[1,0] = 2.0   t[1,1] = 8.0   t[1,2] = 4.0
+    let m = min_along(t, 0)          # per-column min → [2, 1, 3]
+    (m[0] == 2.0) && (m[1] == 1.0) && (m[2] == 3.0)
+}
+
+fn test_min_along_axis1() -> bool {
+    let !t = forge.zeros[f32, [2, 3]]
+    t[0,0] = 5.0   t[0,1] = 1.0   t[0,2] = 3.0
+    t[1,0] = 2.0   t[1,1] = 8.0   t[1,2] = 4.0
+    let m = min_along(t, 1)          # per-row min → [1, 2]
+    (m[0] == 1.0) && (m[1] == 2.0)
+}
+
+# negatives, and parity with max_along on the same data
+fn test_min_along_negatives() -> bool {
+    let !t = forge.zeros[f32, [2, 2]]
+    t[0,0] = 0.0 - 1.0   t[0,1] = 4.0
+    t[1,0] = 0.0 - 5.0   t[1,1] = 2.0
+    let mn = min_along(t, 0)         # [-5, 2]
+    let mx = max_along(t, 0)         # [-1, 4]
+    (mn[0] == 0.0 - 5.0) && (mn[1] == 2.0) && (mx[0] == 0.0 - 1.0) && (mx[1] == 4.0)
+}

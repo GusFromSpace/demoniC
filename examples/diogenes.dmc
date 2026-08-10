@@ -1,0 +1,37 @@
+fn alexander(favor: str) -> str {
+    print("Alexander: Ask of me any favor you choose.")
+    favor
+}
+
+fn diogenes(favor: str) -> nil {
+    if favor == "anything" {
+        print("Diogenes: Stand out of my sun.")
+    } else {
+        print("Diogenes: ...")
+    }
+    nil
+}
+
+fn main() -> nil {
+    diogenes(alexander("anything"))
+    nil
+}
+
+# alexander is a pure pass-through: it prints a side-effect but returns its
+# argument unchanged. Justified: the function body is `{ print(...); favor }`,
+# so the return value is always the input `favor` string.
+fn test_alexander_identity_anything() -> bool {
+    alexander("anything") == "anything"
+}
+
+# Same identity invariant with a different string — the print statement and
+# return are independent of which string is passed in.
+fn test_alexander_identity_other() -> bool {
+    alexander("gold and power") == "gold and power"
+}
+
+# Applying alexander twice must still return the original string (idempotent
+# identity): alexander(alexander(s)) == s because each call returns its input.
+fn test_alexander_double_application() -> bool {
+    alexander(alexander("stand out of my sun")) == "stand out of my sun"
+}

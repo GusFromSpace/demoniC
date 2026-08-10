@@ -1,0 +1,74 @@
+# enum_traffic.dmc — C-like enums (#336): named variants, exhaustively matched.
+#
+# An enum value is its variant's i64 ordinal (declaration order), so `as i64`
+# gives the index and `match` is checked for full coverage — drop a variant and
+# the type-checker rejects the program (no silent fall-through).
+#
+# Variant patterns come two ways: qualified `Light.Red` and bare `Green`
+# (resolved against the scrutinee's enum). A bare ident that is NOT a variant is
+# an ordinary catch-all that binds the value.
+#
+#   Run:   dmc run examples/enum_traffic.dmc
+#   Test:  dmc test examples/enum_traffic.dmc
+#   JIT:   dmc jit examples/enum_traffic.dmc   (also `dmc test --jit`)
+#
+# Enums lower through the Cranelift JIT as well (#350): a variant is its i64
+# ordinal, `Light.Red` is an `iconst`, and a `match` arm — qualified or bare —
+# is i64 equality against that ordinal. This file is in the JIT parity set.
+
+enum Light { Red, Yellow, Green }
+
+# The light that follows `l` in the standard cycle. Exhaustive — every variant
+# is handled, so no catch-all is needed (and adding a variant would force this
+# match to be updated).
+fn next(l: Light) -> Light {
+    match l {
+        Light.Red    => Light.Green,
+        Light.Green  => Light.Yellow,
+        Light.Yellow => Light.Red,
+    }
+}
+
+# Seconds a phase stays lit. Mixes a qualified arm with bare-variant arms.
+fn duration(l: Light) -> i64 {
+    match l {
+        Light.Red => 30,
+        Green     => 25,
+        Yellow    => 5,
+    }
+}
+
+# May a car proceed? A catch-all `_` covers the non-green phases.
+fn can_go(l: Light) -> bool {
+    match l {
+        Light.Green => true,
+        _           => false,
+    }
+}
+
+fn main() -> nil {
+    let !l = Light.Red
+    for _i in 0..4 {
+        print("light=" + (l as i64 as str) + " dur=" + (duration(l) as str)
+              + " go=" + (can_go(l) as str))
+        l = next(l)
+    }
+    nil
+}
+
+fn test_cycle_is_closed() -> bool {
+    # Red -> Green -> Yellow -> Red, back to the start after 3 steps.
+    (next(next(next(Light.Red))) as i64) == (Light.Red as i64)
+}
+
+fn test_ordinals_are_declaration_order() -> bool {
+    (Light.Red as i64) == 0 && (Light.Yellow as i64) == 1 && (Light.Green as i64) == 2
+}
+
+fn test_durations() -> bool {
+    duration(Light.Red) == 30 && duration(Light.Green) == 25 && duration(Light.Yellow) == 5
+}
+
+fn test_can_go_only_green() -> bool {
+    can_go(Light.Green) && !can_go(Light.Red) && !can_go(Light.Yellow)
+}

@@ -1,0 +1,67 @@
+# attn / attn_gqa forward + reverse-mode VJP under the JIT (#368).
+#
+# Fused scaled-dot-product attention — softmax((Q @ K') / sqrt(D)) @ V — is the
+# core of every transformer block, and the fifth fused tensor op to
+# differentiate under the JIT @grad subset, after softmax, rms_norm,
+# layer_norm, and rope. It is the first whose VJP flows to THREE tensor inputs:
+#
+#   P  = softmax((Q Kᵀ)/√D)          (per batch, per query head)
+#   dV += Pᵀ·dO                       dP = dO·Vᵀ
+#   dS = P ∘ (dP − rowsum(dP ∘ P))/√D                (softmax VJP + scaling)
+#   dQ = dS·K                         dK += dSᵀ·Q
+#
+# attn_gqa additionally accumulates dK/dV across the query heads that share a
+# KV head (grouped-query attention, the Qwen/Llama layout — H_q=2, H_kv=1
+# below exercises the group sum).
+#
+# The @grad forward saves each head's post-softmax weights P, so the backward
+# replays them instead of recomputing scores. Bracketed values were
+# cross-checked interp-vs-JIT (agree to f32); the interpreter VJP is itself
+# finite-diff-validated in gradcheck.dmc. Second order falls back to interp.
+
+# ── VJP through plain multi-head attn: loss = sum(attn(q,k,v) .* t) ──────────
+@grad fn at_loss(!q: Tensor[f32, [1, 2, 2, 2]], !k: Tensor[f32, [1, 2, 2, 2]],
+                 !v: Tensor[f32, [1, 2, 2, 2]], t: Tensor[f32, [1, 2, 2, 2]]) -> f32 {
+    sum(attn(q, k, v) .* t)
+}
+
+fn test_attn_grad() -> bool {
+    let q = [[[[0.5f32, -0.3f32], [1.2f32, 0.4f32]], [[-0.7f32, 0.9f32], [0.2f32, -1.1f32]]]]
+    let k = [[[[0.8f32, 0.1f32], [-0.5f32, 1.3f32]], [[0.6f32, -0.2f32], [1.0f32, 0.7f32]]]]
+    let v = [[[[1.5f32, -0.6f32], [0.3f32, 2.0f32]], [[-1.2f32, 0.8f32], [0.5f32, -0.4f32]]]]
+    let t = [[[[0.7f32, 1.1f32], [-0.9f32, 0.5f32]], [[1.3f32, -0.2f32], [0.6f32, 0.8f32]]]]
+    let (l, g) = at_loss.fwd_bwd(q, k, v, t)
+    # verified (interp == JIT): l≈−0.16703 ; dq[0,0,0,0]≈−0.40971 ;
+    # dk[0,0,0,1]≈−0.05141 ; dv[0,0,0,1]≈1.07953
+    (l > 0.0-0.168) && (l < 0.0-0.166)
+        && (g.q[0,0,0,0] > 0.0-0.4107) && (g.q[0,0,0,0] < 0.0-0.4087)
+        && (g.k[0,0,0,1] > 0.0-0.0524) && (g.k[0,0,0,1] < 0.0-0.0504)
+        && (g.v[0,0,0,1] > 1.0785) && (g.v[0,0,0,1] < 1.0805)
+}
+
+# ── VJP through GQA: dK/dV accumulate across the KV head's query group ───────
+@grad fn gq_loss(!q: Tensor[f32, [1, 2, 2, 2]], !k: Tensor[f32, [1, 1, 2, 2]],
+                 !v: Tensor[f32, [1, 1, 2, 2]], t: Tensor[f32, [1, 2, 2, 2]]) -> f32 {
+    sum(attn_gqa(q, k, v) .* t)
+}
+
+fn test_attn_gqa_grad() -> bool {
+    let q = [[[[0.5f32, -0.3f32], [1.2f32, 0.4f32]], [[-0.7f32, 0.9f32], [0.2f32, -1.1f32]]]]
+    let k = [[[[0.8f32, 0.1f32], [-0.5f32, 1.3f32]]]]
+    let v = [[[[1.5f32, -0.6f32], [0.3f32, 2.0f32]]]]
+    let t = [[[[0.7f32, 1.1f32], [-0.9f32, 0.5f32]], [[1.3f32, -0.2f32], [0.6f32, 0.8f32]]]]
+    let (l, g) = gq_loss.fwd_bwd(q, k, v, t)
+    # verified (interp == JIT): l≈1.31479 ; dq[0,1,1,1]≈0.21436 ;
+    # dk[0,0,0,0]≈−0.79385 (summed over BOTH query heads) ; dv[0,0,1,1]≈0.55703
+    (l > 1.3138) && (l < 1.3158)
+        && (g.q[0,1,1,1] > 0.2134) && (g.q[0,1,1,1] < 0.2154)
+        && (g.k[0,0,0,0] > 0.0-0.7949) && (g.k[0,0,0,0] < 0.0-0.7929)
+        && (g.v[0,0,1,1] > 0.5560) && (g.v[0,0,1,1] < 0.5580)
+}
+
+fn main() {
+    let ok1 = test_attn_grad()
+    let ok2 = test_attn_gqa_grad()
+    print("attn grad ok:")      print(ok1)
+    print("attn_gqa grad ok:")  print(ok2)
+}

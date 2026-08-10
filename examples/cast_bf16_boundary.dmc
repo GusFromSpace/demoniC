@@ -1,0 +1,39 @@
+# @cast(bf16) dtype-boundary contract (issue #374).
+#
+# A generic-`T` stdlib builtin invoked under `@cast(bf16)` computes in f32:
+# the exotic-float cast (bf16/f16/tf32/fp8) is a NO-OP on numeric values in
+# both backends. It does not round inputs to bf16, and it does not round the
+# accumulation — there is no "bf16-accumulate" mode. bf16/f16/tf32/fp8 are
+# all f32-backed; the directive changes only the nominal dtype tag.
+#
+# Each test picks a value NOT representable in bf16 (bf16 keeps 7 mantissa
+# bits): 1.001953125 = 1 + 1/512 needs 9. If the cast rounded to bf16 at any
+# boundary or in the reduction, the result would drift to the bf16 value and
+# diverge from the pure-f32 answer. Equality proves the no-op contract.
+#
+# Verified: interp + JIT parity (`dmc test --jit`).
+
+# Reduction under @cast(bf16) accumulates in f32.
+fn test_sum_under_bf16_cast_is_f32() -> bool {
+    let !x = forge.zeros[f32, [4]]
+    x[0] = 1.001953125
+    x[1] = 1.001953125
+    x[2] = 1.001953125
+    x[3] = 1.001953125
+    let s_cast = @cast(bf16) { sum(x) }
+    let s_f32  = sum(x)
+    (s_cast == s_f32) && (s_cast == 4.0078125)
+}
+
+# The `silu` builtin — the case the Qwen3-4B port comment calls out — computes
+# in f32 under @cast(bf16): its internal sigmoid is NOT evaluated in bf16.
+fn test_silu_under_bf16_cast_is_f32() -> bool {
+    let !w = forge.zeros[f32, [4]]
+    w[0] = 1.001953125
+    w[1] = 1.001953125
+    w[2] = 1.001953125
+    w[3] = 1.001953125
+    let a_cast = @cast(bf16) { sum(silu(w)) }
+    let a_f32  = sum(silu(w))
+    a_cast == a_f32
+}

@@ -1,0 +1,76 @@
+# caesar.dmc — ROT13 Caesar cipher encode and decode of "HELLO WORLD".
+# Demonstrates: tensor as char array, chr() builtin, arithmetic on char codes.
+# No JIT needed. Run: dmc run examples/caesar.dmc
+
+fn rot13_char(code: i64) -> i64 {
+    if code >= 65 {
+        if code <= 90 {
+            ((code - 65 + 13) % 26) + 65
+        } else {
+            code
+        }
+    } else {
+        code
+    }
+}
+
+# --- numeric gates: ROT13 facts verifiable by hand ---
+# 'H'(72) -> 'U'(85): (72-65+13)%26+65 = 20+65 = 85
+fn test_rot13_h() -> bool {
+    rot13_char(72) == 85
+}
+
+# 'A'(65) -> 'N'(78), and 'N'(78) -> 'A'(65) (wraparound)
+fn test_rot13_wrap() -> bool {
+    rot13_char(65) == 78 && rot13_char(78) == 65
+}
+
+# Non-letters pass through; ROT13 is its own inverse on letters.
+fn test_rot13_involution() -> bool {
+    rot13_char(32) == 32 && rot13_char(rot13_char(76)) == 76
+}
+
+fn main() -> nil {
+    # "HELLO WORLD" stored as ASCII codes in a tensor (space = 32)
+    let !msg = vault.zeros[f32, [11]]
+    msg[0]  = 72.0   # H
+    msg[1]  = 69.0   # E
+    msg[2]  = 76.0   # L
+    msg[3]  = 76.0   # L
+    msg[4]  = 79.0   # O
+    msg[5]  = 32.0   # (space)
+    msg[6]  = 87.0   # W
+    msg[7]  = 79.0   # O
+    msg[8]  = 82.0   # R
+    msg[9]  = 76.0   # L
+    msg[10] = 68.0   # D
+
+    let !orig_line = "Original: "
+    for i in 0..11 {
+        orig_line = orig_line + chr(msg[i] as i64)
+    }
+    print(orig_line)
+
+    let !encoded = vault.zeros[f32, [11]]
+    for i in 0..11 {
+        encoded[i] = rot13_char(msg[i] as i64) as f32
+    }
+
+    let !enc_line = "Encoded:  "
+    for i in 0..11 {
+        enc_line = enc_line + chr(encoded[i] as i64)
+    }
+    print(enc_line)
+
+    let !decoded = vault.zeros[f32, [11]]
+    for i in 0..11 {
+        decoded[i] = rot13_char(encoded[i] as i64) as f32
+    }
+
+    let !dec_line = "Decoded:  "
+    for i in 0..11 {
+        dec_line = dec_line + chr(decoded[i] as i64)
+    }
+    print(dec_line)
+    nil
+}

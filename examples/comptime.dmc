@@ -1,0 +1,83 @@
+# comptime.dmc — compile-time shape arithmetic via implicitly-comptime
+# shape parameters. See SPEC.md §7.8, docs/DIRECTIVES.md.
+#
+# Shape parameters (the `[ ]` params) are implicitly comptime: a function
+# monomorphizes over them, so the shape math below is folded per instantiation.
+# The explicit `@comptime { ... }` directive — for forcing comptime evaluation
+# of *derived* values — is spec'd (SPEC.md §7.8) but not yet implemented: today
+# it is a parse-accepted no-op (#369), so this example uses the implicit form.
+
+# Example 1: derive a tile count from a shape parameter.
+fn tile_count[D, H]() -> i64 {
+    let d_per_head = D / H
+    let l2_bytes   = 1024 * 1024              # 1 MiB target
+    l2_bytes / (4 * d_per_head)               # f32 = 4 bytes
+}
+
+# Example 2: a footprint-budget assertion over shape parameters.
+# If the budget is exceeded for a given monomorphization, the panic fires.
+# (Under the spec's `@comptime` this would fail at build time; today the
+# check runs where the function is evaluated.)
+fn assert_activation_budget[B, S, D]() -> nil {
+    let bytes = B * S * D * 4                 # f32
+    let budget = 8 * 1024 * 1024 * 1024       # 8 GiB
+    if bytes > budget {
+        panic("activation footprint exceeds 8 GiB at f32")
+    }
+    nil
+}
+
+# Example 3: shape-derived mesh axis sizing for a given rank count.
+fn plan_mesh[N_RANKS]() -> Mesh[dp=N_RANKS/8, tp=8] {
+    if N_RANKS % 8 != 0 {
+        panic("rank count must be divisible by tp=8")
+    }
+    Mesh[dp=N_RANKS/8, tp=8]
+}
+
+# Tests — verified ground truth, not magic numbers.
+# tile_count formula: (1024 * 1024) / (4 * (D / H)) — integer division throughout.
+
+# D=2048, H=16 → d_per_head=128 → 1048576 / (4*128) = 1048576 / 512 = 2048
+fn test_tile_count_2048_16() -> bool {
+    tile_count[2048, 16]() == 2048
+}
+
+# D=4096, H=1 → d_per_head=4096 → 1048576 / (4*4096) = 1048576 / 16384 = 64
+fn test_tile_count_4096_1() -> bool {
+    tile_count[4096, 1]() == 64
+}
+
+# D=1024, H=8 → d_per_head=128 → same quotient as test 1: 1048576 / 512 = 2048
+fn test_tile_count_1024_8() -> bool {
+    tile_count[1024, 8]() == 2048
+}
+
+# Monotonicity: larger d_per_head → fewer tiles (more bytes per tile).
+# D=4096,H=1 (d_per_head=4096) → 64; D=2048,H=16 (d_per_head=128) → 2048.
+# 64 < 2048, so the larger head-dim gives fewer tiles.
+fn test_tile_count_monotone() -> bool {
+    let big_head  = tile_count[4096, 1]()   # d_per_head = 4096 → 64 tiles
+    let small_head = tile_count[2048, 16]()  # d_per_head = 128  → 2048 tiles
+    big_head < small_head
+}
+
+# assert_activation_budget completes without panic for a budget-safe input.
+# B=1, S=1, D=1 → bytes = 4, far below 8 GiB.
+# If this panicked, the test function would never return true.
+fn test_activation_budget_safe() -> bool {
+    let _ = assert_activation_budget[1, 1, 1]()
+    true
+}
+
+fn main() -> nil {
+    let blocks = tile_count[2048, 16]()           # = 2048
+
+    let _ = assert_activation_budget[32, 4096, 8192]()
+
+    let mesh = plan_mesh[64]()                    # 8x8 mesh
+    # Old print() did not newline, so these two values printed on one line with
+    # no separator; concatenate them into a single line-oriented print.
+    print(to_str(blocks) + to_str(mesh))
+    nil
+}

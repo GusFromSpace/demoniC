@@ -1,0 +1,400 @@
+# Lotka-Volterra predator-prey field simulation
+#
+# Two scalar fields on a 2D grid:
+#   R(x,y,t) = rabbit density
+#   F(x,y,t) = fox    density
+#
+# Per-step update, discretized:
+#   R += dt * (a*R - b*R*F)        rabbits grow, get eaten
+#   F += dt * (c*R*F - d*F)        foxes grow by eating, starve otherwise
+# Plus a 5-point Laplacian diffusion term so populations spread spatially.
+#
+# Initial conditions are asymmetric: rabbits clustered bottom-right,
+# foxes in upper-left. There's no contact at t=0 -- they have to find
+# each other. The resulting wavefront propagates diagonally, oscillates,
+# and (under these parameters) settles into a damped traveling wave.
+#
+# Print ASCII frames every 8 steps so you can watch it happen.
+
+# ----- grid + parameter constants -----
+
+# 12 rows x 30 cols -- tall narrow rectangle reads well in a terminal.
+# All tensors below are [12, 30].
+
+# Lotka-Volterra rates (chosen so populations oscillate, not explode).
+#   a, c > 0: prey growth, predator growth-from-prey
+#   b, d > 0: predation rate, predator decay
+# dt small enough for forward-Euler to stay stable at these magnitudes.
+fn a_rate() -> f32 { 1.2f32 }     # rabbit growth
+fn b_rate() -> f32 { 0.8f32 }     # rabbits eaten per fox per unit time
+fn c_rate() -> f32 { 0.5f32 }     # foxes born per rabbit eaten
+fn d_rate() -> f32 { 0.9f32 }     # fox starvation
+fn dt_step() -> f32 { 0.08f32 }   # timestep
+fn diffusion() -> f32 { 0.15f32 } # neighbor-share fraction per step
+
+# ----- helpers -----
+
+# Initial rabbit field: a soft Gaussian-ish bump in the lower-right quadrant.
+# Center at (row=9, col=23). Falloff via Manhattan distance because we
+# don't have sqrt in scope and the qualitative shape is identical.
+fn init_rabbits() -> Tensor[f32, [12, 30]] {
+    let mut R: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 9
+    let cc = 23
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            # Smooth falloff: full density at center, zero beyond radius ~8.
+            if dist < 8 {
+                let val = (8 - dist) as f32
+                R[i, j] = val * 0.15f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    R
+}
+
+# Initial fox field: Gaussian-ish bump in the upper-left quadrant.
+# Center at (row=2, col=6).
+fn init_foxes() -> Tensor[f32, [12, 30]] {
+    let mut F: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let cr = 2
+    let cc = 6
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let dr = if i > cr { i - cr } else { cr - i }
+            let dc = if j > cc { j - cc } else { cc - j }
+            let dist = dr + dc
+            if dist < 6 {
+                let val = (6 - dist) as f32
+                F[i, j] = val * 0.18f32
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    F
+}
+
+# One 5-point Laplacian diffusion step:
+#   X'[i,j] = X[i,j] + k * (avg of 4 neighbors - X[i,j])
+# Boundary cells use the cell itself as missing neighbors (no-flux BC).
+fn diffuse(X: Tensor[f32, [12, 30]]) -> Tensor[f32, [12, 30]] {
+    let mut Y: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let k = diffusion()
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let here = X[i, j]
+            let up    = if i > 0  { X[i - 1, j] } else { here }
+            let down  = if i < 11 { X[i + 1, j] } else { here }
+            let left  = if j > 0  { X[i, j - 1] } else { here }
+            let right = if j < 29 { X[i, j + 1] } else { here }
+            let neighbor_avg = (up + down + left + right) * 0.25f32
+            Y[i, j] = here + k * (neighbor_avg - here)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    Y
+}
+
+# Forward-Euler step of the reaction-diffusion system.
+# Returns (R', F') after one local reaction + one diffusion pass.
+fn step(
+    R: Tensor[f32, [12, 30]], F: Tensor[f32, [12, 30]]
+) -> (Tensor[f32, [12, 30]], Tensor[f32, [12, 30]]) {
+    let a = a_rate()
+    let b = b_rate()
+    let c = c_rate()
+    let d = d_rate()
+    let h = dt_step()
+
+    # Local reaction: per-cell Lotka-Volterra. No broadcast magic --
+    # explicit loop so the math reads alongside the differential form.
+    let mut Rn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut Fn: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            let r = R[i, j]
+            let f = F[i, j]
+            let rf = r * f
+            let dR = a * r - b * rf
+            let dF = c * rf - d * f
+            let r_new = r + h * dR
+            let f_new = f + h * dF
+            # Clamp to zero -- populations can't go negative.
+            Rn[i, j] = if r_new > 0.0f32 { r_new } else { 0.0f32 }
+            Fn[i, j] = if f_new > 0.0f32 { f_new } else { 0.0f32 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    # Then spatial spread.
+    let R2 = diffuse(Rn)
+    let F2 = diffuse(Fn)
+    (R2, F2)
+}
+
+# Render one cell as a single character.
+#   density-threshold scheme:
+#     more foxes than rabbits and high  -> 'X'
+#     more foxes than rabbits and mid   -> 'x'
+#     more rabbits than foxes and high  -> 'O'
+#     more rabbits than foxes and mid   -> 'o'
+#     both high                          -> '@'   (conflict zone)
+#     both negligible                    -> '.'
+fn render_cell(r: f32, f: f32) -> i64 {
+    let hi = 0.4f32
+    let mid = 0.1f32
+    let r_hi = r > hi
+    let f_hi = f > hi
+    let r_mid = r > mid
+    let f_mid = f > mid
+
+    if r_hi {
+        if f_hi {
+            64    # '@'  -- conflict
+        } else {
+            79    # 'O'  -- many rabbits
+        }
+    } else if f_hi {
+        88        # 'X'  -- many foxes
+    } else if r_mid {
+        if f_mid {
+            35    # '#'  -- mid both
+        } else {
+            111   # 'o'  -- mid rabbits
+        }
+    } else if f_mid {
+        120       # 'x'  -- mid foxes
+    } else {
+        46        # '.'  -- background
+    }
+}
+
+fn char_str(code: i64) -> str {
+    if code == 64 {
+        "@"
+    } else if code == 79 {
+        "O"
+    } else if code == 88 {
+        "X"
+    } else if code == 35 {
+        "#"
+    } else if code == 111 {
+        "o"
+    } else if code == 120 {
+        "x"
+    } else {
+        "."
+    }
+}
+
+fn print_frame(R: Tensor[f32, [12, 30]], F: Tensor[f32, [12, 30]], step_num: i64) -> nil {
+    print("step " + to_str(step_num) + ":")
+    let mut i = 0
+    while i < 12 {
+        let mut line = ""
+        let mut j = 0
+        while j < 30 {
+            let code = render_cell(R[i, j], F[i, j])
+            line = line + char_str(code)
+            j = j + 1
+        }
+        print(line)
+        i = i + 1
+    }
+    print("")
+    nil
+}
+
+# ----- tests -----
+
+# render_cell with both densities zero -> background '.' (ascii 46)
+fn test_render_cell_background() -> bool {
+    render_cell(0.0f32, 0.0f32) == 46
+}
+
+# r=0.5 (>hi=0.4), f=0.0 (<hi) -> 'O' (ascii 79)
+fn test_render_cell_rabbits_hi() -> bool {
+    render_cell(0.5f32, 0.0f32) == 79
+}
+
+# r=0.0, f=0.5 (>hi=0.4) -> 'X' (ascii 88)
+fn test_render_cell_foxes_hi() -> bool {
+    render_cell(0.0f32, 0.5f32) == 88
+}
+
+# r=0.5, f=0.5 -> both hi -> '@' conflict (ascii 64)
+fn test_render_cell_conflict() -> bool {
+    render_cell(0.5f32, 0.5f32) == 64
+}
+
+# init_rabbits: center is (row=9, col=23), dist=0 < 8
+# val = (8 - 0) as f32 = 8.0; density = 8.0 * 0.15 = 1.2
+fn test_init_rabbits_center() -> bool {
+    let R = init_rabbits()
+    let v = R[9, 23]
+    let expected = 1.2f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 0.0001f32
+}
+
+# init_foxes: center is (row=2, col=6), dist=0 < 6
+# val = (6 - 0) as f32 = 6.0; density = 6.0 * 0.18 = 1.08
+fn test_init_foxes_center() -> bool {
+    let F = init_foxes()
+    let v = F[2, 6]
+    let expected = 1.08f32
+    let diff = if v > expected { v - expected } else { expected - v }
+    diff < 0.0001f32
+}
+
+# init_rabbits: corner (0,0): Manhattan dist from (9,23) = 9+23=32 >= 8 -> stays 0.0
+fn test_init_rabbits_far_corner() -> bool {
+    let R = init_rabbits()
+    R[0, 0] == 0.0f32
+}
+
+# init_foxes: corner (11,29): Manhattan dist from (2,6) = 9+23=32 >= 6 -> stays 0.0
+fn test_init_foxes_far_corner() -> bool {
+    let F = init_foxes()
+    F[11, 29] == 0.0f32
+}
+
+# diffuse on a uniform field must be a no-op:
+# if all neighbors == here, neighbor_avg == here, change == 0 everywhere.
+fn test_diffuse_uniform() -> bool {
+    let mut U: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let fill = 0.42f32
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            U[i, j] = fill
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let D = diffuse(U)
+    # every cell should still equal fill
+    let mut ok = true
+    let mut i2 = 0
+    while i2 < 12 {
+        let mut j2 = 0
+        while j2 < 30 {
+            let diff = if D[i2, j2] > fill { D[i2, j2] - fill } else { fill - D[i2, j2] }
+            if diff > 0.0001f32 {
+                ok = false
+            }
+            j2 = j2 + 1
+        }
+        i2 = i2 + 1
+    }
+    ok
+}
+
+# step with zero populations: reaction terms are all zero,
+# diffuse(zeros) is zeros -> result should be all zero.
+fn test_step_zero_populations() -> bool {
+    let Z: Tensor[f32, [12, 30]] = forge.zeros[f32, [12, 30]]
+    let (R2, F2) = step(Z, Z)
+    let mut all_zero = true
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            if R2[i, j] != 0.0f32 {
+                all_zero = false
+            }
+            if F2[i, j] != 0.0f32 {
+                all_zero = false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    all_zero
+}
+
+# After one step from real initial conditions, all densities must be >= 0
+# (the step function clamps to zero, so this must hold by construction).
+fn test_populations_nonneg_after_step() -> bool {
+    let R = init_rabbits()
+    let F = init_foxes()
+    let (R2, F2) = step(R, F)
+    let mut ok = true
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            if R2[i, j] < 0.0f32 {
+                ok = false
+            }
+            if F2[i, j] < 0.0f32 {
+                ok = false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ok
+}
+
+# ----- population total helper (also used in main) -----
+
+# Sum of all cells -- crude "total population" stat.
+fn total(X: Tensor[f32, [12, 30]]) -> f32 {
+    let mut s = 0.0f32
+    let mut i = 0
+    while i < 12 {
+        let mut j = 0
+        while j < 30 {
+            s = s + X[i, j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    s
+}
+
+fn main() -> nil {
+    print("--- predator-prey field, 12x30 grid, 64 steps ---")
+    print("legend: '.' empty   o/O rabbits   x/X foxes   @ conflict   # mixed")
+    print("")
+
+    let mut R = init_rabbits()
+    let mut F = init_foxes()
+
+    print_frame(R, F, 0)
+    print("totals: rabbits=" + to_str(total(R)) + "  foxes=" + to_str(total(F)))
+    print("")
+
+    let mut s = 1
+    while s <= 64 {
+        let (R2, F2) = step(R, F)
+        R = R2
+        F = F2
+        if s % 8 == 0 {
+            print_frame(R, F, s)
+            print("totals: rabbits=" + to_str(total(R)) + "  foxes=" + to_str(total(F)))
+            print("")
+        }
+        s = s + 1
+    }
+
+    nil
+}

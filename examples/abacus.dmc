@@ -1,0 +1,182 @@
+# abacus.dmc — a gratuitously over-engineered terminal soroban whose beads ARE
+# tensors, now taught to do math an abacus has no business doing. Runs on BOTH
+# backends: `dmc run` and `dmc jit` (all output is string-concatenated, no
+# tuples; the cursed arithmetic is pure tensor contraction, so the JIT eats it).
+#
+# State is a [6,5] bead tensor A: row i is rod i (place value 10^(5-i)); column
+# 0 is the heaven bead (worth 5), columns 1..4 are the four earth beads (worth 1
+# each). A[i,j] == 1.0 means that bead is active. The number is never stored — it
+# is recovered by contracting the bead tensor against bead-value and place-value
+# vectors. Beads in, integer out.
+#
+#   Run:   dmc run examples/abacus.dmc
+#   JIT:   dmc jit examples/abacus.dmc
+#   Test:  dmc test examples/abacus.dmc
+
+fn pow10(k: i64) -> i64 {
+    let !p = 1
+    for i in 0..k { p = p * 10 }
+    p
+}
+
+fn encode(n: i64) -> Tensor[f32, [6, 5]] {
+    let !A = forge.zeros[f32, [6, 5]]
+    for i in 0..6 {
+        let digit = (n / pow10(5 - i)) % 10
+        if (digit / 5) == 1 { A[i, 0] = 1.0f32 }
+        let e = digit % 5
+        for k in 0..e { A[i, 1 + k] = 1.0f32 }
+    }
+    A
+}
+
+# digits = A @ bead_values. The heart of the "tensors as beads" conceit.
+fn digit_tensor(A: Tensor[f32, [6, 5]]) -> Tensor[f32, [6, 1]] {
+    let bead_w = [[5.0f32], [1.0f32], [1.0f32], [1.0f32], [1.0f32]]   # [5,1]
+    A @ bead_w                                                         # [6,1]
+}
+
+fn value(A: Tensor[f32, [6, 5]]) -> i64 {
+    let d = digit_tensor(A)
+    let !total = 0
+    for i in 0..6 { total = total + (d[i, 0] as i64) * pow10(5 - i) }
+    total
+}
+
+# ── rendering (string-concat only, so the JIT can print it too) ───────────────
+fn earth_count(A: Tensor[f32, [6, 5]], i: i64) -> i64 {
+    let !e = 0
+    for k in 0..4 { e = e + (A[i, 1 + k] as i64) }
+    e
+}
+
+fn cell(A: Tensor[f32, [6, 5]], i: i64, row: i64) -> str {
+    if row == 2 {
+        "═══"
+    } else if row < 2 {
+        let active = (A[i, 0] as i64) == 1       # heaven bead down == active
+        let here   = if row == 0 { active == false } else { active }
+        if here { " O " } else { " | " }
+    } else {
+        let c = row - 3                          # earth slot 0..4 (top to bottom)
+        let e = earth_count(A, i)
+        if c < e { " O " } else if c == e { " | " } else { " O " }
+    }
+}
+
+fn render(A: Tensor[f32, [6, 5]]) -> nil {
+    print("      ┌──────── soroban ────────┐")
+    for row in 0..8 {
+        let !line = "      "
+        for i in 0..6 { line = line + cell(A, i, row) }
+        print(line)
+    }
+    print("       1e5 1e4 1e3 1e2 1e1 1e0")
+    print("       value = " + (value(A) as str))
+    print("")
+    nil
+}
+
+fn show(n: i64) -> nil {
+    print("════ abacus showing " + (n as str) + " ════")
+    render(encode(n))
+    nil
+}
+
+# ── addition: per-rod digit sum with carry, least significant first ──────────
+fn add(A: Tensor[f32, [6, 5]], B: Tensor[f32, [6, 5]]) -> i64 {
+    let da = digit_tensor(A)
+    let db = digit_tensor(B)
+    let !carry = 0
+    let !total = 0
+    for ii in 0..6 {
+        let i  = 5 - ii
+        let ai = da[i, 0] as i64
+        let bi = db[i, 0] as i64
+        let s  = ai + bi + carry
+        let digit = s % 10
+        let cin = carry
+        carry = s / 10
+        total = total + digit * pow10(5 - i)
+        print("   rod " + (i as str) + ": " + (ai as str) + " + " + (bi as str)
+              + " + " + (cin as str) + " = " + (digit as str) + "  carry->" + (carry as str))
+    }
+    total
+}
+
+# ── CURSED: multiplication via the OUTER PRODUCT of the two digit vectors ─────
+# da ⊗ db is a [6,6] tensor of every partial product; entry (i,j) lands at place
+# 10^((5-i)+(5-j)). An abacus moves beads one rod at a time — this does the whole
+# multiplication table in a single tensor op, then sums it down to a number.
+fn multiply(A: Tensor[f32, [6, 5]], B: Tensor[f32, [6, 5]]) -> i64 {
+    let da = digit_tensor(A)          # [6,1]
+    let db = digit_tensor(B)          # [6,1]
+    let P  = da @ db'                 # [6,6] outer product — the partial products
+    let !total = 0
+    for i in 0..6 {
+        for j in 0..6 {
+            total = total + (P[i, j] as i64) * pow10((5 - i) + (5 - j))
+        }
+    }
+    total
+}
+
+# ── CURSED: integer square root by Newton's method ───────────────────────────
+fn isqrt(n: i64) -> i64 {
+    if n < 2 {
+        n
+    } else {
+        let !x = n
+        let !y = (x + 1) / 2
+        while y < x {
+            x = y
+            y = (x + n / x) / 2
+        }
+        x
+    }
+}
+
+fn main() -> nil {
+    # static reads
+    show(7)            # heaven bead (5) + 2 earth on the units rod
+    show(482913)
+
+    # addition on the beads, with a carry trace
+    let a = 482913
+    let b = 58189
+    print("──── " + (a as str) + " + " + (b as str) + " on the abacus ────")
+    let s = add(encode(a), encode(b))
+    print("   sum = " + (s as str))
+    show(s)
+
+    # cursed: multiplication via tensor outer product
+    print("──── multiplication via bead outer product ────")
+    print("   123 * 456 = " + (multiply(encode(123), encode(456)) as str))
+    print("   789 * 654 = " + (multiply(encode(789), encode(654)) as str))
+
+    # cursed: square root of the number on the beads
+    print("──── square root on the abacus (Newton) ────")
+    let r = encode(166464)
+    print("   isqrt(" + (value(r) as str) + ") = " + (isqrt(value(r)) as str))
+    show(isqrt(value(r)))
+    nil
+}
+
+# ── ground-truth gates ───────────────────────────────────────────────────────
+fn test_bead_roundtrip() -> bool {
+    (value(encode(0)) == 0) && (value(encode(5)) == 5) && (value(encode(9)) == 9)
+        && (value(encode(482913)) == 482913) && (value(encode(999999)) == 999999)
+}
+fn test_bead_addition() -> bool {
+    (add(encode(482913), encode(58189)) == 541102)
+        && (add(encode(4), encode(8)) == 12)
+        && (add(encode(555), encode(555)) == 1110)
+}
+fn test_bead_multiply() -> bool {
+    (multiply(encode(123), encode(456)) == 56088)
+        && (multiply(encode(999), encode(999)) == 998001)
+        && (multiply(encode(0), encode(12345)) == 0)
+}
+fn test_bead_sqrt() -> bool {
+    (isqrt(166464) == 408) && (isqrt(0) == 0) && (isqrt(1) == 1) && (isqrt(998001) == 999)
+}
