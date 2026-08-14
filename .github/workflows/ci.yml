@@ -36,3 +36,11 @@ jobs:
         # Every JIT-eligible example test additionally runs on both backends
         # and the results are compared.
         run: compiler/target/release/dmc test --jit examples
+      - name: diff_backends.py (run-vs-jit whole-example diff)
+        # Diffs full program output between the interpreter and the JIT. The
+        # interpreter is the reference semantics, so any unexplained
+        # divergence is a JIT bug.
+        run: python3 tools/diff_backends.py
+      - name: jit_probes.py (run-vs-jit edge-case battery)
+        # Curated edge cases the example corpus does not reach.
+        run: python3 tools/jit_probes.py

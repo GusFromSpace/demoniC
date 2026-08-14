@@ -86,6 +86,22 @@ cargo test --all
 random well-typed programs, runs each through both the interpreter and the
 JIT, and reports any divergence.
 
+`tools/` holds the correctness gates CI runs. The interpreter is the
+reference semantics, so most of them check that the JIT agrees with it:
+
+```
+python3 tools/diff_backends.py        # interpreter vs JIT, whole-example output
+python3 tools/jit_probes.py           # interpreter vs JIT, curated edge cases
+python3 tools/diff_fuzz.py            # generated programs, both backends diffed
+python3 tools/numpy_oracle.py         # tensor ops vs an independent NumPy reference
+python3 tools/diff_demonic_lexer.py   # the demoniC-in-demoniC lexer vs the Rust one
+python3 tools/lint_dmc.py             # .dmc style checks
+```
+
+If you change the JIT, run `diff_backends.py` and `jit_probes.py`: a change
+that makes the JIT disagree with the interpreter is a bug even if it is
+faster, and these are what catch it.
+
 ## Status
 
 Pre-0.1 draft. Breaking changes are expected on every revision. The
