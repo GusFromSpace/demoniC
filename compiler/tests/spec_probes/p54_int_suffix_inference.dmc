@@ -1,0 +1,26 @@
+# Probe 54 — SPEC §3.1 (#445): an explicit integer type suffix types the
+# literal CONCRETELY, everywhere — including an unannotated `let`. Previously
+# the suffix was consumed and discarded by the lexer, so `let c = 0xffu32`
+# inferred I64 and failed at the first u32 use site.
+fn takes_u32(x: u32) -> u32 { x }
+fn takes_u64(x: u64) -> u64 { x }
+fn test_suffix_u32() -> bool {
+    let c = 0x00ff_ff00u32
+    takes_u32(c) == 0x00ff_ff00u32
+}
+fn test_suffix_u64_mut() -> bool {
+    let !n = 5u64
+    n = n + 1u64
+    takes_u64(n) == 6u64
+}
+fn test_suffix_f32() -> bool {
+    let x = 1.5f32
+    x + 1.5f32 == 3.0f32
+}
+
+fn main() -> nil {
+    print(test_suffix_u32() as str)
+    print(test_suffix_u64_mut() as str)
+    print(test_suffix_f32() as str)
+    nil
+}

@@ -59,8 +59,8 @@ fn plot_cubic() -> f64 {
 }
 
 fn matrix_panel() -> f64 {
-    let !a = vault.zeros[f32, [2, 2]]
-    let !b = vault.zeros[f32, [2, 2]]
+    let !a = forge.zeros[f32, [2, 2]]
+    let !b = forge.zeros[f32, [2, 2]]
 
     a[0, 0] = 1.0
     a[0, 1] = 2.0

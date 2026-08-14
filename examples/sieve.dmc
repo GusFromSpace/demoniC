@@ -5,7 +5,7 @@
 # --- numeric gate: prime counts are independently known ---
 # count_primes_upto restates main's sieve; n must be <= 100 (tensor capacity 101).
 fn count_primes_upto(n: i64) -> i64 {
-    let !s = vault.ones[f32, [101]]
+    let !s = forge.ones[f32, [101]]
     s[0] = 0.0
     s[1] = 0.0
     let !i = 2
@@ -40,7 +40,7 @@ fn test_count_primes_small() -> bool {
 
 fn main() -> nil {
     let n = 100
-    let !sieve = vault.ones[f32, [101]]
+    let !sieve = forge.ones[f32, [101]]
     sieve[0] = 0.0
     sieve[1] = 0.0
 

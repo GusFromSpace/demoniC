@@ -62,6 +62,13 @@ pub struct Checker {
     /// to fall through to generic field access and silently produce garbage
     /// at runtime.
     grad_fn_counts: HashMap<String, usize>,
+    /// #403 (MEMORY §2): per-fn param mutability (`!` markers), by position.
+    /// Lets call sites treat an uninit binding passed to a `!` param as the
+    /// fill that initializes it, and one passed to a plain param as a read.
+    fn_mut_params: HashMap<String, Vec<bool>>,
+    /// #442 (MEMORY §3.1): the lexically enclosing arena blocks, innermost
+    /// last. Empty = the default Forge context (MEMORY §3 rule 3).
+    arena_stack: Vec<ArenaKind>,
     pub checked_modules: HashMap<PathBuf, ModuleEnv>,
     /// Demon mode: the Control Art Restriction released. When set, the
     /// safe-mode lint family (`warn()`) is suppressed entirely — raw, full
@@ -79,6 +86,8 @@ impl Checker {
             warnings: Vec::new(),
             current_fn_ret: None,
             grad_fn_counts: HashMap::new(),
+            fn_mut_params: HashMap::new(),
+            arena_stack: Vec::new(),
             checked_modules: HashMap::new(),
             demon: false,
         }
@@ -297,7 +306,10 @@ impl Checker {
 
     // ── Pass 3: arena coherence ───────────────────────────────────────────
     // `?` and `<-` violations are reported during pass 2 via current_fn_ret.
-    // Cross-arena write detection requires arena-tag propagation (deferred).
+    // #442: the binding-level cross-arena write check also runs in pass 2
+    // (Vault-origin tags + the lexical `arena_stack`). What remains here is
+    // arena-tag *propagation* — through aliases, `!` params, and model
+    // fields — which needs arena-qualified types (#442 follow-ups).
 
     fn pass3_arena_coherence(&mut self, _program: &Program) {}
 
@@ -319,6 +331,10 @@ impl Checker {
             f.name.clone(),
             f.directives.iter().filter(|d| d.name == "grad").count(),
         );
+        self.fn_mut_params.insert(
+            f.name.clone(),
+            f.params.iter().map(|p| p.mutating).collect(),
+        );
     }
 
     fn register_extern_fn(&mut self, e: &ExternFnDecl) {
@@ -334,6 +350,10 @@ impl Checker {
         let ret = e.ret_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(TyType::Unit);
         self.env.pop_shape_scope();
         self.env.functions.insert(e.name.clone(), FnSig { shape_params, params, ret });
+        self.fn_mut_params.insert(
+            e.name.clone(),
+            e.params.iter().map(|p| p.mutating).collect(),
+        );
     }
 
     fn register_model(&mut self, m: &ModelDecl) {
@@ -418,7 +438,11 @@ impl Checker {
             Item::Model(m)    => self.check_model(m),
             Item::TypeAlias(_) => {}
             Item::Enum(_) => {} // registered in pass 1; nothing to check in a body
-            Item::Arena(a) => { let _ = self.check_block(&a.body); }
+            Item::Arena(a) => {
+                self.arena_stack.push(a.kind.clone());
+                let _ = self.check_block(&a.body);
+                self.arena_stack.pop();
+            }
             Item::Let(l)   => { self.check_let(l); }
             Item::Use(_)   => {}
             Item::Directive { directives, inner, .. } => {
@@ -776,6 +800,25 @@ impl Checker {
             };
             self.env.set_ctor_shape(name.clone(), ctor_shape);
         }
+        // #403 (MEMORY §2): a fresh `forge.uninit`/`vault.uninit` allocation is
+        // undefined until written — mark simple-ident bindings for the
+        // definite-assignment check (reads before the first write error). A
+        // same-scope rebind to anything else masks the flag in this scope;
+        // inner-scope shadows are masked by the scope walk itself.
+        if let Pattern::Ident(name, _) = &l.pattern {
+            if is_uninit_ctor(&l.value) {
+                self.env.mark_uninit(name.clone());
+            } else {
+                self.env.unmark_uninit_here(name);
+            }
+            // #442 (MEMORY §3.1): tag bindings whose value lives in the Vault,
+            // so mutating them outside a `vault { … }` block can error.
+            if is_vault_ctor(&l.value) {
+                self.env.mark_vault_origin(name.clone());
+            } else {
+                self.env.unmark_vault_origin_here(name);
+            }
+        }
         // Bind pattern names; `let !` and `let mut` both produce mutable bindings.
         if l.mutating || l.is_mut {
             if let Pattern::Ident(name, _) = &l.pattern {
@@ -1006,9 +1049,80 @@ impl Checker {
         match stmt {
             Stmt::Let(l) => { self.check_let(l); }
             Stmt::Expr { lhs, assign, span } => {
+                // #403 (MEMORY §2): the write target of a plain `=` / `:=` /
+                // `<-` is not a read — it is the write that initializes an
+                // uninit binding. Suppress the read error for the target
+                // during the LHS check, re-mark for the RHS so `t[0] = t[1]`
+                // still reports the undefined read, then clear for good.
+                // Compound ops (`+=`, …) read the target: no suppression.
+                let uninit_write: Option<String> = match assign {
+                    Some((AssignOp::Eq | AssignOp::ColonEq | AssignOp::StreamArrow, _)) =>
+                        lhs_root_ident(lhs)
+                            .filter(|r| self.env.is_uninit(r))
+                            .map(str::to_string),
+                    _ => None,
+                };
+                if let Some(r) = &uninit_write { self.env.clear_uninit(r); }
                 let lhs_ty = self.check_expr(lhs);
                 if let Some((op, rhs)) = assign {
+                    if let Some(r) = &uninit_write { self.env.mark_uninit(r.clone()); }
                     let rhs_ty = self.check_expr(rhs);
+                    if let Some(r) = &uninit_write { self.env.clear_uninit(r); }
+                    // Re-assigning a fresh uninit allocation re-arms the flag.
+                    if matches!(op, AssignOp::Eq | AssignOp::ColonEq) && is_uninit_ctor(rhs) {
+                        if let Expr::Ident(n, _) = lhs {
+                            self.env.mark_uninit(n.clone());
+                        }
+                    }
+                    // #442 (MEMORY §3.1): mutating Vault data outside a
+                    // `vault { … }` block is a cross-arena write. Mutations
+                    // are element/field writes, compound assigns, and `<-`
+                    // appends through a Vault-origin binding. A plain
+                    // whole-`=` rebind is not a mutation (the old Vault data
+                    // is untouched); it re-tags by the new value below.
+                    let is_mutation = match op {
+                        AssignOp::Eq => !matches!(lhs, Expr::Ident(..)),
+                        AssignOp::ColonEq => false,
+                        _ => true, // compound assigns and `<-` modify in place
+                    };
+                    // #442: the spec's hard error (MEMORY §3.1). Landed first
+                    // as a safe-mode warning because the corpus freely mutated
+                    // vault-allocated scratch outside `vault {}`; those 264
+                    // sites were migrated to `forge.*` (they were per-run
+                    // scratch, not long-lived data) before this promotion.
+                    // Ungated by demon mode, matching the sibling §2
+                    // uninit-read error — this is a spec violation, not a lint.
+                    if is_mutation
+                        && !matches!(self.arena_stack.last(), Some(ArenaKind::Vault))
+                    {
+                        if let Some(root) = lhs_root_ident(lhs) {
+                            if self.env.is_vault_origin(root) {
+                                self.error_with_hint(
+                                    format!(
+                                        "cross-arena write: `{root}` lives in the Vault; \
+                                         mutating it belongs in an explicit `vault {{ … }}` \
+                                         block (MEMORY §3.1)"),
+                                    span.clone(),
+                                    Some(format!(
+                                        "wrap the write: `vault {{ {root}[…] = … }}` — or \
+                                         allocate with `forge.*` if this is per-step scratch")),
+                                );
+                            }
+                        }
+                    }
+                    // Whole-`=`/`:=` rebinds re-tag the binding by the arena
+                    // of its new value.
+                    if matches!(op, AssignOp::Eq | AssignOp::ColonEq) {
+                        if let Expr::Ident(n, _) = lhs {
+                            if is_vault_ctor(rhs) {
+                                self.env.mark_vault_origin(n.clone());
+                            } else if matches!(op, AssignOp::ColonEq) {
+                                self.env.unmark_vault_origin_here(n);
+                            } else {
+                                self.env.clear_vault_origin(n);
+                            }
+                        }
+                    }
                     // Enforce immutability: plain `let x = ...` may not be written through.
                     // `:=` (shadow) and `<-` (stream-append) are exempt.
                     if !matches!(op, AssignOp::ColonEq | AssignOp::StreamArrow) {
@@ -1031,7 +1145,20 @@ impl Checker {
                             // immutability rule. Walk the index/field chain to the base
                             // identifier and reuse the immutable-binding check.
                             if let Some(base) = lhs_root_ident(lhs) {
-                                if self.env.lookup(base).is_some()
+                                // #403 (SPEC §4.8): a KV is append-only — `<-` is the
+                                // only legal way to extend it, and element writes are
+                                // rejected outright. Without this, `c[i] = v` surfaced
+                                // only at runtime, as a misleading out-of-bounds on the
+                                // `~` axis (which starts at 0).
+                                if matches!(self.env.lookup(base), Some(TyType::KV(..))) {
+                                    self.error(
+                                        format!(
+                                            "cannot element-assign `{base}[…]` — a `KV` is \
+                                             append-only; use `{base} <- value` to extend \
+                                             the stream (SPEC §4.8)"),
+                                        span.clone(),
+                                    );
+                                } else if self.env.lookup(base).is_some()
                                     && !self.env.is_mutable_binding(base)
                                 {
                                     self.error(
@@ -1135,6 +1262,29 @@ impl Checker {
             Stmt::Match(me) => { let _ = self.check_match(me); }
             Stmt::For { pattern, iter, body, span } => {
                 let iter_ty = self.check_expr(iter);
+                // #403 (MEMORY §9.1): `<-` appending to the value being
+                // iterated is the mutate-while-iterating bug class. The spec
+                // pins this rule to lexical scope deliberately — any `<-` on
+                // the loop's iterable binding anywhere in the body errors,
+                // regardless of branches — keeping the diagnostic
+                // deterministic. Snapshot iteration (`let snap = c` then
+                // `for v in snap { c <- … }`) stays legal because the
+                // iterable names a different binding. The `<-` itself marks
+                // the target as a stream, so no KV type lookup is needed.
+                if let Expr::Ident(iter_name, _) = iter {
+                    let mut appends = Vec::new();
+                    collect_stream_appends_block(body, iter_name, &mut appends);
+                    for hit in appends {
+                        self.error(
+                            format!(
+                                "stream-iteration-aliasing: `{iter_name} <- …` inside a \
+                                 `for` loop iterating `{iter_name}` — bind a snapshot \
+                                 first (`let snap = {iter_name}`) and iterate that \
+                                 (MEMORY §9.1)"),
+                            hit,
+                        );
+                    }
+                }
                 // #204: maps are not iterable — `for … in <map>` type-checks but
                 // fails at runtime ("cannot iterate over map"). Lint toward the
                 // key/value accessors. Safe-mode lint (suppressed in demon mode).
@@ -1455,13 +1605,51 @@ impl Checker {
     fn check_expr(&mut self, expr: &Expr) -> TyType {
         use Expr::*;
         match expr {
-            Literal(lit, _) => self.lit_type(lit),
+            Literal(lit, sp) => {
+                // #445 + #295: a suffix-typed int literal must fit its own
+                // declared width (`300u8` is an error with or without an
+                // annotation).
+                // 64-bit suffixes are exempt: the lexer stores hex/binary
+                // masks as i64 BIT PATTERNS (#282), so `0xffff…ffffu64` reads
+                // as -1 here yet is a legitimate u64 value. Any 64-bit
+                // pattern fits a 64-bit type by construction.
+                if let crate::ast::Literal::Int(n, Some(st)) = lit {
+                    if !matches!(st, crate::ast::ScalarType::I64 | crate::ast::ScalarType::U64) {
+                    if let Some((lo, hi)) = int_scalar_range(st.clone()) {
+                        let v = *n as i128;
+                        if v < lo || v > hi {
+                            self.error(format!(
+                                "integer literal {} out of range for its `{}` suffix (valid range {}..={})",
+                                n, TyType::Scalar(st.clone()), lo, hi), sp.clone());
+                        }
+                    }
+                    }
+                }
+                self.lit_type(lit)
+            }
             Nil(_) => TyType::Unit,
             Underscore(_) | Spread(_) => TyType::Unknown,
             Ident(name, span) => {
                 // Locals first, then top-level fns, then arena keywords as opaque.
                 if let Some(t) = self.env.lookup(name) {
-                    return t.clone();
+                    let t = t.clone();
+                    // #403 (MEMORY §2): definite assignment for uninit
+                    // allocations — reading a `forge.uninit` binding before
+                    // any write lands returns undefined bytes. Report at the
+                    // first read, then clear: one bug, one report. Write
+                    // targets and fill-style call arguments never reach here
+                    // marked (suppressed/cleared at their sites).
+                    if self.env.is_uninit(name) {
+                        self.env.clear_uninit(name);
+                        self.error(
+                            format!(
+                                "read of uninitialized memory: `{name}` comes from \
+                                 `forge.uninit`/`vault.uninit` and nothing has been \
+                                 written to it yet (MEMORY §2)"),
+                            span.clone(),
+                        );
+                    }
+                    return t;
                 }
                 if let Some(sig) = self.env.functions.get(name) {
                     return TyType::Fn {
@@ -1524,7 +1712,7 @@ impl Checker {
                 if elems.len() == 1 { return self.check_expr(&elems[0]); }
                 TyType::Tuple(elems.iter().map(|e| self.check_expr(e)).collect())
             }
-            TensorLit(elems, _) => {
+            TensorLit(elems, lit_span) => {
                 // Infer shape: scalar elements → 1D [N]; tensor elements → prepend N.
                 let n = elems.len() as i64;
                 let elem_ty = if let Some(first) = elems.first() {
@@ -1533,7 +1721,7 @@ impl Checker {
                     TyType::Unknown
                 };
                 for e in elems.iter().skip(1) { let _ = self.check_expr(e); }
-                match elem_ty {
+                let ty = match elem_ty {
                     TyType::Tensor(inner_elem, inner_shape) => {
                         // 2D+ literal: outer dim N, then inner shape dims.
                         let mut dims = vec![SymDim::Const(n)];
@@ -1544,7 +1732,29 @@ impl Checker {
                         TyType::Tensor(Box::new(TyType::Scalar(s)), Shape::new(vec![SymDim::Const(n)]))
                     }
                     _ => TyType::Tensor(Box::new(TyType::Unknown), Shape::new(vec![SymDim::Const(n)])),
+                };
+                // #403 (SPEC §4.2): tensor literals are for small, human-legible
+                // constants; the spec warns past 256 total elements and reserves
+                // the right to make it an error. Leaf count comes from the full
+                // inferred shape, so nested literals count all their scalars.
+                if let TyType::Tensor(_, shape) = &ty {
+                    let total = shape.dims.iter().try_fold(1i64, |acc, d| match d {
+                        SymDim::Const(k) => Some(acc.saturating_mul(*k)),
+                        _ => None,
+                    });
+                    if let Some(total) = total {
+                        if total > 256 {
+                            self.warn(
+                                format!("tensor literal has {total} elements — literals are for \
+                                         small, human-legible constants (SPEC §4.2 warns past 256)"),
+                                lit_span.clone(),
+                                Some("for bulk data use `forge.zeros/ones/uninit` and fill, \
+                                      or `vault.load` for constants".to_string()),
+                            );
+                        }
+                    }
                 }
+                ty
             }
             Block(b) => self.check_block(b),
             If(ie) => self.check_if(ie),
@@ -1563,7 +1773,14 @@ impl Checker {
                 let ret = Box::new(fl.ret_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(TyType::Unit));
                 TyType::Fn { params, ret }
             }
-            ArenaBlock(ab) => self.check_block(&ab.body),
+            ArenaBlock(ab) => {
+                // #442 (MEMORY §3): arena context is lexical — track the
+                // innermost block for the cross-arena write check.
+                self.arena_stack.push(ab.kind.clone());
+                let t = self.check_block(&ab.body);
+                self.arena_stack.pop();
+                t
+            }
             DirectiveBlock { directives, body, .. } => {
                 self.lint_unimplemented_directives(directives);
                 self.check_block(body)
@@ -1829,7 +2046,7 @@ impl Checker {
                 // Lookalike-operator lint (#194): `^` is XOR, not power. The
                 // high-confidence shape is `<int> ^ <int literal>` — almost
                 // always a port of `base ** exp` from another language.
-                if matches!(op, BitXor) && matches!(rhs, Expr::Literal(Literal::Int(_), _)) {
+                if matches!(op, BitXor) && matches!(rhs, Expr::Literal(Literal::Int(..), _)) {
                     self.warn(
                         "`^` is bitwise XOR, not exponentiation".to_string(),
                         span.clone(),
@@ -2076,6 +2293,40 @@ impl Checker {
                     return TyType::Unknown;
                 }
 
+                // #403 (MEMORY §2): fill-vs-read for uninit bindings passed as
+                // call arguments, decided BEFORE the args are type-checked
+                // (the identifier check reports any still-marked binding as a
+                // read). Bound to a `!` param of a known fn → the call is the
+                // fill: clear silently. Bound to a plain param, or passed to a
+                // builtin (builtins never fill their arguments) → a read:
+                // leave the mark. Unknown callees (methods, fn values, module
+                // paths) → clear silently rather than guess.
+                for (i, a) in args.iter().enumerate() {
+                    // Named args don't map to positional param indexes —
+                    // treat them as fills rather than misindex.
+                    let (arg_ident, positional) = match a {
+                        CallArg::Positional(Expr::Ident(n, _)) => (n, true),
+                        CallArg::Named { value: Expr::Ident(n, _), .. } => (n, false),
+                        _ => continue,
+                    };
+                    if !self.env.is_uninit(arg_ident) { continue; }
+                    let treat_as_read = positional && match expr {
+                        Expr::Ident(fname, _) => match self.fn_mut_params.get(fname) {
+                            // Known fn: `!` param fills, plain param reads.
+                            Some(muts) => !muts.get(i).copied().unwrap_or(false),
+                            // Builtins never fill their arguments — both the
+                            // fixed-arity set (builtin_sig) and the variadic
+                            // set (is_builtin). Anything else (merged-import
+                            // fns lose their `!` flags) → assume fill.
+                            None => crate::types::builtin_sig(fname).is_some()
+                                || self.env.is_builtin(fname),
+                        },
+                        _ => false,
+                    };
+                    if !treat_as_read {
+                        self.env.clear_uninit(arg_ident);
+                    }
+                }
                 // Resolve callee.
                 let mut arg_tys: Vec<TyType> = args.iter().map(|a| match a {
                     CallArg::Positional(e) => self.check_expr(e),
@@ -2141,6 +2392,29 @@ impl Checker {
                                         _ => TyType::Tuple(vec![loss_ty, TyType::Unknown]),
                                     };
                                 }
+                            }
+                        }
+                    }
+                    // #441: a call to a method not defined on the receiver's
+                    // model is a check-time error. Without this, the field
+                    // access falls through to `Unknown` and the call becomes a
+                    // silent no-op at runtime (statement position) or an
+                    // opaque value that errors only at its point of use (value
+                    // position). Fields are allowed through so a fn-typed
+                    // field stays callable; unknown `Named` types (not in
+                    // `env.models`) stay quiet. All model methods are hoisted
+                    // in pass 1, so forward references within and across
+                    // models remain legal.
+                    if let TyType::Named { name: model_name, .. } = &base_ty {
+                        if let Some(info) = self.env.models.get(model_name) {
+                            if !info.methods.contains_key(method)
+                                && !info.fields.contains_key(method)
+                            {
+                                self.error(
+                                    format!("no method `{method}` on model `{model_name}`"),
+                                    span.clone(),
+                                );
+                                return TyType::Unknown;
                             }
                         }
                     }
@@ -2349,7 +2623,14 @@ impl Checker {
 
     fn lit_type(&self, lit: &Literal) -> TyType {
         match lit {
-            Literal::Int(n)   => TyType::IntLit(*n),
+            // #445: an explicit type suffix (`42u32`) is the most explicit
+            // statement of intent a literal can carry — it types concretely,
+            // exactly like a suffixed float. Only the bare literal stays
+            // context-adopting.
+            Literal::Int(n, suffix) => match suffix {
+                Some(s) => { let _ = n; TyType::Scalar(s.clone()) }
+                None => TyType::IntLit(*n),
+            },
             Literal::Float(v, suffix) => match suffix {
                 Some(s) => TyType::Scalar(s.clone()),
                 // Untyped float literal: stays context-flexible (#284), adopting
@@ -2531,6 +2812,40 @@ fn lhs_root_ident(e: &Expr) -> Option<&str> {
 /// still letting the existing `Shape::matmul`/`Shape::broadcast` checks fire on
 /// provably-incompatible *constant* dims (they return `Unknown` — no error —
 /// for symbolic dims, so this never false-positives on shape-parametric code).
+/// #403 (MEMORY §2): does this expression allocate uninitialized memory
+/// (`forge.uninit[…]` / `vault.uninit[…]`)? Element-type-agnostic on purpose:
+/// a model-element uninit (#181) is just as undefined as a scalar-element one,
+/// so this matches looser than `ctor_tensor_ty`.
+fn is_uninit_ctor(expr: &Expr) -> bool {
+    let base = match expr {
+        Expr::Postfix { expr: base, op: PostfixOp::Index(_), .. } => base.as_ref(),
+        _ => return false,
+    };
+    matches!(base, Expr::Postfix { expr: inner, op: PostfixOp::Field(m), .. }
+        if m == "uninit" && matches!(inner.as_ref(), Expr::Ident(a, _) if a == "forge" || a == "vault"))
+}
+
+/// #442 (MEMORY §3.1): does this expression produce a value living in the
+/// Vault? True when the postfix spine (calls, index/bracket args) bottoms out
+/// in a `vault.<method>` access (`vault.zeros[…]`, `vault.load[…](path)`, …)
+/// or when it is a `vault { … }` block expression (whose allocations land in
+/// the Vault by MEMORY §3 rule 1).
+fn is_vault_ctor(expr: &Expr) -> bool {
+    if matches!(expr, Expr::ArenaBlock(ab) if ab.kind == ArenaKind::Vault) {
+        return true;
+    }
+    let mut e = expr;
+    loop {
+        match e {
+            Expr::Postfix { expr: inner, op: PostfixOp::Field(_), .. } => {
+                return matches!(inner.as_ref(), Expr::Ident(a, _) if a == "vault");
+            }
+            Expr::Postfix { expr: inner, .. } => e = inner.as_ref(),
+            _ => return false,
+        }
+    }
+}
+
 fn ctor_tensor_ty(expr: &Expr) -> Option<TyType> {
     let (base, idxs) = match expr {
         Expr::Postfix { expr: base, op: PostfixOp::Index(idxs), .. } => (base.as_ref(), idxs),
@@ -2605,7 +2920,7 @@ pub(crate) fn is_supported_str_method(name: &str) -> bool {
 /// operands (`+ 0` / `* 1` / …).
 fn is_num_literal(e: &Expr, v: f64) -> bool {
     match e {
-        Expr::Literal(Literal::Int(n), _) => *n as f64 == v,
+        Expr::Literal(Literal::Int(n, _), _) => *n as f64 == v,
         Expr::Literal(Literal::Float(f, _), _) => *f == v,
         Expr::Tuple(elems, _) if elems.len() == 1 => is_num_literal(&elems[0], v),
         _ => false,
@@ -2621,7 +2936,7 @@ fn expr_may_be_negative(e: &Expr) -> bool {
         // in the AST (a leading `-` is a `UnOp::Neg`), so a literal subtrahend
         // marks the decrement idiom; only flag a non-literal difference.
         Expr::BinOp { op: BinOp::Sub, rhs, .. } =>
-            !matches!(rhs.as_ref(), Expr::Literal(Literal::Int(_), _)),
+            !matches!(rhs.as_ref(), Expr::Literal(Literal::Int(..), _)),
         // See through grouping parens (parser builds a 1-tuple for `(e)`).
         Expr::Tuple(elems, _) if elems.len() == 1 => expr_may_be_negative(&elems[0]),
         _ => false,
@@ -2646,7 +2961,7 @@ fn directive_i64_arg(d: &Directive, name: &str) -> Option<i64> {
 
 fn expr_i64(expr: &Expr) -> Option<i64> {
     match expr {
-        Expr::Literal(Literal::Int(n), _) => Some(*n),
+        Expr::Literal(Literal::Int(n, _), _) => Some(*n),
         Expr::UnOp { op: UnOp::Neg, operand, .. } => expr_i64(operand).map(|n| -n),
         _ => None,
     }
@@ -2934,7 +3249,7 @@ fn collect_shape_vars(ty: &Type, out: &mut std::collections::HashSet<String>) {
 /// reads the `.split[n, ...]` piece count.
 fn lit_usize(e: &crate::ast::Expr) -> Option<usize> {
     match e {
-        crate::ast::Expr::Literal(crate::ast::Literal::Int(n), _) if *n > 0 => Some(*n as usize),
+        crate::ast::Expr::Literal(crate::ast::Literal::Int(n, _), _) if *n > 0 => Some(*n as usize),
         _ => None,
     }
 }
@@ -3227,6 +3542,70 @@ fn scan_stmt_wb(stmt: &Stmt, sc: &mut WbScope, out: &mut Vec<TypeError>) {
             }
         }
         Stmt::Break(_) | Stmt::Continue(_) => {}
+    }
+}
+
+/// #403 (MEMORY §9.1): collect spans of `name <- …` statements anywhere in
+/// `block`, lexically — nested loops, if/match arms, directive and arena
+/// blocks included. `<-` exists only as a statement-level assign op, so
+/// expressions need walking only where they carry blocks.
+fn collect_stream_appends_block(block: &Block, name: &str, out: &mut Vec<Span>) {
+    for stmt in &block.stmts {
+        collect_stream_appends_stmt(stmt, name, out);
+    }
+    if let Some(tail) = &block.tail_expr {
+        collect_stream_appends_expr(tail, name, out);
+    }
+}
+
+fn collect_stream_appends_stmt(stmt: &Stmt, name: &str, out: &mut Vec<Span>) {
+    match stmt {
+        Stmt::Expr { lhs, assign, span } => {
+            if matches!(assign, Some((AssignOp::StreamArrow, _)))
+                && matches!(lhs, Expr::Ident(n, _) if n == name)
+            {
+                out.push(span.clone());
+            } else if assign.is_none() {
+                collect_stream_appends_expr(lhs, name, out);
+            }
+        }
+        Stmt::If(ifx) => collect_stream_appends_if(ifx, name, out),
+        Stmt::Match(m) => {
+            for arm in &m.arms {
+                collect_stream_appends_expr(&arm.body, name, out);
+            }
+        }
+        Stmt::For { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::Loop { body, .. }
+        | Stmt::DirectiveBlock { body, .. } => collect_stream_appends_block(body, name, out),
+        Stmt::Directive { inner, .. } => collect_stream_appends_stmt(inner, name, out),
+        Stmt::Let(_) | Stmt::Stage { .. } | Stmt::Break(_) | Stmt::Continue(_)
+        | Stmt::Return { .. } => {}
+    }
+}
+
+fn collect_stream_appends_if(ifx: &IfExpr, name: &str, out: &mut Vec<Span>) {
+    collect_stream_appends_block(&ifx.then_branch, name, out);
+    match &ifx.else_branch {
+        Some(ElseBranch::Block(b)) => collect_stream_appends_block(b, name, out),
+        Some(ElseBranch::If(inner)) => collect_stream_appends_if(inner, name, out),
+        None => {}
+    }
+}
+
+fn collect_stream_appends_expr(e: &Expr, name: &str, out: &mut Vec<Span>) {
+    match e {
+        Expr::Block(b) => collect_stream_appends_block(b, name, out),
+        Expr::If(ifx) => collect_stream_appends_if(ifx, name, out),
+        Expr::Match(m) => {
+            for arm in &m.arms {
+                collect_stream_appends_expr(&arm.body, name, out);
+            }
+        }
+        Expr::ArenaBlock(ab) => collect_stream_appends_block(&ab.body, name, out),
+        Expr::DirectiveBlock { body, .. } => collect_stream_appends_block(body, name, out),
+        _ => {}
     }
 }
 

@@ -15,6 +15,10 @@ repository. Where an example disagrees with the spec, the spec wins.
 - Indentation is not semantic. Whitespace separates tokens; nothing else.
 - Statements are terminated by newline or `;`. Both are legal; neither is
   required inside `( )` or `[ ]`.
+- A **function signature** may wrap across lines: newlines are insignificant
+  inside the parameter list `( )`, and one newline between `)` and `->` is
+  also allowed, so the return arrow may begin its own line. The body's `{`
+  must follow the signature on the same line.
 - Anything starting with `@` is a **directive** (§2.6). Directives are part of
   the language, not user-defined annotations.
 - Notation: `*` = zero or more, `+` = one or more, `?` = optional,
@@ -171,6 +175,14 @@ error (`let x: i8 = 300`). Only syntactic literals (and a leading unary `-`)
 are range-checked; literal arithmetic like `200 - 100` is never falsely
 flagged.
 
+An **explicit type suffix** on an integer literal (`42u32`, `0xffi16`)
+types the literal concretely, exactly like a suffixed float: it binds an
+unannotated `let` at the suffix type, conflicts with a different
+annotation or parameter type as a normal type error, and is
+range-checked against its own width (`300u8` is a compile-time error).
+The 64-bit suffixes are exempt from the range check: hex and binary
+literals store as 64-bit bit patterns, so any such mask fits.
+
 **`str` operations:** indexing `s[i]` returns the UTF-8 byte at position `i`
 as `i64`. Concatenation uses `+`. Integer-to-string conversion: `n as str`.
 Length: `len(s)`.
@@ -238,6 +250,12 @@ let mut x = ...                          # long form, identical to !x
 
 Binding a mutable copy of an existing value (`let !y = x`) copies by value:
 mutating `y` leaves `x` untouched.
+
+**Bindings from model fields.** `let !x = m.field` follows the field's kind:
+a **tensor** field binds a live alias — every write through the binding
+(element write, whole-binding assignment, compound assignment, stream
+append) reaches the field; every other field kind (scalars above all) binds
+its current **value**, a snapshot per the copy rule above.
 
 ### 3.5 Functions
 

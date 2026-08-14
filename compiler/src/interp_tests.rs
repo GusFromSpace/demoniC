@@ -2550,6 +2550,74 @@ fn exec_cmd_echo() {
 }
 
 #[test]
+fn port_roundtrip_python() {
+    // #402: process-port floor — open a python port, call through the JSON
+    // ABI, close. python3 is a dev prerequisite here, same as
+    // examples/port_bridge.dmc. `len` avoids float-formatting assumptions.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            if e1 != nil { return "open failed" }
+            let (out, e2) = port_call(p, "len", "[1, 2, 3]")
+            if e2 != nil { return "call failed" }
+            let (_, e3) = port_close(p)
+            if e3 != nil { return "close failed" }
+            out
+        }
+    "#);
+    assert_eq!(as_str(&v), "3");
+}
+
+#[test]
+fn port_call_after_close_tags_port_closed() {
+    // #402 / PORTS.md §6: errors are str tags matched by prefix.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            let (_, e2) = port_close(p)
+            let (out, e3) = port_call(p, "len", "[1]")
+            if e3 == nil { "no error" } else { e3 }
+        }
+    "#);
+    match &v {
+        Value::Str(s) => assert!(s.starts_with("port-closed"), "got {:?}", s),
+        other => panic!("expected Str, got {:?}", other),
+    }
+}
+
+#[test]
+fn port_open_unsupported_runtime_tags_port_open() {
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e) = port_open("lua")
+            if e == nil { "no error" } else { e }
+        }
+    "#);
+    match &v {
+        Value::Str(s) => assert!(s.starts_with("port-open"), "got {:?}", s),
+        other => panic!("expected Str, got {:?}", other),
+    }
+}
+
+#[test]
+fn port_call_foreign_exception_tags_port_call() {
+    // A python-side exception (sqrt of a string) must surface as a
+    // `port-call` tag, not kill the port or the interpreter.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            let (out, e2) = port_call(p, "math.sqrt", json_encode("sixteen"))
+            let (_, e3) = port_close(p)
+            if e2 == nil { "no error" } else { e2 }
+        }
+    "#);
+    match &v {
+        Value::Str(s) => assert!(s.starts_with("port-call"), "got {:?}", s),
+        other => panic!("expected Str, got {:?}", other),
+    }
+}
+
+#[test]
 fn list_dir_tmp() {
     let v = run(r#"
         fn main() -> i64 {
@@ -6672,6 +6740,39 @@ fn rng_uniform_int_draws_in_range_395() {
 }
 
 #[test]
+fn field_binding_scalar_copies_444() {
+    // `let !x = self.field` on a SCALAR field is a value copy (SPEC §3.4),
+    // not a live alias — a snapshot must not track later field writes.
+    let v = run("model B { !n: i64\n\
+                 fn probe(self) -> i64 { let !snap = self.n  self.n = 99  snap } }\n\
+                 fn main() -> i64 { let !b = B { n: 7 }  b.probe() }");
+    assert!(matches!(v, Value::Int(7)), "snapshot must hold 7, got {:?}", v);
+}
+
+#[test]
+fn field_binding_tensor_rebind_writes_through_444() {
+    // A tensor-field binding is a live alias: whole-binding assignment
+    // writes the FIELD (matching element writes), never silently rebinds.
+    let v = run("model G { !buf: Tensor[i64, [4]]\n\
+                 fn fill!(self, v: i64) -> nil { let !b = self.buf\n\
+                     b = forge.ones[i64, [4]] .* v  nil } }\n\
+                 fn main() -> bool { let !g = G { buf: forge.zeros[i64, [4]] }\n\
+                     g.fill!(7)  g.buf[0] == 7 }");
+    assert!(matches!(v, Value::Bool(true)), "rebind must reach the field, got {:?}", v);
+}
+
+#[test]
+fn field_binding_compound_assign_writes_through_444() {
+    // Compound ops through the alias read the field's current value and
+    // write the result back to the field.
+    let v = run("model C { !t: Tensor[i64, [2]]\n\
+                 fn bump!(self) -> nil { let !b = self.t  b += forge.ones[i64, [2]]  nil } }\n\
+                 fn main() -> bool { let !c = C { t: forge.zeros[i64, [2]] }\n\
+                     c.bump!()  c.bump!()  c.t[1] == 2 }");
+    assert!(matches!(v, Value::Bool(true)), "two bumps must reach the field, got {:?}", v);
+}
+
+#[test]
 fn model_load_errors_394() {
     let e = run_err("model L[D] { w: Tensor[f32,[D]] }\nfn main() -> nil { let l = L[D=4].load(\"/tmp/x\")  nil }");
     assert!(e.contains("#394") && e.contains("serialization"), "got: {}", e);
@@ -6805,4 +6906,412 @@ fn kv_append_uses_declared_stream_axis() {
          \x20   sum(c) as i64\n\
          }");
     assert_eq!(as_int(&v), 10);
+}
+
+// --- #443: index expressions must be evaluated before the target is borrowed ---
+//
+// An indexed element write whose target is a model-field alias (`Value::FieldRef`)
+// used to take `borrow_mut()` on the struct's fields and *then* evaluate the index
+// expression. Any index that read the same struct re-entered the interpreter, whose
+// member-access path borrows that same `RefCell` — a hard panic that aborted the
+// whole `dmc test` process mid-suite rather than reporting a failure. The shape
+// matrix below is the one from the issue; each case is a separate test so a
+// regression shows up as one failing case, not a truncated run.
+
+#[test]
+fn field_alias_write_with_self_read_in_index_443() {
+    // Shape 1: `let !c = self.cells` then `c[self.table[0]] = 1`. Was: panic.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[self.table[0]] = 1
+        nil
+    }
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]], cells: vault.zeros[i64, [8]] }
+    b.table[0] = 3
+    b.go!()
+    b.cells[3]
+}
+"#);
+    assert_eq!(as_int(&v), 1);
+}
+
+#[test]
+fn field_alias_write_with_self_read_in_value_443() {
+    // Shape 3: `self` in value position only. Always worked — `rval` is
+    // evaluated before the arm is entered. Guards the pre-eval order.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[0] = self.table[0] + 7
+        nil
+    }
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]], cells: vault.zeros[i64, [8]] }
+    b.table[0] = 2
+    b.go!()
+    b.cells[0]
+}
+"#);
+    assert_eq!(as_int(&v), 9);
+}
+
+#[test]
+fn field_alias_write_with_method_call_in_index_443() {
+    // Shape 5: a method call in index position re-enters the interpreter one
+    // frame deeper before reading `self`. Was: panic.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn idx(self) -> i64 { self.table[0] + 1 }
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[self.idx()] = 1
+        nil
+    }
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]], cells: vault.zeros[i64, [8]] }
+    b.table[0] = 4
+    b.go!()
+    b.cells[5]
+}
+"#);
+    assert_eq!(as_int(&v), 1);
+}
+
+#[test]
+fn field_alias_read_with_self_read_in_index_443() {
+    // Shape 6: read-only indexing through an alias takes no mutable borrow.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn go(self) -> i64 {
+        let c = self.cells
+        c[self.table[0]]
+    }
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]], cells: vault.zeros[i64, [8]] }
+    b.table[0] = 3
+    b.cells[3] = 11
+    b.go()
+}
+"#);
+    assert_eq!(as_int(&v), 11);
+}
+
+#[test]
+fn field_alias_write_indexed_by_same_field_443() {
+    // Shape 7: the index reads the *same* field being written. The index is
+    // resolved from the pre-write contents, then the store lands.
+    let v = run(r#"
+model Box {
+    !cells: Tensor[i64, [8]]
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[self.cells[1]] = 1
+        nil
+    }
+}
+fn main() -> i64 {
+    let !b = Box { cells: vault.zeros[i64, [8]] }
+    b.cells[1] = 6
+    b.go!()
+    b.cells[6]
+}
+"#);
+    assert_eq!(as_int(&v), 1);
+}
+
+#[test]
+fn local_tensor_write_with_self_read_in_index_443() {
+    // Shape 8: a plain local target holds no borrow — always worked, kept as
+    // the control for the `Value::Tensor` arm now that both share a store path.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    fn go(self) -> i64 {
+        let !t = forge.zeros[i64, [8]]
+        t[self.table[0]] = 5
+        t[3]
+    }
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]] }
+    b.table[0] = 3
+    b.go()
+}
+"#);
+    assert_eq!(as_int(&v), 5);
+}
+
+#[test]
+fn struct_field_write_with_self_read_in_index_443() {
+    // The `m.field[i] = v` arm has the same shape as the alias arm: it borrows
+    // the struct's fields, so an index that reads `m` must be resolved first.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]], cells: vault.zeros[i64, [8]] }
+    b.table[0] = 2
+    b.cells[b.table[0]] = 4
+    b.cells[2]
+}
+"#);
+    assert_eq!(as_int(&v), 4);
+}
+
+#[test]
+fn table_driven_register_reset_443() {
+    // The form that found the bug: a table-driven loop reading both the index
+    // and the value straight off `self` inside the write.
+    let v = run(r#"
+model Device {
+    !reg_offset: Tensor[i64, [3]]
+    !reg_reset: Tensor[i64, [3]]
+    !regs: Tensor[i64, [2, 8]]
+    fn reset_device!(self, dev: i64) -> nil {
+        let !regs = self.regs
+        for k in 0..3 {
+            regs[dev, self.reg_offset[k] / 4] = self.reg_reset[k]
+        }
+        nil
+    }
+}
+fn main() -> i64 {
+    let !d = Device {
+        reg_offset: [0, 8, 20],
+        reg_reset: [7, 8, 9],
+        regs: vault.zeros[i64, [2, 8]],
+    }
+    d.reset_device!(1)
+    d.regs[1, 0] * 100 + d.regs[1, 2] * 10 + d.regs[1, 5] + d.regs[0, 0]
+}
+"#);
+    assert_eq!(as_int(&v), 789);
+}
+
+#[test]
+fn field_alias_slice_write_with_self_read_in_bounds_443() {
+    // The hazard is in every index form, not just scalars: a slice bound that
+    // reads `self` runs through the same pre-evaluation path.
+    let v = run(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[self.table[0]..self.table[1]] = 1
+        nil
+    }
+}
+fn main() -> i64 {
+    let !b = Box { table: vault.zeros[i64, [4]], cells: vault.zeros[i64, [8]] }
+    b.table[0] = 2
+    b.table[1] = 5
+    b.go!()
+    sum(b.cells) as i64
+}
+"#);
+    assert_eq!(as_int(&v), 3);
+}
+
+// ── #452: lists are copy-on-write, and still values ──────────────────────────
+//
+// `Value::List` holds an `Rc<Vec<Value>>` so that `xs = list_push(xs, v)` can
+// append in place instead of copying the whole backing vector on every call.
+// The sharing that buys the speedup is exactly what would break the language's
+// value semantics if a write ever landed on a buffer someone else can see, so
+// each mutating builtin gets a test that binds a second name to the list first
+// and asserts the second name never moves.
+
+#[test]
+fn list_push_does_not_mutate_an_alias_452() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list_push(list_push(list(), 1), 2)
+            let ys = xs
+            xs = list_push(xs, 3)
+            xs = list_push(xs, 4)
+            list_len(ys) * 100 + list_len(xs)
+        }
+    "#);
+    assert_eq!(as_int(&v), 204, "alias saw the pushes");
+}
+
+#[test]
+fn list_set_does_not_mutate_an_alias_452() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list_push(list_push(list(), 1), 2)
+            let ys = xs
+            xs = list_set(xs, 0, 99)
+            list_get(ys, 0) * 100 + list_get(xs, 0)
+        }
+    "#);
+    assert_eq!(as_int(&v), 199, "alias saw the element write");
+}
+
+#[test]
+fn list_pop_does_not_mutate_an_alias_452() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let xs = list_push(list_push(list(), 1), 2)
+            let ys = xs
+            let (rest, last) = list_pop(xs)
+            list_len(ys) * 100 + list_len(rest) * 10 + last
+        }
+    "#);
+    assert_eq!(as_int(&v), 212, "alias saw the pop");
+}
+
+#[test]
+fn list_rev_and_sort_do_not_mutate_an_alias_452() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let xs = list_push(list_push(list_push(list(), 3), 1), 2)
+            let ys = xs
+            let r = list_rev(xs)
+            let s = list_sort(xs)
+            list_get(ys, 0) * 100 + list_get(r, 0) * 10 + list_get(s, 0)
+        }
+    "#);
+    assert_eq!(as_int(&v), 321, "in-place reverse/sort leaked to the source list");
+}
+
+#[test]
+fn list_concat_with_itself_keeps_both_sides_452() {
+    // Same buffer on both sides of the write: the copy has to happen before the
+    // extend, or the source grows while it is being read.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list_push(list_push(list(), 1), 2)
+            let ys = xs
+            xs = list_concat(xs, xs)
+            list_len(xs) * 100 + list_len(ys) * 10 + list_get(xs, 3)
+        }
+    "#);
+    assert_eq!(as_int(&v), 422);
+}
+
+#[test]
+fn list_alias_survives_a_reassigning_loop_452() {
+    // The build-a-list loop that motivated #452, with a live alias taken
+    // mid-flight: the in-place append must not be visible through `snapshot`.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list()
+            let !i = 0
+            let !snapshot = list()
+            while i < 50 {
+                xs = list_push(xs, i)
+                if i == 9 { snapshot = xs }
+                i = i + 1
+            }
+            list_len(xs) * 1000 + list_len(snapshot)
+        }
+    "#);
+    assert_eq!(as_int(&v), 50010);
+}
+
+#[test]
+fn list_alias_through_a_fn_argument_452() {
+    // A list passed to a user fn is a value there too — the callee's pushes
+    // must not reach the caller's binding.
+    let v = run(r#"
+        fn grow(l: list) -> i64 {
+            let !inner = l
+            inner = list_push(inner, 99)
+            list_len(inner)
+        }
+        fn main() -> i64 {
+            let xs = list_push(list_push(list(), 1), 2)
+            let n = grow(xs)
+            n * 100 + list_len(xs)
+        }
+    "#);
+    assert_eq!(as_int(&v), 302, "callee's push reached the caller's list");
+}
+
+#[test]
+fn list_build_is_not_quadratic_452() {
+    // Complexity guard for the #452 fix. Twenty thousand appends is a few
+    // milliseconds when `list_push` writes into a uniquely owned buffer and
+    // minutes when it deep-copies the backing vector on every call, so the
+    // generous bound below still separates linear from quadratic by orders of
+    // magnitude — it fails on a regression without being timing-flaky.
+    let start = std::time::Instant::now();
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list()
+            let !i = 0
+            while i < 20000 {
+                xs = list_push(xs, i)
+                i = i + 1
+            }
+            list_len(xs)
+        }
+    "#);
+    let elapsed = start.elapsed();
+    assert_eq!(as_int(&v), 20000);
+    assert!(elapsed.as_secs() < 20, "20k list_push calls took {:?} — copy-on-write append regressed to a per-call copy", elapsed);
+}
+
+#[test]
+fn list_reassignment_reading_the_target_twice_452() {
+    // The in-place path releases the target binding's handle on the buffer, so
+    // it must never fire when something *else* in the statement still has to
+    // read that binding. Here the builtin call is only a sub-expression of the
+    // right-hand side and `xs` is read again in both branches.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list_push(list_push(list_push(list(), 1), 2), 3)
+            xs = if list_len(xs) > 2 { list_slice(xs, 0, 2) } else { xs }
+            list_len(xs) * 10 + list_get(xs, 1)
+        }
+    "#);
+    assert_eq!(as_int(&v), 22);
+}
+
+#[test]
+fn list_reassignment_from_a_short_circuit_reading_the_target_452() {
+    // Same hazard through `&&`: the left operand's builtin call must not
+    // release `xs` out from under the right operand, nor from under the branch.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list_push(list_push(list(), 7), 8)
+            xs = if list_len(xs) > 1 && list_get(xs, 1) == 8 { list_push(xs, 9) } else { xs }
+            list_len(xs) * 10 + list_get(xs, 2)
+        }
+    "#);
+    assert_eq!(as_int(&v), 39);
+}
+
+#[test]
+fn list_reassignment_with_the_target_read_in_a_later_arg_452() {
+    // `xs` appears twice in the same call. The release happens only after every
+    // argument is evaluated, so the second read still sees the original list.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !xs = list_push(list_push(list(), 5), 6)
+            xs = list_push(xs, list_len(xs))
+            list_len(xs) * 10 + list_get(xs, 2)
+        }
+    "#);
+    assert_eq!(as_int(&v), 32);
 }

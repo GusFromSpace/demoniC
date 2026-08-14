@@ -276,9 +276,16 @@ impl Parser {
             self.parse_params()?
         };
         self.expect(&TokenKind::RParen, "after fn params")?;
-        let ret_type = if self.eat(&TokenKind::Arrow) {
+        // #446: a multi-line parameter list often wants the return arrow on
+        // its own line. Newlines are insignificant inside `( )`, so the one
+        // *after* `)` used to end the signature early and the body's `{` then
+        // read as missing. `eat_over_newlines` restores position when the
+        // next non-newline token is not `->`, so a genuinely absent return
+        // type is unaffected.
+        let ret_type = if self.eat_over_newlines(&TokenKind::Arrow) {
             Some(self.parse_type()?)
         } else { None };
+        self.expect_fn_body_brace(&name)?;
         let body = self.parse_block()?;
         Ok(FnDecl {
             directives, name, mutates_self, shape_params, params, ret_type, body,
@@ -308,7 +315,8 @@ impl Parser {
             self.parse_params()?
         };
         self.expect(&TokenKind::RParen, "after extern fn params")?;
-        let ret_type = if self.eat(&TokenKind::Arrow) {
+        // #446: same wrapped-signature allowance as `parse_fn_decl`.
+        let ret_type = if self.eat_over_newlines(&TokenKind::Arrow) {
             Some(self.parse_type()?)
         } else { None };
         Ok(ExternFnDecl { abi, name, shape_params, params, ret_type, span: self.span_from(&start) })
@@ -497,6 +505,20 @@ impl Parser {
 
     // ─── Statements / Block ───────────────────────────────────────────────
 
+    /// #446: report a missing function-body brace against the SIGNATURE.
+    /// `parse_block`'s generic "expected LBrace" sent readers looking at the
+    /// body when the real problem was that the signature ended early.
+    fn expect_fn_body_brace(&mut self, what: &str) -> ParseResult<()> {
+        if matches!(self.peek(), TokenKind::Newline) {
+            return Err(self.err(format!(
+                "`{}`: expected `{{` to open the function body, found end of line \
+                 — the opening brace must be on the same line as the end of the \
+                 signature (a wrapped parameter list may put `->` on its own line)",
+                what)));
+        }
+        Ok(())
+    }
+
     fn parse_block(&mut self) -> ParseResult<Block> {
         let start = self.peek_span();
         self.expect(&TokenKind::LBrace, "before block")?;
@@ -673,7 +695,7 @@ impl Parser {
         let start = self.peek_span();
         self.expect(&TokenKind::Stage, "in stage")?;
         let stage = match self.advance().kind {
-            TokenKind::IntLit(n) => n,
+            TokenKind::IntLit(n, _) => n,
             other => return Err(self.err(format!("expected int after `stage`, found {:?}", other))),
         };
         self.expect(&TokenKind::Colon, "after stage number")?;
@@ -793,9 +815,10 @@ impl Parser {
                 }
                 Ok(Pattern::Ident(s, self.span_from(&start)))
             }
-            TokenKind::IntLit(n) => {
+            TokenKind::IntLit(n, ref suffix) => {
+                let ty = parse_int_suffix(suffix);
                 self.advance();
-                Ok(Pattern::Literal(Literal::Int(n), self.span_from(&start)))
+                Ok(Pattern::Literal(Literal::Int(n, ty), self.span_from(&start)))
             }
             TokenKind::FloatLit(f, ref suffix) => {
                 self.advance();
@@ -850,7 +873,7 @@ impl Parser {
             TokenKind::Minus => {
                 self.advance();
                 match self.advance().kind {
-                    TokenKind::IntLit(n)   => Ok(Pattern::Literal(Literal::Int(-n), self.span_from(&start))),
+                    TokenKind::IntLit(n, suffix) => Ok(Pattern::Literal(Literal::Int(-n, parse_int_suffix(&suffix)), self.span_from(&start))),
                     TokenKind::FloatLit(f, suffix) => {
                         let ty = parse_float_suffix(&suffix);
                         Ok(Pattern::Literal(Literal::Float(-f, ty), self.span_from(&start)))
@@ -896,6 +919,7 @@ impl Parser {
                     }
                 }
                 self.expect(&TokenKind::RParen, "after fn type args")?;
+                self.skip_newlines();   // #446
                 self.expect(&TokenKind::Arrow, "in fn type")?;
                 let ret = self.parse_type()?;
                 Ok(Type::Fn(args, Box::new(ret), self.span_from(&start)))
@@ -1654,7 +1678,7 @@ impl Parser {
     fn parse_primary(&mut self) -> ParseResult<Expr> {
         let start = self.peek_span();
         match self.peek().clone() {
-            TokenKind::IntLit(n)   => { self.advance(); Ok(Expr::Literal(Literal::Int(n),   self.span_from(&start))) }
+            TokenKind::IntLit(n, ref suffix) => { let ty = parse_int_suffix(suffix); self.advance(); Ok(Expr::Literal(Literal::Int(n, ty), self.span_from(&start))) }
             TokenKind::FloatLit(f, suffix) => { self.advance(); let ty = parse_float_suffix(&suffix); Ok(Expr::Literal(Literal::Float(f, ty), self.span_from(&start))) }
             TokenKind::StrLit(s)   => { self.advance(); Ok(Expr::Literal(Literal::Str(s),   self.span_from(&start))) }
             TokenKind::CharLit(c)  => { self.advance(); Ok(Expr::Literal(Literal::Char(c),  self.span_from(&start))) }
@@ -1777,16 +1801,18 @@ impl Parser {
             Vec::new()
         } else { self.parse_params()? };
         self.expect(&TokenKind::RParen, "in fn literal")?;
-        let ret_type = if self.eat(&TokenKind::Arrow) {
+        // #446: same wrapped-signature allowance as `parse_fn_decl`.
+        let ret_type = if self.eat_over_newlines(&TokenKind::Arrow) {
             Some(self.parse_type()?)
         } else { None };
+        self.expect_fn_body_brace("fn literal")?;
         let body = self.parse_block()?;
         Ok(FnLit { shape_params, params, ret_type, body, span: self.span_from(&start) })
     }
 
     fn peek_can_start_expr(&self) -> bool {
         match self.peek() {
-            TokenKind::IntLit(_) | TokenKind::FloatLit(..) | TokenKind::StrLit(_) |
+            TokenKind::IntLit(..) | TokenKind::FloatLit(..) | TokenKind::StrLit(_) |
             TokenKind::CharLit(_) |
             TokenKind::True | TokenKind::False | TokenKind::Nil |
             TokenKind::Ident(_) | TokenKind::SelfKw |
@@ -1830,6 +1856,22 @@ impl Parser {
         self.advance();
         Ok(s)
     }
+}
+
+/// #445: map an integer literal's explicit type suffix. Mirrors
+/// `parse_float_suffix`; the lexer only emits these eight strings.
+fn parse_int_suffix(suffix: &Option<String>) -> Option<ScalarType> {
+    suffix.as_ref().map(|s| match s.as_str() {
+        "i8" => ScalarType::I8,
+        "i16" => ScalarType::I16,
+        "i32" => ScalarType::I32,
+        "i64" => ScalarType::I64,
+        "u8" => ScalarType::U8,
+        "u16" => ScalarType::U16,
+        "u32" => ScalarType::U32,
+        "u64" => ScalarType::U64,
+        _ => ScalarType::I64,
+    })
 }
 
 fn parse_float_suffix(suffix: &Option<String>) -> Option<ScalarType> {

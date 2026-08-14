@@ -20,9 +20,11 @@ fn attention[B, S, D](
 
 fn main() -> nil {
     forge {
-        let q = forge.uninit[f32, [8, 512, 64]]
-        let k = forge.uninit[f32, [8, 512, 64]]
-        let v = forge.uninit[f32, [8, 512, 64]]
+        # zeros, not uninit: attention() reads its inputs, and reading
+        # uninitialized memory is a compile-time error (MEMORY §2, #403).
+        let q = forge.zeros[f32, [8, 512, 64]]
+        let k = forge.zeros[f32, [8, 512, 64]]
+        let v = forge.zeros[f32, [8, 512, 64]]
         let out = attention(q, k, v)
         print(out.shape)         # → [8, 512, 64]
     }

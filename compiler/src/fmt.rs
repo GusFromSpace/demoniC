@@ -1000,7 +1000,10 @@ impl Printer {
 
 fn lit_to_string(lit: &Literal) -> String {
     match lit {
-        Literal::Int(n)   => n.to_string(),
+        Literal::Int(n, suffix) => match suffix {
+            Some(t) => format!("{}{}", n, scalar_type_str(t)),
+            None => n.to_string(),
+        },
         Literal::Float(f, suffix) => {
             // Preserve at least one decimal place so the lexer sees it as float
             let mut s = format!("{}", f);

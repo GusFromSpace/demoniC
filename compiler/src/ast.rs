@@ -431,7 +431,9 @@ pub struct MeshAxis {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(i64),
+    /// The optional ScalarType is an explicit type suffix (`42u32`) — the
+    /// most explicit statement of intent a literal can carry (#445).
+    Int(i64, Option<ScalarType>),
     Float(f64, Option<ScalarType>),
     Str(String),
     /// Char literal `c"x"` — Unicode scalar value, type `u32`.

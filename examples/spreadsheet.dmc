@@ -36,7 +36,7 @@ fn print_row(sheet: Tensor[f32, [16]], row: i64) -> nil {
 }
 
 fn main() -> f32 {
-    let !sheet = vault.zeros[f32, [16]]
+    let !sheet = forge.zeros[f32, [16]]
 
     # Row 0: units, price, revenue, tax.
     sheet[cell(0, 0)] = 12.0

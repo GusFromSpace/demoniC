@@ -12,7 +12,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // ── Literals ──────────────────────────────────────────────────────────
-    IntLit(i64),
+    IntLit(i64, Option<String>),
     FloatLit(f64, Option<String>),
     StrLit(String),
     /// Char literal `c"x"` -- Unicode scalar value; type is `u32`.
@@ -452,7 +452,7 @@ impl<'src> Lexer<'src> {
             Some(c) => c,
         };
         match self.advance() {
-            Some(b'\'') => Ok(TokenKind::IntLit(val as i64)),
+            Some(b'\'') => Ok(TokenKind::IntLit(val as i64, None)),
             _ => Err(self.err("byte literal must contain exactly one byte")),
         }
     }
@@ -482,8 +482,8 @@ impl<'src> Lexer<'src> {
                 // writable even though they exceed i64::MAX.
                 let v = u64::from_str_radix(&digits, 16)
                     .map_err(|_| self.err("hex literal out of range"))? as i64;
-                self.try_eat_int_suffix();
-                return Ok(TokenKind::IntLit(v));
+                let suffix = self.try_eat_int_suffix().map(|s| s.to_string());
+                return Ok(TokenKind::IntLit(v, suffix));
             } else if self.peek() == Some(b'b') || self.peek() == Some(b'B') {
                 self.advance(); // eat `b`
                 // Grammar (#291.6): `"0b" bin_digit { bin_digit | "_" }` — a
@@ -500,8 +500,8 @@ impl<'src> Lexer<'src> {
                 // #282: same bit-pattern rule as hex above.
                 let v = u64::from_str_radix(&digits, 2)
                     .map_err(|_| self.err("binary literal out of range"))? as i64;
-                self.try_eat_int_suffix();
-                return Ok(TokenKind::IntLit(v));
+                let suffix = self.try_eat_int_suffix().map(|s| s.to_string());
+                return Ok(TokenKind::IntLit(v, suffix));
             }
         }
 
@@ -549,7 +549,7 @@ impl<'src> Lexer<'src> {
             return Ok(TokenKind::FloatLit(v, suffix));
         }
 
-        let _suffix = self.try_eat_int_suffix();
+        let suffix = self.try_eat_int_suffix().map(|s| s.to_string());
         // #401: optional binary size suffix (K/M/G) for byte counts, e.g.
         // `@recompute(budget=4G)`. Consumed here so it doesn't split off as a
         // separate `Ident` token.
@@ -562,7 +562,7 @@ impl<'src> Lexer<'src> {
             .collect();
         let v: i64 = clean.parse().map_err(|_| self.err("integer literal out of range"))?;
         let v = v.checked_mul(size_mult).ok_or_else(|| self.err("integer literal out of range"))?;
-        Ok(TokenKind::IntLit(v))
+        Ok(TokenKind::IntLit(v, suffix))
     }
 
     /// Consume an optional binary size suffix and return its multiplier (1 if

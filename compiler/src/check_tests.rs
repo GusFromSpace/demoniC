@@ -257,6 +257,273 @@ fn symbolic_ctor_shapes_do_not_false_positive() {
 }
 
 #[test]
+fn oversized_tensor_literal_warns() {
+    // #403 (SPEC §4.2): tensor literals are for small constants — past 256
+    // total elements the checker warns (spec reserves the right to error).
+    let elems = std::iter::repeat("1.0").take(300).collect::<Vec<_>>().join(", ");
+    let src = format!("fn main() -> f32 {{ let t = [{elems}]  t[0] }}");
+    let warns = warnings(&src);
+    assert!(warns.iter().any(|w| w.contains("300 elements")),
+            "expected oversized-literal warning, got {:?}", warns);
+
+    // Nested literals count leaves through the full inferred shape: 2 × 150.
+    let row = std::iter::repeat("1").take(150).collect::<Vec<_>>().join(", ");
+    let src = format!("fn main() -> i64 {{ let t = [[{row}], [{row}]]  t[0, 0] }}");
+    let warns = warnings(&src);
+    assert!(warns.iter().any(|w| w.contains("300 elements")),
+            "expected nested-literal warning, got {:?}", warns);
+
+    // Exactly 256 stays quiet — the bound is "more than 256".
+    let elems = std::iter::repeat("1.0").take(256).collect::<Vec<_>>().join(", ");
+    let src = format!("fn main() -> f32 {{ let t = [{elems}]  t[0] }}");
+    let warns = warnings(&src);
+    assert!(warns.is_empty(), "256-element literal must not warn, got {:?}", warns);
+}
+
+#[test]
+fn kv_element_assign_is_check_error() {
+    // #403 (SPEC §4.8): a KV is append-only. Element assignment through a
+    // KV-typed binding must fail at check time — previously it surfaced only
+    // at runtime, as a misleading out-of-bounds on the `~` axis.
+    let errs = check(r#"
+        fn main() -> nil {
+            let !cache: KV[f32, [2, ~, 3]] = forge.ones[f32, [2, 1, 3]]
+            cache[0, 0, 0] = 5.0
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("append-only") && e.contains("cache")),
+            "expected KV append-only error, got {:?}", errs);
+
+    // `<-` append and element reads stay legal.
+    assert!(passes(r#"
+        fn main() -> f32 {
+            let !cache: KV[f32, [2, ~, 3]] = forge.ones[f32, [2, 1, 3]]
+            cache <- forge.ones[f32, [2, 2, 3]]
+            cache[0, 0, 0]
+        }
+    "#));
+}
+
+#[test]
+fn cross_arena_write_outside_vault_block_is_check_error() {
+    // #442 (MEMORY §3.1): mutating Vault data from the default Forge context
+    // belongs in an explicit `vault { … }` block. The spec's hard error, as
+    // of the corpus migration to `forge.*` for per-run scratch.
+    let es = check(r#"
+        fn main() -> nil {
+            let !w = vault.ones[f32, [4]]
+            w[0] = 0.5
+            nil
+        }
+    "#);
+    assert!(es.iter().any(|e| e.contains("cross-arena write") && e.contains("`w`")),
+            "expected cross-arena write error, got {:?}", es);
+
+    // Compound assign is a read-modify-write of Vault memory.
+    let es = check(r#"
+        fn main() -> nil {
+            let !w = vault.ones[f32, [4]]
+            w -= vault.ones[f32, [4]]
+            nil
+        }
+    "#);
+    assert!(es.iter().any(|e| e.contains("cross-arena write")),
+            "expected compound-assign cross-arena error, got {:?}", es);
+
+    // A `vault { … }` block *expression* also produces Vault data; a nested
+    // `forge { … }` context does not sneak past the innermost-block rule.
+    let es = check(r#"
+        fn main() -> nil {
+            let !w = vault { [1.0, 2.0] }
+            vault { forge { w[0] = 3.0 } }
+            nil
+        }
+    "#);
+    assert!(es.iter().any(|e| e.contains("cross-arena write")),
+            "expected innermost-context cross-arena error, got {:?}", es);
+}
+
+#[test]
+fn vault_writes_inside_vault_block_are_legal() {
+    // The training-step idiom: mutate Vault weights inside `vault { … }`.
+    let es = check(r#"
+        fn main() -> nil {
+            let !w = vault.ones[f32, [4]]
+            vault {
+                w[0] = 0.5
+                w -= vault.ones[f32, [4]]
+            }
+            nil
+        }
+    "#);
+    assert!(!es.iter().any(|e| e.contains("cross-arena")),
+            "vault-block writes must be legal, got {:?}", es);
+    // Reads of Vault data anywhere are fine; so are Forge-tensor writes
+    // anywhere; so is a plain whole-`=` rebind (not a mutation), after which
+    // the binding is Forge data and writes are legal.
+    let es = check(r#"
+        fn main() -> f32 {
+            let !w = vault.ones[f32, [4]]
+            let !t = forge.ones[f32, [4]]
+            t[0] = w[1]
+            w = forge.zeros[f32, [4]]
+            w[0] = 1.0
+            sum(w) + sum(t)
+        }
+    "#);
+    assert!(!es.iter().any(|e| e.contains("cross-arena")),
+            "rebind/forge writes must be legal, got {:?}", es);
+}
+
+#[test]
+fn uninit_read_before_write_is_check_error() {
+    // #403 (MEMORY §2): definite assignment over uninit allocations —
+    // reading a `forge.uninit` binding before any write is a check error.
+    // Builtins (sum) never fill their args, so this is a read.
+    let errs = check(r#"
+        fn main() -> f32 {
+            let t = forge.uninit[f32, [4]]
+            sum(t)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("uninitialized") && e.contains("`t`")),
+            "expected uninit-read error, got {:?}", errs);
+
+    // Reading the binding on the RHS of its own first write is still a read.
+    let errs = check(r#"
+        fn main() -> nil {
+            let !t = forge.uninit[f32, [4]]
+            t[0] = t[1]
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("uninitialized")),
+            "expected self-RHS uninit-read error, got {:?}", errs);
+
+    // Passing to a plain (non-`!`) param of a known fn is a read.
+    let errs = check(r#"
+        fn total(t: Tensor[f32, [4]]) -> f32 { sum(t) }
+        fn main() -> f32 {
+            let t = forge.uninit[f32, [4]]
+            total(t)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("uninitialized")),
+            "expected plain-param uninit-read error, got {:?}", errs);
+}
+
+#[test]
+fn uninit_write_then_read_passes() {
+    // The canonical fill loop: the first write initializes the binding
+    // (binding-level, deliberately coarse — MEMORY §2 / #403).
+    assert!(passes(r#"
+        fn main() -> f32 {
+            let !t = forge.uninit[f32, [4]]
+            for i in 0..4 { t[i] = 1.0 }
+            sum(t)
+        }
+    "#));
+    // Passing to a `!` param is the fill.
+    assert!(passes(r#"
+        fn fill(!t: Tensor[f32, [4]]) -> nil {
+            for i in 0..4 { t[i] = 0.0 }
+            nil
+        }
+        fn main() -> f32 {
+            let !t = forge.uninit[f32, [4]]
+            fill(t)
+            sum(t)
+        }
+    "#));
+    // Whole reassignment initializes; rebinding a fresh uninit re-arms.
+    assert!(passes(r#"
+        fn main() -> f32 {
+            let !t = forge.uninit[f32, [4]]
+            t = forge.ones[f32, [4]]
+            sum(t)
+        }
+    "#));
+    let errs = check(r#"
+        fn main() -> f32 {
+            let !t = forge.ones[f32, [4]]
+            t = forge.uninit[f32, [4]]
+            sum(t)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("uninitialized")),
+            "re-armed uninit flag must fire, got {:?}", errs);
+    // A same-scope rebind to an initialized value masks the flag.
+    assert!(passes(r#"
+        fn main() -> f32 {
+            let t = forge.uninit[f32, [4]]
+            let t = forge.ones[f32, [4]]
+            sum(t)
+        }
+    "#));
+}
+
+#[test]
+fn stream_append_inside_loop_over_same_kv_is_check_error() {
+    // #403 (MEMORY §9.1): `<-` to the binding a `for` loop iterates is the
+    // mutate-while-iterating hazard, rejected lexically — branches included.
+    let errs = check(r#"
+        fn main() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                c <- forge.ones[f32, [1]]
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error, got {:?}", errs);
+
+    // Buried in a branch inside a nested loop — the rule is lexical, so it
+    // still fires.
+    let errs = check(r#"
+        fn main() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                for i in 0..2 {
+                    if i == 0 { c <- forge.ones[f32, [1]] }
+                }
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing")),
+            "expected nested/branched stream-aliasing error, got {:?}", errs);
+}
+
+#[test]
+fn stream_append_via_snapshot_iteration_still_passes() {
+    // The MEMORY §9.1 sanctioned idiom: iterate a snapshot binding, append to
+    // the stream itself. Different binding name — no error. Appending to a
+    // *different* stream inside a loop is likewise fine.
+    assert!(passes(r#"
+        fn main() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            let snap = c
+            for v in snap {
+                c <- forge.ones[f32, [1]]
+            }
+            nil
+        }
+    "#));
+    assert!(passes(r#"
+        fn main() -> nil {
+            let !a: KV[f32, [~]] = forge.ones[f32, [4]]
+            let !b: KV[f32, [~]] = forge.ones[f32, [1]]
+            for v in a {
+                b <- forge.ones[f32, [1]]
+            }
+            nil
+        }
+    "#));
+}
+
+#[test]
 fn kv_seeding_annotation_still_checks() {
     // The trap to avoid: making constructors report a concrete Tensor broke
     // `let k: KV[..] = forge.ones[..]`. The constructor's reported type stays
@@ -671,6 +938,56 @@ fn method_on_unknown_or_model_receiver_does_not_warn() {
     "#);
     assert!(!warns.iter().any(|w| w.contains("method-call syntax")),
             "false positive on a model-method call: {:?}", warns);
+}
+
+#[test]
+fn ghost_model_method_call_is_check_error() {
+    // #441: a call to a method not defined on the receiver's model must fail
+    // at check time. Previously the field access fell through to `Unknown`,
+    // so the call was a silent no-op at runtime in statement position, or an
+    // opaque value erroring only at its point of use in value position.
+    let errs = check(r#"
+        model Counter { !value: i64
+            fn bump!(self) -> nil { self.value = self.value + 1  nil }
+        }
+        fn f() -> bool {
+            let !c = Counter { value: 0 }
+            c.ghost!(42)
+            c.bump!()
+            c.value == 1
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("no method `ghost!` on model `Counter`")),
+            "expected unknown-method error, got {:?}", errs);
+
+    // Value position reaches the same resolution path and must error too.
+    let errs = check(r#"
+        model Counter { !value: i64 }
+        fn f() -> bool {
+            let c = Counter { value: 0 }
+            c.phantom() == 7
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("no method `phantom` on model `Counter`")),
+            "expected unknown-method error in value position, got {:?}", errs);
+}
+
+#[test]
+fn model_method_forward_references_still_pass() {
+    // #441 must not break legal forward references: model methods are hoisted
+    // in pass 1, so a call before its definition — within one model, and to a
+    // method of a model declared later in the file — stays clean.
+    assert!(passes(r#"
+        model A { n: i64
+            fn early(self) -> i64 { self.late() }
+            fn use_b(self, b: B) -> i64 { b.bmethod() }
+            fn late(self) -> i64 { self.n }
+        }
+        model B { m: i64
+            fn bmethod(self) -> i64 { self.m }
+        }
+        fn f(a: A, b: B) -> i64 { a.early() + a.use_b(b) }
+    "#));
 }
 
 #[test]
@@ -2397,4 +2714,119 @@ fn body_ending_in_let_gets_targeted_diagnostic() {
 
     // Correctly-formatted code (tail expression present) still checks clean.
     assert!(check("fn main() -> i64 { let x = 5  x + 1 }").is_empty());
+}
+
+// --- #443: element writes through immutable `self` stay check-time errors ----
+//
+// Shapes 2 and 4 of the issue's matrix. The interpreter fix for #443 must not
+// make these reachable at runtime: they are rejected by the immutable-binding
+// rule, which is why the language forces callers into the `let !c = self.f`
+// alias form in the first place.
+
+#[test]
+fn element_write_through_immutable_self_rejected_443() {
+    // Shape 2: `self.cells[self.table[0]] = 1` — self read in index position.
+    let errs = check(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn go!(self) -> nil {
+        self.cells[self.table[0]] = 1
+        nil
+    }
+}
+fn main() -> nil { nil }
+"#);
+    assert!(errs.iter().any(|e| e.contains("cannot write to an element of immutable binding `self`")),
+            "expected the immutable-self element-write error, got {:?}", errs);
+
+    // Shape 4: same write with the self read in value position instead.
+    let errs = check(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn go!(self) -> nil {
+        self.cells[0] = self.table[0] + 7
+        nil
+    }
+}
+fn main() -> nil { nil }
+"#);
+    assert!(errs.iter().any(|e| e.contains("cannot write to an element of immutable binding `self`")),
+            "expected the immutable-self element-write error, got {:?}", errs);
+}
+
+#[test]
+fn field_alias_element_write_checks_clean_443() {
+    // The alias form the rule steers callers to must keep checking clean —
+    // including with a `self` read inside the index (shapes 1 and 5).
+    assert!(passes(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn idx(self) -> i64 { self.table[0] + 1 }
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[self.table[0]] = 1
+        c[self.idx()] = 2
+        nil
+    }
+}
+fn main() -> nil { nil }
+"#), "alias-form element write should check clean, got {:?}", check(r#"
+model Box {
+    !table: Tensor[i64, [4]]
+    !cells: Tensor[i64, [8]]
+    fn idx(self) -> i64 { self.table[0] + 1 }
+    fn go!(self) -> nil {
+        let !c = self.cells
+        c[self.table[0]] = 1
+        c[self.idx()] = 2
+        nil
+    }
+}
+fn main() -> nil { nil }
+"#));
+}
+
+#[test]
+fn int_suffix_types_unannotated_local_445() {
+    // The suffix is the most explicit statement of intent a literal carries:
+    // `let c = 0xffu32` binds a u32, not a defaulted i64.
+    assert!(passes(
+        "fn takes_u32(x: u32) -> u32 { x }\n\
+         fn f() -> bool { let c = 0x00ff_ff00u32  takes_u32(c) == 0x00ff_ff00u32 }"),
+        "u32-suffixed initializer must bind u32");
+    assert!(passes(
+        "fn f() -> u64 { let !n = 5u64  n = n + 1u64  n }"),
+        "u64-suffixed mutable local must bind u64");
+}
+
+#[test]
+fn int_suffix_conflicts_and_ranges_445() {
+    // Suffix vs annotation conflict is an error, not a silent override.
+    let e = check("fn f() -> nil { let x: u32 = 5u64  nil }");
+    assert!(!e.is_empty(), "u64 literal into u32 annotation must error");
+    // A literal must fit its own suffix, annotation or not (#295).
+    let e = check("fn f() -> nil { let x = 300u8  nil }");
+    assert!(e.iter().any(|m| m.contains("range")), "300u8 must range-error, got {:?}", e);
+    // 64-bit hex masks store as i64 bit patterns (#282) — always legal.
+    assert!(passes("fn f() -> nil { let m = 0xffff_ffff_ffff_ffffu64  nil }"),
+        "u64 mask literal must stay legal");
+}
+
+#[test]
+fn cross_arena_error_is_not_demon_suppressed_442() {
+    // A spec violation, not a lint: demon mode drops safe-mode lints but must
+    // still reject a cross-arena write, matching the §2 uninit-read error.
+    let tokens = super::lexer::Lexer::new(
+        "fn main() -> nil { let !w = vault.ones[f32, [4]]  w[0] = 0.5  nil }")
+        .tokenize().expect("lex failed");
+    let program = super::parser::Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.demon = true;
+    checker.check_program(&program, None);
+    let es: Vec<String> = checker.errors.iter().map(|e| e.msg.clone()).collect();
+    assert!(es.iter().any(|e| e.contains("cross-arena write")),
+            "demon mode must still reject a cross-arena write, got {:?}", es);
 }

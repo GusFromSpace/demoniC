@@ -627,3 +627,53 @@ fn range_over_sums_unchanged() {
     let p = parse("fn f(lo: i64, hi: i64) -> nil { for i in lo + 1 .. hi - 1 { } nil }");
     assert_eq!(p.items.len(), 1);
 }
+
+// ── #446: wrapped signatures — `->` may begin its own line ──────────────────
+
+#[test]
+fn arrow_on_own_line_after_wrapped_params_446() {
+    // Newlines are insignificant inside `( )`; the one after `)` used to end
+    // the signature early, so the body's `{` read as missing.
+    let p = parse("fn wide(a: i64, b: i64,\n        c: i64, d: i64)\n        -> i64 {\n    a + b + c + d\n}");
+    assert_eq!(p.items.len(), 1);
+    match &p.items[0] {
+        Item::Fn(f) => {
+            assert_eq!(f.params.len(), 4, "all four params must survive");
+            assert!(f.ret_type.is_some(), "return type must be attached");
+        }
+        other => panic!("expected a fn item, got {:?}", other),
+    }
+}
+
+#[test]
+fn arrow_on_own_line_in_fn_literal_446() {
+    let p = parse("fn main() -> nil { let f = fn(a: i64,\n b: i64)\n -> i64 { a * b }  nil }");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn arrow_on_own_line_in_extern_decl_446() {
+    let p = parse("extern fn ext(a: i32,\n              b: i32)\n              -> nil");
+    assert_eq!(p.items.len(), 1);
+}
+
+#[test]
+fn no_return_type_fn_unaffected_446() {
+    // The newline-tolerant eat must restore position when no `->` follows,
+    // so a body-only signature still parses and the NEXT item is intact.
+    let p = parse("fn noret(a: i64) { print(a) }\nfn other() -> i64 { 1 }");
+    assert_eq!(p.items.len(), 2, "both items must parse");
+    match &p.items[0] {
+        Item::Fn(f) => assert!(f.ret_type.is_none(), "first fn has no return type"),
+        other => panic!("expected a fn item, got {:?}", other),
+    }
+}
+
+#[test]
+fn missing_body_brace_names_the_signature_446() {
+    // The old message ("expected LBrace before block") pointed at the body;
+    // the real problem is that the signature ended early.
+    let e = parse_err("fn f(a: i64) -> i64\n{\n    a\n}");
+    assert!(e.contains("`f`"), "diagnostic must name the fn, got: {e}");
+    assert!(e.contains("signature"), "diagnostic must point at the signature, got: {e}");
+}

@@ -40,7 +40,7 @@ impl SymDim {
     /// any expression we can't analyze (function calls, indexing, etc.).
     pub fn from_expr(expr: &Expr) -> SymDim {
         match expr {
-            Expr::Literal(Literal::Int(n), _) => SymDim::Const(*n),
+            Expr::Literal(Literal::Int(n, _), _) => SymDim::Const(*n),
             Expr::Ident(name, _) => {
                 if name == "_" { SymDim::Wildcard }
                 else if name == "~" { SymDim::Streaming }

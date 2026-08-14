@@ -1,0 +1,45 @@
+# Probe 55 — SPEC §0 / §6.1 (#446): a wrapped parameter list may put the
+# return arrow on its own line. Newlines are insignificant inside `( )`, but
+# the one AFTER `)` used to end the signature early — the body's `{` then
+# read as a missing brace, with the error pointing at the body rather than
+# the arrow. Tensor-heavy signatures have no other legal wrapped form.
+fn lcs_span(a: Tensor[u8, [16]], asta: Tensor[i64, [4]],
+            alen: Tensor[i64, [4]], n: i64,
+            b: Tensor[u8, [16]])
+            -> i64 {
+    let _ = a[0]
+    let _ = b[0]
+    asta[0] + alen[0] + n
+}
+
+# The same allowance in a fn literal.
+fn apply_wrapped() -> i64 {
+    let f = fn(x: i64,
+               y: i64)
+               -> i64 { x * y }
+    f(6, 7)
+}
+
+# A signature with no return type is unaffected.
+fn noret(a: i64) { let _ = a }
+
+fn main() -> nil {
+    let sta = forge.zeros[i64, [4]]
+    let len = forge.zeros[i64, [4]]
+    let ba = forge.zeros[u8, [16]]
+    let bb = forge.zeros[u8, [16]]
+    print(lcs_span(ba, sta, len, 5, bb))
+    print(apply_wrapped())
+    noret(1)
+    nil
+}
+
+fn test_wrapped_signature_runs() -> bool {
+    let sta = forge.zeros[i64, [4]]
+    let len = forge.zeros[i64, [4]]
+    let ba = forge.zeros[u8, [16]]
+    let bb = forge.zeros[u8, [16]]
+    lcs_span(ba, sta, len, 5, bb) == 5
+}
+
+fn test_wrapped_fn_literal_runs() -> bool { apply_wrapped() == 42 }

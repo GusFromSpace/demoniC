@@ -418,6 +418,10 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         "path_is_file" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::Bool))),
         // Process execution
         "exec_cmd" => Some(mk(2, TyType::Unknown)),
+        // Ports (#402, PORTS.md §2) — each returns `(_, Err)`
+        "port_open"  => Some(mk(1, TyType::Unknown)),
+        "port_call"  => Some(mk(3, TyType::Unknown)),
+        "port_close" => Some(mk(1, TyType::Unknown)),
         // Regex
         "regex_match"       => Some(mk(2, TyType::Scalar(crate::ast::ScalarType::Bool))),
         "regex_find"        => Some(mk(2, TyType::Unknown)),
@@ -544,6 +548,15 @@ pub struct Env {
     /// into assignment / arg-passing compatibility (where a concrete shape would
     /// wrongly clash with symbolic model fields or `View` params).
     ctor_shapes: Vec<HashMap<String, Shape>>,
+    /// #403 (MEMORY §2): bindings allocated by `forge.uninit`/`vault.uninit`
+    /// that no write has landed on yet. Parallel to `scopes`, masked by
+    /// shadowing bindings exactly like `ctor_shapes`.
+    uninit_bindings: Vec<std::collections::HashSet<String>>,
+    /// #442 (MEMORY §3.1): bindings whose value lives in the Vault — the RHS
+    /// bottomed out in a `vault.*` constructor or a `vault { … }` block.
+    /// Mutating one outside a `vault { … }` context is a cross-arena write.
+    /// Same scoping discipline as `uninit_bindings`.
+    vault_bindings: Vec<std::collections::HashSet<String>>,
     /// Symbolic shape parameters in scope, mapped to their declared bounds
     /// (None if unbounded, Some(c) if `= c` was provided).
     pub shape_params: Vec<HashMap<String, Option<SymDim>>>,
@@ -573,11 +586,82 @@ impl Env {
         self.scopes.push(HashMap::new());
         self.mutable_idents.push(std::collections::HashSet::new());
         self.ctor_shapes.push(HashMap::new());
+        self.uninit_bindings.push(std::collections::HashSet::new());
+        self.vault_bindings.push(std::collections::HashSet::new());
     }
     pub fn pop_scope(&mut self)  {
         self.scopes.pop();
         self.mutable_idents.pop();
         self.ctor_shapes.pop();
+        self.uninit_bindings.pop();
+        self.vault_bindings.pop();
+    }
+
+    /// #442 (MEMORY §3.1): record that a binding's value lives in the Vault.
+    pub fn mark_vault_origin(&mut self, name: impl Into<String>) {
+        if let Some(scope) = self.vault_bindings.last_mut() {
+            scope.insert(name.into());
+        }
+    }
+
+    /// #442: a same-scope rebind to a non-Vault value masks the tag here only.
+    pub fn unmark_vault_origin_here(&mut self, name: &str) {
+        if let Some(scope) = self.vault_bindings.last_mut() {
+            scope.remove(name);
+        }
+    }
+
+    /// #442: the binding was rebound to a non-Vault value — drop the tag
+    /// wherever it lives (same shadow-masked walk as `clear_uninit`).
+    pub fn clear_vault_origin(&mut self, name: &str) {
+        for (vals, marks) in self.scopes.iter().rev().zip(self.vault_bindings.iter_mut().rev()) {
+            if marks.remove(name) { return; }
+            if vals.contains_key(name) { return; }
+        }
+    }
+
+    /// #442: does the binding's value live in the Vault?
+    pub fn is_vault_origin(&self, name: &str) -> bool {
+        for (vals, marks) in self.scopes.iter().rev().zip(self.vault_bindings.iter().rev()) {
+            if marks.contains(name) { return true; }
+            if vals.contains_key(name) { return false; }
+        }
+        false
+    }
+
+    /// #403 (MEMORY §2): record a fresh uninit allocation for a binding in the
+    /// current scope (where the `let` also binds the value).
+    pub fn mark_uninit(&mut self, name: impl Into<String>) {
+        if let Some(scope) = self.uninit_bindings.last_mut() {
+            scope.insert(name.into());
+        }
+    }
+
+    /// #403: a same-scope rebind of the name to a non-uninit value masks the
+    /// flag in this scope only — outer-scope flags survive the shadow.
+    pub fn unmark_uninit_here(&mut self, name: &str) {
+        if let Some(scope) = self.uninit_bindings.last_mut() {
+            scope.remove(name);
+        }
+    }
+
+    /// #403: the first write landed (or the read was reported — one bug, one
+    /// report). Walks inside-out with the same shadow mask as
+    /// `lookup_ctor_shape`: stop at the first scope binding the name at all.
+    pub fn clear_uninit(&mut self, name: &str) {
+        for (vals, marks) in self.scopes.iter().rev().zip(self.uninit_bindings.iter_mut().rev()) {
+            if marks.remove(name) { return; }
+            if vals.contains_key(name) { return; }
+        }
+    }
+
+    /// #403: is the binding still an unwritten uninit allocation?
+    pub fn is_uninit(&self, name: &str) -> bool {
+        for (vals, marks) in self.scopes.iter().rev().zip(self.uninit_bindings.iter().rev()) {
+            if marks.contains(name) { return true; }
+            if vals.contains_key(name) { return false; }
+        }
+        false
     }
     pub fn push_shape_scope(&mut self) { self.shape_params.push(HashMap::new()); }
     pub fn pop_shape_scope(&mut self)  { self.shape_params.pop(); }
@@ -742,6 +826,8 @@ impl Env {
             "path_exists", "path_is_dir", "path_is_file",
             // Process execution
             "exec_cmd",
+            // Ports (#402, PORTS.md §2)
+            "port_open", "port_call", "port_close",
             // Regex
             "regex_match", "regex_find", "regex_find_all",
             "regex_replace", "regex_replace_all", "regex_split",

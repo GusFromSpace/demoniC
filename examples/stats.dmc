@@ -44,7 +44,7 @@ fn test_min_max() -> bool {
 }
 
 fn main() -> nil {
-    let !data = vault.zeros[f32, [8]]
+    let !data = forge.zeros[f32, [8]]
     data[0] = 4.0
     data[1] = 7.0
     data[2] = 13.0

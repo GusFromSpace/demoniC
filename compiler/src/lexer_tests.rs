@@ -23,22 +23,22 @@ mod tests {
 
     #[test]
     fn int_decimal() {
-        assert_eq!(lex_kinds_noeol("42"), vec![TokenKind::IntLit(42)]);
+        assert_eq!(lex_kinds_noeol("42"), vec![TokenKind::IntLit(42, None)]);
     }
 
     #[test]
     fn int_with_underscores() {
-        assert_eq!(lex_kinds_noeol("1_000_000"), vec![TokenKind::IntLit(1_000_000)]);
+        assert_eq!(lex_kinds_noeol("1_000_000"), vec![TokenKind::IntLit(1_000_000, None)]);
     }
 
     #[test]
     fn int_hex() {
-        assert_eq!(lex_kinds_noeol("0xdead_beef"), vec![TokenKind::IntLit(0xdead_beef)]);
+        assert_eq!(lex_kinds_noeol("0xdead_beef"), vec![TokenKind::IntLit(0xdead_beef, None)]);
     }
 
     #[test]
     fn int_binary() {
-        assert_eq!(lex_kinds_noeol("0b1010_1100"), vec![TokenKind::IntLit(0b1010_1100)]);
+        assert_eq!(lex_kinds_noeol("0b1010_1100"), vec![TokenKind::IntLit(0b1010_1100, None)]);
     }
 
     #[test]
@@ -183,20 +183,20 @@ mod tests {
     #[test]
     fn line_comment_skipped() {
         let toks = lex_kinds_noeol("42 # this is a comment");
-        assert_eq!(toks, vec![TokenKind::IntLit(42)]);
+        assert_eq!(toks, vec![TokenKind::IntLit(42, None)]);
     }
 
     #[test]
     fn block_comment_skipped() {
         let toks = lex_kinds_noeol("1 #{ skip me }# 2");
-        assert_eq!(toks, vec![TokenKind::IntLit(1), TokenKind::IntLit(2)]);
+        assert_eq!(toks, vec![TokenKind::IntLit(1, None), TokenKind::IntLit(2, None)]);
     }
 
     #[test]
     fn nested_block_comment() {
         // From hello.dmc fixture: nested block comments must work
         let src = "#{ outer #{ inner }# still outer }# 99";
-        assert_eq!(lex_kinds_noeol(src), vec![TokenKind::IntLit(99)]);
+        assert_eq!(lex_kinds_noeol(src), vec![TokenKind::IntLit(99, None)]);
     }
 
     // ── Newline significance ───────────────────────────────────────────────
@@ -349,25 +349,25 @@ mod tests {
 
     #[test]
     fn byte_lit_basic() {
-        assert_eq!(lex_kinds_noeol("b'0'"), vec![TokenKind::IntLit(48)]);
-        assert_eq!(lex_kinds_noeol("b'A'"), vec![TokenKind::IntLit(65)]);
-        assert_eq!(lex_kinds_noeol("b' '"), vec![TokenKind::IntLit(32)]);
+        assert_eq!(lex_kinds_noeol("b'0'"), vec![TokenKind::IntLit(48, None)]);
+        assert_eq!(lex_kinds_noeol("b'A'"), vec![TokenKind::IntLit(65, None)]);
+        assert_eq!(lex_kinds_noeol("b' '"), vec![TokenKind::IntLit(32, None)]);
     }
 
     #[test]
     fn byte_lit_escapes() {
-        assert_eq!(lex_kinds_noeol(r"b'\n'"),  vec![TokenKind::IntLit(10)]);
-        assert_eq!(lex_kinds_noeol(r"b'\t'"),  vec![TokenKind::IntLit(9)]);
-        assert_eq!(lex_kinds_noeol(r"b'\\'"),  vec![TokenKind::IntLit(92)]);
-        assert_eq!(lex_kinds_noeol(r"b'\''"),  vec![TokenKind::IntLit(39)]);
-        assert_eq!(lex_kinds_noeol(r"b'\0'"),  vec![TokenKind::IntLit(0)]);
+        assert_eq!(lex_kinds_noeol(r"b'\n'"),  vec![TokenKind::IntLit(10, None)]);
+        assert_eq!(lex_kinds_noeol(r"b'\t'"),  vec![TokenKind::IntLit(9, None)]);
+        assert_eq!(lex_kinds_noeol(r"b'\\'"),  vec![TokenKind::IntLit(92, None)]);
+        assert_eq!(lex_kinds_noeol(r"b'\''"),  vec![TokenKind::IntLit(39, None)]);
+        assert_eq!(lex_kinds_noeol(r"b'\0'"),  vec![TokenKind::IntLit(0, None)]);
     }
 
     #[test]
     fn byte_lit_slots_in_as_int() {
         assert_eq!(
             lex_kinds_noeol("x == b'0'"),
-            vec![TokenKind::Ident("x".into()), TokenKind::EqEq, TokenKind::IntLit(48)]
+            vec![TokenKind::Ident("x".into()), TokenKind::EqEq, TokenKind::IntLit(48, None)]
         );
     }
 
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn int_zero() {
-        assert_eq!(lex_kinds_noeol("0"), vec![TokenKind::IntLit(0)]);
+        assert_eq!(lex_kinds_noeol("0"), vec![TokenKind::IntLit(0, None)]);
     }
 
     #[test]
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn comment_is_skipped() {
         let toks = lex_kinds_noeol("42 # this is a comment");
-        assert_eq!(toks, vec![TokenKind::IntLit(42)]);
+        assert_eq!(toks, vec![TokenKind::IntLit(42, None)]);
     }
 
     #[test]
@@ -646,7 +646,7 @@ mod tests {
     fn int_suffix_does_not_eat_adjacent_keyword() {
         // #280: `1if` is IntLit(1) + `if`, not IntLit(1) + Ident("f").
         let toks = lex_kinds_noeol("1if true { 2 } else { 3 }");
-        assert_eq!(toks[0], TokenKind::IntLit(1));
+        assert_eq!(toks[0], TokenKind::IntLit(1, None));
         assert_eq!(toks[1], TokenKind::If, "the `i` of `if` was eaten as a suffix");
     }
 
@@ -654,15 +654,20 @@ mod tests {
     fn int_suffix_does_not_eat_adjacent_ident() {
         // #280: `1in` must keep `in` intact (`in` lexes as a plain ident).
         let toks = lex_kinds_noeol("1in");
-        assert_eq!(toks, vec![TokenKind::IntLit(1), TokenKind::Ident("in".to_string())]);
+        assert_eq!(toks, vec![TokenKind::IntLit(1, None), TokenKind::Ident("in".to_string())]);
     }
 
     #[test]
-    fn int_suffix_still_consumed() {
-        // Real suffixes still attach to the literal.
+    fn int_suffix_consumed_and_carried() {
+        // Real suffixes attach to the literal AND survive into the token
+        // (#445 — previously consumed-then-discarded).
         for src in ["1i8", "1i16", "1i32", "1i64", "1u8", "1u16", "1u32", "1u64"] {
             let toks = lex_kinds_noeol(src);
-            assert_eq!(toks, vec![TokenKind::IntLit(1)], "suffix not consumed in `{src}`");
+            assert_eq!(
+                toks,
+                vec![TokenKind::IntLit(1, Some(src[1..].to_string()))],
+                "suffix not carried in `{src}`"
+            );
         }
     }
 
@@ -670,7 +675,7 @@ mod tests {
     fn int_suffix_requires_token_boundary() {
         // #280: `1i32abc` is IntLit(1) + Ident("i32abc"), not a split suffix.
         let toks = lex_kinds_noeol("1i32abc");
-        assert_eq!(toks, vec![TokenKind::IntLit(1), TokenKind::Ident("i32abc".to_string())]);
+        assert_eq!(toks, vec![TokenKind::IntLit(1, None), TokenKind::Ident("i32abc".to_string())]);
     }
 
     // ── 64-bit bit-pattern literals (#282) ────────────────────────────────
@@ -678,15 +683,15 @@ mod tests {
     #[test]
     fn hex_literal_high_bit() {
         // #282: all-ones and sign-bit hex patterns are valid i64 bit patterns.
-        assert_eq!(lex_kinds_noeol("0xffffffffffffffff"), vec![TokenKind::IntLit(-1)]);
-        assert_eq!(lex_kinds_noeol("0x8000000000000000"), vec![TokenKind::IntLit(i64::MIN)]);
-        assert_eq!(lex_kinds_noeol("0xFFFF_FFFF_FFFF_FFFF"), vec![TokenKind::IntLit(-1)]);
+        assert_eq!(lex_kinds_noeol("0xffffffffffffffff"), vec![TokenKind::IntLit(-1, None)]);
+        assert_eq!(lex_kinds_noeol("0x8000000000000000"), vec![TokenKind::IntLit(i64::MIN, None)]);
+        assert_eq!(lex_kinds_noeol("0xFFFF_FFFF_FFFF_FFFF"), vec![TokenKind::IntLit(-1, None)]);
     }
 
     #[test]
     fn binary_literal_high_bit() {
         let ones = "0b".to_string() + &"1".repeat(64);
-        assert_eq!(lex_kinds_noeol(&ones), vec![TokenKind::IntLit(-1)]);
+        assert_eq!(lex_kinds_noeol(&ones), vec![TokenKind::IntLit(-1, None)]);
     }
 
     #[test]
@@ -702,15 +707,15 @@ mod tests {
         // underscore may only sit between digits, so `0x_ff` is invalid.
         assert!(Lexer::new("0x_ff").tokenize().is_err(), "`0x_ff` must be rejected");
         // grammar-legal underscores (between/trailing) still lex fine.
-        assert_eq!(lex_kinds_noeol("0xf_f"), vec![TokenKind::IntLit(0xff)]);
-        assert_eq!(lex_kinds_noeol("0xff_"), vec![TokenKind::IntLit(0xff)]);
+        assert_eq!(lex_kinds_noeol("0xf_f"), vec![TokenKind::IntLit(0xff, None)]);
+        assert_eq!(lex_kinds_noeol("0xff_"), vec![TokenKind::IntLit(0xff, None)]);
     }
 
     #[test]
     fn binary_leading_underscore_rejected() {
         // #291.6: same rule for `"0b" bin_digit { bin_digit | "_" }`.
         assert!(Lexer::new("0b_11").tokenize().is_err(), "`0b_11` must be rejected");
-        assert_eq!(lex_kinds_noeol("0b1_1"), vec![TokenKind::IntLit(0b11)]);
+        assert_eq!(lex_kinds_noeol("0b1_1"), vec![TokenKind::IntLit(0b11, None)]);
     }
 
     // ── Column counting in characters (#281) ──────────────────────────────
@@ -721,7 +726,7 @@ mod tests {
         let toks = Lexer::new("é+1").tokenize().unwrap();
         let plus = toks.iter().find(|t| t.kind == TokenKind::Plus).unwrap();
         assert_eq!(plus.span.col, 2, "`+` must be column 2 after a 2-byte char");
-        let one = toks.iter().find(|t| t.kind == TokenKind::IntLit(1)).unwrap();
+        let one = toks.iter().find(|t| t.kind == TokenKind::IntLit(1, None)).unwrap();
         assert_eq!(one.span.col, 3);
     }
 
@@ -729,10 +734,10 @@ mod tests {
 
     #[test]
     fn int_size_suffix_g_m_k() {
-        assert_eq!(lex_kinds_noeol("4G"), vec![TokenKind::IntLit(4 * 1024 * 1024 * 1024)]);
-        assert_eq!(lex_kinds_noeol("2M"), vec![TokenKind::IntLit(2 * 1024 * 1024)]);
-        assert_eq!(lex_kinds_noeol("3K"), vec![TokenKind::IntLit(3 * 1024)]);
-        assert_eq!(lex_kinds_noeol("1Gi"), vec![TokenKind::IntLit(1024 * 1024 * 1024)]);
+        assert_eq!(lex_kinds_noeol("4G"), vec![TokenKind::IntLit(4 * 1024 * 1024 * 1024, None)]);
+        assert_eq!(lex_kinds_noeol("2M"), vec![TokenKind::IntLit(2 * 1024 * 1024, None)]);
+        assert_eq!(lex_kinds_noeol("3K"), vec![TokenKind::IntLit(3 * 1024, None)]);
+        assert_eq!(lex_kinds_noeol("1Gi"), vec![TokenKind::IntLit(1024 * 1024 * 1024, None)]);
     }
 
     #[test]
@@ -740,7 +745,7 @@ mod tests {
         // `4Gx` must NOT eat `G` as a suffix — it stays IntLit(4) + Ident("Gx").
         assert_eq!(
             lex_kinds_noeol("4Gx"),
-            vec![TokenKind::IntLit(4), TokenKind::Ident("Gx".into())]
+            vec![TokenKind::IntLit(4, None), TokenKind::Ident("Gx".into())]
         );
     }
 }

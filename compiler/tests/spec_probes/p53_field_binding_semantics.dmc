@@ -1,0 +1,49 @@
+# Probe 53 — SPEC §3.4 (#444): mut bindings from model fields.
+# A SCALAR field binds by value (a snapshot, per the `let !y = x` copy rule);
+# a TENSOR field binds as a live alias, and every write through the alias —
+# element, whole-binding assignment, or compound op — reaches the field.
+# Previously scalars aliased (snapshots tracked later writes) and whole-binding
+# assignment silently rebound the local, which produced two no-op framebuffer
+# mutators in demoniOS.
+model Machine {
+    !sp: i64
+    !fb: Tensor[i64, [4]]
+
+    fn enter(self) -> bool {
+        let !base = self.sp        # snapshot: must hold 2 forever
+        self.sp = 9
+        base == 2
+    }
+
+    fn clear!(self, v: i64) -> nil {
+        let !b = self.fb
+        b = forge.ones[i64, [4]] .* v    # whole-binding write reaches the field
+        nil
+    }
+}
+
+fn main() -> nil {
+    let !m = Machine { sp: 2, fb: forge.zeros[i64, [4]] }
+    print(m.enter() as str)
+    m.clear!(5)
+    print(m.fb[3])
+    nil
+}
+
+fn test_scalar_snapshot() -> bool {
+    let !m = Machine { sp: 2, fb: forge.zeros[i64, [4]] }
+    m.enter()
+}
+
+fn test_whole_binding_write_reaches_field() -> bool {
+    let !m = Machine { sp: 2, fb: forge.zeros[i64, [4]] }
+    m.clear!(5)
+    m.fb[0] == 5
+}
+
+fn test_element_write_still_reaches_field() -> bool {
+    let !m = Machine { sp: 2, fb: forge.zeros[i64, [4]] }
+    let !b = m.fb
+    b[2] = 8
+    m.fb[2] == 8
+}

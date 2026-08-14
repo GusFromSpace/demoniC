@@ -4,18 +4,33 @@
 # lexer) expressed in the language itself, runnable under `dmc run`.
 #
 # PARITY: differentially tested against the reference Rust lexer (`dmc --lex`)
-# over the entire examples/ corpus — every token boundary and raw byte-slice
-# matches on all 112 files. The check is tools/diff_demonic_lexer.py (it diffs
-# raws, the ground truth; KIND names are our own tags and differ by design).
+# over the whole examples/ corpus plus synthetic probes by
+# tools/diff_demonic_lexer.py, which compares token boundaries (raw byte-slices),
+# token kinds, and line:col — bridging the two kind vocabularies with an
+# explicit table.
 #
 # Covers keywords, idents (incl. trailing `!`), sized int/float and 0x/0b
-# literals with suffixes, escaped strings, nested block comments, depth-tracked
-# newlines, and the full operator set incl. the dotted family .+ .* .< .<= .>=
+# literals with suffixes, escaped strings, char literals `c"x"`, byte literals
+# `b'x'`, nested block comments, depth-tracked newlines, and the full operator
+# set incl. the dotted family .+ .* .< .<= .>=
+#
+# SPANS: every token carries `lo`/`hi` byte offsets AND `line`/`col`, counted
+# the way the reference counts them — both 1-based, and `col` advances per
+# CHARACTER, not per byte (UTF-8 continuation bytes do not bump it, cf. #281).
+# The self-hosted parser above this lexer needs line:col to report anything
+# useful, so it is part of the token, not a later reconstruction.
+#
+# ERRORS: `lex` returns `(tokens, Err)` per SPEC §3.9 — `Err` is `nil` on
+# success or a `"lex error at L:C: msg"` string on failure. Messages and fault
+# positions mirror compiler/src/lexer.rs, which reports the cursor AFTER the
+# offending byte was consumed (so a fault on byte `p` is reported at `p + 1`).
+# There is no silent "bad" token any more: what the reference rejects, we reject.
 #
 # Dump mode for the harness:  dmc run examples/demonic_lexer.dmc <file.dmc>
-# emits a JSON array of [kind, lo, hi] with exact source byte offsets.
+# emits a JSON array of [kind, lo, hi, line, col]. On a lex error it emits an
+# empty array, matching the reference's empty token stream on a rejected file.
 #
-# 666 lines of demoniC lexing demoniC. Fitting.
+# demoniC lexing demoniC. Fitting.
 
 fn is_digit(b: i64) -> bool { b >= 48 && b <= 57 }
 fn is_lower(b: i64) -> bool { b >= 97 && b <= 122 }
@@ -34,7 +49,8 @@ fn is_kw(s: str) -> bool {
     s == "continue" || s == "return" || s == "vault" || s == "forge" ||
     s == "stream" || s == "view" || s == "shape" || s == "dtype" || s == "as" ||
     s == "model" || s == "stage" || s == "self" || s == "type" || s == "use" ||
-    s == "pub" || s == "extern" || s == "true" || s == "false" || s == "nil"
+    s == "enum" || s == "pub" || s == "extern" ||
+    s == "true" || s == "false" || s == "nil"
 }
 
 fn is_scalar_type_kw(s: str) -> bool {
@@ -46,17 +62,30 @@ fn is_scalar_type_kw(s: str) -> bool {
     s == "bool" || s == "str"
 }
 
-fn tok(k: str, r: str, lo: i64, hi: i64) -> map {
+# A token is `{k, r, lo, hi, line, col}`: kind tag, raw slice, half-open byte
+# range, and the 1-based source position of `lo` — the same information the
+# reference carries in `Token` + `Span`.
+fn tok(k: str, r: str, lo: i64, hi: i64, line: i64, col: i64) -> map {
     let !m = map_new()
     map_set(m, "k", k)
     map_set(m, "r", r)
     map_set(m, "lo", lo)
     map_set(m, "hi", hi)
+    map_set(m, "line", line)
+    map_set(m, "col", col)
     m
 }
 
 fn tok_kind(t: map) -> str { map_get(t, "k") }
 fn tok_raw(t: map) -> str { map_get(t, "r") }
+fn tok_line(t: map) -> i64 { to_int(map_get(t, "line")) }
+fn tok_col(t: map) -> i64 { to_int(map_get(t, "col")) }
+
+# Decoded payload, present on literals that have one: the unescaped text of a
+# string or char literal, and the integer value of a byte literal. The raw slice
+# stays authoritative for spans; this is what the parser above will consume.
+fn tok_val(t: map) -> str { map_get(t, "v") }
+fn tok_int_val(t: map) -> i64 { to_int(map_get(t, "v")) }
 
 # Build a substring by walking bytes + chr.
 fn substr(src: str, lo: i64, hi: i64) -> str {
@@ -71,14 +100,91 @@ fn substr(src: str, lo: i64, hi: i64) -> str {
 
 fn len_str(s: str) -> i64 { len(s) }
 
-# Main lexer. Returns list of token maps. Emits "newline" tokens only when
-# they are significant (outside ( ) and [ ]).
-fn lex(src: str) -> list {
+# --- line/column tracking ---------------------------------------------------
+#
+# Count `src[from..to]` into a running (line, col). The caller keeps the cursor
+# and only ever moves it forward, so the whole file costs ONE pass over the
+# bytes rather than a rescan per token.
+#
+# `col` counts characters, not bytes: a UTF-8 continuation byte (0b10xx_xxxx)
+# does not bump it. The reference does the same (#281) — without it, every
+# column after a multi-byte identifier or string is wrong in diagnostics.
+fn advance_pos(src: str, from: i64, to: i64, line: i64, col: i64) -> (i64, i64) {
+    let !l = line
+    let !c = col
+    let !p = from
+    while p < to {
+        let b = src[p]
+        if b == 10 {
+            l = l + 1
+            c = 1
+        } else if (b & 192) != 128 {
+            c = c + 1
+        }
+        p = p + 1
+    }
+    (l, c)
+}
+
+# --- errors (SPEC §3.9) -----------------------------------------------------
+
+fn lex_error(msg: str, line: i64, col: i64) -> str {
+    "lex error at " + to_str(line) + ":" + to_str(col) + ": " + msg
+}
+
+# The reference reports a fault at the cursor AFTER the offending byte was
+# consumed, so a fault on byte `p` is reported at `p + 1` — clamped at EOF,
+# where there was no byte to consume.
+fn err_pos(p: i64, n: i64) -> i64 { if p >= n { n } else { p + 1 } }
+
+# Escapes accepted inside `"..."` strings and `c"x"` char literals.
+fn is_str_escape(e: i64) -> bool {
+    e == 110 || e == 114 || e == 116 || e == 92 || e == 34 || e == 48
+}
+
+# Escapes accepted inside `b'x'` byte literals — the same set plus `\'`, since
+# the quote that delimits a byte literal has to be escapable inside one.
+fn is_byte_escape(e: i64) -> bool {
+    e == 110 || e == 114 || e == 116 || e == 92 || e == 39 || e == 34 || e == 48
+}
+
+# --- byte-literal lookahead -------------------------------------------------
+#
+# `b'x'` is a byte literal, but `b'` is also the transpose of a tensor named
+# `b` — which is everywhere in ML code (`a @ b'`). `p` indexes the `'` right
+# after the `b`. Only the unambiguous shapes fire: an escape (`b'\...`, which
+# lex-time validation then checks), or a single ASCII byte with a closing quote
+# immediately after it. Anything else — an operator, a newline, EOF, a
+# multi-byte char — leaves `b` an identifier and `'` a transpose.
+fn looks_like_byte_lit(src: str, n: i64, p: i64) -> bool {
+    if p >= n { return false }
+    if src[p] != 39 { return false }
+    if p + 1 >= n { return false }
+    let c = src[p + 1]
+    if c == 92 { return true }
+    if c < 128 && c != 39 && c != 10 {
+        return p + 2 < n && src[p + 2] == 39
+    }
+    false
+}
+
+# Main lexer. Returns `(tokens, Err)`: a list of token maps, and `nil` or a
+# diagnostic string (SPEC §3.9). Emits "newline" tokens only when they are
+# significant (outside ( ) and [ ]).
+fn lex(src: str) -> (list, str) {
     let !toks = list()
     let n = len_str(src)
     let !i = 0
     let !paren_depth = 0
     let !bracket_depth = 0
+
+    # Line/column cursor. `lc_pos` is the byte we have counted up to; it only
+    # moves forward, so tracking positions is O(n) over the file, not O(n) per
+    # token. Synced to each token's start below; `cur_line`/`cur_col` are then
+    # that token's position and are handed to every `tok()` call.
+    let !lc_pos = 0
+    let !cur_line = 1
+    let !cur_col = 1
 
     while i < n {
         # skip horizontal ws
@@ -87,6 +193,11 @@ fn lex(src: str) -> list {
 
         let b = src[i]
         let tok_lo = i
+
+        let (sync_line, sync_col) = advance_pos(src, lc_pos, tok_lo, cur_line, cur_col)
+        cur_line = sync_line
+        cur_col = sync_col
+        lc_pos = tok_lo
 
         # --- comments ---
         if b == 35 {  # '#'
@@ -105,6 +216,10 @@ fn lex(src: str) -> list {
                         i = i + 1
                     }
                 }
+                if depth > 0 {
+                    let (el, ec) = advance_pos(src, lc_pos, n, cur_line, cur_col)
+                    return (toks, lex_error("unterminated block comment", el, ec))
+                }
                 continue
             } else {
                 # line comment: consume to but not including \n
@@ -117,51 +232,160 @@ fn lex(src: str) -> list {
         if b == 10 {
             i = i + 1
             if paren_depth == 0 && bracket_depth == 0 {
-                toks = list_push(toks, tok("newline", "\n", tok_lo, i))
+                toks = list_push(toks, tok("newline", "\n", tok_lo, i, cur_line, cur_col))
             }
             continue
         }
 
         # --- string literal ---
+        # A raw newline or EOF inside the quotes is an error, not a run to the
+        # end of the file: the reference stops at the first unterminated line so
+        # the diagnostic points at the missing quote, not the last byte.
         if b == 34 {  # '"'
             let start = i
             i = i + 1  # skip opening "
             let !sval = ""
-            while i < n {
+            let !closed = false
+            while !closed {
+                if i >= n || src[i] == 10 {
+                    let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                    return (toks, lex_error("unterminated string literal", el, ec))
+                }
                 let cb = src[i]
                 if cb == 34 {  # closing "
                     i = i + 1
-                    break
-                }
-                if cb == 92 {  # '\'
+                    closed = true
+                } else if cb == 92 {  # '\'
                     i = i + 1
-                    if i >= n { break }
+                    if i >= n || !is_str_escape(src[i]) {
+                        let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                        return (toks, lex_error("invalid escape sequence", el, ec))
+                    }
                     let esc = src[i]
                     if esc == 110 { sval = sval + "\n" }
                     else if esc == 114 { sval = sval + "\r" }
                     else if esc == 116 { sval = sval + "\t" }
                     else if esc == 92 { sval = sval + "\\" }
                     else if esc == 34 { sval = sval + "\"" }
-                    else if esc == 48 { sval = sval + chr(0) }
-                    else { sval = sval + chr(esc) }
+                    else { sval = sval + chr(0) }
                     i = i + 1
                 } else {
                     sval = sval + chr(cb)
                     i = i + 1
                 }
             }
-            toks = list_push(toks, tok("str", substr(src, start, i), start, i))
+            let !t = tok("str", substr(src, start, i), start, i, cur_line, cur_col)
+            map_set(t, "v", sval)
+            toks = list_push(toks, t)
             continue
         }
 
         # --- char literal c"X" ---
+        # Escapes are processed, not skipped: a naive "scan to the next quote"
+        # ends c"\"" one byte early and desynchronizes everything after it.
+        # Exactly one Unicode scalar value must sit between the quotes, so a
+        # multi-byte character counts as one, and c"ab" / c"" are errors.
         if b == 99 && i+1 < n && src[i+1] == 34 {  # c"
             let start = i
             i = i + 2  # skip c"
-            # simplistic: take until " (support basic escapes)
-            while i < n && src[i] != 34 { i = i + 1 }
-            if i < n { i = i + 1 }
-            toks = list_push(toks, tok("char", substr(src, start, i), start, i))
+            let !cval = ""
+            let !nchars = 0
+            let !closed = false
+            while !closed {
+                if i >= n || src[i] == 10 {
+                    let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                    return (toks, lex_error("unterminated char literal", el, ec))
+                }
+                let cb = src[i]
+                if cb == 34 {
+                    i = i + 1
+                    closed = true
+                } else if cb == 92 {  # '\'
+                    i = i + 1
+                    if i >= n || !is_str_escape(src[i]) {
+                        let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                        return (toks, lex_error("invalid escape sequence in char literal", el, ec))
+                    }
+                    let esc = src[i]
+                    if esc == 110 { cval = cval + "\n" }
+                    else if esc == 114 { cval = cval + "\r" }
+                    else if esc == 116 { cval = cval + "\t" }
+                    else if esc == 92 { cval = cval + "\\" }
+                    else if esc == 34 { cval = cval + "\"" }
+                    else { cval = cval + chr(0) }
+                    i = i + 1
+                    nchars = nchars + 1
+                } else if cb < 128 {
+                    cval = cval + chr(cb)
+                    i = i + 1
+                    nchars = nchars + 1
+                } else {
+                    # multi-byte UTF-8: the lead byte plus its continuations are
+                    # ONE character
+                    let mb_lo = i
+                    i = i + 1
+                    while i < n && (src[i] & 192) == 128 { i = i + 1 }
+                    cval = cval + substr(src, mb_lo, i)
+                    nchars = nchars + 1
+                }
+            }
+            if nchars != 1 {
+                let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+                return (toks, lex_error("char literal must contain exactly one character", el, ec))
+            }
+            let !ct = tok("char", substr(src, start, i), start, i, cur_line, cur_col)
+            map_set(ct, "v", cval)
+            toks = list_push(toks, ct)
+            continue
+        }
+
+        # --- byte literal b'x' (Rust-style, #334) ---
+        # `looks_like_byte_lit` is what keeps `a @ b'` (transpose of a tensor
+        # named `b`) lexing as ident + transpose; only the unambiguous
+        # `b'<byte>'` / `b'\<esc>'` shape reaches here.
+        if b == 98 && looks_like_byte_lit(src, n, i + 1) {
+            let start = i
+            i = i + 2  # skip b and the opening '
+            let !bval = 0
+            # These next two guards mirror the reference, which carries them for
+            # the same reason: the lookahead above already excludes EOF, a raw
+            # newline and an immediate closing quote, so neither can fire today.
+            # They are the contract if that lookahead is ever loosened.
+            if i >= n || src[i] == 10 {
+                let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                return (toks, lex_error("unterminated byte literal", el, ec))
+            }
+            if src[i] == 39 {
+                let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                return (toks, lex_error("empty byte literal", el, ec))
+            }
+            if src[i] == 92 {  # '\'
+                i = i + 1
+                if i >= n || !is_byte_escape(src[i]) {
+                    let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                    return (toks, lex_error("invalid escape sequence in byte literal", el, ec))
+                }
+                let esc = src[i]
+                if esc == 110 { bval = 10 }
+                else if esc == 114 { bval = 13 }
+                else if esc == 116 { bval = 9 }
+                else if esc == 48 { bval = 0 }
+                else { bval = esc }
+                i = i + 1
+            } else {
+                bval = src[i]
+                i = i + 1
+            }
+            if i >= n || src[i] != 39 {
+                let (el, ec) = advance_pos(src, lc_pos, err_pos(i, n), cur_line, cur_col)
+                return (toks, lex_error("byte literal must contain exactly one byte", el, ec))
+            }
+            i = i + 1
+            # The reference yields an IntLit here — a byte literal IS an integer,
+            # so it must carry the "int" tag, not a tag of its own.
+            let !bt = tok("int", substr(src, start, i), start, i, cur_line, cur_col)
+            map_set(bt, "v", bval)
+            toks = list_push(toks, bt)
             continue
         }
 
@@ -173,18 +397,29 @@ fn lex(src: str) -> list {
                 let nx = src[i+1]
                 if nx == 120 || nx == 88 {  # 0x
                     i = i + 2
+                    # #291.6: a hex digit must follow `0x` directly — `_` only
+                    # separates digits, so `0x_ff` (and a bare `0x`) is an error.
+                    if i >= n || !is_hex(src[i]) {
+                        let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+                        return (toks, lex_error("hex literal must start with a hex digit", el, ec))
+                    }
                     while i < n && (is_hex(src[i]) || src[i] == 95) { i = i + 1 }
                     while i < n && is_alnum(src[i]) { i = i + 1 }   # sized suffix (u8/i32/...)
                     let raw = substr(src, start, i)
-                    toks = list_push(toks, tok("int", raw, start, i))
+                    toks = list_push(toks, tok("int", raw, start, i, cur_line, cur_col))
                     continue
                 }
                 if nx == 98 || nx == 66 {  # 0b
                     i = i + 2
+                    # #291.6: same rule as hex — `0b_11` and a bare `0b` are errors.
+                    if i >= n || !is_bin(src[i]) {
+                        let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+                        return (toks, lex_error("binary literal must start with 0 or 1", el, ec))
+                    }
                     while i < n && (is_bin(src[i]) || src[i] == 95) { i = i + 1 }
                     while i < n && is_alnum(src[i]) { i = i + 1 }   # sized suffix (u8/i32/...)
                     let raw = substr(src, start, i)
-                    toks = list_push(toks, tok("int", raw, start, i))
+                    toks = list_push(toks, tok("int", raw, start, i, cur_line, cur_col))
                     continue
                 }
             }
@@ -215,15 +450,18 @@ fn lex(src: str) -> list {
                 if i < n && (src[i] == 43 || src[i] == 45) { i = i + 1 }
                 let exp_start = i
                 while i < n && is_digit(src[i]) { i = i + 1 }
-                # (we do not error on empty exp here; reference does in some paths)
+                if i == exp_start {
+                    let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+                    return (toks, lex_error("empty exponent in float literal", el, ec))
+                }
             }
             # suffix
             while i < n && is_alnum(src[i]) { i = i + 1 }
             let raw = substr(src, start, i)
             if is_f {
-                toks = list_push(toks, tok("float", raw, start, i))
+                toks = list_push(toks, tok("float", raw, start, i, cur_line, cur_col))
             } else {
-                toks = list_push(toks, tok("int", raw, start, i))
+                toks = list_push(toks, tok("int", raw, start, i, cur_line, cur_col))
             }
             continue
         }
@@ -252,7 +490,7 @@ fn lex(src: str) -> list {
             } else {
                 "ident"
             }
-            toks = list_push(toks, tok(k, raw, start, i))
+            toks = list_push(toks, tok(k, raw, start, i, cur_line, cur_col))
             continue
         }
 
@@ -264,177 +502,211 @@ fn lex(src: str) -> list {
                 let nx = src[i]
                 if nx == 62 {  # >
                     i = i + 1
-                    toks = list_push(toks, tok("relu", "\\>", tok_lo, i))
+                    toks = list_push(toks, tok("relu", "\\>", tok_lo, i, cur_line, cur_col))
                     continue
                 }
                 if nx == 60 {  # <
                     i = i + 1
-                    toks = list_push(toks, tok("gelu", "\\<", tok_lo, i))
+                    toks = list_push(toks, tok("gelu", "\\<", tok_lo, i, cur_line, cur_col))
                     continue
                 }
                 if nx == 124 && i+1 < n && src[i+1] == 62 {
                     i = i + 2
-                    toks = list_push(toks, tok("pipe", "\\|>", tok_lo, i))
+                    toks = list_push(toks, tok("pipe", "\\|>", tok_lo, i, cur_line, cur_col))
                     continue
                 }
             }
-            # lone \ is error in real lexer; treat as ident-ish for robustness here
-            toks = list_push(toks, tok("bad", "\\", tok_lo, i))
-            continue
+            let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+            return (toks, lex_error("unexpected `\\` — expected `\\>`, `\\<`, or `\\|>`", el, ec))
         }
 
         # two-char composites
         if b == 124 {  # |
             i = i + 1
             if i < n && src[i] == 124 {
-                i = i + 1; toks = list_push(toks, tok("oror", "||", tok_lo, i)); continue
+                i = i + 1; toks = list_push(toks, tok("oror", "||", tok_lo, i, cur_line, cur_col)); continue
             }
             if i < n && src[i] == 62 {
-                i = i + 1; toks = list_push(toks, tok("pipe", "|>", tok_lo, i)); continue
+                i = i + 1; toks = list_push(toks, tok("pipe", "|>", tok_lo, i, cur_line, cur_col)); continue
             }
             if i < n && src[i] == 61 {
-                i = i + 1; toks = list_push(toks, tok("bareq", "|=", tok_lo, i)); continue
+                i = i + 1; toks = list_push(toks, tok("bareq", "|=", tok_lo, i, cur_line, cur_col)); continue
             }
-            toks = list_push(toks, tok("bar", "|", tok_lo, i)); continue
+            toks = list_push(toks, tok("bar", "|", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 62 {  # >
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("ge", ">=", tok_lo, i)); continue }
-            if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("rshift", ">>", tok_lo, i)); continue }
-            toks = list_push(toks, tok("gt", ">", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("ge", ">=", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("rshift", ">>", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("gt", ">", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 60 {  # <
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("le", "<=", tok_lo, i)); continue }
-            if i < n && src[i] == 45 { i = i + 1; toks = list_push(toks, tok("stream", "<-", tok_lo, i)); continue }
-            if i < n && src[i] == 60 { i = i + 1; toks = list_push(toks, tok("lshift", "<<", tok_lo, i)); continue }
-            toks = list_push(toks, tok("lt", "<", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("le", "<=", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 45 { i = i + 1; toks = list_push(toks, tok("stream", "<-", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 60 { i = i + 1; toks = list_push(toks, tok("lshift", "<<", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("lt", "<", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 61 {  # =
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("eqeq", "==", tok_lo, i)); continue }
-            if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("fatarrow", "=>", tok_lo, i)); continue }
-            toks = list_push(toks, tok("eq", "=", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("eqeq", "==", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("fatarrow", "=>", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("eq", "=", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 33 {  # !
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("neq", "!=", tok_lo, i)); continue }
-            toks = list_push(toks, tok("bang", "!", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("neq", "!=", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("bang", "!", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 43 {  # +
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("pluseq", "+=", tok_lo, i)); continue }
-            toks = list_push(toks, tok("plus", "+", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("pluseq", "+=", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("plus", "+", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 45 {  # -
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("minuseq", "-=", tok_lo, i)); continue }
-            if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("arrow", "->", tok_lo, i)); continue }
-            toks = list_push(toks, tok("minus", "-", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("minuseq", "-=", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("arrow", "->", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("minus", "-", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 42 {  # *
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("stareq", "*=", tok_lo, i)); continue }
-            if i < n && src[i] == 42 { i = i + 1; toks = list_push(toks, tok("starstar", "**", tok_lo, i)); continue }
-            toks = list_push(toks, tok("star", "*", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("stareq", "*=", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 42 { i = i + 1; toks = list_push(toks, tok("starstar", "**", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("star", "*", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 47 {  # /
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("slasheq", "/=", tok_lo, i)); continue }
-            toks = list_push(toks, tok("slash", "/", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("slasheq", "/=", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("slash", "/", tok_lo, i, cur_line, cur_col)); continue
         }
-        if b == 37 { toks = list_push(toks, tok("pct", "%", tok_lo, tok_lo+1)); i = i + 1; continue }
+        if b == 37 { toks = list_push(toks, tok("pct", "%", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
         if b == 94 {  # ^
             i = i + 1
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("careteq", "^=", tok_lo, i)); continue }
-            toks = list_push(toks, tok("caret", "^", tok_lo, i)); continue
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("careteq", "^=", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("caret", "^", tok_lo, i, cur_line, cur_col)); continue
         }
         if b == 38 {  # &
             i = i + 1
-            if i < n && src[i] == 38 { i = i + 1; toks = list_push(toks, tok("andand", "&&", tok_lo, i)); continue }
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("ampeq", "&=", tok_lo, i)); continue }
-            toks = list_push(toks, tok("amp", "&", tok_lo, i)); continue
+            if i < n && src[i] == 38 { i = i + 1; toks = list_push(toks, tok("andand", "&&", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("ampeq", "&=", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("amp", "&", tok_lo, i, cur_line, cur_col)); continue
         }
 
         # single-char punctuation / operators
-        if b == 64 { toks = list_push(toks, tok("at", "@", tok_lo, tok_lo+1)); i = i + 1; continue }
-        if b == 39 { toks = list_push(toks, tok("transpose", "'", tok_lo, tok_lo+1)); i = i + 1; continue }
-        if b == 63 { toks = list_push(toks, tok("query", "?", tok_lo, tok_lo+1)); i = i + 1; continue }
-        if b == 126 { toks = list_push(toks, tok("tilde", "~", tok_lo, tok_lo+1)); i = i + 1; continue }
+        if b == 64 { toks = list_push(toks, tok("at", "@", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
+        if b == 39 { toks = list_push(toks, tok("transpose", "'", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
+        if b == 63 { toks = list_push(toks, tok("query", "?", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
+        if b == 126 { toks = list_push(toks, tok("tilde", "~", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
         if b == 46 {  # .
             i = i + 1
             if i < n && src[i] == 46 {
                 i = i + 1
-                if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("dotdoteq", "..=", tok_lo, i)); continue }
-                toks = list_push(toks, tok("dotdot", "..", tok_lo, i)); continue
+                if i < n && src[i] == 61 {
+                    i = i + 1
+                    toks = list_push(toks, tok("dotdoteq", "..=", tok_lo, i, cur_line, cur_col))
+                    continue
+                }
+                toks = list_push(toks, tok("dotdot", "..", tok_lo, i, cur_line, cur_col)); continue
             }
-            if i < n && src[i] == 43 { i = i + 1; toks = list_push(toks, tok("dotplus", ".+", tok_lo, i)); continue }
-            if i < n && src[i] == 45 { i = i + 1; toks = list_push(toks, tok("dotminus", ".-", tok_lo, i)); continue }
+            if i < n && src[i] == 43 { i = i + 1; toks = list_push(toks, tok("dotplus", ".+", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 45 { i = i + 1; toks = list_push(toks, tok("dotminus", ".-", tok_lo, i, cur_line, cur_col)); continue }
             if i < n && src[i] == 42 {
                 i = i + 1
-                if i < n && src[i] == 42 { i = i + 1; toks = list_push(toks, tok("dotstarstar", ".**", tok_lo, i)); continue }
-                toks = list_push(toks, tok("dotstar", ".*", tok_lo, i)); continue
+                if i < n && src[i] == 42 {
+                    i = i + 1
+                    toks = list_push(toks, tok("dotstarstar", ".**", tok_lo, i, cur_line, cur_col))
+                    continue
+                }
+                toks = list_push(toks, tok("dotstar", ".*", tok_lo, i, cur_line, cur_col)); continue
             }
-            if i < n && src[i] == 47 { i = i + 1; toks = list_push(toks, tok("dotslash", "./", tok_lo, i)); continue }
-            if i < n && src[i] == 94 { i = i + 1; toks = list_push(toks, tok("dotcaret", ".^", tok_lo, i)); continue }
+            if i < n && src[i] == 47 { i = i + 1; toks = list_push(toks, tok("dotslash", "./", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 94 { i = i + 1; toks = list_push(toks, tok("dotcaret", ".^", tok_lo, i, cur_line, cur_col)); continue }
             # dotted elementwise comparisons: .<  .<=  .>  .>=
             if i < n && src[i] == 60 {
                 i = i + 1
-                if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("dotle", ".<=", tok_lo, i)); continue }
-                toks = list_push(toks, tok("dotlt", ".<", tok_lo, i)); continue
+                if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("dotle", ".<=", tok_lo, i, cur_line, cur_col)); continue }
+                toks = list_push(toks, tok("dotlt", ".<", tok_lo, i, cur_line, cur_col)); continue
             }
             if i < n && src[i] == 62 {
                 i = i + 1
-                if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("dotge", ".>=", tok_lo, i)); continue }
-                toks = list_push(toks, tok("dotgt", ".>", tok_lo, i)); continue
+                if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("dotge", ".>=", tok_lo, i, cur_line, cur_col)); continue }
+                toks = list_push(toks, tok("dotgt", ".>", tok_lo, i, cur_line, cur_col)); continue
             }
-            toks = list_push(toks, tok("dot", ".", tok_lo, i)); continue
+            toks = list_push(toks, tok("dot", ".", tok_lo, i, cur_line, cur_col)); continue
         }
 
         # delimiters (track depth for newlines)
-        if b == 40 { paren_depth = paren_depth + 1; toks = list_push(toks, tok("lparen", "(", tok_lo, tok_lo+1)); i = i + 1; continue }
+        if b == 40 {
+            paren_depth = paren_depth + 1
+            toks = list_push(toks, tok("lparen", "(", tok_lo, tok_lo+1, cur_line, cur_col))
+            i = i + 1
+            continue
+        }
         if b == 41 {
             if paren_depth > 0 { paren_depth = paren_depth - 1 }
-            toks = list_push(toks, tok("rparen", ")", tok_lo, tok_lo+1))
+            toks = list_push(toks, tok("rparen", ")", tok_lo, tok_lo+1, cur_line, cur_col))
             i = i + 1
             continue
         }
-        if b == 91 { bracket_depth = bracket_depth + 1; toks = list_push(toks, tok("lbrack", "[", tok_lo, tok_lo+1)); i = i + 1; continue }
+        if b == 91 {
+            bracket_depth = bracket_depth + 1
+            toks = list_push(toks, tok("lbrack", "[", tok_lo, tok_lo+1, cur_line, cur_col))
+            i = i + 1
+            continue
+        }
         if b == 93 {
             if bracket_depth > 0 { bracket_depth = bracket_depth - 1 }
-            toks = list_push(toks, tok("rbrack", "]", tok_lo, tok_lo+1))
+            toks = list_push(toks, tok("rbrack", "]", tok_lo, tok_lo+1, cur_line, cur_col))
             i = i + 1
             continue
         }
-        if b == 123 { toks = list_push(toks, tok("lbrace", "{", tok_lo, tok_lo+1)); i = i + 1; continue }
-        if b == 125 { toks = list_push(toks, tok("rbrace", "}", tok_lo, tok_lo+1)); i = i + 1; continue }
+        if b == 123 { toks = list_push(toks, tok("lbrace", "{", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
+        if b == 125 { toks = list_push(toks, tok("rbrace", "}", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
 
         if b == 58 {  # :
             i = i + 1
-            if i < n && src[i] == 58 { i = i + 1; toks = list_push(toks, tok("coloncolon", "::", tok_lo, i)); continue }
-            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("coloneq", ":=", tok_lo, i)); continue }
-            toks = list_push(toks, tok("colon", ":", tok_lo, i)); continue
+            if i < n && src[i] == 58 { i = i + 1; toks = list_push(toks, tok("coloncolon", "::", tok_lo, i, cur_line, cur_col)); continue }
+            if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("coloneq", ":=", tok_lo, i, cur_line, cur_col)); continue }
+            toks = list_push(toks, tok("colon", ":", tok_lo, i, cur_line, cur_col)); continue
         }
-        if b == 44 { toks = list_push(toks, tok("comma", ",", tok_lo, tok_lo+1)); i = i + 1; continue }
-        if b == 59 { toks = list_push(toks, tok("semi", ";", tok_lo, tok_lo+1)); i = i + 1; continue }
+        if b == 44 { toks = list_push(toks, tok("comma", ",", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
+        if b == 59 { toks = list_push(toks, tok("semi", ";", tok_lo, tok_lo+1, cur_line, cur_col)); i = i + 1; continue }
 
-        # fallback: unknown single byte as "bad"
-        toks = list_push(toks, tok("bad", chr(b), tok_lo, tok_lo+1))
-        i = i + 1
+        # fallback: no rule matches this byte. It used to become a silent "bad"
+        # token, which let the lexer "succeed" on input the reference rejects.
+        let (el, ec) = advance_pos(src, lc_pos, tok_lo + 1, cur_line, cur_col)
+        return (toks, lex_error("unexpected character `" + chr(b) + "`", el, ec))
     }
 
-    toks = list_push(toks, tok("eof", "", i, i))
+    # EOF sits at the end of the source, past any trailing whitespace.
+    let (eof_line, eof_col) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+    toks = list_push(toks, tok("eof", "", i, i, eof_line, eof_col))
+    (toks, nil)
+}
+
+# Discard the error and keep the tokens — for callers (and tests) that already
+# know the input lexes. Anything handling untrusted source should call `lex`
+# directly and check the `Err`.
+fn lex_ok(src: str) -> list {
+    let (toks, e) = lex(src)
     toks
 }
 
+# Convenience: the diagnostic alone, `nil` when the source lexes clean.
+fn lex_err_of(src: str) -> str {
+    let (toks, e) = lex(src)
+    e
+}
+
 # Convenience: lex and return count (for quick tests)
-fn lex_count(src: str) -> i64 { list_len(lex(src)) }
+fn lex_count(src: str) -> i64 { list_len(lex_ok(src)) }
 
 # --- Tests ---
 
 fn test_hello_sanity() -> bool {
     let src = "fn main() -> nil {\n    let n = 42\n    print(\"hi\")\n    nil\n}\n"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     let n = list_len(toks)
     n > 10 &&
         tok_kind(list_get(toks, 0)) == "kw_fn" &&
@@ -445,7 +717,7 @@ fn test_hello_sanity() -> bool {
 
 fn test_numbers() -> bool {
     let src = "0xdead 0b1010 1_000 3.14 .5 1e9 42i32"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     # 7 tokens + eof
     list_len(toks) == 8 &&
         tok_kind(list_get(toks, 0)) == "int" &&
@@ -454,13 +726,13 @@ fn test_numbers() -> bool {
 
 fn test_ops_and_strings() -> bool {
     let src = "a + b * c @ d' |> e \\> f \"str\\nval\""
-    let toks = lex(src)
+    let toks = lex_ok(src)
     list_len(toks) >= 12
 }
 
 fn test_comments() -> bool {
     let src = "# line\nfn x() { #{ nested #{ ok }# }# 1 }"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     # leading newline from the \n after line comment is expected; kw_fn must appear,
     # the inner block comment must be skipped, and the literal 1 must be tokenized.
     let n = list_len(toks)
@@ -479,7 +751,7 @@ fn test_comments() -> bool {
 fn test_depth_newlines() -> bool {
     # newline inside () should be suppressed by lexer (no "newline" token)
     let src = "f(\n1,\n2\n)"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     let !saw_nl = false
     let !j = 0
     let m = list_len(toks)
@@ -492,7 +764,7 @@ fn test_depth_newlines() -> bool {
 
 fn test_trailing_bang() -> bool {
     let src = "foo!()"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     tok_kind(list_get(toks, 0)) == "ident" &&
         tok_raw(list_get(toks, 0)) == "foo!"
 }
@@ -501,7 +773,7 @@ fn test_dotted_compares() -> bool {
     # Each dotted elementwise comparison must lex as ONE token.
     # Regression: `.<=` previously split into `.` then `<=`, which broke
     # raw-parity with the reference on the render/ and raytracer examples.
-    let toks = lex("a .< b .<= c .> d .>= e")
+    let toks = lex_ok("a .< b .<= c .> d .>= e")
     let !lt = false
     let !le = false
     let !gt = false
@@ -523,26 +795,194 @@ fn test_sized_hex() -> bool {
     # Hex/binary literals keep their sized suffix inside a single token.
     # Regression: `0x65u8` previously split into `0x65` then `u8`, breaking
     # raw-parity with the reference across the demoniOS examples.
-    let toks = lex("0x65u8 0x5000_0000u64 0b1010u8")
+    let toks = lex_ok("0x65u8 0x5000_0000u64 0b1010u8")
     tok_kind(list_get(toks, 0)) == "int" &&
         tok_raw(list_get(toks, 0)) == "0x65u8" &&
         tok_raw(list_get(toks, 1)) == "0x5000_0000u64" &&
         tok_raw(list_get(toks, 2)) == "0b1010u8"
 }
 
+# --- #454: keyword, literal, span and error coverage ---
+
+fn test_enum_keyword() -> bool {
+    # `enum` was missing from is_kw(), so it lexed as an identifier while the
+    # reference gave Enum. Raws matched, so a boundary-only diff never saw it.
+    let toks = lex_ok("enum Color { Red }")
+    let bang = lex_ok("enum!")
+    tok_kind(list_get(toks, 0)) == "kw_enum" &&
+        tok_raw(list_get(toks, 0)) == "enum" &&
+        # the trailing-`!` convention still demotes a keyword to an identifier
+        tok_kind(list_get(bang, 0)) == "ident" &&
+        tok_raw(list_get(bang, 0)) == "enum!"
+}
+
+fn test_byte_literal() -> bool {
+    # b'A' is ONE token spanning 4 bytes and classified as an int, exactly as
+    # the reference's IntLit(65). It used to split into ident/transpose/ident/
+    # transpose — four tokens over the same bytes.
+    let toks = lex_ok("b'A' b'\\n' b'\\''")
+    list_len(toks) == 4 &&
+        tok_kind(list_get(toks, 0)) == "int" &&
+        tok_raw(list_get(toks, 0)) == "b'A'" &&
+        tok_int_val(list_get(toks, 0)) == 65 &&
+        tok_raw(list_get(toks, 1)) == "b'\\n'" &&
+        tok_int_val(list_get(toks, 1)) == 10 &&
+        tok_raw(list_get(toks, 2)) == "b'\\''" &&
+        tok_int_val(list_get(toks, 2)) == 39
+}
+
+fn test_byte_lit_vs_transpose() -> bool {
+    # The disambiguation the byte literal must not break: `a @ b'` is the
+    # transpose of a tensor named `b`, which is everywhere in ML code.
+    let toks = lex_ok("a @ b'\n")
+    let two = lex_ok("b'ab'")
+    tok_kind(list_get(toks, 0)) == "ident" &&
+        tok_kind(list_get(toks, 1)) == "at" &&
+        tok_kind(list_get(toks, 2)) == "ident" &&
+        tok_raw(list_get(toks, 2)) == "b" &&
+        tok_kind(list_get(toks, 3)) == "transpose" &&
+        # two bytes between the quotes is not a byte literal either
+        tok_kind(list_get(two, 0)) == "ident" &&
+        tok_kind(list_get(two, 1)) == "transpose"
+}
+
+fn test_char_escapes() -> bool {
+    # An escaped quote used to terminate the scan early: c"\"" came out as the
+    # 4-byte raw `c"\"` and every token after it was shifted. Built by
+    # concatenation because the doubled escaping is unreadable inline.
+    let q = "\""
+    let bs = "\\"
+    let esc_quote = "c" + q + bs + q + q      # c"\""
+    let esc_nl = "c" + q + bs + "n" + q       # c"\n"
+    let plain = "c" + q + "x" + q             # c"x"
+    let toks = lex_ok(esc_quote + " " + esc_nl + " " + plain)
+    list_len(toks) == 4 &&
+        tok_kind(list_get(toks, 0)) == "char" &&
+        tok_raw(list_get(toks, 0)) == esc_quote &&
+        tok_val(list_get(toks, 0)) == q &&
+        tok_raw(list_get(toks, 1)) == esc_nl &&
+        tok_val(list_get(toks, 1)) == "\n" &&
+        tok_raw(list_get(toks, 2)) == plain
+}
+
+fn test_line_col_basic() -> bool {
+    # Byte offsets alone are useless to the parser above us; every token also
+    # carries the 1-based line:col the reference reports.
+    let toks = lex_ok("fn f() {\n  let x = 1\n}\n")
+    let t0 = list_get(toks, 0)          # `fn`
+    let t1 = list_get(toks, 1)          # `f`
+    let t6 = list_get(toks, 6)          # `let` on line 2
+    tok_raw(t0) == "fn" && tok_line(t0) == 1 && tok_col(t0) == 1 &&
+        tok_raw(t1) == "f" && tok_line(t1) == 1 && tok_col(t1) == 4 &&
+        tok_raw(t6) == "let" && tok_line(t6) == 2 && tok_col(t6) == 3
+}
+
+fn test_line_col_counts_chars_not_bytes() -> bool {
+    # `é` is two bytes but one column (#281). If col counted bytes, the closing
+    # quote here would report 12 instead of 11 and every diagnostic on the line
+    # after a non-ASCII string would point at the wrong caret.
+    let toks = lex_ok("let s = \"é\"\nlet t = 2")
+    let str_tok = list_get(toks, 3)     # the string literal
+    let nl = list_get(toks, 4)          # the newline right after it
+    tok_kind(str_tok) == "str" && tok_col(str_tok) == 9 &&
+        tok_kind(nl) == "newline" && tok_line(nl) == 1 && tok_col(nl) == 12 &&
+        tok_line(list_get(toks, 5)) == 2
+}
+
+# --- error path (SPEC §3.9); messages and positions mirror the reference ---
+
+fn test_err_unterminated_string() -> bool {
+    lex_err_of("let s = \"oops\n") == "lex error at 2:1: unterminated string literal"
+}
+
+fn test_err_invalid_escape() -> bool {
+    lex_err_of("\"a\\q\"") == "lex error at 1:5: invalid escape sequence"
+}
+
+fn test_err_unterminated_char() -> bool {
+    lex_err_of("c\"x") == "lex error at 1:4: unterminated char literal"
+}
+
+fn test_err_char_not_one_character() -> bool {
+    # Both directions: two characters, and none at all.
+    lex_err_of("c\"ab\"") ==
+        "lex error at 1:6: char literal must contain exactly one character" &&
+    lex_err_of("c\"\"") ==
+        "lex error at 1:4: char literal must contain exactly one character"
+}
+
+fn test_err_byte_lit_bad_escape() -> bool {
+    lex_err_of("b'\\q'") ==
+        "lex error at 1:5: invalid escape sequence in byte literal"
+}
+
+fn test_err_byte_lit_too_long() -> bool {
+    lex_err_of("b'\\na'") ==
+        "lex error at 1:6: byte literal must contain exactly one byte" &&
+    # source ends mid-escape: the reference blames the escape, not the quote
+    lex_err_of("b'\\") ==
+        "lex error at 1:4: invalid escape sequence in byte literal"
+}
+
+fn test_err_lone_backslash() -> bool {
+    lex_err_of("a \\ b") ==
+        "lex error at 1:4: unexpected `\\` — expected `\\>`, `\\<`, or `\\|>`"
+}
+
+fn test_err_unknown_character() -> bool {
+    # Used to become a silent "bad" token, which let the lexer "succeed" on
+    # input the reference rejects.
+    lex_err_of("a $ b") == "lex error at 1:4: unexpected character `$`"
+}
+
+fn test_err_unterminated_block_comment() -> bool {
+    lex_err_of("#{ open") == "lex error at 1:8: unterminated block comment"
+}
+
+fn test_err_hex_needs_digit() -> bool {
+    # `_` may only separate digits, so `0x_ff` is rejected — as is a bare `0x`.
+    lex_err_of("let a = 0x_ff") ==
+        "lex error at 1:11: hex literal must start with a hex digit" &&
+    lex_err_of("let a = 0x") ==
+        "lex error at 1:11: hex literal must start with a hex digit"
+}
+
+fn test_err_binary_needs_digit() -> bool {
+    lex_err_of("let a = 0b_11") ==
+        "lex error at 1:11: binary literal must start with 0 or 1"
+}
+
+fn test_err_empty_exponent() -> bool {
+    lex_err_of("let a = 1e") == "lex error at 1:11: empty exponent in float literal"
+}
+
+fn test_clean_source_has_no_error() -> bool {
+    # The other half of the contract: a valid program returns a nil Err.
+    lex_err_of("fn main() -> nil {\n    print(\"ok\")\n    nil\n}\n") == nil
+}
+
 # --- Dumper support for differential testing harness ---
-# When invoked as: dmc run examples/selfhost_lexer.dmc <path.dmc>
-# it reads the path (via argv), lexes it, and emits a JSON array of [kind, raw]
-# pairs. This is trivial for Python to parse with json.loads and compare raws
-# against `dmc --lex` output.
+# When invoked as: dmc run examples/demonic_lexer.dmc <path.dmc>
+# it reads the path (via argv), lexes it, and emits a JSON array of
+# [kind, lo, hi, line, col] — everything tools/diff_demonic_lexer.py needs to
+# compare boundaries, classification and position against `dmc --lex`.
+#
+# A lex error prints an empty array: the reference prints a diagnostic and NO
+# tokens on a file it rejects, so an empty stream on both sides is what
+# agreement looks like. (There is no stderr builtin to carry the message; the
+# harness reports the resulting length divergence when only one side rejects.)
 fn dump_tokens_for(path: str) -> nil {
     let (src, err) = read_file(path)
     if !(err == nil) {
         print("SELFHOST_ERROR " + to_str(err))
         return nil
     }
-    let ts = lex(src)
-    let !pairs = list()
+    let (ts, lerr) = lex(src)
+    if !(lerr == nil) {
+        print("[]")
+        return nil
+    }
+    let !rows = list()
     let n = list_len(ts)
     let !j = 0
     while j < n {
@@ -551,10 +991,10 @@ fn dump_tokens_for(path: str) -> nil {
         if k == "eof" { break }
         let lo = to_int(map_get(t, "lo"))
         let hi = to_int(map_get(t, "hi"))
-        pairs = list_push(pairs, list(k, lo, hi))
+        rows = list_push(rows, list(k, lo, hi, tok_line(t), tok_col(t)))
         j = j + 1
     }
-    print(json_encode(pairs))
+    print(json_encode(rows))
     nil
 }
 
@@ -567,7 +1007,11 @@ fn main() -> nil {
     }
     # demo mode (no args)
     let demo = "fn main() -> nil {\n    let x = 1 + 2\n    print(\"demo\")\n    nil\n}"
-    let ts = lex(demo)
+    let (ts, lerr) = lex(demo)
+    if !(lerr == nil) {
+        print(lerr)
+        return nil
+    }
     print("selfhost lexer tokens: " + to_str(list_len(ts)))
     print("first: " + tok_kind(list_get(ts, 0)) + " " + tok_raw(list_get(ts, 0)))
     nil
@@ -581,6 +1025,13 @@ fn test_eval_program() -> bool {
     test_comments() &&
     test_depth_newlines() &&
     test_trailing_bang() &&
+    test_enum_keyword() &&
+    test_byte_literal() &&
+    test_byte_lit_vs_transpose() &&
+    test_char_escapes() &&
+    test_line_col_basic() &&
+    test_line_col_counts_chars_not_bytes() &&
+    test_clean_source_has_no_error() &&
     test_hello_fixture() &&
     test_model_and_directive() &&
     test_read_and_lex_real_hello() &&
@@ -603,7 +1054,7 @@ fn test_hello_fixture() -> bool {
               "    let nothing  = nil\n\n" +
               "    let probe = [1.0, -2.0, 3.0] \\|> \\>\n\n" +
               "    print(greeting)\n    nil\n}\n"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     let n = list_len(toks)
     # Must see a healthy number of tokens and key ones
     let !saw_fn = false
@@ -632,7 +1083,7 @@ fn test_hello_fixture() -> bool {
 
 fn test_model_and_directive() -> bool {
     let src = "@grad fn f() {}\nmodel M { x: i32\n  fn fwd(self) {} }"
-    let toks = lex(src)
+    let toks = lex_ok(src)
     let n = list_len(toks)
     n > 10
 }
@@ -654,13 +1105,13 @@ fn read_hello() -> str {
 fn test_read_and_lex_real_hello() -> bool {
     let txt = read_hello()
     if txt == "" { return true }
-    list_len(lex(txt)) > 15
+    list_len(lex_ok(txt)) > 15
 }
 
 # Exact parity with reference lexer on the canonical fixture (86 tokens incl. EOF).
 fn test_hello_token_count_parity() -> bool {
     let txt = read_hello()
     if txt == "" { return true }
-    list_len(lex(txt)) == 86
+    list_len(lex_ok(txt)) == 86
 }
 

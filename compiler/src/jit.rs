@@ -761,16 +761,16 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
 /// decide whether a tensor literal is an i64 or f32 tensor. (#273 follow-up.)
 fn is_int_literal_leaf(e: &Expr) -> bool {
     match e {
-        Expr::Literal(Literal::Int(_), _) => true,
+        Expr::Literal(Literal::Int(..), _) => true,
         Expr::UnOp { op: UnOp::Neg, operand, .. } =>
-            matches!(operand.as_ref(), Expr::Literal(Literal::Int(_), _)),
+            matches!(operand.as_ref(), Expr::Literal(Literal::Int(..), _)),
         _ => false,
     }
 }
 
 fn const_int_axis(e: &Expr) -> Option<i64> {
     match e {
-        Expr::Literal(Literal::Int(n), _) => Some(*n),
+        Expr::Literal(Literal::Int(n, _), _) => Some(*n),
         Expr::UnOp { op: UnOp::Neg, operand, .. } => {
             const_int_axis(operand).map(|n| -n)
         }
@@ -798,7 +798,7 @@ fn resolve_shape_expr(
     span: &Span,
 ) -> Result<i64, JitError> {
     match e {
-        Expr::Literal(Literal::Int(n), _) => Ok(*n),
+        Expr::Literal(Literal::Int(n, _), _) => Ok(*n),
         Expr::Ident(name, ispan) => env.get(name).copied().ok_or_else(|| JitError {
             msg: format!("unbound shape parameter `{}`", name),
             line: ispan.line, col: ispan.col,
@@ -3013,7 +3013,7 @@ enum StaticIndexCat { Scalar, Full, Range { start: i64, end: i64 } }
 
 fn lit_int(e: Option<&Expr>) -> Option<i64> {
     match e? {
-        Expr::Literal(Literal::Int(n), _) => Some(*n),
+        Expr::Literal(Literal::Int(n, _), _) => Some(*n),
         _ => None,
     }
 }
@@ -3191,7 +3191,7 @@ fn model_ctor_dims(e: &Expr, env: &HashMap<String, i64>) -> Vec<i64> {
 /// 1-tuple wrapping one (transparent parens).
 fn is_const_literal_expr(e: &Expr) -> bool {
     match e {
-        Expr::Literal(Literal::Int(_), _)
+        Expr::Literal(Literal::Int(_, _), _)
         | Expr::Literal(Literal::Float(_, _), _)
         | Expr::Literal(Literal::Bool(_), _) => true,
         Expr::UnOp { op: UnOp::Neg, operand, .. } => is_const_literal_expr(operand),
@@ -3313,7 +3313,7 @@ fn unify_param_type(
                 };
                 let actual = tt.shape[i];
                 match want {
-                    Expr::Literal(Literal::Int(n), _) => {
+                    Expr::Literal(Literal::Int(n, _), _) => {
                         if *n != actual {
                             return err(span, format!(
                                 "shape mismatch at dim {}: expected {}, got {}",
@@ -3368,7 +3368,7 @@ fn unify_param_type(
                     ShapeElem::Expr(e) => {
                         let actual = kv.dim_at(i);
                         match e.as_ref() {
-                            Expr::Literal(Literal::Int(n), _) => {
+                            Expr::Literal(Literal::Int(n, _), _) => {
                                 if *n != actual {
                                     return err(span, format!(
                                         "KV shape mismatch at dim {}: expected {}, got {}",
@@ -3453,7 +3453,7 @@ fn unify_param_type(
                     ShapeElem::Expr(e) => {
                         let actual = kv.dim_at(i);
                         match e.as_ref() {
-                            Expr::Literal(Literal::Int(n), _) => {
+                            Expr::Literal(Literal::Int(n, _), _) => {
                                 if *n != actual {
                                     return err(span, format!(
                                         "KV array shape mismatch at dim {}: expected {}, got {}",
@@ -4642,7 +4642,7 @@ impl<'a> Translator<'a> {
                 self.brif(eq, arm_block, next_check);
             } else {
             match &arm.pattern {
-                Pattern::Literal(Literal::Int(n), _) => {
+                Pattern::Literal(Literal::Int(n, _), _) => {
                     let n_val = self.builder.ins().iconst(cl::I64, *n);
                     let eq = self.builder.ins().icmp(IntCC::Equal, scr_i64, n_val);
                     self.brif(eq, arm_block, next_check);
@@ -4750,7 +4750,7 @@ impl<'a> Translator<'a> {
                 self.brif(eq, arm_block, next_check);
             } else {
             match &arm.pattern {
-                Pattern::Literal(Literal::Int(n), _) => {
+                Pattern::Literal(Literal::Int(n, _), _) => {
                     let n_val = self.builder.ins().iconst(cl::I64, *n);
                     let eq = self.builder.ins().icmp(IntCC::Equal, scr_i64, n_val);
                     self.brif(eq, arm_block, next_check);
@@ -4990,7 +4990,7 @@ impl<'a> Translator<'a> {
 
     fn lower_literal(&mut self, lit: &Literal, span: &Span) -> Result<(Value, TyKind), JitError> {
         match lit {
-            Literal::Int(n) => {
+            Literal::Int(n, _) => {
                 let v = self.builder.ins().iconst(cl::I64, *n);
                 Ok((v, TyKind::Scalar(ScalarKind::I64)))
             }
@@ -13673,7 +13673,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "non-positional args"),
         };
         let axis = match a_expr {
-            Expr::Literal(Literal::Int(n), _) => *n,
+            Expr::Literal(Literal::Int(n, _), _) => *n,
             _ => return err(span, "axis must be a literal int in slice 5"),
         };
         Ok((t_expr, axis))
@@ -13794,7 +13794,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "non-positional args"),
         };
         let axis = match a_expr {
-            Expr::Literal(Literal::Int(n), _) => *n,
+            Expr::Literal(Literal::Int(n, _), _) => *n,
             _ => return err(span, "axis must be a literal int"),
         };
 
@@ -19594,7 +19594,7 @@ mod tests {
     fn jit_slice_store_bounds_clamp_parity() {
         // #291.4 store sub-note: the slice-STORE path took raw runtime start/end
         // with no negative-resolution/clamping, while the interpreter's store
-        // (assign_to_tensor → resolve_index_selection) normalizes just like the
+        // (assign_to_tensor → resolve_index_values) normalizes just like the
         // read path. `t[0..100] = rhs` now clamps under `dmc jit` too.
         for src in [
             // over-long end clamps to the full extent, so a size-5 src fits

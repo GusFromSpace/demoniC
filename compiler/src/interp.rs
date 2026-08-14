@@ -192,7 +192,17 @@ pub enum Value {
     /// the interpreter doesn't model yet.
     Opaque(String),
     /// Dynamic list — heterogeneous ordered collection.
-    List(Vec<Value>),
+    ///
+    /// A VALUE type (unlike `Map` below): `let ys = xs` snapshots, and no
+    /// mutation of `xs` is ever visible through `ys`. The `Rc` is a
+    /// copy-on-write buffer, not shared mutable state — every writer goes
+    /// through `Rc::make_mut`, which clones the backing `Vec` the moment more
+    /// than one value holds it. Sharing is therefore unobservable; it only
+    /// buys us the case where the buffer *is* uniquely owned, and then the
+    /// write lands in place. That is what makes the `xs = list_push(xs, v)`
+    /// build-a-list loop O(1) amortized instead of O(n) per push (#452).
+    /// Use `Value::list(vec)` to construct.
+    List(Rc<Vec<Value>>),
     /// Dynamic map — string-keyed heterogeneous collection.
     /// Wrapped in Rc<RefCell<...>> so all clones share the same backing
     /// HashMap — mutations (map_set, map_del) are visible through every copy,
@@ -280,11 +290,22 @@ impl fmt::Display for Value {
     }
 }
 
+/// Unwrap a list's copy-on-write buffer into an owned `Vec`.
+///
+/// Moves the buffer out when this handle is the only one left, and falls back
+/// to a clone when the list is still shared — so consuming a freshly built or
+/// uniquely owned list costs nothing, and a shared one keeps value semantics.
+fn into_list_vec(rc: Rc<Vec<Value>>) -> Vec<Value> {
+    Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone())
+}
+
 impl Value {
     /// Construct a `Float`-tagged tensor value (the common case).
     fn tensor(data: ArrayD<f64>) -> Value { Value::Tensor(TensorVal::new(data, DType::F32)) }
     /// Construct a tensor value with an explicit dtype tag.
     fn tensor_dt(data: ArrayD<f64>, dtype: DType) -> Value { Value::Tensor(TensorVal::new(data, dtype)) }
+    /// Construct a list value from an owned `Vec` (wraps it in the COW buffer).
+    pub fn list(items: Vec<Value>) -> Value { Value::List(Rc::new(items)) }
     fn as_int(&self) -> Option<i64> {
         match self { Value::Int(n) => Some(*n), _ => None }
     }
@@ -372,6 +393,15 @@ impl Drop for CallDepthGuard {
     }
 }
 
+/// #402: an open process port (PORTS.md §7.1) — a child runtime speaking
+/// line-oriented JSON over its own stdin/stdout. The demoniC side holds the
+/// pipes; the Value side carries only an opaque `port#<id>:<lang>` handle.
+struct PortProc {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+}
+
 pub struct Interpreter {
     /// Lexical scope stack: each scope a name→value map.
     scopes: Vec<HashMap<String, Value>>,
@@ -406,6 +436,10 @@ pub struct Interpreter {
     start_time: std::time::Instant,
     /// Command-line arguments passed to the program (for `argv()`).
     argv: Vec<String>,
+    /// #402: open ports by handle id. Ids are never reused, so a call on a
+    /// closed handle reports `port-closed` instead of reaching a stranger.
+    ports: HashMap<i64, PortProc>,
+    next_port_id: i64,
     /// Optional op-count profile; Some only when --profile is active.
     pub profile: Option<OpProfile>,
     pub interp_modules: HashMap<std::path::PathBuf, InterpModuleEnv>,
@@ -424,11 +458,56 @@ pub struct Interpreter {
     /// stack is exhausted. `Rc<Cell<…>>` so the guard can decrement on drop without
     /// holding a borrow of the interpreter across the call body.
     call_depth: Rc<Cell<usize>>,
+    /// #452: name of the binding that the statement in flight will overwrite
+    /// with the result of the builtin call being evaluated. Set only for the
+    /// exact shape `name = builtin(name, …)`, `None` everywhere else. The call
+    /// takes this hint and, once its arguments are evaluated, drops that
+    /// binding's handle on the list buffer it was handed — the binding is dead
+    /// the moment the call returns, so releasing it early leaves the buffer
+    /// uniquely owned and lets the write land in place instead of copying.
+    /// See `release_move_target`.
+    move_hint: Option<String>,
 }
 
 struct AxisSelection {
     indices: Vec<usize>,
     reduce_rank: bool,
+}
+
+/// An index element whose sub-expressions have already been evaluated to
+/// integers. Splitting index *evaluation* (which re-enters `eval_expr`) from
+/// index *resolution* (pure arithmetic against the target's shape) lets a
+/// caller finish all interpretation before it takes a `borrow_mut()` on the
+/// destination's backing store. #443: `let !c = self.cells; c[self.table[0]] = 1`
+/// used to evaluate the index under the field's live mutable borrow, so the
+/// `self.table` read hit `RefCell already mutably borrowed` and aborted the
+/// whole process — a panic, not a diagnostic.
+#[derive(Clone)]
+enum IndexVal {
+    /// `..` — full axis
+    FullSlice,
+    /// a range expression in index position: `a..b` / `a..=b`
+    Range { start: Option<i64>, end: Option<i64>, inclusive: bool },
+    /// slice syntax with an optional step
+    Slice { start: Option<i64>, end: Option<i64>, step: i64 },
+    /// a scalar index (may be negative — normalized against the axis length)
+    Index(i64),
+}
+
+impl IndexVal {
+    /// Whether this element keeps its axis (used for the keepdims rule below).
+    fn is_slice(&self) -> bool {
+        !matches!(self, IndexVal::Index(_))
+    }
+}
+
+/// Coerce an evaluated index sub-expression to an integer, naming the position
+/// (`"tensor index"`, `"slice step"`, …) in the error.
+fn index_int(val: &Value, what: &str, span: &Span) -> EvalResult<i64> {
+    val.as_int().ok_or_else(|| RuntimeError::at(
+        format!("{} must be integer, got {}", what, val.type_name()),
+        span.clone(),
+    ))
 }
 
 fn assign_scalar_to_selection(arr: &mut ArrayD<f64>, selections: &[AxisSelection], val: f64) {
@@ -476,43 +555,80 @@ fn assign_scalar_to_selection(arr: &mut ArrayD<f64>, selections: &[AxisSelection
 }
 
 impl Interpreter {
+    /// Evaluate every expression inside an index into an integer, leaving a
+    /// form `resolve_index_values` can consume without the interpreter. This
+    /// is the only half that can re-enter `eval_expr`, so a caller that is
+    /// about to hold a `RefCell` borrow of the destination must run it *first*
+    /// (#443).
+    fn eval_index_elems(&mut self, elems: &[IndexElem], span: &Span) -> EvalResult<Vec<IndexVal>> {
+        let mut out = Vec::with_capacity(elems.len());
+        for elem in elems {
+            out.push(match elem {
+                IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => {
+                    let start = match start {
+                        Some(e) => Some(index_int(&self.eval_expr(e)?, "range start", span)?),
+                        None => None,
+                    };
+                    let end = match end {
+                        Some(e) => Some(index_int(&self.eval_expr(e)?, "range end", span)?),
+                        None => None,
+                    };
+                    IndexVal::Range { start, end, inclusive: *inclusive }
+                }
+                IndexElem::Expr(e) => {
+                    IndexVal::Index(index_int(&self.eval_expr(e)?, "tensor index", span)?)
+                }
+                IndexElem::FullSlice(_) => IndexVal::FullSlice,
+                IndexElem::Slice { start, end, step, .. } => {
+                    let step = match step {
+                        Some(e) => index_int(&self.eval_expr(e)?, "slice step", span)?,
+                        None => 1,
+                    };
+                    let start = match start {
+                        Some(e) => Some(index_int(&self.eval_expr(e)?, "slice start", span)?),
+                        None => None,
+                    };
+                    let end = match end {
+                        Some(e) => Some(index_int(&self.eval_expr(e)?, "slice end", span)?),
+                        None => None,
+                    };
+                    IndexVal::Slice { start, end, step }
+                }
+            });
+        }
+        Ok(out)
+    }
+
     fn resolve_index_selection(&mut self, arr_shape: &[usize], elems: &[IndexElem], span: Span) -> EvalResult<Vec<AxisSelection>> {
+        let vals = self.eval_index_elems(elems, &span)?;
+        Self::resolve_index_values(arr_shape, &vals, &span)
+    }
+
+    /// Turn pre-evaluated index values into per-axis selections. Takes no
+    /// `self`: pure arithmetic against `arr_shape`, safe to call under a live
+    /// borrow of the tensor being indexed.
+    fn resolve_index_values(arr_shape: &[usize], vals: &[IndexVal], span: &Span) -> EvalResult<Vec<AxisSelection>> {
         let ndim = arr_shape.len();
         let mut selections = Vec::new();
 
-        let mut padded_elems = elems.to_vec();
+        let mut padded_elems = vals.to_vec();
         while padded_elems.len() < ndim {
-            padded_elems.push(IndexElem::FullSlice(span.clone()));
+            padded_elems.push(IndexVal::FullSlice);
         }
 
         if padded_elems.len() > ndim {
             return Err(RuntimeError::at(
                 format!("index has {} dims but tensor has {}", padded_elems.len(), ndim),
-                span,
+                span.clone(),
             ));
         }
 
         for (axis, elem) in padded_elems.iter().enumerate() {
             let dim = arr_shape[axis];
             match elem {
-                IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => {
-                    let start_val = if let Some(start_expr) = start {
-                        let val = self.eval_expr(start_expr)?;
-                        Some(val.as_int().ok_or_else(|| {
-                            RuntimeError::at(format!("range start must be integer, got {}", val.type_name()), span.clone())
-                        })?)
-                    } else {
-                        None
-                    };
-
-                    let end_val = if let Some(end_expr) = end {
-                        let val = self.eval_expr(end_expr)?;
-                        Some(val.as_int().ok_or_else(|| {
-                            RuntimeError::at(format!("range end must be integer, got {}", val.type_name()), span.clone())
-                        })?)
-                    } else {
-                        None
-                    };
+                IndexVal::Range { start, end, inclusive } => {
+                    let start_val = *start;
+                    let end_val = *end;
 
                     let start_normalized = start_val.unwrap_or(0);
                     let mut end_normalized = end_val.unwrap_or(dim as i64);
@@ -542,21 +658,14 @@ impl Interpreter {
                         reduce_rank: false,
                     });
                 }
-                IndexElem::Expr(e) => {
-                    let val = self.eval_expr(e)?;
-                    let n = val.as_int().ok_or_else(|| {
-                        RuntimeError::at(format!("tensor index must be integer, got {}", val.type_name()), span.clone())
-                    })?;
+                IndexVal::Index(n) => {
+                    let n = *n;
                     let i = if n < 0 { (dim as i64 + n) as usize } else { n as usize };
                     if i >= dim {
                         return Err(RuntimeError::at(format!("index {} out of bounds for axis {} of size {}", i, axis, dim), span.clone()));
                     }
-                    let is_slice = |el: &IndexElem| -> bool {
-                        matches!(el, IndexElem::FullSlice(_) | IndexElem::Slice { .. })
-                            || matches!(el, IndexElem::Expr(Expr::Range { .. }))
-                    };
-                    let has_before = padded_elems[..axis].iter().any(is_slice);
-                    let has_after = padded_elems[axis + 1..].iter().any(is_slice);
+                    let has_before = padded_elems[..axis].iter().any(IndexVal::is_slice);
+                    let has_after = padded_elems[axis + 1..].iter().any(IndexVal::is_slice);
                     let keepdims = has_before && has_after;
 
                     selections.push(AxisSelection {
@@ -564,42 +673,20 @@ impl Interpreter {
                         reduce_rank: !keepdims,
                     });
                 }
-                IndexElem::FullSlice(_) => {
+                IndexVal::FullSlice => {
                     selections.push(AxisSelection {
                         indices: (0..dim).collect(),
                         reduce_rank: false,
                     });
                 }
-                IndexElem::Slice { start, end, step, .. } => {
-                    let step_val = if let Some(step_expr) = step {
-                        let val = self.eval_expr(step_expr)?;
-                        val.as_int().ok_or_else(|| {
-                            RuntimeError::at(format!("slice step must be integer, got {}", val.type_name()), span.clone())
-                        })?
-                    } else {
-                        1
-                    };
+                IndexVal::Slice { start, end, step } => {
+                    let step_val = *step;
                     if step_val == 0 {
                         return Err(RuntimeError::at("slice step cannot be zero".to_string(), span.clone()));
                     }
 
-                    let start_val = if let Some(start_expr) = start {
-                        let val = self.eval_expr(start_expr)?;
-                        Some(val.as_int().ok_or_else(|| {
-                            RuntimeError::at(format!("slice start must be integer, got {}", val.type_name()), span.clone())
-                        })?)
-                    } else {
-                        None
-                    };
-
-                    let end_val = if let Some(end_expr) = end {
-                        let val = self.eval_expr(end_expr)?;
-                        Some(val.as_int().ok_or_else(|| {
-                            RuntimeError::at(format!("slice end must be integer, got {}", val.type_name()), span.clone())
-                        })?)
-                    } else {
-                        None
-                    };
+                    let start_val = *start;
+                    let end_val = *end;
 
                     let start_normalized = start_val.unwrap_or(if step_val > 0 { 0 } else { dim as i64 - 1 });
                     let end_normalized = end_val.unwrap_or(if step_val > 0 { dim as i64 } else { -1 });
@@ -693,6 +780,14 @@ impl Interpreter {
     }
 
     fn assign_to_tensor(&mut self, arr: &mut ArrayD<f64>, dtype: DType, idx_elems: &[IndexElem], rval: Value, span: Span) -> EvalResult<()> {
+        let idx_vals = self.eval_index_elems(idx_elems, &span)?;
+        Self::assign_to_tensor_resolved(arr, dtype, &idx_vals, rval, span)
+    }
+
+    /// Store `rval` into `arr` at already-evaluated indices. Deliberately takes
+    /// no `self`, so it cannot re-enter the interpreter: callers may hold a
+    /// `RefCell` borrow of the destination across this call (#443).
+    fn assign_to_tensor_resolved(arr: &mut ArrayD<f64>, dtype: DType, idx_vals: &[IndexVal], rval: Value, span: Span) -> EvalResult<()> {
         // #226/#241: element writes mutate the backing array directly
         // (bypassing TensorVal::new), so round the written value through f32
         // here when the target is an F32 tensor. F64/Int/Trit pass through.
@@ -703,7 +798,7 @@ impl Interpreter {
                 other => other,
             }
         } else { rval };
-        let selections = self.resolve_index_selection(arr.shape(), idx_elems, span.clone())?;
+        let selections = Self::resolve_index_values(arr.shape(), idx_vals, &span)?;
 
         let mut target_shape = Vec::new();
         for sel in selections.iter() {
@@ -774,6 +869,8 @@ impl Interpreter {
             rng_state: 0x9E3779B97F4A7C15,  // SplitMix64 golden-ratio seed
             start_time: std::time::Instant::now(),
             argv: Vec::new(),
+            ports: HashMap::new(),
+            next_port_id: 1,
             profile: None,
             interp_modules: HashMap::new(),
             public_items: std::collections::HashSet::new(),
@@ -781,6 +878,7 @@ impl Interpreter {
             extern_fns: std::collections::HashSet::new(),
             pending_writebacks: Vec::new(),
             call_depth: Rc::new(Cell::new(0)),
+            move_hint: None,
         }
     }
 
@@ -1142,6 +1240,20 @@ impl Interpreter {
         None
     }
 
+    /// `lookup` + FieldRef resolution (#444): a binding created by
+    /// `let !alias = recv.field` reads as the field's CURRENT value anywhere
+    /// a plain value would. Callers that need the raw alias (write-through,
+    /// stream append) keep using `lookup`.
+    fn lookup_deref(&self, name: &str) -> Option<Value> {
+        match self.lookup(name) {
+            Some(Value::FieldRef { rc, field }) => {
+                let borrowed = rc.borrow();
+                borrowed.iter().find(|(k, _)| k == &field).map(|(_, v)| v.clone())
+            }
+            other => other,
+        }
+    }
+
     fn lookup_stream_axis(&self, name: &str) -> Option<usize> {
         for scope in self.stream_axes.iter().rev() {
             if let Some(axis) = scope.get(name) { return Some(*axis); }
@@ -1152,11 +1264,64 @@ impl Interpreter {
     fn assign(&mut self, name: &str, v: Value) -> EvalResult<()> {
         for scope in self.scopes.iter_mut().rev() {
             if scope.contains_key(name) {
+                // A FieldRef binding is an alias of a model field (#444):
+                // every assignment through it writes the FIELD and keeps the
+                // alias — matching element writes and `self.field = …`.
+                // Previously this rebound the local, so `b = …` after
+                // `let !b = self.buf` silently never reached the field.
+                // `v` is always fully evaluated before assign is called, so
+                // no interpreter re-entry can occur under this borrow (#443).
+                if let Some(Value::FieldRef { rc, field }) = scope.get(name) {
+                    let rc = rc.clone();
+                    let field = field.clone();
+                    let mut borrowed = rc.borrow_mut();
+                    return match borrowed.iter_mut().find(|(k, _)| k == &field) {
+                        Some((_, slot)) => { *slot = v; Ok(()) }
+                        None => Err(RuntimeError::msg(
+                            format!("undefined field `{}`", field))),
+                    };
+                }
                 scope.insert(name.to_string(), v);
                 return Ok(());
             }
         }
         Err(RuntimeError::msg(format!("cannot assign to undefined `{}`", name)))
+    }
+
+    /// #452: release the about-to-be-overwritten binding's handle on a list
+    /// buffer that was just passed to a builtin.
+    ///
+    /// `toks = list_push(toks, t)` hands the builtin a second handle on the
+    /// buffer while the binding still holds the first, so a copy-on-write push
+    /// would copy every time — O(n) per element, O(n²) to build the list. But
+    /// the binding is dead: the statement overwrites it with this call's
+    /// result. Clearing it here, after the arguments are evaluated and before
+    /// the builtin runs, leaves the buffer uniquely owned and the push lands in
+    /// place.
+    ///
+    /// Deliberately narrow — it fires only when all of these hold:
+    ///   * this call is the *entire* right-hand side of `name = …`, so nothing
+    ///     else in the statement can still read the old value (`move_hint`, set
+    ///     in `Stmt::Expr`, which is where that shape is matched),
+    ///   * the call's first positional argument is that same bare `name`,
+    ///   * the binding still holds the *identical* buffer that was passed in.
+    /// If the builtin then fails, the binding is left `Nil`; a runtime error
+    /// unwinds out of the program, so no demoniC code can observe it.
+    fn release_move_target(&mut self, hint: Option<&str>, first_arg: Option<&CallArg>, arg_vals: &[Value]) {
+        let Some(target) = hint else { return };
+        let Some(CallArg::Positional(Expr::Ident(argname, _))) = first_arg else { return };
+        if argname != target { return; }
+        let Some(Value::List(passed)) = arg_vals.first() else { return };
+        // Raw pointer, not a clone — an extra handle here would defeat the point.
+        let passed = Rc::as_ptr(passed);
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(slot) = scope.get_mut(target) {
+                if matches!(slot, Value::List(held) if std::ptr::eq(Rc::as_ptr(held), passed)) {
+                    *slot = Value::Nil;
+                }
+                return;
+            }
+        }
     }
 
     fn bind_pattern(&mut self, pat: &Pattern, v: Value) {
@@ -2297,8 +2462,30 @@ impl Interpreter {
                             let recv = self.eval_expr(inner)?;
                             if let Value::Struct(rc) = recv {
                                 if let Pattern::Ident(alias, _) = &l.pattern {
-                                    self.bind(alias, Value::FieldRef { rc, field: fname.clone() });
-                                    return Ok(Flow::Normal(Value::Nil));
+                                    // #444: only TENSOR fields bind as a live
+                                    // alias (the element-write-through idiom).
+                                    // Every other field kind — scalars above
+                                    // all — binds its current VALUE, per the
+                                    // spec's `let !y = x` copy rule; aliasing
+                                    // a scalar made every "snapshot this
+                                    // field" read a moving target.
+                                    let fval = {
+                                        let borrowed = rc.borrow();
+                                        borrowed.iter()
+                                            .find(|(k, _)| k == fname)
+                                            .map(|(_, v)| v.clone())
+                                    };
+                                    match fval {
+                                        Some(Value::Tensor(_)) => {
+                                            self.bind(alias, Value::FieldRef { rc, field: fname.clone() });
+                                            return Ok(Flow::Normal(Value::Nil));
+                                        }
+                                        Some(v) => {
+                                            self.bind(alias, v);
+                                            return Ok(Flow::Normal(Value::Nil));
+                                        }
+                                        None => {} // not a field — fall through
+                                    }
                                 }
                             }
                         }
@@ -2328,7 +2515,31 @@ impl Interpreter {
             }
             Stmt::Expr { lhs, assign, span } => {
                 if let Some((op, rhs)) = assign {
-                    let rval = self.eval_expr(rhs)?;
+                    // #452: flag `name = builtin(name, …)` — and *only* that
+                    // exact shape — for the in-place path (see
+                    // `release_move_target`). Requiring the call to be the
+                    // whole right-hand side is what makes the release safe: the
+                    // binding it clears is guaranteed to be overwritten by that
+                    // same call's result, and no other part of the expression
+                    // can still be waiting to read the old value. `xs = if
+                    // list_len(xs) > 2 { list_slice(xs, 0, 2) } else { xs }`
+                    // reads `xs` again after the call, so it does not qualify.
+                    // Cleared unconditionally below — the hint must never
+                    // outlive this one right-hand side.
+                    if let (AssignOp::Eq, Expr::Ident(name, _)) = (&*op, &*lhs) {
+                        if let Expr::Postfix { expr: callee, op: PostfixOp::Call(cargs), .. } = &*rhs {
+                            let callee_is_builtin = matches!(callee.as_ref(),
+                                Expr::Ident(f, _) if is_builtin(f) && !self.fns.contains_key(f));
+                            let first_arg_is_target = matches!(cargs.first(),
+                                Some(CallArg::Positional(Expr::Ident(a, _))) if a == name);
+                            if callee_is_builtin && first_arg_is_target {
+                                self.move_hint = Some(name.clone());
+                            }
+                        }
+                    }
+                    let rval = self.eval_expr(rhs);
+                    self.move_hint = None;
+                    let rval = rval?;
                     match (op, lhs) {
                         // Simple assignment to ident
                         (AssignOp::Eq, Expr::Ident(name, _)) => {
@@ -2338,7 +2549,7 @@ impl Interpreter {
                             }
                         }
                         (AssignOp::PlusEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             // Tensor ops dispatch to the elementwise variant;
                             // pure-scalar dispatch to the scalar variant. The
                             // language doesn't distinguish += vs .+= at the
@@ -2350,7 +2561,7 @@ impl Interpreter {
                             self.assign(name, new).ok();
                         }
                         (AssignOp::MinusEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             let op = if matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_)) {
                                 BinOp::DotSub
                             } else { BinOp::Sub };
@@ -2362,7 +2573,7 @@ impl Interpreter {
                         // the JIT, which applies them). Dispatch scalar vs tensor
                         // like `+=`/`-=`.
                         (AssignOp::StarEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             let op = if matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_)) {
                                 BinOp::DotMul
                             } else { BinOp::Mul };
@@ -2370,7 +2581,7 @@ impl Interpreter {
                             self.assign(name, new).ok();
                         }
                         (AssignOp::SlashEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             let op = if matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_)) {
                                 BinOp::DotDiv
                             } else { BinOp::Div };
@@ -2379,17 +2590,17 @@ impl Interpreter {
                         }
                         // Bitwise compound-assign (int only; no tensor variant).
                         (AssignOp::AmpEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             let new = apply_binop(BinOp::BitAnd, &cur, &rval)?;
                             self.assign(name, new).ok();
                         }
                         (AssignOp::BarEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             let new = apply_binop(BinOp::BitOr, &cur, &rval)?;
                             self.assign(name, new).ok();
                         }
                         (AssignOp::CaretEq, Expr::Ident(name, _)) => {
-                            let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
                             let new = apply_binop(BinOp::BitXor, &cur, &rval)?;
                             self.assign(name, new).ok();
                         }
@@ -2522,7 +2733,7 @@ impl Interpreter {
                                     // #266: model-array (List) write — `arr[i] = instance`
                                     // stores the value into slot i (parity with the JIT's
                                     // ModelArray store). Single scalar index; negatives wrap.
-                                    Value::List(mut items) => {
+                                    Value::List(mut buf) => {
                                         let raw = match idx_elems.as_slice() {
                                             [IndexElem::Expr(e)] => self.eval_expr(e)?.as_int().ok_or_else(|| {
                                                 RuntimeError::at("model-array index must be an integer", span.clone())
@@ -2530,21 +2741,37 @@ impl Interpreter {
                                             _ => return Err(RuntimeError::at(
                                                 "model-array assignment requires a single scalar index", span.clone())),
                                         };
-                                        let len = items.len() as i64;
+                                        let len = buf.len() as i64;
                                         let i = if raw < 0 { len + raw } else { raw };
                                         if i < 0 || i >= len {
                                             return Err(RuntimeError::at(
                                                 format!("index {} out of bounds for axis 0 of size {}", raw, len), span.clone()));
                                         }
-                                        items[i as usize] = rval;
-                                        self.assign(name, Value::List(items)).ok();
+                                        // Drop the binding's handle on the buffer first:
+                                        // `make_mut` copies while a second holder exists,
+                                        // which would make an element-by-element fill of a
+                                        // model array quadratic (#452). The slot is
+                                        // reassigned on the next line either way.
+                                        self.assign(name, Value::Nil).ok();
+                                        Rc::make_mut(&mut buf)[i as usize] = rval;
+                                        self.assign(name, Value::List(buf)).ok();
                                     }
                                     Value::FieldRef { rc, field } => {
+                                        // #443: resolve the index *before* borrowing the
+                                        // struct's fields. An index that reads the same
+                                        // struct (`c[self.table[0]] = 1`, or a method call)
+                                        // re-enters the interpreter, and the member-access
+                                        // path borrows this same RefCell — under a live
+                                        // `borrow_mut()` that is a process-killing panic,
+                                        // not a diagnostic. `rval` is already evaluated
+                                        // above, which is why `self` in value position
+                                        // was always safe.
+                                        let idx_vals = self.eval_index_elems(idx_elems, &span)?;
                                         let mut borrowed = rc.borrow_mut();
                                         if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == &field) {
                                             if let Value::Tensor(ref mut arr) = slot {
                                                 let dt = arr.dtype;
-                                                self.assign_to_tensor(arr, dt, idx_elems, rval, span.clone())?;
+                                                Self::assign_to_tensor_resolved(arr, dt, &idx_vals, rval, span.clone())?;
                                             } else {
                                                 return Err(RuntimeError::at(
                                                     format!("indexed assignment requires a tensor, got {}", slot.type_name()),
@@ -2564,11 +2791,14 @@ impl Interpreter {
                                 // m.field[i] = val — tensor element write through struct field
                                 let recv = self.eval_expr(struct_expr)?;
                                 if let Value::Struct(fields) = recv {
+                                    // #443: same hazard as the FieldRef arm — the index may
+                                    // read `m` itself, so evaluate it before the borrow.
+                                    let idx_vals = self.eval_index_elems(idx_elems, &span)?;
                                     let mut borrowed = fields.borrow_mut();
                                     if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == field_name) {
                                         if let Value::Tensor(ref mut arr) = slot {
                                             let dt = arr.dtype;
-                                            self.assign_to_tensor(arr, dt, idx_elems, rval, span.clone())?;
+                                            Self::assign_to_tensor_resolved(arr, dt, &idx_vals, rval, span.clone())?;
                                         } else {
                                             return Err(RuntimeError::at(
                                                 format!("indexed assignment requires a tensor, got {}", slot.type_name()),
@@ -2991,6 +3221,12 @@ impl Interpreter {
     fn eval_postfix(&mut self, expr: &Expr, op: &PostfixOp, span: Span) -> EvalResult<Value> {
         match op {
             PostfixOp::Call(args) => {
+                // #452: claim the enclosing statement's move hint before any
+                // argument is evaluated. The hint is set only for a call that
+                // *is* the whole right-hand side, and that call is the first
+                // one entered, so taking it here hands it to its rightful owner
+                // and leaves nested calls with `None`.
+                let move_hint = self.move_hint.take();
                 // Evaluate args first (call-by-value, left-to-right).
                 let mut arg_vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -3082,6 +3318,16 @@ impl Interpreter {
                                 return Err(RuntimeError::at(format!(
                                     "model serialization `{}.{}` is specified (SPEC §3.10) \
                                      but not yet implemented (#394)", mname, method), span));
+                            }
+                            // #441: no such method on this model. A field of
+                            // that name may still hold a callable, so only
+                            // error when neither exists — otherwise this fell
+                            // through to a silent no-op in statement position.
+                            let has_field = fields.borrow().iter()
+                                .any(|(k, _)| k == method.as_str());
+                            if !has_field {
+                                return Err(RuntimeError::at(format!(
+                                    "no method `{}` on model `{}`", method, mname), span));
                             }
                         }
                     }
@@ -3182,7 +3428,10 @@ impl Interpreter {
                         Ok(result)
                     }
                     Value::Lambda { lit, captured_env } => self.call_lambda(&lit.clone(), captured_env, arg_vals, span),
-                    Value::Builtin(name) => self.call_builtin(&name, arg_vals, span),
+                    Value::Builtin(name) => {
+                        self.release_move_target(move_hint.as_deref(), args.first(), &arg_vals);
+                        self.call_builtin(&name, arg_vals, span)
+                    }
                     Value::Opaque(name) => {
                         // Calling a type constructor / arena helper — pre-alpha: nil
                         Ok(Value::Opaque(format!("{}(...)", name)))
@@ -3398,7 +3647,10 @@ impl Interpreter {
                                     "reshape: expected shape list in brackets", span)),
                             };
                             let new_shape: Vec<usize> = match shape_val {
-                                Value::List(vs) | Value::Tuple(vs) => vs.iter()
+                                Value::List(vs) => vs.iter()
+                                    .filter_map(|v| v.as_int().map(|n| n as usize))
+                                    .collect(),
+                                Value::Tuple(vs) => vs.iter()
                                     .filter_map(|v| v.as_int().map(|n| n as usize))
                                     .collect(),
                                 // [2, 3, 4] in demoniC evaluates as a Tensor literal
@@ -3491,7 +3743,7 @@ impl Interpreter {
                             return Err(RuntimeError::at(
                                 format!("index {} out of bounds for axis 0 of size {}", n, len), span));
                         }
-                        vs.into_iter().nth(resolved as usize).ok_or_else(|| RuntimeError::at(
+                        vs.get(resolved as usize).cloned().ok_or_else(|| RuntimeError::at(
                             format!("list index {} out of range", resolved), span))
                     }
                     // Multi-axis slicing: t[.., n, ..] — mix of FullSlice and scalar indices.
@@ -3785,7 +4037,7 @@ impl Interpreter {
                     }).ok_or_else(|| RuntimeError::msg(format!(
                         "`{}[{}, [N]]` requires a 1D size", method, base)))?;
                     self.prof_alloc();
-                    return Ok(Some(Value::List(vec![Value::Nil; n])));
+                    return Ok(Some(Value::list(vec![Value::Nil; n])));
                 }
             }
         }
@@ -3801,7 +4053,7 @@ impl Interpreter {
         if method == "identity" {
             let n = pos_vec.iter().find_map(|e| match e {
                 Expr::TensorLit(dims, _) => dims.first().map(|d| self.eval_dim(d)),
-                Expr::Literal(Literal::Int(k), _) if *k >= 0 => Some(*k as usize),
+                Expr::Literal(Literal::Int(k, _), _) if *k >= 0 => Some(*k as usize),
                 _ => None,
             }).unwrap_or(0);
             if checked_shape_elems(&[n, n]).is_none() {
@@ -3819,7 +4071,7 @@ impl Interpreter {
         // Returns a zero-initialised DType::Trit tensor clamped to {-1, 0, +1}.
         if method == "trit" {
             let trit_dims: Vec<usize> = pos_vec.iter().filter_map(|e| match e {
-                Expr::Literal(Literal::Int(k), _) if *k >= 0 => Some(*k as usize),
+                Expr::Literal(Literal::Int(k, _), _) if *k >= 0 => Some(*k as usize),
                 _ => None,
             }).collect();
             let arr = ArrayD::from_elem(IxDyn(&trit_dims), 0.0_f64);
@@ -3986,7 +4238,7 @@ fn is_trit_type_name(name: &str) -> bool {
 
 fn lit_value(lit: &Literal) -> Value {
     match lit {
-        Literal::Int(n)   => Value::Int(*n),
+        Literal::Int(n, _) => Value::Int(*n),
         Literal::Float(x, _) => Value::Float(*x),
         Literal::Str(s)   => Value::Str(s.clone()),
         Literal::Char(c)  => Value::Int(*c as i64),
@@ -4569,7 +4821,7 @@ fn extract_kv_capacity(expr: &Expr) -> Option<usize> {
         for arg in args {
             if let CallArg::Named { name, value, .. } = arg {
                 if name == "capacity" {
-                    if let Expr::Literal(Literal::Int(n), _) = value {
+                    if let Expr::Literal(Literal::Int(n, _), _) = value {
                         if *n > 0 { return Some(*n as usize); }
                     }
                 }
@@ -5003,7 +5255,7 @@ fn expand_iter(v: &Value) -> EvalResult<Vec<Value>> {
             Ok((*start..end).map(Value::Int).collect())
         }
         Value::Tuple(vs) => Ok(vs.clone()),
-        Value::List(vs) => Ok(vs.clone()),
+        Value::List(vs) => Ok((**vs).clone()),
         Value::Tensor(t) => {
             // Iterate along the first axis as nested tensors / scalars,
             // preserving the dtype so iterating an integer tensor yields Ints.
@@ -5038,7 +5290,7 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
             let parts: Vec<Value> = s.split(delim.as_str())
                 .map(|p| Value::Str(p.to_string()))
                 .collect();
-            Ok(Value::List(parts))
+            Ok(Value::list(parts))
         }
         "trim" | "strip" => Ok(Value::Str(s.trim().to_string())),
         "upper" => Ok(Value::Str(s.to_uppercase())),
@@ -5107,7 +5359,7 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
             let parts: Vec<Value> = s.lines()
                 .map(|l| Value::Str(l.to_string()))
                 .collect();
-            Ok(Value::List(parts))
+            Ok(Value::list(parts))
         }
         "len" => Ok(Value::Int(s.len() as i64)),
         _ => {
@@ -5118,6 +5370,48 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
 }
 
 // ─── Builtins ────────────────────────────────────────────────────────────────
+
+/// #402: the python process-port harness (PORTS.md §7.1), passed to
+/// `python3 -c`. Request per line: `{"name": str, "payload": str}` where
+/// `name` is a dotted import path (`math.sqrt`, `json.dumps`, or a bare
+/// builtin like `len`) and `payload` is JSON for the function's single
+/// argument — `null` or empty calls with no arguments. Response per line:
+/// `{"ok": result}` or `{"err": message}`.
+const PY_PORT_HARNESS: &str = r#"
+import sys, json, importlib, builtins
+def _resolve(name):
+    parts = name.split('.')
+    if len(parts) == 1 and hasattr(builtins, parts[0]):
+        return getattr(builtins, parts[0])
+    obj = importlib.import_module(parts[0])
+    for p in parts[1:]:
+        obj = getattr(obj, p)
+    return obj
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        fn = _resolve(req['name'])
+        payload = req.get('payload')
+        arg = json.loads(payload) if payload not in (None, '') else None
+        res = fn() if arg is None else fn(arg)
+        out = json.dumps({'ok': res})
+    except Exception as e:
+        out = json.dumps({'err': str(e)})
+    sys.stdout.write(out + '\n')
+    sys.stdout.flush()
+"#;
+
+/// #402: recover the registry id from an opaque `port#<id>:<lang>` handle.
+fn port_handle_id(v: Option<&Value>) -> Option<i64> {
+    if let Some(Value::Opaque(s)) = v {
+        s.strip_prefix("port#")?.split(':').next()?.parse().ok()
+    } else {
+        None
+    }
+}
 
 pub(crate) fn is_builtin(name: &str) -> bool {
     matches!(name,
@@ -5181,6 +5475,8 @@ pub(crate) fn is_builtin(name: &str) -> bool {
         "path_exists" | "path_is_dir" | "path_is_file" |
         // Process execution
         "exec_cmd" |
+        // Ports (#402, PORTS.md §2)
+        "port_open" | "port_call" | "port_close" |
         // CLI argument parsing
         "cli_arg" | "cli_flag" | "cli_positional" | "cli_positional_count" |
         // Regex
@@ -5206,7 +5502,7 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 }
 
 impl Interpreter {
-    fn call_builtin(&mut self, name: &str, args: Vec<Value>, sp: Span) -> EvalResult<Value> {
+    fn call_builtin(&mut self, name: &str, mut args: Vec<Value>, sp: Span) -> EvalResult<Value> {
     match name {
         "print" => {
             let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
@@ -5782,7 +6078,8 @@ impl Interpreter {
             let parts: Vec<String> = if args.len() == 2 {
                 // join(sep, collection) form
                 match &args[1] {
-                    Value::Tuple(vs) | Value::List(vs) => vs.iter().map(|v| format!("{}", v)).collect(),
+                    Value::Tuple(vs) => vs.iter().map(|v| format!("{}", v)).collect(),
+                    Value::List(vs) => vs.iter().map(|v| format!("{}", v)).collect(),
                     Value::Str(s) => vec![s.clone()],
                     other => return Err(RuntimeError::at(
                         format!("join: second arg must be a tuple, list, or str, got {}", other.type_name()), sp)),
@@ -5875,19 +6172,22 @@ impl Interpreter {
         )),
 
         // ── Dynamic collections: list ─────────────────────────────────────────
-        "list" => Ok(Value::List(args)), // list() → empty; list(1,2,3) → [1,2,3]
+        "list" => Ok(Value::list(args)), // list() → empty; list(1,2,3) → [1,2,3]
         "list_push" => {
-            let lst = match args.first() {
+            let mut lst = match args.first() {
                 Some(Value::List(vs)) => vs.clone(),
                 Some(other) => return Err(RuntimeError::at(
                     format!("list_push: first arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_push: requires list and item args", sp)),
             };
+            // Release the argument vector's handle on the buffer before writing:
+            // `make_mut` copies whenever a second holder exists, and `args[0]`
+            // would otherwise be one (#452).
+            args[0] = Value::Nil;
             let item = args.into_iter().nth(1).ok_or_else(||
                 RuntimeError::at("list_push: requires item arg", sp))?;
-            let mut new_lst = lst;
-            new_lst.push(item);
-            Ok(Value::List(new_lst))
+            Rc::make_mut(&mut lst).push(item);
+            Ok(Value::List(lst))
         }
         "list_pop" => {
             let mut lst = match args.first() {
@@ -5899,7 +6199,8 @@ impl Interpreter {
             if lst.is_empty() {
                 return Err(RuntimeError::at("list_pop: list is empty", sp));
             }
-            let last = lst.pop().unwrap();
+            args[0] = Value::Nil;
+            let last = Rc::make_mut(&mut lst).pop().unwrap();
             Ok(Value::Tuple(vec![Value::List(lst), last]))
         }
         "list_get" => {
@@ -5913,7 +6214,7 @@ impl Interpreter {
                 RuntimeError::at("list_get: index must be an integer", sp.clone()))?;
             let len = lst.len() as i64;
             let idx = if idx_raw < 0 { (len + idx_raw) as usize } else { idx_raw as usize };
-            lst.into_iter().nth(idx).ok_or_else(||
+            lst.get(idx).cloned().ok_or_else(||
                 RuntimeError::at(format!("list_get: index {} out of range for list of length {}", idx_raw, len), sp))
         }
         "list_set" => {
@@ -5925,15 +6226,16 @@ impl Interpreter {
             };
             let idx_raw = args.get(1).and_then(|v| v.as_int()).ok_or_else(||
                 RuntimeError::at("list_set: index must be an integer", sp.clone()))?;
-            let val = args.into_iter().nth(2).ok_or_else(||
-                RuntimeError::at("list_set: requires value arg", sp.clone()))?;
             let len = lst.len() as i64;
             let idx = if idx_raw < 0 { (len + idx_raw) as usize } else { idx_raw as usize };
             if idx >= lst.len() {
                 return Err(RuntimeError::at(
                     format!("list_set: index {} out of range for list of length {}", idx_raw, len), sp));
             }
-            lst[idx] = val;
+            args[0] = Value::Nil;
+            let val = args.into_iter().nth(2).ok_or_else(||
+                RuntimeError::at("list_set: requires value arg", sp.clone()))?;
+            Rc::make_mut(&mut lst)[idx] = val;
             Ok(Value::List(lst))
         }
         "list_len" => {
@@ -5958,7 +6260,8 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("list_concat: requires second list arg", sp)),
             };
             let mut result = a;
-            result.extend(b);
+            args[0] = Value::Nil;
+            Rc::make_mut(&mut result).extend(b.iter().cloned());
             Ok(Value::List(result))
         }
         "list_slice" => {
@@ -5976,7 +6279,7 @@ impl Interpreter {
             let start = (if start_raw < 0 { (len + start_raw).max(0) } else { start_raw.min(len) }) as usize;
             let end = (if end_raw < 0 { (len + end_raw).max(0) } else { end_raw.min(len) }) as usize;
             let end = end.max(start);
-            Ok(Value::List(lst[start..end].to_vec()))
+            Ok(Value::list(lst[start..end].to_vec()))
         }
         "list_contains" => {
             let lst = match args.first() {
@@ -6006,7 +6309,8 @@ impl Interpreter {
                     format!("list_rev: arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_rev: requires list arg", sp)),
             };
-            lst.reverse();
+            args[0] = Value::Nil;
+            Rc::make_mut(&mut lst).reverse();
             Ok(Value::List(lst))
         }
 
@@ -6087,7 +6391,7 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("map_keys: requires map arg", sp)),
             };
             let keys: Vec<Value> = m.borrow().keys().map(|k| Value::Str(k.clone())).collect();
-            Ok(Value::List(keys))
+            Ok(Value::list(keys))
         }
         "map_vals" => {
             let m = match args.first() {
@@ -6097,7 +6401,7 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("map_vals: requires map arg", sp)),
             };
             let vals: Vec<Value> = m.borrow().values().cloned().collect();
-            Ok(Value::List(vals))
+            Ok(Value::list(vals))
         }
         "map_len" => {
             match args.first() {
@@ -6123,7 +6427,7 @@ impl Interpreter {
         }
         "argv" => {
             let argv: Vec<Value> = self.argv.iter().map(|s| Value::Str(s.clone())).collect();
-            Ok(Value::List(argv))
+            Ok(Value::list(argv))
         }
         "exit" => {
             let code = args.first().and_then(|v| v.as_int()).unwrap_or(0);
@@ -6258,9 +6562,9 @@ impl Interpreter {
             Ok(Value::Float(mean + std * z))
         }
         "rand_choice" => {
-            let lst = match args.first() {
-                Some(Value::List(vs)) => vs.clone(),
-                Some(Value::Tuple(vs)) => vs.clone(),
+            let lst: &[Value] = match args.first() {
+                Some(Value::List(vs)) => vs.as_slice(),
+                Some(Value::Tuple(vs)) => vs.as_slice(),
                 Some(other) => return Err(RuntimeError::at(
                     format!("rand_choice: arg must be list or tuple, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("rand_choice: requires list arg", sp)),
@@ -6298,14 +6602,15 @@ impl Interpreter {
                     format!("list_map: first arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_map: requires list and fn args", sp)),
             };
+            args[0] = Value::Nil;
             let fn_val = args.into_iter().nth(1).ok_or_else(||
                 RuntimeError::at("list_map: requires fn arg", sp.clone()))?;
             let mut result = Vec::with_capacity(lst.len());
-            for item in lst {
+            for item in into_list_vec(lst) {
                 let out = self.call_value(fn_val.clone(), vec![item], sp.clone())?;
                 result.push(out);
             }
-            Ok(Value::List(result))
+            Ok(Value::list(result))
         }
         "list_filter" => {
             let lst = match args.first() {
@@ -6314,10 +6619,11 @@ impl Interpreter {
                     format!("list_filter: first arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_filter: requires list and fn args", sp)),
             };
+            args[0] = Value::Nil;
             let fn_val = args.into_iter().nth(1).ok_or_else(||
                 RuntimeError::at("list_filter: requires fn arg", sp.clone()))?;
             let mut result = Vec::new();
-            for item in lst {
+            for item in into_list_vec(lst) {
                 let out = self.call_value(fn_val.clone(), vec![item.clone()], sp.clone())?;
                 if out.as_bool().unwrap_or(match &out {
                     Value::Int(n) => *n != 0,
@@ -6328,7 +6634,7 @@ impl Interpreter {
                     result.push(item);
                 }
             }
-            Ok(Value::List(result))
+            Ok(Value::list(result))
         }
         "list_reduce" => {
             let lst = match args.first() {
@@ -6339,10 +6645,11 @@ impl Interpreter {
             };
             let fn_val = args.get(1).ok_or_else(||
                 RuntimeError::at("list_reduce: requires fn arg", sp.clone()))?.clone();
+            args[0] = Value::Nil;
             let init = args.into_iter().nth(2).ok_or_else(||
                 RuntimeError::at("list_reduce: requires init arg", sp.clone()))?;
             let mut acc = init;
-            for item in lst {
+            for item in into_list_vec(lst) {
                 acc = self.call_value(fn_val.clone(), vec![acc, item], sp.clone())?;
             }
             Ok(acc)
@@ -6354,11 +6661,12 @@ impl Interpreter {
                     format!("list_sort: arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_sort: requires list arg", sp)),
             };
-            lst.sort_by(|a, b| cmp_value(a, b));
+            args[0] = Value::Nil;
+            Rc::make_mut(&mut lst).sort_by(cmp_value);
             Ok(Value::List(lst))
         }
         "list_sort_by" => {
-            let mut lst = match args.first() {
+            let lst = match args.first() {
                 Some(Value::List(vs)) => vs.clone(),
                 Some(other) => return Err(RuntimeError::at(
                     format!("list_sort_by: first arg must be list, got {}", other.type_name()), sp)),
@@ -6368,7 +6676,7 @@ impl Interpreter {
                 RuntimeError::at("list_sort_by: requires fn arg", sp.clone()))?;
             // Compute keys first (avoids re-calling during sort which would need &mut self)
             let mut keys: Vec<Value> = Vec::with_capacity(lst.len());
-            for item in &lst {
+            for item in lst.iter() {
                 let k = self.call_value(fn_val.clone(), vec![item.clone()], sp.clone())?;
                 keys.push(k);
             }
@@ -6376,8 +6684,7 @@ impl Interpreter {
             let mut indices: Vec<usize> = (0..lst.len()).collect();
             indices.sort_by(|&a, &b| cmp_value(&keys[a], &keys[b]));
             let sorted: Vec<Value> = indices.into_iter().map(|i| lst[i].clone()).collect();
-            lst = sorted;
-            Ok(Value::List(lst))
+            Ok(Value::list(sorted))
         }
         "list_zip" => {
             let a = match args.first() {
@@ -6392,10 +6699,10 @@ impl Interpreter {
                     format!("list_zip: second arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_zip: requires second list arg", sp)),
             };
-            let pairs: Vec<Value> = a.into_iter().zip(b.into_iter())
-                .map(|(x, y)| Value::Tuple(vec![x, y]))
+            let pairs: Vec<Value> = a.iter().zip(b.iter())
+                .map(|(x, y)| Value::Tuple(vec![x.clone(), y.clone()]))
                 .collect();
-            Ok(Value::List(pairs))
+            Ok(Value::list(pairs))
         }
         "list_enumerate" => {
             let lst = match args.first() {
@@ -6404,10 +6711,11 @@ impl Interpreter {
                     format!("list_enumerate: arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_enumerate: requires list arg", sp)),
             };
-            let pairs: Vec<Value> = lst.into_iter().enumerate()
+            args[0] = Value::Nil;
+            let pairs: Vec<Value> = into_list_vec(lst).into_iter().enumerate()
                 .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v]))
                 .collect();
-            Ok(Value::List(pairs))
+            Ok(Value::list(pairs))
         }
         "list_flatten" => {
             let lst = match args.first() {
@@ -6416,14 +6724,15 @@ impl Interpreter {
                     format!("list_flatten: arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_flatten: requires list arg", sp)),
             };
+            args[0] = Value::Nil;
             let mut result = Vec::new();
-            for item in lst {
+            for item in into_list_vec(lst) {
                 match item {
-                    Value::List(inner) => result.extend(inner),
+                    Value::List(inner) => result.extend(into_list_vec(inner)),
                     other => result.push(other),
                 }
             }
-            Ok(Value::List(result))
+            Ok(Value::list(result))
         }
         "list_uniq" => {
             let lst = match args.first() {
@@ -6432,12 +6741,13 @@ impl Interpreter {
                     format!("list_uniq: arg must be list, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("list_uniq: requires list arg", sp)),
             };
+            args[0] = Value::Nil;
             let mut result: Vec<Value> = Vec::new();
-            for item in lst {
+            for item in into_list_vec(lst) {
                 let already_seen = result.iter().any(|prev| values_equal(prev, &item));
                 if !already_seen { result.push(item); }
             }
-            Ok(Value::List(result))
+            Ok(Value::list(result))
         }
         "list_sum" => {
             let lst = match args.first() {
@@ -6465,7 +6775,7 @@ impl Interpreter {
             if lst.is_empty() {
                 return Err(RuntimeError::at("list_min: list is empty", sp));
             }
-            let min = lst.into_iter().reduce(|a, b| {
+            let min = lst.iter().cloned().reduce(|a, b| {
                 if cmp_value(&a, &b) != std::cmp::Ordering::Greater { a } else { b }
             }).unwrap();
             Ok(min)
@@ -6480,7 +6790,7 @@ impl Interpreter {
             if lst.is_empty() {
                 return Err(RuntimeError::at("list_max: list is empty", sp));
             }
-            let max = lst.into_iter().reduce(|a, b| {
+            let max = lst.iter().cloned().reduce(|a, b| {
                 if cmp_value(&a, &b) != std::cmp::Ordering::Less { a } else { b }
             }).unwrap();
             Ok(max)
@@ -6493,16 +6803,17 @@ impl Interpreter {
             };
             let f = args.get(1).cloned()
                 .ok_or_else(|| RuntimeError::at("list_flat_map: requires function arg", sp.clone()))?;
+            args[0] = Value::Nil;
             let mut out = Vec::new();
-            for item in lst {
+            for item in into_list_vec(lst) {
                 let result = self.call_value(f.clone(), vec![item], sp.clone())?;
                 match result {
-                    Value::List(vs) => out.extend(vs),
+                    Value::List(vs) => out.extend(into_list_vec(vs)),
                     Value::Tuple(vs) => out.extend(vs),
                     other => out.push(other),
                 }
             }
-            Ok(Value::List(out))
+            Ok(Value::list(out))
         }
         "list_partition" => {
             let lst = match args.first() {
@@ -6511,13 +6822,14 @@ impl Interpreter {
             };
             let f = args.get(1).cloned()
                 .ok_or_else(|| RuntimeError::at("list_partition: requires predicate arg", sp.clone()))?;
+            args[0] = Value::Nil;
             let mut yes = Vec::new();
             let mut no = Vec::new();
-            for item in lst {
+            for item in into_list_vec(lst) {
                 let r = self.call_value(f.clone(), vec![item.clone()], sp.clone())?;
                 if matches!(r, Value::Bool(true)) { yes.push(item); } else { no.push(item); }
             }
-            Ok(Value::Tuple(vec![Value::List(yes), Value::List(no)]))
+            Ok(Value::Tuple(vec![Value::list(yes), Value::list(no)]))
         }
         "list_head" => {
             match args.first() {
@@ -6544,7 +6856,7 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("list_take: count arg required", sp)),
             };
             let take = (n.max(0) as usize).min(lst.len());
-            Ok(Value::List(lst.into_iter().take(take).collect()))
+            Ok(Value::list(lst[..take].to_vec()))
         }
         "list_drop" => {
             let lst = match args.first() {
@@ -6557,7 +6869,7 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("list_drop: count arg required", sp)),
             };
             let skip = (n.max(0) as usize).min(lst.len());
-            Ok(Value::List(lst.into_iter().skip(skip).collect()))
+            Ok(Value::list(lst[skip..].to_vec()))
         }
         "map_merge" => {
             let base_rc = match args.first() {
@@ -6606,7 +6918,8 @@ impl Interpreter {
             };
             let f = args.get(1).cloned()
                 .ok_or_else(|| RuntimeError::at("list_any: requires predicate arg", sp.clone()))?;
-            for item in lst {
+            args[0] = Value::Nil;
+            for item in into_list_vec(lst) {
                 let r = self.call_value(f.clone(), vec![item], sp.clone())?;
                 if matches!(r, Value::Bool(true)) { return Ok(Value::Bool(true)); }
             }
@@ -6619,7 +6932,8 @@ impl Interpreter {
             };
             let f = args.get(1).cloned()
                 .ok_or_else(|| RuntimeError::at("list_all: requires predicate arg", sp.clone()))?;
-            for item in lst {
+            args[0] = Value::Nil;
+            for item in into_list_vec(lst) {
                 let r = self.call_value(f.clone(), vec![item], sp.clone())?;
                 if !matches!(r, Value::Bool(true)) { return Ok(Value::Bool(false)); }
             }
@@ -6720,15 +7034,15 @@ impl Interpreter {
                         match entry {
                             Ok(e) => names.push(Value::Str(e.file_name().to_string_lossy().into_owned())),
                             Err(e) => return Ok(Value::Tuple(vec![
-                                Value::List(Vec::new()),
+                                Value::list(Vec::new()),
                                 Value::Str(format!("error: {}", e)),
                             ])),
                         }
                     }
-                    Ok(Value::Tuple(vec![Value::List(names), Value::Nil]))
+                    Ok(Value::Tuple(vec![Value::list(names), Value::Nil]))
                 }
                 Err(e) => Ok(Value::Tuple(vec![
-                    Value::List(Vec::new()),
+                    Value::list(Vec::new()),
                     Value::Str(format!("error: {}", e)),
                 ])),
             }
@@ -6870,6 +7184,119 @@ impl Interpreter {
             }
         }
 
+        // ── Ports (#402, PORTS.md §2/§6/§7.1) ────────────────────────────────
+        // Process-port floor: a child runtime speaking line-oriented JSON
+        // over stdin/stdout. All three builtins return `(_, Err)` where Err
+        // is nil or a str beginning with a PORTS.md §6 tag; code must match
+        // only the tag prefix.
+        "port_open" => {
+            let lang = match args.first() {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err(RuntimeError::at("port_open: lang must be str", sp)),
+            };
+            // Only the python runtime is wired up so far; others report
+            // `port-open` (PORTS.md: "runtime could not be started") rather
+            // than pretending.
+            if lang != "python" {
+                return Ok(Value::Tuple(vec![Value::Nil, Value::Str(format!(
+                    "port-open: unsupported runtime `{}` — the process-port floor implements `python`", lang))]));
+            }
+            match std::process::Command::new("python3")
+                .args(["-u", "-c", PY_PORT_HARNESS])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let stdin = child.stdin.take().expect("piped stdin");
+                    let stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+                    let id = self.next_port_id;
+                    self.next_port_id += 1;
+                    self.ports.insert(id, PortProc { child, stdin, stdout });
+                    Ok(Value::Tuple(vec![
+                        Value::Opaque(format!("port#{}:{}", id, lang)),
+                        Value::Nil,
+                    ]))
+                }
+                Err(e) => Ok(Value::Tuple(vec![Value::Nil, Value::Str(
+                    format!("port-open: failed to start python3: {}", e))])),
+            }
+        }
+        "port_call" => {
+            use std::io::{BufRead, Write};
+            let call_err = |msg: String| Ok(Value::Tuple(vec![
+                Value::Str(String::new()), Value::Str(msg)]));
+            let id = match port_handle_id(args.first()) {
+                Some(id) => id,
+                None => return Err(RuntimeError::at(
+                    "port_call: first arg must be a Port handle from port_open", sp)),
+            };
+            let name = match args.get(1) {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err(RuntimeError::at("port_call: name must be str", sp)),
+            };
+            let payload = match args.get(2) {
+                Some(Value::Str(s)) => s.clone(),
+                Some(Value::Nil) | None => String::new(),
+                _ => return Err(RuntimeError::at("port_call: payload must be a JSON str", sp)),
+            };
+            let port = match self.ports.get_mut(&id) {
+                Some(p) => p,
+                None => return call_err("port-closed: handle was already closed".to_string()),
+            };
+            let req = format!("{{\"name\":{},\"payload\":{}}}",
+                json_encode_str(&name), json_encode_str(&payload));
+            if let Err(e) = writeln!(port.stdin, "{}", req).and_then(|_| port.stdin.flush()) {
+                return call_err(format!("port-protocol: write failed: {}", e));
+            }
+            let mut line = String::new();
+            match port.stdout.read_line(&mut line) {
+                Ok(0) => return call_err("port-protocol: runtime closed the pipe".to_string()),
+                Ok(_) => {}
+                Err(e) => return call_err(format!("port-protocol: read failed: {}", e)),
+            }
+            match json_decode_str(line.trim()) {
+                Ok(Value::Map(m)) => {
+                    let m = m.borrow();
+                    if let Some(err) = m.get("err") {
+                        let msg = match err {
+                            Value::Str(s) => s.clone(),
+                            other => json_encode_value(other),
+                        };
+                        call_err(format!("port-call: {}", msg))
+                    } else if let Some(ok) = m.get("ok") {
+                        // Re-encode through the crate's canonical JSON writer,
+                        // so the result str is canonical regardless of the
+                        // foreign runtime's formatting.
+                        Ok(Value::Tuple(vec![
+                            Value::Str(json_encode_value(ok)), Value::Nil]))
+                    } else {
+                        call_err("port-protocol: response has neither `ok` nor `err`".to_string())
+                    }
+                }
+                Ok(_) => call_err("port-protocol: response is not a JSON object".to_string()),
+                Err(e) => call_err(format!("port-protocol: {}", e)),
+            }
+        }
+        "port_close" => {
+            let id = match port_handle_id(args.first()) {
+                Some(id) => id,
+                None => return Err(RuntimeError::at(
+                    "port_close: arg must be a Port handle from port_open", sp)),
+            };
+            match self.ports.remove(&id) {
+                Some(port) => {
+                    let PortProc { stdin, mut child, .. } = port;
+                    drop(stdin);               // EOF ends the harness loop
+                    let _ = child.wait();      // reap; exit status is not an error surface
+                    Ok(Value::Tuple(vec![Value::Nil, Value::Nil]))
+                }
+                None => Ok(Value::Tuple(vec![Value::Nil, Value::Str(
+                    "port-closed: handle was already closed".to_string())])),
+            }
+        }
+
         // ── CLI argument builtins ─────────────────────────────────────────────
         "cli_arg" => {
             let name = match args.first() {
@@ -7006,7 +7433,7 @@ impl Interpreter {
                     let matches: Vec<Value> = re.find_iter(&text)
                         .map(|m| Value::Str(m.as_str().to_string()))
                         .collect();
-                    Ok(Value::List(matches))
+                    Ok(Value::list(matches))
                 }
                 Err(e) => Err(RuntimeError::at(
                     format!("regex_find_all: invalid pattern `{}`: {}", pattern, e), sp)),
@@ -7064,7 +7491,7 @@ impl Interpreter {
                     let parts: Vec<Value> = re.split(&text)
                         .map(|p| Value::Str(p.to_string()))
                         .collect();
-                    Ok(Value::List(parts))
+                    Ok(Value::list(parts))
                 }
                 Err(e) => Err(RuntimeError::at(
                     format!("regex_split: invalid pattern `{}`: {}", pattern, e), sp)),
@@ -9258,7 +9685,7 @@ impl<'a> JsonParser<'a> {
         self.expect(b'[')?;
         self.skip_ws();
         let mut items = Vec::new();
-        if self.peek() == Some(b']') { self.consume(); return Ok(Value::List(items)); }
+        if self.peek() == Some(b']') { self.consume(); return Ok(Value::list(items)); }
         loop {
             items.push(self.parse_value()?);
             self.skip_ws();
@@ -9269,7 +9696,7 @@ impl<'a> JsonParser<'a> {
                 None => return Err("unterminated array".to_string()),
             }
         }
-        Ok(Value::List(items))
+        Ok(Value::list(items))
     }
 
     fn parse_object(&mut self) -> Result<Value, String> {

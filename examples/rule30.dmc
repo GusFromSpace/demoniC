@@ -18,7 +18,7 @@ fn main() -> nil {
     let W    = 79   # row width (odd, so centre is exact)
     let gens = 36   # generations to evolve
 
-    let !row = vault.zeros[f32, [79]]
+    let !row = forge.zeros[f32, [79]]
     row[39] = 1.0   # single seed cell at centre
 
     let !g = 0
@@ -33,7 +33,7 @@ fn main() -> nil {
         print(line)
 
         # ── compute next generation ────────────────────────────────────────
-        let !next = vault.zeros[f32, [79]]
+        let !next = forge.zeros[f32, [79]]
         let !j = 1
         while j < W - 1 {
             let l = row[j - 1] as i64

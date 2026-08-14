@@ -32,7 +32,7 @@ fn test_rot13_involution() -> bool {
 
 fn main() -> nil {
     # "HELLO WORLD" stored as ASCII codes in a tensor (space = 32)
-    let !msg = vault.zeros[f32, [11]]
+    let !msg = forge.zeros[f32, [11]]
     msg[0]  = 72.0   # H
     msg[1]  = 69.0   # E
     msg[2]  = 76.0   # L
@@ -51,7 +51,7 @@ fn main() -> nil {
     }
     print(orig_line)
 
-    let !encoded = vault.zeros[f32, [11]]
+    let !encoded = forge.zeros[f32, [11]]
     for i in 0..11 {
         encoded[i] = rot13_char(msg[i] as i64) as f32
     }
@@ -62,7 +62,7 @@ fn main() -> nil {
     }
     print(enc_line)
 
-    let !decoded = vault.zeros[f32, [11]]
+    let !decoded = forge.zeros[f32, [11]]
     for i in 0..11 {
         decoded[i] = rot13_char(encoded[i] as i64) as f32
     }
