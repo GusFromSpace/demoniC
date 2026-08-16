@@ -41,6 +41,12 @@ ALLOWLIST = {
     # once, the JIT accumulates in f32 per step — visible only at f32-ulp scale
     # in iterative/reduction-heavy programs.
     "examples/pagerank.dmc": "#241 residual — power iteration `M @ v`: matmul accumulation width (f64 interp vs f32 JIT)",
+    # Both became JIT-eligible only once `to_str` was lowered (#469); the
+    # divergence is pre-existing and the same #241 class as pagerank above —
+    # `total()` hand-accumulates 360 f32 adds, which the interpreter carries in
+    # f64 and the JIT in f32. Agreement holds to ~7 significant digits.
+    "examples/sim/lotka_volterra.dmc": "#241 residual — `total()` f32 accumulation loop (f64 interp vs f32 JIT)",
+    "examples/sim/lotka_volterra_meso.dmc": "#241 residual — `total()` f32 accumulation loop (f64 interp vs f32 JIT)",
 }
 
 _TENSOR_PREFIX = re.compile(r"Tensor\[[^\]]*\]\s*")

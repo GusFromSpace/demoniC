@@ -415,6 +415,13 @@ enum TyKind {
     /// the scrutinee's variant set (see `Jit::enums`). Distinct enums never
     /// unify, mirroring the interpreter's tagged `EnumVal`.
     Enum(String),
+    /// A tuple value. The JIT value is an i64 pointer to a forge-allocated
+    /// region of `n` uniform 8-byte slots, one per element, in order. Elements
+    /// are packed/unpacked by `pack_slot`/`unpack_slot` — narrow ints extend to
+    /// i64, floats go through their bit pattern, pointers store as-is — so the
+    /// layout does not vary with the element types. A 1-tuple is never
+    /// constructed: `(T)` is transparently `T`, matching both backends.
+    Tuple(Vec<TyKind>),
 }
 
 impl TyKind {
@@ -435,6 +442,10 @@ impl TyKind {
             TyKind::Fn(params, ret) => {
                 let ps: Vec<String> = params.iter().map(|p| p.render()).collect();
                 format!("fn({}) -> {}", ps.join(", "), ret.render())
+            }
+            TyKind::Tuple(els) => {
+                let es: Vec<String> = els.iter().map(|e| e.render()).collect();
+                format!("({})", es.join(", "))
             }
         }
     }
@@ -462,6 +473,7 @@ impl TyKind {
             TyKind::Bf16Tensor(_) => cl::I64, // bf16 tensors are i64 data pointers
             TyKind::Enum(_)   => cl::I64,  // #350: enums are i64 ordinals
             TyKind::Fn(_, _)         => cl::I64, // function pointers are i64 code pointers
+            TyKind::Tuple(_)  => cl::I64,  // tuples are i64 pointers to slot arrays
         }
     }
     fn is_tensor(&self) -> bool { matches!(self, TyKind::Tensor(_)) }
@@ -482,6 +494,9 @@ fn enumify(ty: TyKind, enums: &HashMap<String, Vec<String>>) -> TyKind {
         TyKind::Fn(params, ret) => TyKind::Fn(
             params.into_iter().map(|p| enumify(p, enums)).collect(),
             Box::new(enumify(*ret, enums)),
+        ),
+        TyKind::Tuple(els) => TyKind::Tuple(
+            els.into_iter().map(|e| enumify(e, enums)).collect(),
         ),
         other => other,
     }
@@ -509,6 +524,15 @@ struct EnumLayout {
 /// parameters are in scope.
 fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError> {
     match ty {
+        // `(A, B)` — a tuple type. The parser also builds a 1-element Tuple
+        // for plain parenthesised grouping, so `(T)` must stay transparently
+        // `T`; both backends agree on that (interp unwraps 1-tuples too).
+        Type::Tuple(els, _) if els.len() == 1 => ty_from_ast(&els[0], env),
+        Type::Tuple(els, _) => {
+            let mut out = Vec::with_capacity(els.len());
+            for e in els { out.push(ty_from_ast(e, env)?); }
+            Ok(TyKind::Tuple(out))
+        }
         Type::Scalar(ScalarType::Str, _) => Ok(TyKind::Str),
         Type::Scalar(_, _) => Ok(TyKind::Scalar(scalar_from_ast(ty)?)),
         Type::Tensor(inner, shape, span) => {
@@ -951,6 +975,8 @@ pub(crate) const JIT_BUILTINS: &[&str] = &[
     "map_new", "map_get", "map_set", "map_contains",
     // Terminal / timing builtins (parity with the interpreter).
     "chr", "sleep_ms", "flush",
+    // Stringification — sugar for `x as str`, sharing its formatters.
+    "to_str", "to_string",
 ];
 
 pub struct Jit {
@@ -2837,6 +2863,10 @@ impl Jit {
                 msg: "main returning a dynamic-shape tensor is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
+            TyKind::Tuple(_) => Err(JitError {
+                msg: "main returning a tuple is not supported (its lifetime crosses the JIT boundary)".into(),
+                line: 0, col: 0,
+            }),
             TyKind::Model(_, _) => Err(JitError {
                 msg: "main returning a model instance is not supported".into(),
                 line: 0, col: 0,
@@ -3946,10 +3976,7 @@ impl<'a> Translator<'a> {
             if let Some((recv, n_expr, axis_expr)) = as_tensor_split_call(&l.value) {
                 return self.lower_tensor_split_destructure(pats, recv, n_expr, axis_expr, &l.span);
             }
-            return unsupported(&l.span,
-                "tuple destructuring is only supported for \
-                 `let (loss, g) = f.fwd_bwd(...)` / `f.fwd_bwd_bwd(...)` \
-                 and `let (a, b, ..) = t.split[n, axis=k]`");
+            return self.lower_tuple_destructure(pats, &l.value, &l.span);
         }
         let name = match &l.pattern {
             Pattern::Ident(n, _) => n.clone(),
@@ -4957,7 +4984,7 @@ impl<'a> Translator<'a> {
                 Ok((cv, target))
             }
             Expr::Tuple(elems, _) if elems.len() == 1 => self.lower_expr(&elems[0]),
-            Expr::Tuple(_, span) => unsupported(span, "tuples"),
+            Expr::Tuple(els, span) => self.lower_tuple(els, span),
             Expr::TensorLit(elems, span) => self.lower_tensor_literal(elems, span),
             Expr::Match(m) => self.lower_match_expr(m),
             Expr::FnLit(f) => self.lower_fn_lit(f),
@@ -5035,6 +5062,96 @@ impl<'a> Translator<'a> {
     /// Lower a struct literal `ModelName { field: expr, ... }` by
     /// forge-allocating a flat 8-bytes-per-field struct and writing each
     /// field value. Returns an `i64` pointer typed as `TyKind::Model(name)`.
+    /// `(a, b, c)` — a tuple value. Laid out exactly like a model instance:
+    /// a forge region of `n` uniform 8-byte slots, element `i` at `i*8`,
+    /// packed by `encode_for_slot` so the layout is independent of the element
+    /// types. A 1-element tuple is the parser's parenthesised-grouping form
+    /// and is returned transparently, matching the interpreter.
+    fn lower_tuple(&mut self, els: &[Expr], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        if els.len() == 1 {
+            return self.lower_expr(&els[0]);
+        }
+        if els.is_empty() {
+            return unsupported(span, "the empty tuple `()`");
+        }
+        let ptr = self.forge_alloc(els.len() as i64 * 8);
+        let mut tys = Vec::with_capacity(els.len());
+        for (i, e) in els.iter().enumerate() {
+            let (val, ty) = self.lower_expr(e)?;
+            // #249: putting an aliasing place-expression into a tuple is a
+            // value copy, exactly as `let y = x` is — otherwise mutating the
+            // source would write through the tuple.
+            let val = if is_aliasing_place_expr(e) {
+                self.copy_tensor_value(val, &ty)
+            } else { val };
+            let store_val = self.encode_for_slot(val, &ty);
+            let off = self.builder.ins().iconst(cl::I64, i as i64 * 8);
+            let slot = self.builder.ins().iadd(ptr, off);
+            self.builder.ins().store(
+                cranelift::codegen::ir::MemFlagsData::new(), store_val, slot, 0);
+            tys.push(ty);
+        }
+        Ok((ptr, TyKind::Tuple(tys)))
+    }
+
+    /// `let (a, b) = <tuple expr>` — bind each element to its name. Supports
+    /// the `..` rest form (`(a, .., z)`), matching the interpreter's
+    /// `bind_pattern`. An arity mismatch is a compile error here: the
+    /// interpreter binds the surplus names to nil, which would be a silent
+    /// divergence, so the JIT refuses loudly instead.
+    fn lower_tuple_destructure(&mut self, pats: &[Pattern], value: &Expr, span: &Span)
+        -> Result<(), JitError>
+    {
+        let (ptr, ty) = self.lower_expr(value)?;
+        let els = match &ty {
+            TyKind::Tuple(els) => els.clone(),
+            other => return unsupported(span, &format!(
+                "tuple destructuring needs a tuple on the right-hand side, got `{}`",
+                other.render())),
+        };
+        let rest_at = pats.iter().position(|p| matches!(p, Pattern::Rest(_)));
+        let named = if rest_at.is_some() { pats.len() - 1 } else { pats.len() };
+        if rest_at.is_some() {
+            if named > els.len() {
+                return unsupported(span, &format!(
+                    "tuple has {} elements but the pattern binds at least {}",
+                    els.len(), named));
+            }
+        } else if named != els.len() {
+            return unsupported(span, &format!(
+                "tuple has {} elements but the pattern binds {}",
+                els.len(), pats.len()));
+        }
+        // With a rest pattern the leading names take the head and the trailing
+        // names take the tail; the middle is absorbed.
+        let head = rest_at.unwrap_or(pats.len());
+        let tail = pats.len().saturating_sub(head + 1);
+        for (pi, pat) in pats.iter().enumerate() {
+            let ei = if rest_at.is_none() || pi < head {
+                pi
+            } else if matches!(pat, Pattern::Rest(_)) {
+                continue;
+            } else {
+                els.len() - (pats.len() - pi)
+            };
+            let name = match pat {
+                Pattern::Ident(n, _) if n != "_" => n.clone(),
+                Pattern::Ident(_, _) | Pattern::Wildcard(_) => continue,
+                _ => return unsupported(span,
+                    "only plain names, `_`, and `..` are supported in a tuple pattern"),
+            };
+            let ety = els[ei].clone();
+            let off = self.builder.ins().iconst(cl::I64, ei as i64 * 8);
+            let slot = self.builder.ins().iadd(ptr, off);
+            let v = self.decode_from_slot(slot, &ety);
+            self.declare_local(name, ety, v);
+        }
+        let _ = tail;
+        Ok(())
+    }
+
     fn lower_struct_lit(
         &mut self,
         name: &str,
@@ -5407,11 +5524,29 @@ impl<'a> Translator<'a> {
         self.enter(then_block);
         let then_val = self.lower_block_value(&i.then_branch)?;
         let then_filled = self.is_filled();
-        let mut join_ty: Option<TyKind> = then_val.as_ref().map(|(_, k)| k.clone());
+        // The join carries a phi param only if EVERY fall-through predecessor
+        // supplies a value. Previously the param was appended whenever the
+        // *then* branch produced one, so `if c { 5 }` (no else) and
+        // `if c { 5 } else { }` both gave the join a param while the else-side
+        // fall-through jumped with zero args — a Cranelift `mismatched
+        // argument count` verifier error, and a hard compile failure for any
+        // program containing that shape.
+        //
+        // The decision has to be made HERE, before the then-side jump:
+        // Cranelift's FunctionBuilder requires a block be terminated before
+        // switching away from it, so the else branch cannot be lowered first
+        // to find out. `else_can_yield_value` answers it syntactically instead
+        // — conservatively, so it only ever *removes* a phi in the shapes that
+        // currently fail to compile.
+        let mut join_ty: Option<TyKind> = if else_can_yield_value(&i.else_branch) {
+            then_val.as_ref().map(|(_, k)| k.clone())
+        } else {
+            None
+        };
         if !then_filled {
-            match &then_val {
-                Some((v, _)) => self.jump(join, &[*v]),
-                None => self.jump(join, &[]),
+            match (&then_val, &join_ty) {
+                (Some((v, _)), Some(_)) => self.jump(join, &[*v]),
+                _ => self.jump(join, &[]),
             }
         }
         self.builder.seal_block(then_block);
@@ -5447,9 +5582,9 @@ impl<'a> Translator<'a> {
             }
         }
         if !else_filled {
-            match &else_val {
-                Some((v, _)) => self.jump(join, &[*v]),
-                None => self.jump(join, &[]),
+            match (&else_val, &join_ty) {
+                (Some((v, _)), Some(_)) => self.jump(join, &[*v]),
+                _ => self.jump(join, &[]),
             }
         }
         self.builder.seal_block(else_block);
@@ -6456,6 +6591,8 @@ impl<'a> Translator<'a> {
                         "fuse-infeasible: KV-cache arrays are not supported inside @fuse"),
                     Some(TyKind::ModelArray(_, _, _)) => err(ispan,
                         "fuse-infeasible: model arrays are not supported inside @fuse"),
+                    Some(TyKind::Tuple(_)) => err(ispan,
+                        "fuse-infeasible: a tuple has no elementwise form"),
                     Some(TyKind::Fn(_, _)) => err(ispan,
                         "fuse-infeasible: function pointer values are not supported inside @fuse"),
                     Some(TyKind::TritTensor(_)) => err(ispan,
@@ -6850,6 +6987,22 @@ impl<'a> Translator<'a> {
         // Every arm here MUST appear in `JIT_BUILTINS` and be implemented in
         // the interpreter too — parity is enforced by jit::tests::builtin_parity_*.
         match name.as_str() {
+            // `to_str(x)` / `to_string(x)` are the call-form spelling of
+            // `x as str` and lower through the identical coercion, so the two
+            // spellings cannot drift apart in formatting.
+            "to_str" | "to_string" => {
+                if args.len() != 1 {
+                    return err(span, format!(
+                        "`{}` takes exactly 1 argument, got {}", name, args.len()));
+                }
+                let e = match &args[0] {
+                    CallArg::Positional(e) => e,
+                    _ => return unsupported(span, "non-positional arg to `to_str`"),
+                };
+                let (v, k) = self.lower_expr(e)?;
+                let out = self.coerce_to(v, &k, &TyKind::Str, span)?;
+                return Ok((out, TyKind::Str));
+            }
             "len" => return self.lower_builtin_len(args, span),
             "str_concat"   => return self.lower_builtin_str_concat(args, span),
             "str_eq"       => return self.lower_builtin_str_eq(args, span),
@@ -8023,7 +8176,8 @@ impl<'a> Translator<'a> {
         // float leaf is f32. This matches the interpreter, which carries integer
         // tensor literals as i64 — without it, `Tensor[i64, …]` params reject a
         // literal arg under JIT. (#273 follow-up.)
-        let all_int = !leaves.is_empty() && leaves.iter().all(|e| is_int_literal_leaf(e));
+        let all_int = !leaves.is_empty()
+            && leaves.iter().all(|e| is_int_literal_leaf(e) || self.peek_leaf_is_int(e));
         let elem = if all_int { ScalarKind::I64 } else { ScalarKind::F32 };
         let t = TensorTy { elem, shape };
         let ptr = self.forge_alloc(t.nbytes());
@@ -8048,6 +8202,39 @@ impl<'a> Translator<'a> {
     /// is a bare identifier whose type in `local_tys` is `TyKind::KV`. This
     /// lets `lower_tensor_literal` choose the KvArray path before emitting any
     /// Cranelift IR (which cannot be rolled back).
+    /// Does this tensor-literal leaf statically carry an integer value?
+    /// Complements the purely syntactic `is_int_literal_leaf`, which only sees
+    /// literals — so `[h[i, 0], h[i, 1]]`, whose leaves are i64 *elements of an
+    /// i64 tensor*, was typed f32 and then needed a lossy f32→i64 conversion at
+    /// the first `Tensor[i64, ..]` parameter it met. Values above 2^24 would
+    /// not survive that round trip, and the interpreter (which types by value)
+    /// never performs it, so this is a divergence waiting to happen rather than
+    /// a mere inconvenience.
+    ///
+    /// Answers from `local_tys` WITHOUT emitting IR, because the element kind
+    /// must be chosen before any element is lowered and Cranelift IR cannot be
+    /// rolled back. Conservative: `false` whenever the answer is not obvious,
+    /// which reproduces the previous f32 behaviour.
+    fn peek_leaf_is_int(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Ident(n, _) => matches!(
+                self.local_tys.get(n.as_str()),
+                Some(TyKind::Scalar(sk)) if sk.is_int()
+            ),
+            // `t[i]` / `t[i, j]` — an element of an integer tensor.
+            Expr::Postfix { expr, op: PostfixOp::Index(_), .. } => {
+                if let Expr::Ident(n, _) = expr.as_ref() {
+                    matches!(
+                        self.local_tys.get(n.as_str()),
+                        Some(TyKind::Tensor(t)) if t.elem.is_int()
+                    )
+                } else { false }
+            }
+            Expr::UnOp { op: UnOp::Neg, operand, .. } => self.peek_leaf_is_int(operand),
+            _ => false,
+        }
+    }
+
     fn peek_kv_lit_elem_type(&self, elems: &[Expr]) -> Option<&KvTy> {
         let first = elems.first()?;
         let name = match first {
@@ -15815,6 +16002,9 @@ impl<'a> Translator<'a> {
             TyKind::Model(_, _) => {
                 return unsupported(span, "unary operators are not supported on model instances");
             }
+            TyKind::Tuple(_) => {
+                return unsupported(span, "unary operators are not supported on tuples");
+            }
             TyKind::Str => {
                 return unsupported(span, "unary operators are not defined on str");
             }
@@ -16897,6 +17087,25 @@ impl<'a> Translator<'a> {
         }
         match (from, to) {
             (TyKind::Scalar(f), TyKind::Scalar(t)) => self.coerce_scalar(v, *f, *t, span),
+            // Tuple → tuple of the same arity: rebuild element-wise. Identical
+            // tuples never get here (`from == to` short-circuits above), so
+            // this fires only when some element needs converting — typically a
+            // float literal defaulting wide against a narrower declared
+            // element type, e.g. `(7, 2.5)` returned as `(i64, f32)`.
+            (TyKind::Tuple(fs), TyKind::Tuple(ts)) if fs.len() == ts.len() => {
+                let out = self.forge_alloc(ts.len() as i64 * 8);
+                for (i, (ft, tt)) in fs.iter().zip(ts.iter()).enumerate() {
+                    let off = self.builder.ins().iconst(cl::I64, i as i64 * 8);
+                    let src = self.builder.ins().iadd(v, off);
+                    let raw = self.decode_from_slot(src, ft);
+                    let conv = self.coerce_to(raw, ft, tt, span)?;
+                    let packed = self.encode_for_slot(conv, tt);
+                    let dst = self.builder.ins().iadd(out, off);
+                    self.builder.ins().store(
+                        cranelift::codegen::ir::MemFlagsData::new(), packed, dst, 0);
+                }
+                Ok(out)
+            }
             // Tensor values in JIT IR are I64 data pointers — passing a tensor
             // where *T is expected (extern fn boundary) is a zero-cost bitcast.
             (TyKind::Tensor(_), TyKind::Scalar(ScalarKind::I64)) => Ok(v),
@@ -18880,6 +19089,78 @@ mod tests {
         assert_eq!(
             jit_run_i64("fn main() -> i64 { if 3 < 5 { 7 } else { 9 } }").unwrap(),
             7,
+        );
+    }
+
+    #[test]
+    fn jit_valueless_if_no_else_phi_arity() {
+        // An `if` with no `else` whose then-branch ends in a value expression
+        // used to give the join block a phi param while the else-side
+        // fall-through jumped with zero args — a Cranelift verifier error that
+        // failed the whole function's compilation, not just this statement.
+        assert_eq!(
+            jit_run_i64(
+                "fn main() -> i64 { let !n = 0  for i in 0..3 { if i > 0 { n = n + 1  n } }  n }"
+            ).unwrap(),
+            2,
+        );
+        // Same shape with an `else` block that supplies no value.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { let !n = 5  if n > 1 { 9 } else { }  n }").unwrap(),
+            5,
+        );
+    }
+
+    #[test]
+    fn jit_value_carrying_if_still_works() {
+        // The fix must not suppress the phi when both branches DO carry a
+        // value, including through an `else if` chain and when one branch
+        // terminates instead of falling through.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { if 3 < 5 { 7 } else if 1 > 0 { 8 } else { 9 } }").unwrap(),
+            7,
+        );
+        assert_eq!(
+            jit_run_i64("fn f(c: bool) -> i64 { if c { return 7 } else { 3 } }\n                         fn main() -> i64 { f(false) }").unwrap(),
+            3,
+        );
+    }
+
+    #[test]
+    fn jit_tuples_construct_and_destructure() {
+        // Tuple-typed signatures were rejected outright ("JIT accepts only
+        // scalar and Tensor types in fn signatures"), which took every program
+        // using one out of the JIT entirely.
+        assert_eq!(
+            jit_run_i64("fn pair() -> (i64, i64) { (3, 4) }\n                         fn main() -> i64 { let (a, b) = pair()  a + b }").unwrap(),
+            7,
+        );
+        // Mixed element types, exercising the element-wise coercion path.
+        assert_eq!(
+            jit_run_i64("fn mixed() -> (i64, f32) { (7, 2.5) }\n                         fn main() -> i64 { let (n, x) = mixed()  n + (x as i64) }").unwrap(),
+            9,
+        );
+        // `(T)` is parenthesised grouping, not a 1-tuple — must stay transparent.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { let x = (5)  x + 1 }").unwrap(),
+            6,
+        );
+        // `_` and the `..` rest form in a tuple pattern.
+        assert_eq!(
+            jit_run_i64("fn t3() -> (i64, i64, i64) { (1, 2, 3) }\n                         fn main() -> i64 { let (a, .., c) = t3()  let (_, y, _) = t3()  a + c + y }").unwrap(),
+            6,
+        );
+    }
+
+    #[test]
+    fn jit_int_tensor_literal_from_int_elements() {
+        // A tensor literal whose leaves are i64 *expressions* (not literals)
+        // used to type f32, so passing it to a `Tensor[i64, ..]` parameter
+        // needed an f32 round trip — silently lossy above 2^24. It must type
+        // i64 directly and preserve the value exactly.
+        assert_eq!(
+            jit_run_i64("fn take(t: Tensor[i64, [2]]) -> i64 { t[0] }\n                         fn main() -> i64 {\n                             let !h = forge.zeros[i64, [2]]\n                             h[0] = 16777217\n                             h[1] = 3\n                             take([h[0], h[1]])\n                         }").unwrap(),
+            16777217,
         );
     }
 
@@ -25531,4 +25812,35 @@ fn main() -> i64 {
             c <- a  c <- a\n  \
             sum(c) as i64\n}");
     }
+}
+
+/// Can this else-side fall through *carrying a value*? Purely syntactic, so it
+/// is answerable before the branch is lowered — which is what `lower_if` needs,
+/// since Cranelift requires a block be terminated before switching away from
+/// it and therefore forces the then-side jump to be emitted first.
+///
+/// Conservative in the safe direction: `true` means "might yield", `false`
+/// means "definitely does not". A `false` result is the only thing that
+/// changes behaviour, and it only suppresses a phi param that would otherwise
+/// have made the function fail to compile.
+fn else_can_yield_value(e: &Option<ElseBranch>) -> bool {
+    match e {
+        None => false,
+        Some(ElseBranch::Block(b)) => block_can_yield_value(b),
+        // An `else if` chain: assume it might. Saying "might" preserves the
+        // pre-existing behaviour, which is correct whenever both sides really
+        // do carry a value; only a definite "no" is allowed to change anything.
+        Some(ElseBranch::If(_)) => true,
+    }
+}
+
+/// Might this block fall through carrying a value? A block yields its
+/// `tail_expr`, but note that a *trailing block-form* `if`/`match` parses as a
+/// statement rather than a tail expression (#421), so an empty `tail_expr`
+/// alone does not mean "no value".
+fn block_can_yield_value(b: &crate::ast::Block) -> bool {
+    if b.tail_expr.is_some() {
+        return true;
+    }
+    matches!(b.stmts.last(), Some(Stmt::If(_)) | Some(Stmt::Match(_)))
 }
