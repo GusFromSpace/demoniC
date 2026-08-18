@@ -1,10 +1,10 @@
-# jit_training_demo.dmc -- Phase 4 JIT slice 7 (issue #15).
+# jit_training_demo.dmc -- a full training loop under the JIT.
 #
 # A complete gradient-descent training loop in pure demoniC. No host
 # driver, no Python -- the forward pass, the backward pass, and the
 # weight update all JIT-compile to native code and run in one process.
 #
-# The `.fwd_bwd` source surface (AUTODIFF.md §1) is the key addition:
+# The `.fwd_bwd` source surface is the key addition:
 #   let (loss, dW) = f.fwd_bwd(W, x)
 # returns the loss AND the gradient of the single `!` mut parameter, so
 # the optimizer step `W = W .- lr .* dW` closes the loop entirely inside

@@ -1,6 +1,6 @@
 # ast_eval.dmc — payload-carrying tagged unions, the canonical demoniC idiom for
 # translating a Rust/Python `enum` whose variants carry data (`Expr::Binary(op,
-# lhs, rhs)`), the pattern that pervades lexers/parsers/ASTs. See SPEC.md §4.5.
+# lhs, rhs)`), the pattern that pervades lexers/parsers/ASTs.
 #
 # Three pieces:
 #   1. a tagged `model` — a `kind` discriminant + the *union* of every variant's

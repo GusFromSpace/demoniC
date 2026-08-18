@@ -1,6 +1,6 @@
 # m1_csg.dmc — SDF raymarcher, milestone M1: the combinator algebra.
 #
-# Builds on m0_sphere.dmc. The new idea is DESIGN.md §3: a scene is
+# Builds on m0_sphere.dmc. The new idea is SDF combinators: a scene is
 # multiple primitive SDFs combined with branchless operators —
 #   union        smin(a,b) = 0.5*(a + b - |a-b|)   (nearest surface)
 #   intersection smax(a,b) = 0.5*(a + b + |a-b|)
@@ -43,7 +43,7 @@ fn sdf_box[H, W](
     let oz = \>qz
     let outside = (ox .* ox .+ oy .* oy .+ oz .* oz) .^ 0.5
     # max(qx,qy,qz) via nested smax, then min(.,0).
-    # NB: `\<` is GeLU in demoniC (OPERATORS.md §3) — so min(x,0) is
+    # NB: `\<` is GeLU in demoniC — so min(x,0) is
     # written branchlessly as `x .- \>x`.
     let m2 = 0.5 .* (qy .+ qz .+ abs_t[H,W](qy .- qz))
     let mx = 0.5 .* (qx .+ m2 .+ abs_t[H,W](qx .- m2))
@@ -51,7 +51,7 @@ fn sdf_box[H, W](
     outside .+ inside
 }
 
-# ── Combinators (DESIGN.md §3) ────────────────────────────────────────
+# ── Combinators ───────────────────────────────────────────────────────
 
 fn op_union[H, W](a: Tensor[f32,[H,W]], b: Tensor[f32,[H,W]]) -> Tensor[f32,[H,W]] {
     0.5 .* (a .+ b .- abs_t[H,W](a .- b))
@@ -103,7 +103,7 @@ fn main() -> nil {
     let dy = ry ./ rl
     let dz = rz ./ rl
 
-    # ── March (DESIGN.md §4), now over the combined scene ──
+    # ── March, now over the combined scene ─────────────────
     let !t    = forge.zeros[f32, [120, 160]]
     let !done = forge.zeros[f32, [120, 160]]
 
@@ -187,7 +187,7 @@ fn main() -> nil {
     let G = hitmask .* (albG .* shade) .+ (1.0 .- hitmask) .* bgG
     let B = hitmask .* (albB .* shade) .+ (1.0 .- hitmask) .* bgB
 
-    # ── Serialize to a P3 PPM (per-row build; DESIGN.md §7.B, §8.1) ──
+    # ── Serialize to a P3 PPM (per-row build) ────────────────────────
     let !ppm = "P3\n" + to_str(W) + " " + to_str(H) + "\n255\n"
     let !r0 = 0
     while r0 < H {

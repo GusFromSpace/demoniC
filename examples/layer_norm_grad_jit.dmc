@@ -1,4 +1,4 @@
-# layer_norm forward + reverse-mode VJP under the JIT (#368).
+# layer_norm forward + reverse-mode VJP under the JIT.
 #
 # layer_norm is the transformer normalizer (GPT/BERT-style); the third fused
 # tensor op to differentiate under the JIT @grad subset (after softmax and

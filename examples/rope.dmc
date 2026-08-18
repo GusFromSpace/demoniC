@@ -1,5 +1,4 @@
 # rope.dmc — fused rotary position embedding from the stdlib.
-# Normative since spec 0.0.3. See STDLIB.md §3.5.
 
 # RoPE encodes absolute and relative position into query/key tensors
 # via paired-coordinate rotation per position. The stdlib's `rope`

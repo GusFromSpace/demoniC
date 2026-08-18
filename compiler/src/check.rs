@@ -429,7 +429,7 @@ impl Checker {
                         format!(
                             "`pub` is not allowed on `extern fn` `{}` — an `extern fn` is \
                              always exported; the `pub` keyword on it is a compile-time error \
-                             (SPEC.md §9)",
+                             (see the spec's `extern fn` rules)",
                             e.name),
                         e.span.clone(),
                     );
@@ -464,7 +464,7 @@ impl Checker {
                 self.warn(
                     format!("directive `@{}` is not implemented — it is parsed but has no effect", d.name),
                     d.span.clone(),
-                    Some("remove it; if it should do something, see #369".to_string()),
+                    Some("remove it; it has no effect in this version".to_string()),
                 );
             }
         }
@@ -541,7 +541,7 @@ impl Checker {
             for name in captured {
                 self.error_with_hint(
                     format!("captured mutable binding `{}` is not differentiable inside a \
-                             `@grad fn` (#398) — its gradient is silently absent", name),
+                             `@grad fn` — its gradient is silently absent", name),
                     f.body.span.clone(),
                     Some(format!("pass `{}` as a `!` parameter so it enters the gradient tape", name)),
                 );
@@ -614,7 +614,7 @@ impl Checker {
         if !has_mut_param {
             self.error(
                 "`@grad fn` with no `!` (mut) parameter has nothing to differentiate \
-                 (AUTODIFF.md §2)",
+                 (see the spec on `@grad`)",
                 f.span.clone(),
             );
         }
@@ -750,8 +750,8 @@ impl Checker {
     fn check_let(&mut self, l: &LetStmt) -> TyType {
         let value_ty = self.check_expr(&l.value);
         // Footgun lint (#232): `let !x = x` rebinds a name to a copy of itself —
-        // redundant dead code, and (in runs) the signature of LLM
-        // repetition-collapse. Only fire when the RHS name actually resolves, so
+        // redundant dead code that type-checks clean, so nothing else catches
+        // it. Only fire when the RHS name actually resolves, so
         // a genuine `let x = x` on an undefined `x` stays a plain undefined error.
         if let (Pattern::Ident(pname, _), Expr::Ident(vname, _)) = (&l.pattern, &l.value) {
             if pname == vname && self.env.lookup(vname).is_some() {
@@ -1003,7 +1003,7 @@ impl Checker {
                 }
                 Stmt::Expr { lhs, .. } => self.check_expr(lhs),
                 Stmt::Stage { body, .. } => self.check_stage_expr(body),
-                Stmt::If(ie) => self.check_if(ie),
+                Stmt::If(ie) => self.check_if(ie, true),   // block's trailing value
                 Stmt::Match(me) => self.check_match(me),
                 _ => unreachable!(),
             }
@@ -1101,7 +1101,7 @@ impl Checker {
                                     format!(
                                         "cross-arena write: `{root}` lives in the Vault; \
                                          mutating it belongs in an explicit `vault {{ … }}` \
-                                         block (MEMORY §3.1)"),
+                                         block"),
                                     span.clone(),
                                     Some(format!(
                                         "wrap the write: `vault {{ {root}[…] = … }}` — or \
@@ -1258,7 +1258,8 @@ impl Checker {
                     }
                 }
             }
-            Stmt::If(if_expr) => { let _ = self.check_if(if_expr); }
+            // A bare `if` statement — its value is discarded (#479).
+            Stmt::If(if_expr) => { let _ = self.check_if(if_expr, false); }
             Stmt::Match(me) => { let _ = self.check_match(me); }
             Stmt::For { pattern, iter, body, span } => {
                 let iter_ty = self.check_expr(iter);
@@ -1279,8 +1280,7 @@ impl Checker {
                             format!(
                                 "stream-iteration-aliasing: `{iter_name} <- …` inside a \
                                  `for` loop iterating `{iter_name}` — bind a snapshot \
-                                 first (`let snap = {iter_name}`) and iterate that \
-                                 (MEMORY §9.1)"),
+                                 first (`let snap = {iter_name}`) and iterate that"),
                             hit,
                         );
                     }
@@ -1347,23 +1347,74 @@ impl Checker {
         }
     }
 
-    fn check_if(&mut self, if_expr: &IfExpr) -> TyType {
+    /// `value_pos` is false for an `if` written as a bare statement, whose
+    /// value is discarded (#479). `if c { save() } else { }` calls something
+    /// for its effect on one side and does nothing on the other; the branch
+    /// "types" are incidental there and unifying them would reject legal code.
+    /// Everywhere the value is actually used — a `let`, an argument, a block's
+    /// trailing expression — the branches must agree.
+    fn check_if(&mut self, if_expr: &IfExpr, value_pos: bool) -> TyType {
         let _ = self.check_expr(&if_expr.cond);
         let then_ty = self.check_block(&if_expr.then_branch);
         match &if_expr.else_branch {
             Some(ElseBranch::Block(b)) => {
                 let else_ty = self.check_block(b);
-                // If one arm diverges (⊥, modelled as Unknown), the if-expression
-                // takes the other arm's type. This makes
-                // `if c { v } else { panic(..) }` yield `typeof v`.
-                if matches!(then_ty, TyType::Unknown) { else_ty }
-                else if matches!(else_ty, TyType::Unknown) { then_ty }
-                else if then_ty.compatible_with(&else_ty) { then_ty }
-                else { TyType::Unit }
+                if !value_pos { return TyType::Unit; }
+                self.unify_if_branches(then_ty, else_ty, &if_expr.span)
             }
-            Some(ElseBranch::If(nested)) => self.check_if(nested),
+            // #479: an `else if` chain must unify with the leading branch too.
+            // This arm used to `return self.check_if(nested)` and DISCARD
+            // `then_ty` outright, so `if a { 1 } else if b { "x" } else { 2 }`
+            // reported no error at all — the first branch's type never met the
+            // rest of the chain.
+            Some(ElseBranch::If(nested)) => {
+                let else_ty = self.check_if(nested, value_pos);
+                if !value_pos { return TyType::Unit; }
+                self.unify_if_branches(then_ty, else_ty, &if_expr.span)
+            }
+            // No `else`: the `if` yields no value on the false path, so the
+            // expression is Unit regardless of what the then-branch produces.
             None => TyType::Unit,
         }
+    }
+
+    /// Unify the two branch types of an `if`/`else` (#479).
+    ///
+    /// `match` has done this since #244; `if` did not, and silently produced
+    /// `Unit` on a mismatch. Two things followed. When the result was consumed,
+    /// the diagnostic named `nil` and pointed at the CONSUMER, sending the
+    /// reader to look for a missing return value several lines from the actual
+    /// mistake. When it was not consumed by an annotated binding, nothing was
+    /// reported at all: `if a > 0 { "x" } else { a }` type-checked clean with a
+    /// `str` branch and an `i64` branch.
+    ///
+    /// Deliberately the SAME predicate `match` uses (`compatible_with`, with
+    /// `Unknown` exempt as the diverging/bottom type), so the two forms cannot
+    /// drift apart — `if c { v } else { panic(..) }` still yields `typeof v`.
+    fn unify_if_branches(&mut self, then_ty: TyType, else_ty: TyType, span: &Span) -> TyType {
+        if matches!(then_ty, TyType::Unknown) { return else_ty; }
+        if matches!(else_ty, TyType::Unknown) { return then_ty; }
+        if then_ty.compatible_with(&else_ty) {
+            // Prefer the concrete side: an untyped literal adopts its context
+            // (SPEC §"Untyped numeric literals"), so `if c { 0.0 } else { x_f32 }`
+            // is an f32, not a float literal.
+            return match (&then_ty, &else_ty) {
+                (TyType::IntLit(_) | TyType::FloatLit(_), other)
+                    if !matches!(other, TyType::IntLit(_) | TyType::FloatLit(_)) => else_ty,
+                _ => then_ty,
+            };
+        }
+        self.error(
+            format!(
+                "`if` branches yield incompatible types: the `if` branch is `{}`, \
+                 the `else` branch is `{}`",
+                then_ty, else_ty,
+            ),
+            span.clone(),
+        );
+        // Report the then-branch's type rather than Unit so a single mismatch
+        // produces ONE diagnostic instead of cascading `nil` errors downstream.
+        then_ty
     }
 
     fn check_match(&mut self, me: &MatchExpr) -> TyType {
@@ -1388,7 +1439,7 @@ impl Checker {
             // until shape-pattern matching lands. (`x @ pat` binds are implemented.)
             if let Pattern::Shape(_, sp) = &arm.pattern {
                 self.error(
-                    "shape patterns in `match` are not yet implemented (#393) — they are \
+                    "shape patterns in `match` are not yet implemented — they are \
                      parsed but never match at runtime; guard on `t.shape` instead",
                     sp.clone(),
                 );
@@ -1645,7 +1696,7 @@ impl Checker {
                             format!(
                                 "read of uninitialized memory: `{name}` comes from \
                                  `forge.uninit`/`vault.uninit` and nothing has been \
-                                 written to it yet (MEMORY §2)"),
+                                 written to it yet"),
                             span.clone(),
                         );
                     }
@@ -1746,7 +1797,7 @@ impl Checker {
                         if total > 256 {
                             self.warn(
                                 format!("tensor literal has {total} elements — literals are for \
-                                         small, human-legible constants (SPEC §4.2 warns past 256)"),
+                                         small, human-legible constants (past 256 elements)"),
                                 lit_span.clone(),
                                 Some("for bulk data use `forge.zeros/ones/uninit` and fill, \
                                       or `vault.load` for constants".to_string()),
@@ -1757,7 +1808,7 @@ impl Checker {
                 ty
             }
             Block(b) => self.check_block(b),
-            If(ie) => self.check_if(ie),
+            If(ie) => self.check_if(ie, true),
             Match(me) => self.check_match(me),
             FnLit(fl) => {
                 self.env.push_scope();
@@ -2006,6 +2057,18 @@ impl Checker {
                         (TyType::FloatLit(_), TyType::IntLit(_)) => lt,
                         // One untyped literal adopts the other (concrete) operand.
                         (TyType::IntLit(_), _) | (TyType::FloatLit(_), _) => rt,
+                        // #473: two concrete floats of different widths — the
+                        // WIDER one wins. Both backends compute `f32 + f64` in
+                        // f64 (the f32 operand promotes; mixed float arithmetic
+                        // never silently narrows), so typing it as the lhs made
+                        // an expression whose runtime value IS an f64
+                        // unbindable to an `f64` — `let w: f64 = a_f32 + b_f64`
+                        // was rejected. Same-width pairs and integer arithmetic
+                        // keep the lhs rule unchanged.
+                        (TyType::Scalar(a), TyType::Scalar(b))
+                            if is_f32_family(a) && matches!(b, ScalarType::F64) => rt,
+                        (TyType::Scalar(a), TyType::Scalar(b))
+                            if matches!(a, ScalarType::F64) && is_f32_family(b) => lt,
                         _ => lt,
                     }
                 } else if matches!(lt, TyType::Unknown) || matches!(rt, TyType::Unknown) {
@@ -2044,8 +2107,8 @@ impl Checker {
             // Bitwise operators require integer operands.
             BitAnd | BitOr | BitXor | BitShl | BitShr => {
                 // Lookalike-operator lint (#194): `^` is XOR, not power. The
-                // high-confidence shape is `<int> ^ <int literal>` — almost
-                // always a port of `base ** exp` from another language.
+                // high-confidence shape is `<int> ^ <int literal>` — nearly
+                // always `base ** exp` reached for with the wrong operator.
                 if matches!(op, BitXor) && matches!(rhs, Expr::Literal(Literal::Int(..), _)) {
                     self.warn(
                         "`^` is bitwise XOR, not exponentiation".to_string(),
@@ -2422,8 +2485,9 @@ impl Checker {
                         // Footgun lint (#199 + #202): demoniC has no `.method()`
                         // call syntax. On a receiver whose type definitionally
                         // carries no methods, `recv.m(args)` type-checks but
-                        // resolves to an *opaque* value at runtime — the #1 failure
-                        // mode of AI-translated code echoing Rust/Python source.
+                        // resolves to an *opaque* value at runtime — the failure
+                        // this lint exists for, since Rust and Python habits make
+                        // `recv.m(args)` the first thing a newcomer writes.
                         // `ty_has_no_methods` deliberately excludes models (`Named`)
                         // and `Unknown`, so genuine model methods and ambiguous
                         // receivers never false-positive.
@@ -2925,6 +2989,13 @@ fn is_num_literal(e: &Expr, v: f64) -> bool {
         Expr::Tuple(elems, _) if elems.len() == 1 => is_num_literal(&elems[0], v),
         _ => false,
     }
+}
+
+/// The f32-family scalar types (#473) — f32-backed in both backends by the
+/// #179 convention. Mirrors `interp::scalar_is_f32_family` / the JIT's copy.
+fn is_f32_family(t: &ScalarType) -> bool {
+    matches!(t, ScalarType::F32 | ScalarType::F16 | ScalarType::Bf16
+                | ScalarType::Tf32 | ScalarType::Fp8E4M3 | ScalarType::Fp8E5M2)
 }
 
 fn expr_may_be_negative(e: &Expr) -> bool {
@@ -3462,7 +3533,7 @@ fn collect_writeback_warnings(body: &Block, out: &mut Vec<TypeError>) {
                 msg: format!(
                     "`{}` is bound to a copy of a tensor element, then assigned but never \
                      read; the assignment does not write back to the tensor (scalar indexing \
-                     copies — MEMORY.md §4)",
+                     copies)",
                     name
                 ),
                 span: let_span.clone(),

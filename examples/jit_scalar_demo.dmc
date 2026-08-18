@@ -1,4 +1,4 @@
-# jit_scalar_demo.dmc -- Phase 4 JIT slice 1 (issue #15).
+# jit_scalar_demo.dmc -- scalars and control flow under the JIT.
 # Scalars + control flow + recursion. No tensors, no arenas, no directives.
 #
 # Run under the JIT:

@@ -52,7 +52,7 @@ fn print_usage() {
     eprintln!("  dmc --parse <file.dmc>            dump the AST tree");
     eprintln!("  dmc --check <file.dmc>            type-check, report diagnostics");
     eprintln!("  dmc run <file.dmc>                execute the program (tree-walking interpreter)");
-    eprintln!("  dmc jit <file.dmc>                Phase 4 JIT (Cranelift, scalars + control flow)");
+    eprintln!("  dmc jit <file.dmc>                JIT (Cranelift, scalars + control flow)");
     eprintln!("  dmc test <file-or-dir>            run zero-arg test_* functions (interpreter)");
     eprintln!("  dmc test --jit <file-or-dir>      also run each test_* under the JIT (parity gate; skips files outside the JIT subset)");
     eprintln!("  dmc selftest [opts]               interp-vs-JIT differential fuzzer over generated scalar programs");
@@ -122,6 +122,7 @@ fn run_selftest(args: &[String]) -> i32 {
                 cfg.timeout = std::time::Duration::from_secs_f64(secs);
             }
             "--floats" => cfg.floats = true,
+            "--no-floats" => cfg.floats = false,
             "--meta-test" => cfg.meta_test = true,
             "--verbose" => cfg.verbose = true,
             other => {
@@ -410,7 +411,7 @@ fn real_main() {
             else if i > 0 && (a == "--vault" || a == "--forge"
                               || a.starts_with("--vault=") || a.starts_with("--forge=")) {
                 eprintln!("error: `{}` — arena sizing flags are specified but not yet \
-                           implemented (#400); remove it (arenas size dynamically today)", a);
+                           implemented; remove it (arenas size dynamically today)", a);
                 std::process::exit(1);
             }
             else { Some(a) }

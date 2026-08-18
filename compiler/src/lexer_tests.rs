@@ -678,6 +678,60 @@ mod tests {
         assert_eq!(toks, vec![TokenKind::IntLit(1, None), TokenKind::Ident("i32abc".to_string())]);
     }
 
+    // ── Float suffix boundaries (#464) ────────────────────────────────────
+    //
+    // The same rule as #280 above and #401 below. `try_eat_float_suffix`
+    // predates both and was the last matcher that would split an adjacent
+    // identifier; these pin it so it cannot drift back.
+
+    #[test]
+    fn float_suffix_consumed_and_carried() {
+        for suf in ["f16", "f32", "f64", "bf16", "tf32", "fp8_e4m3", "fp8_e5m2"] {
+            let src = format!("1.0{suf}");
+            assert_eq!(
+                lex_kinds_noeol(&src),
+                vec![TokenKind::FloatLit(1.0, Some(suf.to_string()))],
+                "suffix not carried in `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn float_suffix_requires_token_boundary() {
+        // #464: `1.0f32abc` is FloatLit(1.0) + Ident("f32abc") — the suffix
+        // must not split the identifier that follows it.
+        assert_eq!(
+            lex_kinds_noeol("1.0f32abc"),
+            vec![TokenKind::FloatLit(1.0, None), TokenKind::Ident("f32abc".to_string())]
+        );
+        // A trailing `_` is not a boundary either, matching the integer rule.
+        assert_eq!(
+            lex_kinds_noeol("1.0f32_x"),
+            vec![TokenKind::FloatLit(1.0, None), TokenKind::Ident("f32_x".to_string())]
+        );
+    }
+
+    #[test]
+    fn float_suffix_does_not_eat_adjacent_ident() {
+        // `1.0for` keeps `for` intact rather than lexing `f` as a suffix start.
+        let toks = lex_kinds_noeol("1.0for");
+        assert_eq!(toks[0], TokenKind::FloatLit(1.0, None));
+        assert_eq!(toks[1], TokenKind::For, "the `f` of `for` was eaten as a suffix");
+    }
+
+    #[test]
+    fn leading_dot_float_suffix_requires_token_boundary() {
+        // The `.5f64` entry point shares the matcher, so it shares the rule.
+        assert_eq!(
+            lex_kinds_noeol(".5f64"),
+            vec![TokenKind::FloatLit(0.5, Some("f64".to_string()))]
+        );
+        assert_eq!(
+            lex_kinds_noeol(".5f64abc"),
+            vec![TokenKind::FloatLit(0.5, None), TokenKind::Ident("f64abc".to_string())]
+        );
+    }
+
     // ── 64-bit bit-pattern literals (#282) ────────────────────────────────
 
     #[test]

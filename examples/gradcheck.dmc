@@ -6,7 +6,7 @@
 #
 # This is the standard "gradcheck" every autodiff library ships (cf. tinygrad's
 # gradient tests vs PyTorch). demoniC had no numerical autodiff oracle before
-# this — the broadcast-bias gradient bug (#299) was found by luck; the bias check
+# this — the broadcast-bias gradient bug was found by luck; the bias check
 # below would have caught it directly.
 #
 #   Run:   dmc run examples/gradcheck.dmc
@@ -40,7 +40,7 @@ fn gradcheck_l2() -> bool {
     ok
 }
 
-# ── 1b. Division: f(w) = sum(t ./ w) ,  grad = -t / w²  (quotient VJP, #252) ───
+# ── 1b. Division: f(w) = sum(t ./ w),  grad = -t / w²  (quotient VJP) ───
 @grad fn div_sum[D](!w: Tensor[f32, [D]], t: Tensor[f32, [D]]) -> f32 {
     sum(t ./ w)
 }
@@ -115,7 +115,7 @@ fn gradcheck_cubic() -> bool {
     ok
 }
 
-# ── 3b. Activations: sum(act(w)) — sigmoid/tanh/gelu/silu now trace (#306) ─────
+# ── 3b. Activations: sum(act(w)) — sigmoid/tanh/gelu/silu now trace ─────
 @grad fn act_sigmoid[D](!w: Tensor[f32, [D]]) -> f32 { sum(sigmoid(w)) }
 @grad fn act_tanh[D](!w: Tensor[f32, [D]]) -> f32 { sum(tanh(w)) }
 @grad fn act_gelu[D](!w: Tensor[f32, [D]]) -> f32 { sum(gelu(w)) }
@@ -143,7 +143,7 @@ fn gradcheck_activations() -> bool {
     ok
 }
 
-# ── 3b'. Second-order activations: @grad @grad sum(act(w)) gives act''(w) (#306) ─
+# ── 3b'. Second-order activations: @grad @grad sum(act(w)) gives act''(w) ─
 # Oracle: the analytic second derivative (fwd_bwd_bwd) vs a central finite
 # difference of the *first* derivative (the first-order fwd_bwd, gradchecked
 # above). Diagonal: perturbing w[i] only moves the i-th first-derivative.
@@ -175,7 +175,7 @@ fn gradcheck_second_order() -> bool {
     ok
 }
 
-# ── 3c. Fused ML ops: softmax / rms_norm / layer_norm (transformer path, #307) ─
+# ── 3c. Fused ML ops: softmax / rms_norm / layer_norm (transformer path) ─
 @grad fn gc_softmax(!w: Tensor[f32, [4]], t: Tensor[f32, [4]]) -> f32 {
     sum(softmax(w, -1) .* t)
 }
@@ -243,7 +243,7 @@ fn gradcheck_layer_norm() -> bool {
     ok
 }
 
-# rope: per-pair rotation (#368). VJP flows only to x; cos/sin are read-only
+# rope: per-pair rotation. VJP flows only to x; cos/sin are read-only
 # tables. Uses arbitrary (non-unit-circle) cos/sin so the check exercises the
 # transpose Jacobian rather than relying on orthogonality.
 @grad fn gc_rope(!w: Tensor[f32, [2, 4]], c: Tensor[f32, [2, 2]], s: Tensor[f32, [2, 2]], t: Tensor[f32, [2, 4]]) -> f32 {
@@ -272,7 +272,7 @@ fn gradcheck_rope() -> bool {
     ok
 }
 
-# ── 3c. attn / attn_gqa: fused scaled-dot-product attention (#368) ────────────
+# ── 3c. attn / attn_gqa: fused scaled-dot-product attention ────────────
 # VJP flows to q, k, AND v. attn_gqa additionally accumulates dK/dV across the
 # query heads sharing a KV head (H_q=2, H_kv=1 below). The masked variant uses
 # a numeric 0/1 mask (interp form): masked positions carry softmax weight 0,
@@ -397,7 +397,7 @@ fn gradcheck_matmul() -> bool {
     ok
 }
 
-# ── 4b. Tier B: reshape / sum_along / mean_along (#307) ───────────────────────
+# ── 4b. Tier B: reshape / sum_along / mean_along ───────────────────────
 @grad fn gc_reshape(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [6]]) -> f32 { sum(w.reshape[[6]] .* t) }
 fn gc_reshape_fwd(w: Tensor[f32, [2, 3]], t: Tensor[f32, [6]]) -> f32 { let (l, g) = gc_reshape.fwd_bwd(w, t)  l }
 @grad fn gc_sumalong(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 { sum(sum_along(w, 1) .* t) }
@@ -425,7 +425,7 @@ fn gradcheck_tier_b() -> bool {
     ok
 }
 
-# ── 4c. Tier C: variance / max / min (global reductions, #307) ────────────────
+# ── 4c. Tier C: variance / max / min (global reductions) ────────────────
 # variance: dx = (2/N)(x - mean); max/min: subgradient routes to the extreme.
 @grad fn gc_var[D](!w: Tensor[f32, [D]]) -> f32 { variance(w) }
 fn gc_var_fwd(w: Tensor[f32, [4]]) -> f32 { let (l, g) = gc_var.fwd_bwd(w)  l }
@@ -450,7 +450,7 @@ fn gradcheck_tier_c() -> bool {
     ok
 }
 
-# ── 5. Broadcast bias: f(b) = ||x .+ b||^2 — the #299 regression guard ─────────
+# ── 5. Broadcast bias: f(b) = ||x .+ b||^2 — the regression guard ─────────
 # grad_b = 2 * sum_over_rows(x .+ b); the old bug left g.b at the broadcast
 # shape [B,H] instead of [H], which this finite-difference check would expose.
 @grad fn bias_loss[B, H](!b: Tensor[f32, [H]], x: Tensor[f32, [B, H]]) -> f32 {
@@ -475,7 +475,7 @@ fn gradcheck_bias_broadcast() -> bool {
     ok
 }
 
-# ── 6. Tail-position `if`/`match` in the differentiated body (#421) ────────────
+# ── 6. Tail-position `if`/`match` in the differentiated body ────────────
 # A trailing block-form `if`/`match` parses as a statement, not the block's tail
 # expression; it must trace identically to the let-bound form.
 @grad fn branch_let[D](!w: Tensor[f32, [D]]) -> f32 {
@@ -515,7 +515,7 @@ fn gradcheck_tail_branch() -> bool {
     ok
 }
 
-# ── 7. Scalar-math builtins on the tape (#420): sqrt/exp/log/sin/cos/tan ──────
+# ── 7. Scalar-math builtins on the tape: sqrt/exp/log/sin/cos/tan ──────
 # The SDF idiom: every distance function ends in a Euclidean norm's sqrt.
 # Previously these builtins silently left the graph even on a traced scalar.
 @grad fn norm2[D](!w: Tensor[f32, [D]]) -> f32 { sqrt(sum(w .* w)) }

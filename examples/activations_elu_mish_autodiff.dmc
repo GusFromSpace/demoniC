@@ -1,4 +1,4 @@
-# elu / mish reverse-mode autodiff (#377). First derivative runs on both
+# elu / mish reverse-mode autodiff. First derivative runs on both
 # backends (see activations_grad_jit.dmc for concrete-shape JIT parity); the
 # second derivative below is interpreter-only. These tests use shape-generic
 # `@grad`, which the JIT skips regardless, so they run under `dmc test` (the

@@ -86,8 +86,9 @@ cargo test --all
 random well-typed programs, runs each through both the interpreter and the
 JIT, and reports any divergence.
 
-`tools/` holds the correctness gates CI runs. The interpreter is the
-reference semantics, so most of them check that the JIT agrees with it:
+`tools/` holds the correctness gates. The interpreter is the reference
+semantics, so most of them check that the JIT agrees with it. CI runs the
+first two on every change; the rest are run on demand:
 
 ```
 python3 tools/diff_backends.py        # interpreter vs JIT, whole-example output

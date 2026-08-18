@@ -1,4 +1,4 @@
-# jit_tensor_demo.dmc -- Phase 4 JIT tensor surface (issue #15).
+# jit_tensor_demo.dmc -- the tensor surface under the JIT.
 # Covers JIT slices 2–4: tensors, Forge arena, elementwise dot-ops,
 # matmul, SIMD F32X4 kernels, and basic broadcasting.
 # JIT slices 5–8 add: softmax/norms, autodiff, attn/rope/GQA, tiled SGEMM.

@@ -2,7 +2,7 @@
 # Tests appended below `fn main`. Each test_ fn derives its expected value
 # by closed-form math (documented in comments), never by running the program.
 # Compare to examples/train_step.dmc, which hand-writes every gradient.
-# Normative since spec 0.0.2. See AUTODIFF.md.
+# See the spec's `@grad` section.
 
 @grad fn forward[B, D, H](
     !W1: Tensor[f32, [D, H]],

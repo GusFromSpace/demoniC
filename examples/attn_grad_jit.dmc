@@ -1,4 +1,4 @@
-# attn / attn_gqa forward + reverse-mode VJP under the JIT (#368).
+# attn / attn_gqa forward + reverse-mode VJP under the JIT.
 #
 # Fused scaled-dot-product attention — softmax((Q @ K') / sqrt(D)) @ V — is the
 # core of every transformer block, and the fifth fused tensor op to

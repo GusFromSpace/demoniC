@@ -4,11 +4,11 @@
 # the block's tensor value. The two directions differ:
 #
 #   * float targets  (bf16/f16/tf32/f32/f64) are VALUE-PRESERVING retags — the
-#     data is already f32-backed, so this is a no-op on the numbers (#179).
+#     data is already f32-backed, so this is a no-op on the numbers.
 #   * integer targets (i8..i64, u8..u64, int4/int8) TRUNCATE TOWARD ZERO and
 #     retag the element type Int:  2.9 -> 2,  -2.9 -> -2  (not floor: -3).
 #
-# This file is the corpus's coverage of the *integer* case (#374). The
+# This file is the corpus's coverage of the *integer* case. The
 # interpreter is canonical and truncates; the JIT has no elementwise-trunc
 # kernel yet, so it rejects an integer `@cast` block as unsupported rather than
 # treating it as a no-op and silently computing a different answer. Under the

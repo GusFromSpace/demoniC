@@ -1,4 +1,4 @@
-# enum_traffic.dmc — C-like enums (#336): named variants, exhaustively matched.
+# enum_traffic.dmc — C-like enums: named variants, exhaustively matched.
 #
 # An enum value is its variant's i64 ordinal (declaration order), so `as i64`
 # gives the index and `match` is checked for full coverage — drop a variant and
@@ -12,7 +12,7 @@
 #   Test:  dmc test examples/enum_traffic.dmc
 #   JIT:   dmc jit examples/enum_traffic.dmc   (also `dmc test --jit`)
 #
-# Enums lower through the Cranelift JIT as well (#350): a variant is its i64
+# Enums lower through the Cranelift JIT as well: a variant is its i64
 # ordinal, `Light.Red` is an `iconst`, and a `match` arm — qualified or bare —
 # is i64 equality against that ordinal. This file is in the JIT parity set.
 

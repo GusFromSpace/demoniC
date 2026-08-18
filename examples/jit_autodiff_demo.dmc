@@ -1,4 +1,4 @@
-# jit_autodiff_demo.dmc -- Phase 4 JIT slice 6 (issue #15).
+# jit_autodiff_demo.dmc -- `@grad` autodiff under the JIT.
 #
 # `@grad fn` reverse-mode autodiff. The JIT emits TWO entry points per
 # `@grad fn`:
@@ -9,7 +9,7 @@
 #                           suite -- see jit::tests::jit_grad_*)
 #
 # The backward pass is emitted statically per shape specialization
-# (AUTODIFF.md: "Not a tape"). It walks the recorded forward graph in
+# — it is not a tape. It walks the recorded forward graph in
 # reverse, applying the adjoint rule for each op:
 #   sum     dL/dx[i] = g                 (broadcast the scalar adjoint)
 #   mean    dL/dx[i] = g / N

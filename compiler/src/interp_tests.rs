@@ -1,7 +1,7 @@
 /// Interpreter unit tests — small programs hitting specific eval paths.
 /// Integration: `dmc run examples/*.dmc` from the shell.
 
-use super::interp::{Interpreter, Value};
+use super::interp::{Interpreter, Value, FW};
 use super::lexer::Lexer;
 use super::parser::Parser;
 use super::resolver::Resolver;
@@ -48,7 +48,7 @@ fn as_int(v: &Value) -> i64 {
 }
 fn as_float(v: &Value) -> f64 {
     match v {
-        Value::Float(x) => *x,
+        Value::Float(x, _) => *x,
         Value::Int(n)   => *n as f64,
         _ => panic!("expected numeric, got {:?}", v),
     }
@@ -3166,13 +3166,13 @@ fn math_const_e() {
 #[test]
 fn math_const_inf() {
     let v = run(r#"fn main() -> f64 { inf }"#);
-    assert!(matches!(v, Value::Float(f) if f.is_infinite() && f > 0.0));
+    assert!(matches!(v, Value::Float(f, _) if f.is_infinite() && f > 0.0));
 }
 
 #[test]
 fn math_const_nan() {
     let v = run(r#"fn main() -> f64 { nan }"#);
-    assert!(matches!(v, Value::Float(f) if f.is_nan()));
+    assert!(matches!(v, Value::Float(f, _) if f.is_nan()));
 }
 
 #[test]
@@ -3222,14 +3222,14 @@ fn to_str_bool() {
 
 #[test]
 fn to_string_aliases_to_str() {
-    // #335: `to_string` is the Rust/Python name models reach for.
+    // #335: `to_string` is the Rust/Python spelling of `to_str`.
     assert_eq!(as_str(&run(r#"fn main() -> str { to_string(42) }"#)), "42");
     assert_eq!(as_str(&run(r#"fn main() -> str { to_string(true) }"#)), "true");
 }
 
 #[test]
 fn to_binary_aliases_to_bin() {
-    // #335: `to_binary` is the name models reach for; aliases `to_bin`.
+    // #335: `to_binary` is the long spelling; aliases `to_bin`.
     assert_eq!(as_str(&run(r#"fn main() -> str { to_binary(5) }"#)), "101");
     assert_eq!(
         as_str(&run(r#"fn main() -> str { to_binary(5) }"#)),
@@ -3308,7 +3308,7 @@ fn ufcs_user_fn_receiver_becomes_first_arg() {
 }
 
 #[test]
-fn ufcs_unlocks_harvest_targets() {
+fn ufcs_unlocks_method_call_targets() {
     // The whole point of #333: `.sort()` / `.to_string()` now resolve.
     assert_eq!(as_float(&run(r#"fn main() -> f64 { let v = [3.0, 1.0, 2.0]  v.sort()[0] }"#)), 1.0);
     assert_eq!(as_str(&run(r#"fn main() -> str { let n = 42  n.to_string() }"#)), "42");
@@ -4777,7 +4777,7 @@ fn main() -> i64 { count_range(0, 20) }
 #[test]
 fn division_by_zero_gives_inf() {
     let v = run(r#"fn main() -> f64 { 1.0 / 0.0 }"#);
-    assert!(matches!(v, Value::Float(f) if f.is_infinite()));
+    assert!(matches!(v, Value::Float(f, _) if f.is_infinite()));
 }
 
 #[test]
@@ -5895,7 +5895,7 @@ fn main() -> f32 {
 }
 "#);
     match v {
-        Value::Float(f) => assert!((f - 9.0).abs() < 1e-6, "expected 9.0, got {f}"),
+        Value::Float(f, _) => assert!((f - 9.0).abs() < 1e-6, "expected 9.0, got {f}"),
         Value::Int(n)   => assert_eq!(n, 9, "expected 9"),
         other           => panic!("expected numeric, got {:?}", other),
     }
@@ -5926,7 +5926,7 @@ fn main() -> f32 {
 }
 "#);
     match v {
-        Value::Float(f) => assert!((f - 3.0).abs() < 1e-6, "expected x[0]=3.0 after swap, got {f}"),
+        Value::Float(f, _) => assert!((f - 3.0).abs() < 1e-6, "expected x[0]=3.0 after swap, got {f}"),
         Value::Int(n)   => assert_eq!(n, 3, "expected x[0]=3 after swap"),
         other           => panic!("expected numeric, got {:?}", other),
     }
@@ -5954,7 +5954,7 @@ fn main() -> f32 {
 }
 "#);
     match v {
-        Value::Float(f) => assert!((f - 30.0).abs() < 1e-6, "expected v[2]=30.0, got {f}"),
+        Value::Float(f, _) => assert!((f - 30.0).abs() < 1e-6, "expected v[2]=30.0, got {f}"),
         Value::Int(n)   => assert_eq!(n, 30, "expected v[2]=30"),
         other           => panic!("expected numeric, got {:?}", other),
     }
@@ -5976,7 +5976,7 @@ fn main() -> f32 {
 }
 "#);
     match v {
-        Value::Float(f) => assert!((f - 1.0).abs() < 1e-6, "non-! param should NOT write back, got {f}"),
+        Value::Float(f, _) => assert!((f - 1.0).abs() < 1e-6, "non-! param should NOT write back, got {f}"),
         Value::Int(n)   => assert_eq!(n, 1, "non-! param should NOT write back"),
         other           => panic!("expected numeric, got {:?}", other),
     }
@@ -5986,7 +5986,7 @@ fn main() -> f32 {
 
 fn approx(v: &Value, expected: f64, tol: f64, label: &str) {
     let got = match v {
-        Value::Float(f) => *f,
+        Value::Float(f, _) => *f,
         Value::Int(n) => *n as f64,
         other => panic!("{}: expected numeric, got {:?}", label, other),
     };
@@ -6011,8 +6011,8 @@ fn main() -> Tensor[f32, [2]] {
     solve(A, b)
 }
 "#);
-    approx(&Value::Float(tensor_elem(&v, &[0])), 1.0, 1e-9, "x");
-    approx(&Value::Float(tensor_elem(&v, &[1])), 3.0, 1e-9, "y");
+    approx(&Value::Float(tensor_elem(&v, &[0]), FW::F64), 1.0, 1e-9, "x");
+    approx(&Value::Float(tensor_elem(&v, &[1]), FW::F64), 3.0, 1e-9, "y");
 }
 
 #[test]
@@ -6023,10 +6023,10 @@ fn main() -> Tensor[f32, [2, 2]] {
     inv([[1.0, 2.0], [3.0, 4.0]])
 }
 "#);
-    approx(&Value::Float(tensor_elem(&v, &[0, 0])), -2.0,  1e-9, "[0,0]");
-    approx(&Value::Float(tensor_elem(&v, &[0, 1])),  1.0,  1e-9, "[0,1]");
-    approx(&Value::Float(tensor_elem(&v, &[1, 0])),  1.5,  1e-9, "[1,0]");
-    approx(&Value::Float(tensor_elem(&v, &[1, 1])), -0.5,  1e-9, "[1,1]");
+    approx(&Value::Float(tensor_elem(&v, &[0, 0]), FW::F64), -2.0,  1e-9, "[0,0]");
+    approx(&Value::Float(tensor_elem(&v, &[0, 1]), FW::F64),  1.0,  1e-9, "[0,1]");
+    approx(&Value::Float(tensor_elem(&v, &[1, 0]), FW::F64),  1.5,  1e-9, "[1,0]");
+    approx(&Value::Float(tensor_elem(&v, &[1, 1]), FW::F64), -0.5,  1e-9, "[1,1]");
 }
 
 #[test]
@@ -6039,7 +6039,7 @@ fn main() -> Tensor[f32, [1]] {
     lstsq(A, b)
 }
 "#);
-    approx(&Value::Float(tensor_elem(&v, &[0])), 1.9857142857, 1e-6, "slope");
+    approx(&Value::Float(tensor_elem(&v, &[0]), FW::F64), 1.9857142857, 1e-6, "slope");
 }
 
 #[test]
@@ -6775,11 +6775,11 @@ fn field_binding_compound_assign_writes_through_444() {
 #[test]
 fn model_load_errors_394() {
     let e = run_err("model L[D] { w: Tensor[f32,[D]] }\nfn main() -> nil { let l = L[D=4].load(\"/tmp/x\")  nil }");
-    assert!(e.contains("#394") && e.contains("serialization"), "got: {}", e);
+    assert!(e.contains("serialization"), "got: {}", e);
     // The empty/positional bracket forms parse as Index (not BracketArgs) and
     // used to slip past the guard to a silent opaque — they must also be loud.
     let empty = run_err("model L { w: Tensor[f32,[2]] }\nfn main() -> nil { let l = L[].load(\"/tmp/x\")  nil }");
-    assert!(empty.contains("#394") && empty.contains("serialization"),
+    assert!(empty.contains("serialization"),
             "empty-bracket load must error, got: {}", empty);
 }
 
@@ -6787,7 +6787,7 @@ fn model_load_errors_394() {
 fn allreduce_method_form_errors_396() {
     // `allreduce.sum(y)` must not silently desugar to `sum(allreduce, y)` (→ 0.0).
     let e = run_err("fn main() -> nil { let !y = forge.zeros[f32,[3]]  y[0] = 1.0  let r = allreduce.sum(y, axis=0)  nil }");
-    assert!(e.contains("#396") && e.contains("collective"), "got: {}", e);
+    assert!(e.contains("collective"), "got: {}", e);
 }
 
 // --- tensor .split (SPEC §6.4, #397 built) ---------------------------------
@@ -6805,7 +6805,7 @@ fn tensor_split_axis_last() {
         }
     "#);
     match v {
-        Value::Float(f) => assert!((f - 28.0).abs() < 1e-6, "got {}", f),
+        Value::Float(f, _) => assert!((f - 28.0).abs() < 1e-6, "got {}", f),
         other => panic!("expected float, got {:?}", other),
     }
 }
@@ -6830,7 +6830,7 @@ fn tensor_split_bare_index_form() {
         }
     "#);
     match v {
-        Value::Float(f) => assert!((f - 7.0).abs() < 1e-6, "got {}", f),
+        Value::Float(f, _) => assert!((f - 7.0).abs() < 1e-6, "got {}", f),
         other => panic!("expected float, got {:?}", other),
     }
 }

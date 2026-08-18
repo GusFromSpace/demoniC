@@ -1,4 +1,4 @@
-# jit_slicing_demo.dmc -- Phase 4 JIT slice 4 (issue #15).
+# jit_slicing_demo.dmc -- slicing and transpose under the JIT.
 # Slicing + scalar broadcasting + transpose, composed with slice-3's
 # shape monomorphization and slice-3's variance primitives.
 #

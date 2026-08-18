@@ -34,20 +34,21 @@ DEFAULT_DMC = REPO / "compiler" / "target" / "release" / "dmc"
 
 # Examples whose run/jit outputs are known to diverge, with the tracking issue.
 # Keep this list short and cited — it should shrink as bugs are fixed.
-ALLOWLIST = {
-    # #241 closed the f32 element-precision gap (stores and dotted ops are now
-    # bit-exact across backends). What remains is the documented accumulation
-    # residual: the interpreter accumulates matmul/reductions in f64 and rounds
-    # once, the JIT accumulates in f32 per step — visible only at f32-ulp scale
-    # in iterative/reduction-heavy programs.
-    "examples/pagerank.dmc": "#241 residual — power iteration `M @ v`: matmul accumulation width (f64 interp vs f32 JIT)",
-    # Both became JIT-eligible only once `to_str` was lowered (#469); the
-    # divergence is pre-existing and the same #241 class as pagerank above —
-    # `total()` hand-accumulates 360 f32 adds, which the interpreter carries in
-    # f64 and the JIT in f32. Agreement holds to ~7 significant digits.
-    "examples/sim/lotka_volterra.dmc": "#241 residual — `total()` f32 accumulation loop (f64 interp vs f32 JIT)",
-    "examples/sim/lotka_volterra_meso.dmc": "#241 residual — `total()` f32 accumulation loop (f64 interp vs f32 JIT)",
-}
+#
+# IT IS EMPTY, and that is the point: as of #481 every example the JIT can run
+# agrees with the interpreter byte for byte. The last two entries went away in
+# this order, and the order is the interesting part:
+#
+#   * both lotka_volterra files (#473) — filed as a "#241 residual" but actually
+#     SCALAR f32 accumulation, fixed by giving the interpreter a real f32 scalar;
+#   * pagerank (#481) — filed as matmul accumulation WIDTH, but the real cause
+#     was CONTRACTION: the JIT's three matmul kernels disagreed with each other
+#     (`n % 4` decided whether you got an FMA kernel), and the interpreter used
+#     ndarray's f64 dot. f32 matmul now contracts with FMA everywhere (SPEC §7.5).
+#
+# Both were mis-attributed to #241 for months. If something lands here again,
+# re-derive the cause from a measurement before citing an issue for it.
+ALLOWLIST: dict[str, str] = {}
 
 _TENSOR_PREFIX = re.compile(r"Tensor\[[^\]]*\]\s*")
 _RETURN_ECHO = re.compile(r"\n?=> .*\n?\Z")

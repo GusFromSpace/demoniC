@@ -12,7 +12,7 @@
 # The bit-exact agreement demonstrates the whole renderer compute surface
 # — forge.zeros, reshape, axis-broadcast, `.^`, `\>`, comparison masks,
 # while-loop tensor accumulators, generic-call shape inference — running
-# through the JIT. See examples/render/DESIGN.md §12.4.
+# through the JIT.
 
 # Signed distance to a sphere, evaluated for every pixel at once.
 # The whole renderer queries the scene only through functions like this.
@@ -57,7 +57,7 @@ fn main() -> i64 {
     let dy = ry ./ rl
     let dz = rz ./ rl
 
-    # ── 2. Sphere-trace march (DESIGN.md §4) ──────────────────────────
+    # ── 2. Sphere-trace march ─────────────────────────────────────────
     # Accumulators allocated before the loop so they survive each step.
     let !t    = forge.zeros[f32, [120, 160]]
     let !done = forge.zeros[f32, [120, 160]]

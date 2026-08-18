@@ -12,8 +12,9 @@
 //!
 //! THE SCALAR REGIME. Generation stays bit-exact (small integers, nonzero
 //! divisors, no `INT_MIN/-1`, additive loop accumulators) so interp and JIT must
-//! agree *exactly* (#241). `--floats` additionally emits f32 (looser, tolerant
-//! comparison — surfaces the known #284/#295 f32/f64 literal-inference gaps).
+//! agree *exactly* (#241). f32 generation is on by default since #473 made
+//! scalar f32 real on both backends — that comparison is exact too, see
+//! `floats_agree`. `--no-floats` restores the integer-only regime.
 //!
 //! VERDICT LATTICE (mirrors diff_fuzz.py / jit_probes.py):
 //!   * both backends agree                         -> ok
@@ -34,7 +35,7 @@
 //! (the AST, the interpreter, the JIT) lives inside the worker — only the `Send`
 //! verdict crosses back. A *native* JIT crash (SIGILL/SIGSEGV) still aborts the
 //! process; that class is why `tools/diff_fuzz.py` (subprocess-isolated) is kept
-//! alongside this — see `make fuzz`.
+//! alongside this — see `tools/diff_fuzz.py`.
 
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
@@ -48,59 +49,61 @@ use crate::jit::{Jit, ScalarRet};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 
-/// A jit "gap" is a clean error for an unlowered feature (not a miscompile).
-const GAP_MARKERS: [&str; 5] =
-    ["not yet", "not support", "use dmc run", "unknown function", "unsupported"];
+// #480: a jit "gap" is a clean refusal to lower a feature, not a miscompile —
+// and the JIT now SAYS which it is (`JitErrorKind`), so this no longer greps the
+// message for English fragments. That guess was wrong in both directions: a
+// clean refusal worded differently was scored as a divergence, and a genuine
+// failure whose text happened to contain "unsupported" was downgraded to a gap.
 
 /// Minimal historical repros — kept as literal source so a regression that
 /// reintroduces a fixed bug is caught immediately. All are FIXED (interp == jit);
-/// see the cited issues. This is the coverage-equivalence anchor for retiring the
-/// scalar slice of `make test-dmc`: every scalar bug the corpus once caught has a
+/// This is the coverage-equivalence anchor for retiring the scalar slice of
+/// `dmc test examples`: every scalar bug the corpus once caught has a
 /// pinned repro here.
 pub const REGRESSION_SEEDS: &[(&str, &str)] = &[
-    // --- #302 manual-sweep parity bugs (control flow) ---
+    // --- manual-sweep parity bugs (control flow) ---
     (
-        "continue_in_for (#302 sweep — JIT hang)",
+        "continue_in_for (JIT hang)",
         "fn main() -> i64 {\n    let !s = 0\n    for i in 0..10 { if i == 3 { continue } s = s + i }\n    s\n}\n",
     ),
     (
-        "non_exhaustive_match (#302 sweep — JIT SIGILL)",
+        "non_exhaustive_match (JIT SIGILL)",
         "fn classify(x: i64) -> i64 {\n    match x { 0 => 10, 1 => 20, _ => 99 }\n}\nfn main() -> i64 { classify(1) + classify(7) }\n",
     ),
     (
-        "match_dispatch (#302 — jump-table over a loop)",
+        "match_dispatch (jump-table over a loop)",
         "fn main() -> i64 { let !s = 0  for k in 0..4 { s = s + match k { 0 => 10, 1 => 20, 2 => 30, _ => 40 } }  s }\n",
     ),
     // --- scalar corners the generator deliberately avoids (div/0, INT_MIN,
     // overflow, shifts): both backends must agree on the guarded/wrapping
     // result. These re-cover the pure-scalar slice of tools/jit_probes.py so
-    // selftest stands in for that battery's scalar cases (#296–#300). ---
+    // selftest stands in for that battery's scalar cases. ---
     (
-        "int_div_round_toward_zero (#296/#297)",
+        "int_div_round_toward_zero",
         "fn main() -> i64 { (0 - 7) / 2 }\n",
     ),
     (
-        "int_mod_sign_follows_dividend (#296/#297)",
+        "int_mod_sign_follows_dividend",
         "fn main() -> i64 { (0 - 7) % 3 }\n",
     ),
     (
-        "int_div_by_zero_guard (#300 — 0, not SIGFPE)",
+        "int_div_by_zero_guard (0, not SIGFPE)",
         "fn main() -> i64 { let !z = 0  10 / z }\n",
     ),
     (
-        "int_shl_max_in_range (#300)",
+        "int_shl_max_in_range",
         "fn main() -> i64 { let !n = 63  1 << n }\n",
     ),
     (
-        "int_add_overflow_wraps (#300)",
+        "int_add_overflow_wraps",
         "fn main() -> i64 { let a: i64 = 9223372036854775807  a + 1 }\n",
     ),
     (
-        "int_sub_overflow_wraps (#300)",
+        "int_sub_overflow_wraps",
         "fn main() -> i64 { let a: i64 = -9223372036854775807 - 1  a - 1 }\n",
     ),
     (
-        "cast_scalar_f32_rounds (#300)",
+        "cast_scalar_f32_rounds",
         "fn main() -> f64 { (0.1 as f32) as f64 }\n",
     ),
 ];
@@ -122,7 +125,11 @@ impl Default for Config {
             iters: 500,
             seed: 1,
             timeout: Duration::from_secs(10),
-            floats: false,
+            // #473: f32 generation is ON by default. It was opt-in while scalar
+            // f32 was known to diverge and could only be compared tolerantly;
+            // now it is exact on both backends, so the default sweep should
+            // gate it. `--no-floats` restores the integer-only regime.
+            floats: true,
             verbose: false,
             repro: None,
             meta_test: false,
@@ -396,9 +403,19 @@ enum JitOut {
     Err(String),
 }
 
-/// Tolerant f32 comparison — mirrors diff_fuzz.py's `values_agree`.
-fn scalars_close(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 1e-4 + 1e-3 * b.abs()
+/// Exact float agreement, NaN included (NaN != NaN under `==`, but the two
+/// backends producing NaN *is* agreement).
+///
+/// #473 made this exact. It used to be a tolerant `|a-b| <= 1e-4 + 1e-3*|b|`
+/// compare, on the reasoning that scalar f32 was computed at different widths
+/// on the two backends and could only be expected to agree to ~7 digits. That
+/// reasoning no longer holds: an `f32` scalar is f32 on both sides, and the
+/// interpreter's round-through-f32 is bit-exact with the JIT's native f32 for
+/// `+ - * /` (#241's double-rounding property). A tolerant compare here is
+/// what let the #473 divergence — up to 1e-8 relative, three orders of
+/// magnitude inside the old window — run green through 500 iterations a sweep.
+fn floats_agree(a: f64, b: f64) -> bool {
+    a == b || (a.is_nan() && b.is_nan())
 }
 
 fn agree(v: &Value, r: &ScalarRet) -> bool {
@@ -406,8 +423,8 @@ fn agree(v: &Value, r: &ScalarRet) -> bool {
         (Value::Int(a), ScalarRet::I64(b)) => a == b,
         (Value::Bool(a), ScalarRet::Bool(b)) => a == b,
         (Value::Nil, ScalarRet::Nil) => true,
-        (Value::Float(a), ScalarRet::F32(b)) => scalars_close(*a, *b as f64),
-        (Value::Float(a), ScalarRet::F64(b)) => scalars_close(*a, *b),
+        (Value::Float(a, _), ScalarRet::F32(b)) => floats_agree(*a, *b as f64),
+        (Value::Float(a, _), ScalarRet::F64(b)) => floats_agree(*a, *b),
         _ => false,
     }
 }
@@ -460,13 +477,13 @@ fn run_jit(program: &crate::ast::Program) -> JitOut {
             Err(e) => return JitOut::Err(e.msg),
         };
         if let Err(e) = jit.compile_program(program) {
-            let is_gap = GAP_MARKERS.iter().any(|m| e.msg.contains(m));
+            let is_gap = e.kind == crate::jit::JitErrorKind::Unsupported;
             return if is_gap { JitOut::Gap(e.msg) } else { JitOut::Err(e.msg) };
         }
         match jit.run_main_scalar() {
             Ok(r) => JitOut::Ok(r),
             Err(e) => {
-                let is_gap = GAP_MARKERS.iter().any(|m| e.msg.contains(m));
+                let is_gap = e.kind == crate::jit::JitErrorKind::Unsupported;
                 if is_gap { JitOut::Gap(e.msg) } else { JitOut::Err(e.msg) }
             }
         }
@@ -627,8 +644,18 @@ fn meta_test() -> bool {
         eprintln!("selftest: meta-test: error: differ failed to flag i64 1 vs 2");
         ok = false;
     }
-    if scalars_close(1.0, 2.0) {
+    if floats_agree(1.0, 2.0) {
         eprintln!("selftest: meta-test: error: differ failed to flag float 1.0 vs 2.0");
+        ok = false;
+    }
+    // #473: the float compare is EXACT, so a one-ulp gap must be flagged. Under
+    // the old tolerant compare this passed, which is why the divergence hid.
+    if floats_agree(0.1_f32 as f64, 0.1_f64) {
+        eprintln!("selftest: meta-test: error: differ failed to flag an f32/f64 ulp gap");
+        ok = false;
+    }
+    if !floats_agree(f64::NAN, f64::NAN) {
+        eprintln!("selftest: meta-test: error: differ failed to accept NaN vs NaN");
         ok = false;
     }
     if !agree(&Value::Int(5), &ScalarRet::I64(5)) {

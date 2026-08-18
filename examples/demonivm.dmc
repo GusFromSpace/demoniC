@@ -4,7 +4,7 @@
 # against an integer operand stack plus a small memory, both held in the Forge.
 # Because opcodes, operands, and jump targets are read out of an integer tensor,
 # every fetch round-trips as a real integer — so arithmetic, comparisons, and
-# branch addresses behave exactly as written (see #125). Showcases: integer
+# branch addresses behave exactly as written. Showcases: integer
 # tensor element reads, indexed stack/memory mutation, and a fetch-decode-
 # execute loop with backward jumps (a real loop running as bytecode).
 #

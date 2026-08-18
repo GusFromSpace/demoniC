@@ -20,9 +20,17 @@ fn comparison_semantics() {
     assert!(!agree(&Value::Bool(true), &ScalarRet::Bool(false)));
     // Cross-type is always a divergence.
     assert!(!agree(&Value::Int(1), &ScalarRet::Bool(true)));
-    // Float tolerance mirrors diff_fuzz.py's values_agree.
-    assert!(scalars_close(1.0, 1.0 + 5e-5));
-    assert!(!scalars_close(1.0, 2.0));
+    // #473: float agreement is EXACT — a one-ulp gap is a divergence, not
+    // noise. The old tolerant window (1e-4 + 1e-3*|b|) was three orders of
+    // magnitude wider than the scalar-f32 divergence #473 fixed, which is why
+    // 500-iteration sweeps ran green through it.
+    assert!(floats_agree(1.0, 1.0));
+    assert!(!floats_agree(1.0, 1.0 + 5e-5));
+    assert!(!floats_agree(0.1_f32 as f64, 0.1_f64));
+    assert!(!floats_agree(1.0, 2.0));
+    // Both backends producing NaN is agreement, though NaN != NaN.
+    assert!(floats_agree(f64::NAN, f64::NAN));
+    assert!(!floats_agree(f64::NAN, 1.0));
 }
 
 #[test]

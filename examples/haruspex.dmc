@@ -1,10 +1,10 @@
 # haruspex.dmc — byte divination through an `any`-typed stack machine.
 #
 # A haruspex read the future in the entrails of a sacrifice. This one slits
-# open a *file* and reads its raw bytes (read_bytes, #197), interpreting each
+# open a *file* and reads its raw bytes (read_bytes), interpreting each
 # byte as an opcode for a tiny stack machine. The catch: the stack mingles
 # numbers and words on the same altar — a heterogeneous stack that only holds
-# together because omens cross function boundaries as `any` (#186).
+# together because omens cross function boundaries as `any`.
 #
 # Point it at anything. With no argument it reads its own entrails.
 #

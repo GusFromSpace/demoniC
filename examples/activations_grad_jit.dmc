@@ -1,4 +1,4 @@
-# JIT autodiff parity for the smooth activations silu / elu / mish (#377).
+# JIT autodiff parity for the smooth activations silu / elu / mish.
 #
 # The JIT reverse-mode tape now differentiates these (first order) via runtime
 # derivative externs (__dmc_<act>_deriv_f32), closing the gap with

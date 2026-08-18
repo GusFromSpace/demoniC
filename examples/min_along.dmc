@@ -1,4 +1,4 @@
-# min_along(t, axis) — per-axis minimum, the counterpart to max_along (#377).
+# min_along(t, axis) — per-axis minimum, the counterpart to max_along.
 # The `*_along` reduction family (sum/mean/variance/max) shipped max_along
 # without its min; this completes the pair. Interp + JIT parity.
 

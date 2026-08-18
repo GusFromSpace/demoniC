@@ -1,10 +1,10 @@
-# enum_shape.dmc — payload-carrying enum variants (#350 Part 2): first-class
+# enum_shape.dmc — payload-carrying enum variants Part 2: first-class
 # tagged unions with pattern binding, the language form of the tagged-`model`
-# idiom (SPEC §4.5 / examples/ast_eval.dmc).
+# idiom (see examples/ast_eval.dmc).
 #
 # A variant may carry positional data — `Circle(i64)`, `Rect(i64, i64)` — and a
 # `match` arm binds that data: `Circle(r) => ...`. Tag-only variants (`Empty`,
-# the #336 form) mix freely with payload variants. Construction is qualified:
+# the form) mix freely with payload variants. Construction is qualified:
 # `Shape.Circle(2)`.
 #
 # Pattern arms come two ways, both shown below: bare `Circle(r)` (the enum is
@@ -14,7 +14,7 @@
 #   Test:  dmc test examples/enum_shape.dmc
 #   JIT:   dmc jit examples/enum_shape.dmc   (also `dmc test --jit`)
 #
-# Payload variants JIT-lower end-to-end (#350 Part 2b): a value is a forge
+# Payload variants JIT-lower end-to-end Part 2b: a value is a forge
 # `[tag, slots…]` region (one 8-byte slot per variant-field, no sharing),
 # construction stores the tag + payload, and a `match` arm loads the slots into
 # the bound names. This file is in the JIT parity set. Scalar payloads only

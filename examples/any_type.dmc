@@ -1,4 +1,4 @@
-# any_type.dmc — the `any` dynamic escape hatch (issue #186).
+# any_type.dmc — the `any` dynamic escape hatch.
 #
 # `any` is the one type whose kind is not fixed at compile time. It is
 # compatible with every other type in both directions, so a value whose type

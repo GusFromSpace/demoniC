@@ -462,7 +462,7 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         "pull_to_mean_along" => Some(mk(3, TyType::Unknown)),
         // Type conversions
         "to_str"   => Some(mk(1, TyType::Scalar(ScalarType::Str))),
-        // #335: aliases for the Rust/Python names models reach for (harvest data).
+        // aliases under the equivalent Rust/Python names.
         "to_string" => Some(mk(1, TyType::Scalar(ScalarType::Str))),
         "to_int"   => Some(mk(1, TyType::Scalar(ScalarType::I64))),
         "to_float" => Some(mk(1, TyType::Scalar(ScalarType::F64))),

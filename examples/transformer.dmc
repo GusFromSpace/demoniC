@@ -1,5 +1,5 @@
 # transformer.dmc — `model` decls and `@cast` scopes on a real block.
-# Normative since spec 0.0.2. See SPEC.md §3.10, §6.4, §7.2.
+# See the spec's model, arena-scope, and mixed-precision sections.
 
 model Block[D, H] {
     ln1: Tensor[f32, [D]]

@@ -1,4 +1,4 @@
-# elu and mish activations — forward (#377). Documented in STDLIB.md as planned;
+# elu and mish activations — forward. Specified as planned;
 # now implemented as differentiable elementwise activations, scalar or f32 tensor.
 #
 #   elu(x)  (α=1) = x           for x > 0

@@ -1,4 +1,4 @@
-# softmax forward + reverse-mode VJP under the JIT (#368).
+# softmax forward + reverse-mode VJP under the JIT.
 #
 # softmax is the first *fused tensor* op to differentiate under the JIT @grad
 # subset (previously interpreter-only). The VJP over the last axis is

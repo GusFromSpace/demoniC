@@ -1,4 +1,4 @@
-# Differentiable control flow with JIT parity (#368).
+# Differentiable control flow with JIT parity.
 #
 # The JIT autodiff is an ahead-of-time symbolic tape, so it cannot trace
 # runtime-data-dependent control flow (that needs conditional adjoint nodes /

@@ -1,4 +1,4 @@
-# Gradient lifetime across forge allocations (#368, AUTODIFF.md §3).
+# Gradient lifetime across forge allocations.
 #
 # A `@grad fn` call automatically reclaims its activations: the JIT snapshots
 # the Forge at entry and, on return, compacts the published gradients down to

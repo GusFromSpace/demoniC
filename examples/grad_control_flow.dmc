@@ -1,4 +1,4 @@
-# Differentiable control flow in @grad bodies (#368).
+# Differentiable control flow in @grad bodies.
 #
 # The interpreter's reverse-mode tape runs the forward pass concretely, so a
 # data-dependent branch is differentiable by define-by-run: the condition (or
@@ -10,7 +10,7 @@
 #
 # Interpreter (`dmc run` / `dmc test`) semantics. The JIT autodiff does not yet
 # trace control flow, so these tests are SKIPPED under `dmc test --jit` rather
-# than diverging (JIT parity is a tracked follow-up on #368).
+# than diverging (JIT parity is a tracked follow-up on).
 
 # ── if / else over tensor branches ──────────────────────────────────────────
 @grad fn cf[D](!w: Tensor[f32, [D]]) -> f32 {

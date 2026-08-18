@@ -2,10 +2,9 @@
 """diff_fuzz.py — structure-aware differential fuzzer, interp vs JIT (#302).
 
 Our interp-vs-JIT differential testing is hand-written (diff_backends.py over
-whole examples, jit_probes.py over curated edge cases). A manual "agent swarm"
-sweep found ~11 real parity bugs (#296–#300) — including a JIT hang on
-continue-in-for and a SIGILL on a non-exhaustive match. That sweep was manual
-differential fuzzing; this automates it.
+whole examples, jit_probes.py over curated edge cases). A manual differential
+sweep found ~11 real parity bugs — including a JIT hang on continue-in-for
+and a SIGILL on a non-exhaustive match. This automates that sweep.
 
 This is the model Cranelift uses for its own backend (`cranelift-fuzzgen`
 generates random CLIF and diffs the interpreter against compiled host code).
@@ -50,7 +49,9 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_DMC = REPO / "compiler" / "target" / "release" / "dmc"
 
 # A jit "gap" is a clean error for an unlowered feature (not a miscompile).
-_GAP_MARKERS = ("not yet", "not support", "use dmc run", "unknown function", "unsupported")
+# #480: the JIT states whether it refused or failed — match that prefix rather
+# than grepping the message for English fragments. See jit_probes.py.
+_UNSUPPORTED = "jit unsupported"
 _RETURN_RE = re.compile(r"=>\s*(.+?)\s*$", re.MULTILINE)
 
 I64, F32, BOOL = "i64", "f32", "bool"
@@ -194,12 +195,32 @@ def run(dmc: Path, mode: str, source: str, timeout: float) -> tuple[str, str]:
 
 
 def values_agree(a: str, b: str) -> bool:
+    """Exact agreement, with NaN treated as agreeing with NaN.
+
+    #473 made this exact. It used to tolerate `|a-b| <= 1e-4 + 1e-3*|b|`, on the
+    reasoning that a scalar f32 was computed at different widths on the two
+    backends and could only agree to ~7 digits. Scalar f32 is now f32 on both
+    sides, and the interpreter's round-through-f32 is bit-exact with the JIT's
+    native f32 for `+ - * /` (#241). The old window was three orders of
+    magnitude wider than the #473 divergence, so it hid it — the same reason
+    `dmc selftest`'s in-process compare was tightened alongside this one.
+    """
     if a == b:
         return True
-    try:  # tolerate float formatting differences within f32 precision
-        return abs(float(a) - float(b)) <= 1e-4 + 1e-3 * abs(float(b))
+    try:
+        fa, fb = float(a), float(b)
     except ValueError:
         return False
+    return fa != fa and fb != fb  # both NaN
+
+
+def _values_agree_meta() -> bool:
+    """The compare must flag what it is there to flag (see --meta-test)."""
+    cases = [("1", "1", True), ("1", "2", False), ("nan", "nan", True),
+             ("nan", "1", False), ("1.0", "1.00005", False),
+             # a one-ulp f32 gap — the scale #473 lived at.
+             ("0.30000001192092896", "0.30000000447034836", False)]
+    return all(values_agree(a, b) is exp for a, b, exp in cases)
 
 
 def classify(dmc: Path, source: str, timeout: float) -> tuple[str, str]:
@@ -208,7 +229,7 @@ def classify(dmc: Path, source: str, timeout: float) -> tuple[str, str]:
     js, jv = run(dmc, "jit", source, timeout)
     if rs == "ok" and js == "ok":
         return ("ok", rv) if values_agree(rv, jv) else ("DIVERGE", f"run={rv!r} jit={jv!r}")
-    if rs == "ok" and js == "error" and any(k in jv for k in _GAP_MARKERS):
+    if rs == "ok" and js == "error" and _UNSUPPORTED in jv:
         return ("gap", jv[:80])
     if rs == "error" and js == "error":
         return ("both-fail", "")
@@ -224,10 +245,14 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--floats", action="store_true",
-                    help="also generate f32 (surfaces the known #284/#295 f32/f64 "
-                         "literal-inference divergences; off by default so the "
-                         "baseline stays clean)")
+    # #473: f32 generation is ON by default. It was opt-in while scalar f32
+    # diverged between the backends and could only be compared tolerantly; both
+    # of those are fixed, so the default sweep gates it. `--no-floats` restores
+    # the integer-only regime.
+    ap.add_argument("--floats", action="store_true", default=True,
+                    help="generate f32 as well as i64/bool (default: on)")
+    ap.add_argument("--no-floats", action="store_false", dest="floats",
+                    help="integer/bool-only generation")
     ap.add_argument("--repro", type=int, help="re-emit and run a single seed")
     ap.add_argument("--meta-test", action="store_true")
     args = ap.parse_args()
@@ -247,6 +272,10 @@ def main() -> int:
     if args.meta_test:
         # Prove the differ has teeth: two trivially different outputs must be
         # flagged as a divergence by values_agree. Runs alongside the fuzzing.
+        if not _values_agree_meta():
+            print("diff_fuzz: meta-test: error: the value comparison does not "
+                  "flag/accept the cases it must (see _values_agree_meta)")
+            return 2
         if values_agree("1", "2"):
             print("diff_fuzz: meta-test: error: differ failed to flag 1 vs 2", file=sys.stderr)
             return 1

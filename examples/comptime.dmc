@@ -1,11 +1,11 @@
 # comptime.dmc — compile-time shape arithmetic via implicitly-comptime
-# shape parameters. See SPEC.md §7.8, docs/DIRECTIVES.md.
+# shape parameters. See the spec's comptime-evaluation section.
 #
 # Shape parameters (the `[ ]` params) are implicitly comptime: a function
 # monomorphizes over them, so the shape math below is folded per instantiation.
 # The explicit `@comptime { ... }` directive — for forcing comptime evaluation
-# of *derived* values — is spec'd (SPEC.md §7.8) but not yet implemented: today
-# it is a parse-accepted no-op (#369), so this example uses the implicit form.
+# of *derived* values — is specified but not yet implemented: today it is a
+# parse-accepted no-op, so this example uses the implicit form.
 
 # Example 1: derive a tile count from a shape parameter.
 fn tile_count[D, H]() -> i64 {

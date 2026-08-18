@@ -1,8 +1,8 @@
 # lispy_vm.dmc — a Scheme interpreter using a tagged-handle heap.
 #
-# A second translation of Norvig's lispy.py (cf. examples/lispy.dmc), exploring
-# a DIFFERENT workaround for the heterogeneous-value gap (#186). Where lispy.dmc
-# makes every value a tagged `list`, this version makes every AST node a plain
+# A translation of Norvig's lispy, exploring one workaround for the
+# heterogeneous-value gap. Rather than making every value a tagged `list`,
+# this version makes every AST node a plain
 # `i64` handle into a side "heap" — the trick real dynamic-language VMs use
 # (tagged pointers / a value heap), expressed in pure demoniC.
 #
@@ -69,7 +69,7 @@ fn tokenize(src: str) -> list {
 
 # ── Atom: classify a token, allocate a cell, return its handle ──────────────────
 fn atom(heap: map, tok: str) -> i64 {
-    # is_numeric (#185) gives a non-aborting numeric test; "-" alone is a symbol.
+    # is_numeric gives a non-aborting numeric test; "-" alone is a symbol.
     if is_numeric(tok) && !(tok == "-") {
         alloc_num(heap, to_float(tok))
     } else {

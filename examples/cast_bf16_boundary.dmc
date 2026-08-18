@@ -1,4 +1,4 @@
-# @cast(bf16) dtype-boundary contract (issue #374).
+# @cast(bf16) dtype-boundary contract.
 #
 # A generic-`T` stdlib builtin invoked under `@cast(bf16)` computes in f32:
 # the exotic-float cast (bf16/f16/tf32/fp8) is a NO-OP on numeric values in
@@ -25,7 +25,7 @@ fn test_sum_under_bf16_cast_is_f32() -> bool {
     (s_cast == s_f32) && (s_cast == 4.0078125)
 }
 
-# The `silu` builtin — the case the Qwen3-4B port comment calls out — computes
+# The `silu` builtin computes
 # in f32 under @cast(bf16): its internal sigmoid is NOT evaluated in bf16.
 fn test_silu_under_bf16_cast_is_f32() -> bool {
     let !w = forge.zeros[f32, [4]]

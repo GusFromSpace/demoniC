@@ -86,16 +86,113 @@ pub type EvalResult<T> = Result<T, RuntimeError>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DType { Int, F32, F64, Trit }
 
+/// Width of a scalar float (#473) — the scalar counterpart of `DType`'s
+/// `F32`/`F64` split for tensors.
+///
+/// `F32` values are rounded through f32 after every operation that produces
+/// one. #241 established this is not an approximation: for `+ - * /`,
+/// computing in f64 and rounding once through f32 is *bit-exact* equal to
+/// native f32 arithmetic, because double rounding is harmless when the
+/// intermediate carries at least 2p+2 bits and f64's 53 > 2*24+2. That is what
+/// makes f32 tensors match the JIT today; scalars match it the same way,
+/// without needing an f32-native evaluator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FW { F64, F32 }
+
+impl FW {
+    /// Width of a binary op's result: f32 only when BOTH operands are f32,
+    /// mirroring the tensor rule in #241 ("result is F64 iff an operand is
+    /// F64"). An f64 operand keeps the result f64, so mixed arithmetic never
+    /// silently narrows.
+    #[inline]
+    fn join(a: FW, b: FW) -> FW {
+        if a == FW::F32 && b == FW::F32 { FW::F32 } else { FW::F64 }
+    }
+    /// Round a value to this width.
+    #[inline]
+    fn round(self, x: f64) -> f64 {
+        match self { FW::F32 => quantize_f32(x), FW::F64 => x }
+    }
+}
+
 /// Round a scalar through f32 (the F32-tensor store semantics).
 #[inline]
 fn quantize_f32(x: f64) -> f64 {
     x as f32 as f64
 }
 
+/// The width a value contributes to an arithmetic result. Ints and non-floats
+/// count as f64 so that `1 + 0.5f32` stays f64 — mixed arithmetic never
+/// silently narrows (#473).
+#[inline]
+fn float_width(v: &Value) -> FW {
+    match v { Value::Float(_, w) => *w, _ => FW::F64 }
+}
+
+/// The f32-family scalar types. `f16`/`bf16`/`tf32`/`fp8_*` are f32-backed in
+/// both backends by the #179 convention — computed in f32 and retagged, never
+/// rounded to their own narrower precision.
+#[inline]
+fn scalar_is_f32_family(t: &ScalarType) -> bool {
+    use ScalarType::*;
+    matches!(t, F32 | F16 | Bf16 | Tf32 | Fp8E4M3 | Fp8E5M2)
+}
+
+
+/// Apply a declared scalar type's float WIDTH to a value (#473).
+///
+/// The binding sites — `let x: f32 = ...`, a typed parameter, a typed return —
+/// are where an annotation stops being documentation and starts being
+/// semantics. Without this, `let a: f32 = 0.1` keeps the f64 0.1 while the JIT
+/// lowers the f32 one, and the two backends part company on the next operation.
+/// Only floats are touched; every other value passes through untouched.
+fn coerce_scalar_width(v: Value, ty: Option<&Type>) -> Value {
+    let Some(Type::Scalar(st, _)) = ty else { return v };
+    match v {
+        Value::Float(x, _) if scalar_is_f32_family(st) => {
+            Value::Float(quantize_f32(x), FW::F32)
+        }
+        Value::Float(x, _) if matches!(st, ScalarType::F64) => Value::Float(x, FW::F64),
+        other => other,
+    }
+}
+
 /// Round every element of a tensor's data through f32.
 #[inline]
 fn quantize_f32_arr(data: &mut ArrayD<f64>) {
     data.mapv_inplace(|x| x as f32 as f64);
+}
+
+/// Sum a sequence at f32 width: round the running total after every add (#481).
+///
+/// This is #241's technique applied to a REDUCTION. `acc + x` on two f32-valued
+/// f64s is exact, so rounding the result through f32 gives exactly the f32 add,
+/// and a fold of them gives exactly a native-f32 sequential sum. The JIT reduces
+/// f32 tensors that way and — since #473 — so does a hand-written
+/// `let !s = 0.0f32   for i { s = s + t[i] }` loop on both backends. Accumulating
+/// in f64 and rounding once at the end, which is what `ndarray::sum` does, is a
+/// *different* number: verified across sizes 2..1000, `sum(t)` disagreed with
+/// the loop it is documented to mean.
+#[inline]
+fn sum_f32<I: Iterator<Item = f64>>(it: I) -> f64 {
+    it.fold(0.0, |acc, x| quantize_f32(acc + x))
+}
+
+/// Sum at the width the tensor's dtype implies (#481): f32 tensors round every
+/// add, everything else accumulates in f64 as before.
+#[inline]
+fn tensor_sum(t: &TensorVal) -> f64 {
+    if t.dtype == DType::F32 { sum_f32(t.iter().copied()) } else { t.iter().sum() }
+}
+
+/// `sum(t) / n` at the tensor's width (#481). The JIT converts the count to f32
+/// and divides in f32, so an f32 tensor must do the same rather than dividing
+/// the f32 total by an f64 count.
+#[inline]
+fn tensor_mean(t: &TensorVal) -> f64 {
+    let total = tensor_sum(t);
+    let n = t.len() as f64;
+    if t.dtype == DType::F32 { quantize_f32(total / quantize_f32(n)) } else { total / n }
 }
 
 /// A tensor value: f64-backed storage plus a coarse dtype tag. Derefs to the
@@ -122,6 +219,13 @@ impl TensorVal {
         TensorVal { data, dtype }
     }
     pub fn is_int(&self) -> bool { self.dtype == DType::Int }
+
+    /// Width a scalar read out of this tensor carries (#473). Elements of an
+    /// `F32` tensor are already f32-rounded by #241's store-time rule; the
+    /// width is what keeps them f32 through the arithmetic that follows.
+    pub fn float_width(&self) -> FW {
+        if self.dtype == DType::F32 { FW::F32 } else { FW::F64 }
+    }
 }
 
 impl std::ops::Deref for TensorVal {
@@ -146,7 +250,11 @@ impl fmt::Display for TensorVal {
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
-    Float(f64),
+    /// #473: a scalar float carries its declared WIDTH, the way `TensorVal`
+    /// carries `DType`. Without it an `f32` annotation is inert at runtime: the
+    /// interpreter computes every float in f64 while the JIT computes true
+    /// f32, so the two backends disagree on `0.1f32 + 0.2f32`.
+    Float(f64, FW),
     Bool(bool),
     Str(String),
     Nil,
@@ -216,7 +324,14 @@ impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(n)   => write!(f, "{}", n),
-            Value::Float(x) => write!(f, "{}", x),
+            // #473: an f32 renders as the f64 expansion of its f32-rounded
+            // value ("12.368000030517578"), NOT the shortest f32 form
+            // ("12.368"). That is #368's rule, it is what f32 *tensors* have
+            // always printed, and the JIT widens f32→f64 before formatting to
+            // match — so the same dtype renders the same way whether it sits in
+            // a scalar or an element. Pinned by
+            // `jit::tests::as_cast_derived_f32_str_matches_interp`.
+            Value::Float(x, _) => write!(f, "{}", x),
             Value::Bool(b)  => write!(f, "{}", b),
             Value::Str(s)   => write!(f, "{:?}", s),
             Value::Nil      => write!(f, "nil"),
@@ -310,7 +425,7 @@ impl Value {
         match self { Value::Int(n) => Some(*n), _ => None }
     }
     fn as_float(&self) -> Option<f64> {
-        match self { Value::Int(n) => Some(*n as f64), Value::Float(x) => Some(*x), _ => None }
+        match self { Value::Int(n) => Some(*n as f64), Value::Float(x, _) => Some(*x), _ => None }
     }
     fn as_bool(&self) -> Option<bool> {
         match self { Value::Bool(b) => Some(*b), _ => None }
@@ -318,7 +433,7 @@ impl Value {
     fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_)     => "int",
-            Value::Float(_)   => "float",
+            Value::Float(_, _)   => "float",
             Value::Bool(_)    => "bool",
             Value::Str(_)     => "str",
             Value::Nil        => "nil",
@@ -779,6 +894,27 @@ impl Interpreter {
         out
     }
 
+    /// The declared type of `field` on a struct value, via its hidden
+    /// `__model__` tag (#473). `None` when the value carries no model tag or
+    /// the model declares no such field.
+    fn struct_field_ty(
+        &self,
+        fields: &Rc<RefCell<Vec<(String, Value)>>>,
+        field: &str,
+    ) -> Option<crate::ast::Type> {
+        let model = {
+            let b = fields.borrow();
+            match b.iter().find(|(k, _)| k == "__model__") {
+                Some((_, Value::Str(n))) => n.clone(),
+                _ => return None,
+            }
+        };
+        self.model_fields.get(&model)?
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, t)| t.clone())
+    }
+
     fn assign_to_tensor(&mut self, arr: &mut ArrayD<f64>, dtype: DType, idx_elems: &[IndexElem], rval: Value, span: Span) -> EvalResult<()> {
         let idx_vals = self.eval_index_elems(idx_elems, &span)?;
         Self::assign_to_tensor_resolved(arr, dtype, &idx_vals, rval, span)
@@ -793,7 +929,7 @@ impl Interpreter {
         // here when the target is an F32 tensor. F64/Int/Trit pass through.
         let rval = if matches!(dtype, DType::F32) {
             match rval {
-                Value::Float(x) => Value::Float(quantize_f32(x)),
+                Value::Float(x, _) => Value::Float(quantize_f32(x), FW::F64),
                 Value::Tensor(mut t) => { quantize_f32_arr(&mut t.data); Value::Tensor(t) }
                 other => other,
             }
@@ -844,7 +980,7 @@ impl Interpreter {
             Value::Int(n) => {
                 assign_scalar_to_selection(arr, &selections, n as f64);
             }
-            Value::Float(val) => {
+            Value::Float(val, _) => {
                 assign_scalar_to_selection(arr, &selections, val);
             }
             other => return Err(RuntimeError::at(format!(
@@ -1133,6 +1269,7 @@ impl Interpreter {
         match item {
             Item::Let(l) => {
                 let v = self.eval_expr(&l.value)?;
+                let v = coerce_scalar_width(v, l.ty.as_ref());
                 self.bind_pattern(&l.pattern, v);
                 if let Some(axis) = l.ty.as_ref().and_then(streaming_axis_from_type) {
                     self.bind_stream_axis_pattern(&l.pattern, axis);
@@ -1198,12 +1335,15 @@ impl Interpreter {
             self.bind(name, val);
         }
         for (p, v) in lit.params.iter().zip(args) {
-            self.bind(&p.name, v);
+            self.bind(&p.name, coerce_scalar_width(v, p.ty.as_ref()));
         }
         let result = self.eval_block(&lit.body);
         self.pop_scope();
         match result {
-            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => Ok(v),
+            // #473: a lambda's declared return type binds its width too.
+            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => {
+                Ok(coerce_scalar_width(v, lit.ret_type.as_ref()))
+            }
             Ok(_) => Ok(Value::Nil),
             // `?` early-return: this lambda returns the propagated tuple.
             Err(e) => match e.propagate { Some(v) => Ok(*v), None => Err(e) },
@@ -1476,7 +1616,7 @@ impl Interpreter {
         // Bind params: tensor params become Input nodes; the `mutating` flag
         // tells the backward pass which ones to return gradients for.
         for (i, (p, v)) in f.params.iter().zip(&args).enumerate() {
-            self.bind(&p.name, v.clone());
+            self.bind(&p.name, coerce_scalar_width(v.clone(), p.ty.as_ref()));
             if let Value::Tensor(_) = v {
                 let node_id = tape.push(TapeNode {
                     op: TapeOp::Input { param_idx: i, mutating: p.mutating },
@@ -1528,16 +1668,16 @@ impl Interpreter {
                 Value::Tensor(t) => {
                     let total: f64 = t.iter().sum();
                     tape.push(TapeNode {
-                        op: TapeOp::Sum, inputs: vec![g1], value: Value::Float(total),
+                        op: TapeOp::Sum, inputs: vec![g1], value: Value::Float(total, FW::F64),
                     })
                 }
                 _ => g1,
             };
             grads = vec![None; tape.nodes.len()];
-            grads[loss2] = Some(Value::Float(1.0));
+            grads[loss2] = Some(Value::Float(1.0, FW::F64));
         } else {
             grads = vec![None; tape.nodes.len()];
-            grads[loss_node] = Some(Value::Float(1.0));
+            grads[loss_node] = Some(Value::Float(1.0, FW::F64));
         }
         tape.backward(&mut grads)?;
 
@@ -1841,14 +1981,14 @@ impl Interpreter {
                                 let out = self.call_builtin(fname, vec![v.clone()], psp.clone())?;
                                 if let Some(nid) = n {
                                     // The raw Sum value (mean's numerator).
-                                    let sum_val = Value::Float(as_tensor(&v)?.iter().sum());
+                                    let sum_val = Value::Float(as_tensor(&v)?.iter().sum(), FW::F64);
                                     let sum_id = tape.push(TapeNode {
                                         op: TapeOp::Sum, inputs: vec![nid],
                                         value: if fname == "sum" { out.clone() } else { sum_val },
                                     });
                                     if fname == "mean" {
                                         let count = as_tensor(&v)?.len() as f64;
-                                        let cnode = tape.push_const(Value::Float(count));
+                                        let cnode = tape.push_const(Value::Float(count, FW::F64));
                                         let mean_id = tape.push(TapeNode {
                                             op: TapeOp::ScalarDiv,
                                             inputs: vec![sum_id, cnode], value: out.clone(),
@@ -1917,7 +2057,7 @@ impl Interpreter {
                                         _ => 1e-6,
                                     }
                                 } else { 1e-6 };
-                                let out = self.call_builtin(fname, vec![xv.clone(), gv.clone(), Value::Float(eps)], psp.clone())?;
+                                let out = self.call_builtin(fname, vec![xv.clone(), gv.clone(), Value::Float(eps, FW::F64)], psp.clone())?;
                                 if xn.is_some() || gn.is_some() {
                                     let xnid = xn.unwrap_or_else(|| tape.push_const(xv.clone()));
                                     let gnid = gn.unwrap_or_else(|| tape.push_const(gv.clone()));
@@ -1943,7 +2083,7 @@ impl Interpreter {
                                         _ => 1e-5,
                                     }
                                 } else { 1e-5 };
-                                let out = self.call_builtin(fname, vec![xv.clone(), gv.clone(), bv.clone(), Value::Float(eps)], psp.clone())?;
+                                let out = self.call_builtin(fname, vec![xv.clone(), gv.clone(), bv.clone(), Value::Float(eps, FW::F64)], psp.clone())?;
                                 if xn.is_some() || gn.is_some() || bn.is_some() {
                                     let xnid = xn.unwrap_or_else(|| tape.push_const(xv.clone()));
                                     let gnid = gn.unwrap_or_else(|| tape.push_const(gv.clone()));
@@ -2219,12 +2359,12 @@ impl Interpreter {
                 let lv = lit_value(lit);
                 match (&lv, val) {
                     (Value::Int(a),   Value::Int(b))   => a == b,
-                    (Value::Float(a), Value::Float(b)) => a == b,
+                    (Value::Float(a, _), Value::Float(b, _)) => a == b,
                     // Cross-match Int/Float like `==` (scalar_compare) and
                     // `list_contains` already do (#291.2): a `0` literal pattern
                     // matches a `0.0` scrutinee, so match agrees with equality.
-                    (Value::Int(a),   Value::Float(b)) => (*a as f64) == *b,
-                    (Value::Float(a), Value::Int(b))   => *a == (*b as f64),
+                    (Value::Int(a),   Value::Float(b, _)) => (*a as f64) == *b,
+                    (Value::Float(a, _), Value::Int(b))   => *a == (*b as f64),
                     (Value::Bool(a),  Value::Bool(b))  => a == b,
                     (Value::Str(a),   Value::Str(b))   => a == b,
                     (Value::Nil,      Value::Nil)       => true,
@@ -2341,7 +2481,7 @@ impl Interpreter {
             }
         }
         for (p, v) in f.params.iter().zip(args) {
-            self.bind(&p.name, v);
+            self.bind(&p.name, coerce_scalar_width(v, p.ty.as_ref()));
             if let Some(axis) = p.ty.as_ref().and_then(streaming_axis_from_type) {
                 self.bind_stream_axis(&p.name, axis);
             }
@@ -2373,7 +2513,17 @@ impl Interpreter {
             .collect();
         self.pop_scope();
         match result {
-            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => Ok(v),
+            // #473: a declared return type is one of the binding sites where an
+            // annotation becomes semantics, alongside a typed `let`, a typed
+            // param, a typed model field and an `as` cast. Without this
+            // `fn k() -> f32 { 0.1 }` hands
+            // back an f64 while the JIT — whose signature carries the declared
+            // f32 — returns the f32, and the two backends part company on the
+            // next operation. A `?` propagation returns a (T, Err) tuple, not a
+            // T, so it is deliberately left alone.
+            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => {
+                Ok(coerce_scalar_width(v, f.ret_type.as_ref()))
+            }
             Ok(Flow::Break) | Ok(Flow::Continue) => Err(RuntimeError::msg("break/continue outside loop")),
             // `?` early-return: this function returns the propagated (T, Err) tuple.
             Err(e) => match e.propagate { Some(v) => Ok(*v), None => Err(e) },
@@ -2492,6 +2642,7 @@ impl Interpreter {
                     }
                 }
                 let v = self.eval_expr(&l.value)?;
+                let v = coerce_scalar_width(v, l.ty.as_ref());
                 self.bind_pattern(&l.pattern, v);
                 // #399: resolve the streaming axis and declared capacity from the
                 // explicit `KV[..~..]` type annotation OR, failing that, the
@@ -2818,9 +2969,14 @@ impl Interpreter {
                         (AssignOp::Eq, Expr::Postfix { expr: base_expr, op: PostfixOp::Field(field_name), .. }) => {
                             let recv = self.eval_expr(base_expr)?;
                             if let Value::Struct(fields) = recv {
+                                // #473: a declared scalar field type binds the
+                                // stored value's float width here too, so a
+                                // later `m.x = 0.1` holds the same f32 that
+                                // `M { x: 0.1 }` stored at construction.
+                                let declared = self.struct_field_ty(&fields, field_name);
                                 let mut borrowed = fields.borrow_mut();
                                 if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == field_name) {
-                                    *slot = rval;
+                                    *slot = coerce_scalar_width(rval, declared.as_ref());
                                 }
                             }
                         }
@@ -3003,7 +3159,7 @@ impl Interpreter {
                         // An all-integer literal is an integer tensor (#125).
                         Ok(Value::tensor_dt(arr, DType::Int))
                     }
-                    Value::Float(f0) => {
+                    Value::Float(f0, _) => {
                         let mut data = vec![f0];
                         for e in elems.iter().skip(1) {
                             let v = self.eval_expr(e)?;
@@ -3058,8 +3214,19 @@ impl Interpreter {
                         }
                     }
                 }
+                // #473: a declared scalar field type binds the stored value's
+                // float width, exactly like a typed `let` or parameter. The JIT
+                // gives an `f32` field 4-byte storage, so `M { x: 0.1 }` reads
+                // back as the f32 0.100000001490116 there; without this the
+                // interpreter would hand back the full-width f64 and the two
+                // backends would part company on the next operation.
+                let field_tys = self.model_fields.get(name).cloned();
                 for (fname, fexpr) in fields {
-                    field_vals.push((fname.clone(), self.eval_expr(fexpr)?));
+                    let v = self.eval_expr(fexpr)?;
+                    let declared = field_tys.as_ref()
+                        .and_then(|fs| fs.iter().find(|(n, _)| n == fname))
+                        .map(|(_, t)| t);
+                    field_vals.push((fname.clone(), coerce_scalar_width(v, declared)));
                 }
                 Ok(Value::Struct(Rc::new(RefCell::new(field_vals))))
             }
@@ -3140,8 +3307,8 @@ impl Interpreter {
                                 };
                                 self.prof_tensor_op(elems);
                             }
-                            (Value::Int(_), _) | (Value::Float(_), _)
-                            | (_, Value::Int(_)) | (_, Value::Float(_)) => {
+                            (Value::Int(_), _) | (Value::Float(_, _), _)
+                            | (_, Value::Int(_)) | (_, Value::Float(_, _)) => {
                                 self.prof_scalar_op();
                             }
                             _ => {}
@@ -3192,11 +3359,11 @@ impl Interpreter {
         if self.fns.contains_key(name) { return Ok(Value::Fn(name.to_string())); }
         if self.extern_fns.contains(name) { return Ok(Value::Fn(name.to_string())); }
         // `pi` is a well-known math constant
-        if name == "pi"  { return Ok(Value::Float(std::f64::consts::PI)); }
-        if name == "tau" { return Ok(Value::Float(std::f64::consts::TAU)); }
-        if name == "e"   { return Ok(Value::Float(std::f64::consts::E)); }
-        if name == "inf" { return Ok(Value::Float(f64::INFINITY)); }
-        if name == "nan" { return Ok(Value::Float(f64::NAN)); }
+        if name == "pi"  { return Ok(Value::Float(std::f64::consts::PI, FW::F64)); }
+        if name == "tau" { return Ok(Value::Float(std::f64::consts::TAU, FW::F64)); }
+        if name == "e"   { return Ok(Value::Float(std::f64::consts::E, FW::F64)); }
+        if name == "inf" { return Ok(Value::Float(f64::INFINITY, FW::F64)); }
+        if name == "nan" { return Ok(Value::Float(f64::NAN, FW::F64)); }
         if self.models.contains(name) {
             // Model names appear in `Transformer[L=24, ...].load(...)` patterns;
             // the interpreter doesn't realize methods, so it's opaque-but-known.
@@ -3316,8 +3483,8 @@ impl Interpreter {
                             // written, no error). Error loudly instead.
                             if matches!(method.as_str(), "save" | "load") {
                                 return Err(RuntimeError::at(format!(
-                                    "model serialization `{}.{}` is specified (SPEC §3.10) \
-                                     but not yet implemented (#394)", mname, method), span));
+                                    "model serialization `{}.{}` is specified \
+                                     but not yet implemented", mname, method), span));
                             }
                             // #441: no such method on this model. A field of
                             // that name may still hold a callable, so only
@@ -3355,8 +3522,8 @@ impl Interpreter {
                         if let Expr::Ident(name, _) = base {
                             if self.models.contains(name) {
                                 return Err(RuntimeError::at(format!(
-                                    "model serialization `{}.{}` is specified (SPEC §3.10) \
-                                     but not yet implemented (#394)", name, method), span));
+                                    "model serialization `{}.{}` is specified \
+                                     but not yet implemented", name, method), span));
                             }
                         }
                     }
@@ -3372,7 +3539,7 @@ impl Interpreter {
                             "allreduce" | "allgather" | "reducescatter" | "broadcast")
                         {
                             return Err(RuntimeError::at(format!(
-                                "distributed collective `{}.{}` is not executable here (#396); \
+                                "distributed collective `{}.{}` is not executable here; \
                                  collectives are unimplemented on a single node", coll, op), span));
                         }
                     }
@@ -3677,7 +3844,7 @@ impl Interpreter {
                         IndexElem::Expr(e) => {
                             match self.eval_expr(e)? {
                                 Value::Int(n)   => raw_idx.push(n),
-                                Value::Float(x) => raw_idx.push(x as i64),
+                                Value::Float(x, _) => raw_idx.push(x as i64),
                                 _ => { all_scalar = false; break; }
                             }
                         }
@@ -3709,7 +3876,7 @@ impl Interpreter {
                             // an Int so downstream `/`, `%`, `&`, range bounds etc.
                             // keep integer semantics (#125).
                             let x = arr[IxDyn(&idx)];
-                            if arr.is_int() { Ok(Value::Int(x as i64)) } else { Ok(Value::Float(x)) }
+                            if arr.is_int() { Ok(Value::Int(x as i64)) } else { Ok(Value::Float(x, arr.float_width())) }
                         } else if idx.len() < arr.ndim() {
                             // Partial index → sub-tensor slice along first axes;
                             // a sub-tensor keeps its parent's dtype.
@@ -3795,7 +3962,7 @@ impl Interpreter {
     fn eval_dim(&mut self, e: &Expr) -> usize {
         match self.eval_expr(e) {
             Ok(Value::Int(n))   if n >= 0 => n as usize,
-            Ok(Value::Float(x)) if x >= 0.0 => x as usize,
+            Ok(Value::Float(x, _)) if x >= 0.0 => x as usize,
             _ => 4,
         }
     }
@@ -4011,7 +4178,7 @@ impl Interpreter {
         if method == "uniform_int" {
             return Err(RuntimeError::at(
                 "`rng.uniform_int` needs its range: \
-                 `rng.uniform_int[T, [shape]](low, high)` (SPEC §3.8)".to_string(),
+                 `rng.uniform_int[T, [shape]](low, high)`".to_string(),
                 expr.span_of(),
             ));
         }
@@ -4239,7 +4406,13 @@ fn is_trit_type_name(name: &str) -> bool {
 fn lit_value(lit: &Literal) -> Value {
     match lit {
         Literal::Int(n, _) => Value::Int(*n),
-        Literal::Float(x, _) => Value::Float(*x),
+        // #473: an f32-family suffix produces a true f32 value. Rounding here
+        // matters on its own: `0.1f32` is 0.100000001490116119384765625, not
+        // the f64 0.1, and the JIT has always lowered it that way.
+        Literal::Float(x, sfx) => match sfx {
+            Some(t) if scalar_is_f32_family(t) => Value::Float(quantize_f32(*x), FW::F32),
+            _ => Value::Float(*x, FW::F64),
+        },
         Literal::Str(s)   => Value::Str(s.clone()),
         Literal::Char(c)  => Value::Int(*c as i64),
         Literal::Bool(b)  => Value::Bool(*b),
@@ -4393,7 +4566,12 @@ fn scalar_arith(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
             Pow | StarStar => a.powf(b),
             _ => unreachable!(),
         };
-        return Ok(Value::Float(v));
+        // #473: f32 operands give an f32 result, rounded — which is bit-exact
+        // with native f32 for `+ - * /` (see `FW`). `Pow` is the documented
+        // exception carried over from #241: `powf` in f64 then rounded can
+        // differ from the JIT's f32 `powf` by up to 1 ulp.
+        let w = FW::join(float_width(l), float_width(r));
+        return Ok(Value::Float(w.round(v), w));
     }
     Err(RuntimeError::msg(format!(
         "{:?} requires numeric operands, got {} and {}", op, l.type_name(), r.type_name()
@@ -4614,11 +4792,40 @@ fn tensor_elementwise(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     Ok(Value::tensor_dt(out, dt))
 }
 
+/// `A(m,k) @ B(k,n)` accumulated with FMA at f32 width (#481).
+///
+/// `ndarray`'s `dot` accumulates in f64 (and blocks internally), which is a
+/// different number from what the JIT computes. All three JIT matmul kernels
+/// contract with FMA over k ascending — one rounding per multiply-add — so the
+/// interpreter must too, and `f32::mul_add` is exactly that: a single correctly
+/// rounded operation, with a software fallback where the host has no FMA unit,
+/// so the answer does not depend on the machine.
+///
+/// Deliberately NOT `ndarray::dot`: this is the reference implementation, and
+/// being the same number as the JIT matters more here than being fast.
+fn gemm_f32_fma(
+    a: &ndarray::ArrayView2<'_, f64>,
+    b: &ndarray::ArrayView2<'_, f64>,
+) -> ndarray::Array2<f64> {
+    let (m, k) = (a.nrows(), a.ncols());
+    let n = b.ncols();
+    let mut out = ndarray::Array2::<f64>::zeros((m, n));
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for kk in 0..k {
+                acc = (a[[i, kk]] as f32).mul_add(b[[kk, j]] as f32, acc);
+            }
+            out[[i, j]] = acc as f64;
+        }
+    }
+    out
+}
+
 fn tensor_matmul(l: &Value, r: &Value) -> EvalResult<Value> {
-    // #241: width of the product follows the operands. Note the interpreter
-    // still *accumulates* dot products in f64 and rounds once at the end,
-    // where the JIT accumulates in f32 per step — a documented residual
-    // divergence (the interpreter is the more accurate of the two here).
+    // #241: width of the product follows the operands. #481: an f32 product
+    // accumulates with FMA at f32 width, matching all three JIT kernels; other
+    // dtypes keep `ndarray`'s f64 dot.
     let dt = float_result_dtype(&[l, r]);
     // Trit operands: unpack to plain f64 (values are already -1/0/1) so the
     // standard matmul path handles them without modification.
@@ -4653,7 +4860,8 @@ fn tensor_matmul(l: &Value, r: &Value) -> EvalResult<Value> {
                 "matmul inner dims: {} vs {}", a2.ncols(), b2.nrows(),
             )));
         }
-        return Ok(Value::tensor_dt(a2.dot(&b2).into_dyn(), dt));
+        let prod = if dt == DType::F32 { gemm_f32_fma(&a2, &b2) } else { a2.dot(&b2) };
+        return Ok(Value::tensor_dt(prod.into_dyn(), dt));
     }
     // Batched matmul. Leading dims are batch dims and broadcast like
     // NumPy/PyTorch; the trailing (M, K) × (K, N) pair is multiplied per
@@ -4686,7 +4894,11 @@ fn tensor_matmul(l: &Value, r: &Value) -> EvalResult<Value> {
         let b_i = broadcast_source_index(&out_idx, &out_batch, b_batch);
         let a_slice = a_flat.index_axis(Axis(0), a_i);
         let b_slice = b_flat.index_axis(Axis(0), b_i);
-        let prod = a_slice.dot(&b_slice);
+        let prod = if dt == DType::F32 {
+            gemm_f32_fma(&a_slice, &b_slice)
+        } else {
+            a_slice.dot(&b_slice)
+        };
         out_flat.index_axis_mut(Axis(0), i).assign(&prod);
     }
     let mut out_shape = out_batch;
@@ -4928,7 +5140,7 @@ fn as_tensor(v: &Value) -> EvalResult<ArrayD<f64>> {
     match v {
         Value::Tensor(t) => Ok(t.data.clone()),
         Value::Int(n)   => Ok(ArrayD::from_elem(IxDyn(&[]), *n as f64)),
-        Value::Float(x) => Ok(ArrayD::from_elem(IxDyn(&[]), *x)),
+        Value::Float(x, _) => Ok(ArrayD::from_elem(IxDyn(&[]), *x)),
         _ => Err(RuntimeError::msg(format!("expected tensor or numeric scalar, got {}", v.type_name()))),
     }
 }
@@ -5000,7 +5212,7 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
     match op {
         Neg => match v {
             Value::Int(n)    => Ok(Value::Int(-n)),
-            Value::Float(x)  => Ok(Value::Float(-x)),
+            Value::Float(x, w)  => Ok(Value::Float(w.round(-x), *w)),
             // Result width follows the operand (#241): an Int/F64 tensor must
             // not be rounded through f32 by the default-F32 construction.
             Value::Tensor(t) => Ok(Value::tensor_dt(t.map(|x| -x), float_result_dtype(&[v]))),
@@ -5010,14 +5222,14 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
         Deref => Ok(v.clone()),  // pre-alpha: no references
         ReLU => match v {
             Value::Tensor(t) => Ok(Value::tensor_dt(t.map(|x| x.max(0.0)), float_result_dtype(&[v]))),
-            Value::Float(x)  => Ok(Value::Float(x.max(0.0))),
+            Value::Float(x, w)  => Ok(Value::Float(w.round(x.max(0.0)), *w)),
             Value::Int(n)    => Ok(Value::Int((*n).max(0))),
             _ => Err(RuntimeError::msg(format!("\\> requires numeric/tensor, got {}", v.type_name()))),
         }
         GeLU => match v {
             // GeLU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
             Value::Tensor(t) => Ok(Value::tensor_dt(t.map(|x| gelu(*x)), float_result_dtype(&[v]))),
-            Value::Float(x) => Ok(Value::Float(gelu(*x))),
+            Value::Float(x, w) => Ok(Value::Float(w.round(gelu(*x)), *w)),
             _ => Err(RuntimeError::msg(format!("\\< requires numeric/tensor, got {}", v.type_name()))),
         }
         BitNot => match v {
@@ -5117,13 +5329,16 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
                    if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64); }
                    if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64); } }
         "f64" => {
-            if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }); }
-            if let Some(n) = v.as_float() { return Value::Float(n); }
+            if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F64); }
+            if let Some(n) = v.as_float() { return Value::Float(n, FW::F64); }
         }
         // f32-family scalar casts round through f32 (#300 ruling) — see apply_cast.
+        // #473: the result is also TAGGED f32, so the width propagates into
+        // whatever the cast feeds. Rounding once and then computing in f64
+        // would still diverge from the JIT on the very next operation.
         "f16" | "bf16" | "tf32" | "f32" | "fp8_e4m3" | "fp8_e5m2" => {
-            if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }); }
-            if let Some(n) = v.as_float() { return Value::Float(n as f32 as f64); }
+            if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F32); }
+            if let Some(n) = v.as_float() { return Value::Float(quantize_f32(n), FW::F32); }
         }
         "bool" => {
             if let Value::Bool(b) = v { return Value::Bool(*b); }
@@ -5195,15 +5410,16 @@ fn apply_cast(v: &Value, ty: &Type) -> Value {
                      if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64); }
                      if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64); } }
             F64 => {
-                if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }); }
-                if let Some(n) = v.as_float() { return Value::Float(n); }
+                if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F64); }
+                if let Some(n) = v.as_float() { return Value::Float(n, FW::F64); }
             }
             // f32-family scalar casts ROUND through f32 (#300 ruling): an explicit
             // `as f32` loses precision, matching the JIT and the tensor cast path
             // which retags these as f32. `0.1 as f32` → 0.10000000149… not 0.1.
             F16 | Bf16 | Tf32 | F32 | Fp8E4M3 | Fp8E5M2 => {
-                if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }); }
-                if let Some(n) = v.as_float() { return Value::Float(n as f32 as f64); }
+                // #473: round AND tag — see apply_cast_by_name.
+                if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F32); }
+                if let Some(n) = v.as_float() { return Value::Float(quantize_f32(n), FW::F32); }
             }
             // int/float→bool: 0/0.0 → false, anything else → true.
             Bool => {
@@ -5260,7 +5476,7 @@ fn expand_iter(v: &Value) -> EvalResult<Vec<Value>> {
             // Iterate along the first axis as nested tensors / scalars,
             // preserving the dtype so iterating an integer tensor yields Ints.
             let is_int = t.is_int();
-            let scalar = |x: f64| if is_int { Value::Int(x as i64) } else { Value::Float(x) };
+            let scalar = |x: f64| if is_int { Value::Int(x as i64) } else { Value::Float(x, FW::F64) };
             let mut out = Vec::new();
             if t.ndim() == 0 { return Ok(vec![scalar(t[IxDyn(&[])])]); }
             for slice in t.axis_iter(Axis(0)) {
@@ -5433,7 +5649,7 @@ pub(crate) fn is_builtin(name: &str) -> bool {
         "to_hex" | "to_bin" | "to_binary" | "to_oct" |
         "str_repeat" | "clamp" |
         "tan" | "asin" | "acos" | "atan" | "atan2" | "hypot" |
-        "sort" | "gcd" | "median" |   // #335: stdlib the harvest showed models reach for
+        "sort" | "gcd" | "median" |   // stdlib under its Rust/Python spelling
         "log2" | "log10" | "isclose" |
         "solve" | "inv" | "lstsq" |
         "rms_norm" | "layer_norm" | "attn" | "attn_gqa" | "rope" | "embed" |
@@ -5626,54 +5842,54 @@ impl Interpreter {
         "sqrt" => {
             let x = args.first().and_then(|v| v.as_float()).ok_or_else(||
                 RuntimeError::msg("sqrt: numeric arg required"))?;
-            Ok(Value::Float(x.sqrt()))
+            Ok(Value::Float(x.sqrt(), FW::F64))
         }
         "exp" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("exp: numeric"))?
-            .exp())),
+            .exp(), FW::F64)),
         "log" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("log: numeric"))?
-            .ln())),
+            .ln(), FW::F64)),
         "abs" => match args.first() {
             Some(Value::Int(n)) => Ok(Value::Int(n.abs())),
-            Some(v) => Ok(Value::Float(v.as_float().unwrap_or(0.0).abs())),
+            Some(v) => Ok(Value::Float(v.as_float().unwrap_or(0.0).abs(), FW::F64)),
             None => Err(RuntimeError::msg("abs: needs arg")),
         }
         "sin" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
-            .unwrap_or(0.0).sin())),
+            .unwrap_or(0.0).sin(), FW::F64)),
         "cos" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
-            .unwrap_or(0.0).cos())),
+            .unwrap_or(0.0).cos(), FW::F64)),
         "floor" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("floor: numeric arg required"))?
-            .floor())),
+            .floor(), FW::F64)),
         "ceil" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("ceil: numeric arg required"))?
-            .ceil())),
+            .ceil(), FW::F64)),
         "tan" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("tan: numeric arg required"))?
-            .tan())),
+            .tan(), FW::F64)),
         "asin" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("asin: numeric arg required"))?
-            .asin())),
+            .asin(), FW::F64)),
         "acos" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("acos: numeric arg required"))?
-            .acos())),
+            .acos(), FW::F64)),
         "atan" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("atan: numeric arg required"))?
-            .atan())),
+            .atan(), FW::F64)),
         "atan2" => {
             let y = args.first().and_then(|v| v.as_float())
                 .ok_or_else(|| RuntimeError::msg("atan2: numeric y arg required"))?;
             let x = args.get(1).and_then(|v| v.as_float())
                 .ok_or_else(|| RuntimeError::msg("atan2: numeric x arg required"))?;
-            Ok(Value::Float(y.atan2(x)))
+            Ok(Value::Float(y.atan2(x), FW::F64))
         }
         "hypot" => {
             let x = args.first().and_then(|v| v.as_float())
                 .ok_or_else(|| RuntimeError::msg("hypot: numeric x arg required"))?;
             let y = args.get(1).and_then(|v| v.as_float())
                 .ok_or_else(|| RuntimeError::msg("hypot: numeric y arg required"))?;
-            Ok(Value::Float(x.hypot(y)))
+            Ok(Value::Float(x.hypot(y), FW::F64))
         }
         // #335: greatest common divisor (Euclid), |a|,|b|; gcd(0,0)=0.
         "gcd" => {
@@ -5686,10 +5902,10 @@ impl Interpreter {
         }
         "log2" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("log2: numeric arg required"))?
-            .log2())),
+            .log2(), FW::F64)),
         "log10" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("log10: numeric arg required"))?
-            .log10())),
+            .log10(), FW::F64)),
         "isclose" => {
             let a = args.first().and_then(|v| v.as_float())
                 .ok_or_else(|| RuntimeError::msg("isclose: numeric a arg required"))?;
@@ -5709,21 +5925,21 @@ impl Interpreter {
                 .ok_or_else(|| RuntimeError::msg("round: numeric arg required"))?;
             let ndigits = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             if ndigits == 0 {
-                Ok(Value::Float(x.round()))
+                Ok(Value::Float(x.round(), FW::F64))
             } else {
                 let factor = 10f64.powi(ndigits as i32);
-                Ok(Value::Float((x * factor).round() / factor))
+                Ok(Value::Float((x * factor).round() / factor, FW::F64))
             }
         }
         "trunc" => {
             let x = args.first().and_then(|v| v.as_float())
                 .ok_or_else(|| RuntimeError::msg("trunc: numeric arg required"))?;
-            Ok(Value::Float(x.trunc()))
+            Ok(Value::Float(x.trunc(), FW::F64))
         }
         "sign" => {
             match args.first() {
                 Some(Value::Int(n))   => Ok(Value::Int(n.signum())),
-                Some(Value::Float(f)) => Ok(Value::Float(f.signum())),
+                Some(Value::Float(f, w)) => Ok(Value::Float(f.signum(), *w)),
                 _ => Err(RuntimeError::msg("sign: numeric arg required")),
             }
         }
@@ -5762,7 +5978,7 @@ impl Interpreter {
             None => Err(RuntimeError::at("typeof: requires 1 argument", sp)),
         },
         "is_int" => Ok(Value::Bool(matches!(args.first(), Some(Value::Int(_))))),
-        "is_float" => Ok(Value::Bool(matches!(args.first(), Some(Value::Float(_))))),
+        "is_float" => Ok(Value::Bool(matches!(args.first(), Some(Value::Float(_, _))))),
         "is_str" => Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_))))),
         "is_bool" => Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_))))),
         "is_list" => Ok(Value::Bool(matches!(args.first(), Some(Value::List(_))))),
@@ -5781,7 +5997,7 @@ impl Interpreter {
                 Ok(Value::Bool(t.parse::<i64>().is_ok() || t.parse::<f64>().is_ok()))
             }
             // Numbers are trivially numeric; everything else is not.
-            Some(Value::Int(_)) | Some(Value::Float(_)) => Ok(Value::Bool(true)),
+            Some(Value::Int(_)) | Some(Value::Float(_, _)) => Ok(Value::Bool(true)),
             _ => Ok(Value::Bool(false)),
         },
         // `try_to_int(s)` / `try_to_float(s)` — return (value, Err) per Spec §3.9:
@@ -5789,7 +6005,7 @@ impl Interpreter {
         "try_to_int" => {
             let (v, err) = match args.first() {
                 Some(Value::Int(n))   => (Value::Int(*n), Value::Nil),
-                Some(Value::Float(f)) => (Value::Int(*f as i64), Value::Nil),
+                Some(Value::Float(f, _)) => (Value::Int(*f as i64), Value::Nil),
                 Some(Value::Bool(b))  => (Value::Int(*b as i64), Value::Nil),
                 Some(Value::Str(s)) => {
                     let t = s.trim();
@@ -5809,14 +6025,14 @@ impl Interpreter {
         }
         "try_to_float" => {
             let (v, err) = match args.first() {
-                Some(Value::Float(f)) => (Value::Float(*f), Value::Nil),
-                Some(Value::Int(n))   => (Value::Float(*n as f64), Value::Nil),
-                Some(Value::Bool(b))  => (Value::Float(*b as i64 as f64), Value::Nil),
+                Some(Value::Float(f, w)) => (Value::Float(*f, *w), Value::Nil),
+                Some(Value::Int(n))   => (Value::Float(*n as f64, FW::F64), Value::Nil),
+                Some(Value::Bool(b))  => (Value::Float(*b as i64 as f64, FW::F64), Value::Nil),
                 Some(Value::Str(s)) => match s.trim().parse::<f64>() {
-                    Ok(f) => (Value::Float(f), Value::Nil),
-                    Err(_) => (Value::Float(0.0), Value::Str(format!("try_to_float: not a number: {:?}", s))),
+                    Ok(f) => (Value::Float(f, FW::F64), Value::Nil),
+                    Err(_) => (Value::Float(0.0, FW::F64), Value::Str(format!("try_to_float: not a number: {:?}", s))),
                 },
-                other => (Value::Float(0.0), Value::Str(format!(
+                other => (Value::Float(0.0, FW::F64), Value::Str(format!(
                     "try_to_float: cannot convert {}",
                     other.map(|v| v.type_name()).unwrap_or("nil")))),
             };
@@ -5826,7 +6042,7 @@ impl Interpreter {
         "to_int" => {
             match args.first() {
                 Some(Value::Int(n))   => Ok(Value::Int(*n)),
-                Some(Value::Float(f)) => Ok(Value::Int(*f as i64)),
+                Some(Value::Float(f, _)) => Ok(Value::Int(*f as i64)),
                 Some(Value::Bool(b))  => Ok(Value::Int(*b as i64)),
                 Some(Value::Str(s))   => {
                     let trimmed = s.trim();
@@ -5845,11 +6061,11 @@ impl Interpreter {
         }
         "to_float" => {
             match args.first() {
-                Some(Value::Float(f)) => Ok(Value::Float(*f)),
-                Some(Value::Int(n))   => Ok(Value::Float(*n as f64)),
-                Some(Value::Bool(b))  => Ok(Value::Float(*b as i64 as f64)),
+                Some(Value::Float(f, w)) => Ok(Value::Float(*f, *w)),
+                Some(Value::Int(n))   => Ok(Value::Float(*n as f64, FW::F64)),
+                Some(Value::Bool(b))  => Ok(Value::Float(*b as i64 as f64, FW::F64)),
                 Some(Value::Str(s))   => {
-                    s.trim().parse::<f64>().map(Value::Float)
+                    s.trim().parse::<f64>().map(|v| Value::Float(v, FW::F64))
                         .map_err(|_| RuntimeError::at(
                             format!("to_float: cannot parse {:?}", s), sp))
                 }
@@ -5870,7 +6086,9 @@ impl Interpreter {
             let n = args.first().and_then(|v| v.as_int()).ok_or_else(|| {
                 RuntimeError::at("f32_from_bits: integer argument required".to_string(), sp.clone())
             })?;
-            Ok(Value::Float(f32::from_bits(n as u32) as f64))
+            // #473: the result IS an f32 by construction, so it carries f32
+            // width — matching the JIT, which returns a true `ScalarKind::F32`.
+            Ok(Value::Float(f32::from_bits(n as u32) as f64, FW::F32))
         }
         "str_repeat" => {
             let s = match args.first() {
@@ -5903,9 +6121,9 @@ impl Interpreter {
             }
             match (&args[0], &args[1], &args[2]) {
                 (Value::Int(x), Value::Int(lo), Value::Int(hi))     => Ok(Value::Int((*x).clamp(*lo, *hi))),
-                (Value::Float(x), Value::Float(lo), Value::Float(hi)) => Ok(Value::Float(x.clamp(*lo, *hi))),
-                (Value::Int(x), Value::Float(lo), Value::Float(hi))  => Ok(Value::Float((*x as f64).clamp(*lo, *hi))),
-                (Value::Float(x), Value::Int(lo), Value::Int(hi))    => Ok(Value::Float(x.clamp(*lo as f64, *hi as f64))),
+                (Value::Float(x, _), Value::Float(lo, _), Value::Float(hi, _)) => Ok(Value::Float(x.clamp(*lo, *hi), FW::F64)),
+                (Value::Int(x), Value::Float(lo, _), Value::Float(hi, _))  => Ok(Value::Float((*x as f64).clamp(*lo, *hi), FW::F64)),
+                (Value::Float(x, _), Value::Int(lo), Value::Int(hi))    => Ok(Value::Float(x.clamp(*lo as f64, *hi as f64), FW::F64)),
                 _ => Err(RuntimeError::at("clamp: numeric args required", sp)),
             }
         }
@@ -5925,10 +6143,15 @@ impl Interpreter {
         }
         "sum" => {
             if let Some(Value::Tensor(t)) = args.first() {
-                Ok(Value::Float(t.sum()))
+                // #481: accumulate at the tensor's own width and carry that
+                // width out. The JIT's reduction is native f32 and returns an
+                // f32 scalar, so both halves matter — accumulating in f64
+                // disagreed with the equivalent loop, and tagging the result
+                // f64 made the very next `+ 0.1f32` disagree as well.
+                Ok(Value::Float(tensor_sum(t), t.float_width()))
             } else if let Some(v) = args.first() {
-                Ok(Value::Float(v.as_float().unwrap_or(0.0)))
-            } else { Ok(Value::Float(0.0)) }
+                Ok(Value::Float(v.as_float().unwrap_or(0.0), float_width(v)))
+            } else { Ok(Value::Float(0.0, FW::F64)) }
         }
         // trace(M) — sum of the diagonal elements of a square 2D tensor.
         // Requires a rank-2 tensor with equal dimensions (M[0] == M[1]).
@@ -5944,8 +6167,13 @@ impl Interpreter {
                         ));
                     }
                     let n = shape[0];
-                    let diag_sum: f64 = (0..n).map(|i| t[[i, i]]).sum();
-                    Ok(Value::Float(diag_sum))
+                    // #481: `trace` is `sum(diag(t))`, so it reduces at the
+                    // tensor's width like every other reduction. (interp-only —
+                    // the JIT does not lower `trace` — but an f32 trace that
+                    // disagreed with an f32 sum would be the same defect.)
+                    let diag = (0..n).map(|i| t[[i, i]]);
+                    let diag_sum = if t.dtype == DType::F32 { sum_f32(diag) } else { diag.sum() };
+                    Ok(Value::Float(diag_sum, t.float_width()))
                 }
                 _ => Err(RuntimeError::at("trace: expected a 2D tensor argument", sp)),
             }
@@ -5977,10 +6205,10 @@ impl Interpreter {
             if let Some(Value::Tensor(t)) = args.first() {
                 // #258: mean of an empty tensor is 0/0 = NaN — the honest
                 // "undefined" answer, matching the JIT (which the previous
-                // special-case-to-0 diverged from).
-                let n = t.len() as f64;
-                Ok(Value::Float(t.sum() / n))
-            } else { Ok(Value::Float(0.0)) }
+                // special-case-to-0 diverged from). #481: reduce and divide at
+                // the tensor's width.
+                Ok(Value::Float(tensor_mean(t), t.float_width()))
+            } else { Ok(Value::Float(0.0, FW::F64)) }
         }
         "max" | "min" => {
             // Variadic scalar min/max. For tensor input, reduce over all elements.
@@ -5997,11 +6225,22 @@ impl Interpreter {
             };
             if let Some(Value::Tensor(t)) = args.first() {
                 if args.len() == 1 {
-                    return Ok(Value::Float(reduce(&mut t.iter().copied())));
+                    // #481: no accumulation to round — max/min just select an
+                    // element — but the SELECTED element is an f32 when the
+                    // tensor is, and the JIT types the result that way. Tagging
+                    // it f64 made `max(t) + 0.1f32` diverge even though `max(t)`
+                    // alone agreed.
+                    return Ok(Value::Float(reduce(&mut t.iter().copied()), t.float_width()));
                 }
             }
+            // Variadic scalar form: f32 only when every operand is (FW::join).
+            let w = args.iter().filter(|v| v.as_float().is_some())
+                .fold(None::<FW>, |acc, v| Some(match acc {
+                    None => float_width(v),
+                    Some(a) => FW::join(a, float_width(v)),
+                })).unwrap_or(FW::F64);
             let vals: Vec<f64> = args.iter().filter_map(|v| v.as_float()).collect();
-            Ok(Value::Float(reduce(&mut vals.into_iter())))
+            Ok(Value::Float(reduce(&mut vals.into_iter()), w))
         }
         "softmax"    => builtin_softmax(&args, sp),
         // #335: sort a tensor ascending along its LAST axis (numpy default).
@@ -6030,7 +6269,7 @@ impl Interpreter {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = v.len();
             let m = if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 };
-            Ok(Value::Float(m))
+            Ok(Value::Float(m, FW::F64))
         }
         // Elementwise activations: accept an f32 scalar (-> f32 scalar) or an
         // f32 tensor of any shape (-> same-shape f32 tensor). Numeric formulas
@@ -6292,9 +6531,9 @@ impl Interpreter {
                 RuntimeError::at("list_contains: requires item arg", sp.clone()))?;
             let found = lst.iter().any(|v| match (v, item) {
                 (Value::Int(a), Value::Int(b)) => a == b,
-                (Value::Float(a), Value::Float(b)) => a == b,
-                (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-                (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+                (Value::Float(a, _), Value::Float(b, _)) => a == b,
+                (Value::Int(a), Value::Float(b, _)) => (*a as f64) == *b,
+                (Value::Float(a, _), Value::Int(b)) => *a == (*b as f64),
                 (Value::Str(a), Value::Str(b)) => a == b,
                 (Value::Bool(a), Value::Bool(b)) => a == b,
                 (Value::Nil, Value::Nil) => true,
@@ -6437,7 +6676,7 @@ impl Interpreter {
         // ── Time ──────────────────────────────────────────────────────────────
         "time_ms" => {
             let elapsed = self.start_time.elapsed();
-            Ok(Value::Float(elapsed.as_secs_f64() * 1000.0))
+            Ok(Value::Float(elapsed.as_secs_f64() * 1000.0, FW::F64))
         }
         "sleep_ms" => {
             let ms = args.first().and_then(|v| v.as_float()).unwrap_or(0.0);
@@ -6538,7 +6777,7 @@ impl Interpreter {
             Ok(Value::Nil)
         }
         "rand_float" => {
-            Ok(Value::Float(self.rand_uniform()))
+            Ok(Value::Float(self.rand_uniform(), FW::F64))
         }
         "rand_int" => {
             let lo = args.first().and_then(|v| v.as_int()).ok_or_else(||
@@ -6559,7 +6798,7 @@ impl Interpreter {
             let u1 = self.rand_uniform().max(f64::MIN_POSITIVE);
             let u2 = self.rand_uniform();
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            Ok(Value::Float(mean + std * z))
+            Ok(Value::Float(mean + std * z, FW::F64))
         }
         "rand_choice" => {
             let lst: &[Value] = match args.first() {
@@ -6627,7 +6866,7 @@ impl Interpreter {
                 let out = self.call_value(fn_val.clone(), vec![item.clone()], sp.clone())?;
                 if out.as_bool().unwrap_or(match &out {
                     Value::Int(n) => *n != 0,
-                    Value::Float(x) => *x != 0.0,
+                    Value::Float(x, _) => *x != 0.0,
                     Value::Nil => false,
                     _ => true,
                 }) {
@@ -6762,7 +7001,7 @@ impl Interpreter {
                 Ok(Value::Int(total))
             } else {
                 let total: f64 = lst.iter().filter_map(|v| v.as_float()).sum();
-                Ok(Value::Float(total))
+                Ok(Value::Float(total, FW::F64))
             }
         }
         "list_min" => {
@@ -7683,7 +7922,7 @@ impl Interpreter {
         "date_format" => {
             let timestamp_ms = match args.first() {
                 Some(Value::Int(n)) => *n,
-                Some(Value::Float(x)) => *x as i64,
+                Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_format: timestamp_ms must be integer", sp)),
             };
             let format_str = match args.get(1) {
@@ -7728,12 +7967,12 @@ impl Interpreter {
         "date_add_ms" => {
             let timestamp_ms = match args.first() {
                 Some(Value::Int(n)) => *n,
-                Some(Value::Float(x)) => *x as i64,
+                Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_add_ms: timestamp_ms must be integer", sp)),
             };
             let delta_ms = match args.get(1) {
                 Some(Value::Int(n)) => *n,
-                Some(Value::Float(x)) => *x as i64,
+                Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_add_ms: delta_ms must be integer", sp)),
             };
             Ok(Value::Int(timestamp_ms + delta_ms))
@@ -7741,12 +7980,12 @@ impl Interpreter {
         "date_diff_ms" => {
             let ts_a = match args.first() {
                 Some(Value::Int(n)) => *n,
-                Some(Value::Float(x)) => *x as i64,
+                Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_diff_ms: ts_a must be integer", sp)),
             };
             let ts_b = match args.get(1) {
                 Some(Value::Int(n)) => *n,
-                Some(Value::Float(x)) => *x as i64,
+                Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_diff_ms: ts_b must be integer", sp)),
             };
             Ok(Value::Int(ts_a - ts_b))
@@ -7787,9 +8026,9 @@ impl Interpreter {
                 .ok_or_else(|| RuntimeError::at("trit_sparsity: needs trit tensor", sp.clone()))?;
             let t = as_tensor(&v)?;
             let total = t.len();
-            if total == 0 { return Ok(Value::Float(0.0)); }
+            if total == 0 { return Ok(Value::Float(0.0, FW::F64)); }
             let zeros = t.iter().filter(|&&x| x == 0.0).count();
-            Ok(Value::Float(zeros as f64 / total as f64))
+            Ok(Value::Float(zeros as f64 / total as f64, FW::F64))
         }
         "trit_pack" => {
             // trit_pack(w) — return (pos_mask, neg_mask) as a tuple of float tensors.
@@ -7837,6 +8076,25 @@ fn normalize_axis(axis: i64, ndim: usize, sp: &Span) -> EvalResult<usize> {
 }
 
 /// Extract a required tensor arg by position with a helpful error.
+/// Like `required_tensor`, but keeps the `TensorVal` wrapper so the caller can
+/// see the DTYPE (#481). `required_tensor` derefs to the raw `ArrayD<f64>`,
+/// which silently drops the f32/f64 tag every reduction now needs.
+fn required_tensor_val<'a>(args: &'a [Value], pos: usize, fn_name: &str, sp: &Span)
+    -> EvalResult<&'a TensorVal>
+{
+    match args.get(pos) {
+        Some(Value::Tensor(t)) => Ok(t),
+        Some(other) => Err(RuntimeError::at(
+            format!("`{}`: arg {} must be a tensor, got {}", fn_name, pos, other.type_name()),
+            sp.clone(),
+        )),
+        None => Err(RuntimeError::at(
+            format!("`{}`: missing tensor arg at position {}", fn_name, pos),
+            sp.clone(),
+        )),
+    }
+}
+
 fn required_tensor<'a>(args: &'a [Value], pos: usize, fn_name: &str, sp: &Span)
     -> EvalResult<&'a ArrayD<f64>>
 {
@@ -7884,22 +8142,29 @@ fn opt_int(args: &[Value], pos: usize, default: i64) -> i64 {
 
 /// `variance(t)` — population variance (1/N) over all elements.
 fn builtin_variance(args: &[Value], sp: Span) -> EvalResult<Value> {
-    let t = required_tensor(args, 0, "variance", &sp)?;
+    let t = required_tensor_val(args, 0, "variance", &sp)?;
     let n = t.len() as f64;
-    if n == 0.0 { return Ok(Value::Float(0.0)); }
-    let mean = t.sum() / n;
-    let var = t.iter().map(|v| { let d = v - mean; d * d }).sum::<f64>() / n;
-    Ok(Value::Float(var))
+    if n == 0.0 { return Ok(Value::Float(0.0, t.float_width())); }
+    // #481: two passes, both at the tensor's width — mean, then the mean of the
+    // squared deviations. Same shape as the JIT's `lower_builtin_variance`.
+    let mean = tensor_mean(t);
+    let devs = t.iter().map(|v| { let d = v - mean; d * d });
+    let var = if t.dtype == DType::F32 {
+        quantize_f32(sum_f32(devs.map(quantize_f32)) / quantize_f32(n))
+    } else {
+        devs.sum::<f64>() / n
+    };
+    Ok(Value::Float(var, t.float_width()))
 }
 
 /// `pull_to_mean(t, alpha)` — one variance-minimizing pass over all elements:
 /// out[i] = t[i] + alpha * (mean(t) - t[i]).
 fn builtin_pull_to_mean(args: &[Value], sp: Span) -> EvalResult<Value> {
-    let t = required_tensor(args, 0, "pull_to_mean", &sp)?;
+    let t = required_tensor_val(args, 0, "pull_to_mean", &sp)?;
     let alpha = args.get(1).and_then(|v| v.as_float()).ok_or_else(|| RuntimeError::at(
         "pull_to_mean: missing alpha arg".to_string(), sp.clone()))?;
-    let n = t.len() as f64;
-    let mean = if n > 0.0 { t.sum() / n } else { 0.0 };
+    // #481: the mean this pulls toward is computed at the tensor's width.
+    let mean = if t.len() > 0 { tensor_mean(t) } else { 0.0 };
     Ok(Value::tensor(t.mapv(|v| v + alpha * (mean - v))))
 }
 
@@ -7915,55 +8180,105 @@ fn reduce_axis(args: &[Value], rank: usize, name: &str, sp: &Span) -> EvalResult
     Ok(axis as usize)
 }
 
+/// Reduce each lane along `axis` with `f`, preserving `ndarray`'s output shape.
+///
+/// `sum_axis` accumulates in f64, which is the #481 defect one axis down: an f32
+/// tensor must round every add inside a lane, exactly as the whole-tensor
+/// `sum` does. `map_axis` hands us each lane so the fold is ours to choose.
+#[inline]
+fn fold_lanes(t: &TensorVal, axis: usize, f32_width: bool) -> ArrayD<f64> {
+    t.map_axis(Axis(axis), |lane| {
+        if f32_width { sum_f32(lane.iter().copied()) } else { lane.iter().sum() }
+    }).into_dyn()
+}
+
 /// `sum_along(t, axis)` / `mean_along(t, axis)`.
 fn builtin_reduce_along(args: &[Value], sp: Span, name: &str, mean: bool) -> EvalResult<Value> {
-    let t = required_tensor(args, 0, name, &sp)?;
+    let t = required_tensor_val(args, 0, name, &sp)?;
     let axis = reduce_axis(args, t.ndim(), name, &sp)?;
-    let summed = t.sum_axis(Axis(axis));
+    // #481: accumulate per lane at the source tensor's width, and keep that
+    // dtype on the output so a later reduction over the result reduces at the
+    // same width too. `Value::tensor` would have retagged it F32 regardless,
+    // but only AFTER an f64 accumulation — rounding the answer, not producing
+    // the f32 one.
+    let f32_width = t.dtype == DType::F32;
+    let summed = fold_lanes(&t, axis, f32_width);
     let out = if mean {
         let n = t.shape()[axis] as f64;
-        summed.mapv(|v| if n > 0.0 { v / n } else { 0.0 })
+        if n <= 0.0 {
+            summed.mapv(|_| 0.0)
+        } else if f32_width {
+            let nq = quantize_f32(n);
+            summed.mapv(|v| quantize_f32(v / nq))
+        } else {
+            summed.mapv(|v| v / n)
+        }
     } else {
         summed
     };
-    Ok(Value::tensor(out.into_dyn()))
+    Ok(Value::tensor_dt(out, t.dtype))
 }
 
 /// `max_along(t, axis)` — maximum reduced along one axis (axis dropped).
 fn builtin_max_along(args: &[Value], sp: Span) -> EvalResult<Value> {
-    let t = required_tensor(args, 0, "max_along", &sp)?;
+    let t = required_tensor_val(args, 0, "max_along", &sp)?;
     let axis = reduce_axis(args, t.ndim(), "max_along", &sp)?;
     if t.shape()[axis] == 0 {
         return Err(RuntimeError::at("max_along: empty axis".to_string(), sp));
     }
+    // #481: selection, so nothing to round — but keep the source dtype so the
+    // result reduces at the right width downstream.
     let out = t.fold_axis(Axis(axis), f64::NEG_INFINITY, |&acc, &v| acc.max(v));
-    Ok(Value::tensor(out.into_dyn()))
+    Ok(Value::tensor_dt(out.into_dyn(), t.dtype))
 }
 
 /// `min_along(t, axis)` — minimum reduced along one axis (axis dropped).
 fn builtin_min_along(args: &[Value], sp: Span) -> EvalResult<Value> {
-    let t = required_tensor(args, 0, "min_along", &sp)?;
+    let t = required_tensor_val(args, 0, "min_along", &sp)?;
     let axis = reduce_axis(args, t.ndim(), "min_along", &sp)?;
     if t.shape()[axis] == 0 {
         return Err(RuntimeError::at("min_along: empty axis".to_string(), sp));
     }
+    // #481: selection, so nothing to round — but keep the source dtype so the
+    // result reduces at the right width downstream.
     let out = t.fold_axis(Axis(axis), f64::INFINITY, |&acc, &v| acc.min(v));
-    Ok(Value::tensor(out.into_dyn()))
+    Ok(Value::tensor_dt(out.into_dyn(), t.dtype))
 }
 
 /// `variance_along(t, axis)` — population variance reduced along one axis.
 fn builtin_variance_along(args: &[Value], sp: Span) -> EvalResult<Value> {
-    let t = required_tensor(args, 0, "variance_along", &sp)?;
+    let t = required_tensor_val(args, 0, "variance_along", &sp)?;
     let axis = reduce_axis(args, t.ndim(), "variance_along", &sp)?;
     let n = t.shape()[axis] as f64;
-    let mean = t.mean_axis(Axis(axis)).ok_or_else(|| RuntimeError::at(
-        "variance_along: empty axis".to_string(), sp.clone()))?;
-    // var = mean(x^2) - mean(x)^2 reduced along the axis.
-    let mean_sq = t.mapv(|v| v * v).mean_axis(Axis(axis)).ok_or_else(|| RuntimeError::at(
-        "variance_along: empty axis".to_string(), sp.clone()))?;
-    let _ = n;
-    let var = &mean_sq - &mean.mapv(|m| m * m);
-    Ok(Value::tensor(var.into_dyn()))
+    if n <= 0.0 {
+        return Err(RuntimeError::at("variance_along: empty axis".to_string(), sp));
+    }
+    // #481: TWO passes — mean, then the mean of the squared deviations —
+    // matching the JIT's `lower_builtin_variance_along`. The old form was the
+    // algebraically equivalent `mean(x²) - mean(x)²`, which is a different
+    // computation in floating point (catastrophic cancellation when the mean
+    // dominates the spread) and diverged from the JIT independently of width.
+    let f32_width = t.dtype == DType::F32;
+    let nq = if f32_width { quantize_f32(n) } else { n };
+    let means = {
+        let summed = fold_lanes(&t, axis, f32_width);
+        if f32_width { summed.mapv(|v| quantize_f32(v / nq)) } else { summed.mapv(|v| v / nq) }
+    };
+    // Broadcast the per-lane mean back over the axis, then reduce the squared
+    // deviations the same way.
+    let devs = {
+        let mut d = t.data.clone();
+        for (mut lane, m) in d.lanes_mut(Axis(axis)).into_iter().zip(means.iter()) {
+            for slot in lane.iter_mut() {
+                let dev = *slot - *m;
+                *slot = if f32_width { quantize_f32(dev * dev) } else { dev * dev };
+            }
+        }
+        TensorVal::new(d.into_dyn(), t.dtype)
+    };
+    let summed = fold_lanes(&devs, axis, f32_width);
+    let var = if f32_width { summed.mapv(|v| quantize_f32(v / nq)) } else { summed.mapv(|v| v / nq) };
+    Ok(Value::tensor_dt(var, t.dtype))
 }
 
 /// `pull_to_mean_along(t, axis, alpha)` — per-axis variance-minimizing pass.
@@ -8125,7 +8440,7 @@ fn builtin_activation(name: &str, args: &[Value], sp: Span) -> EvalResult<Value>
             let x = v.as_float().ok_or_else(|| RuntimeError::at(
                 format!("{name}: requires an f32 scalar or f32 tensor"), sp.clone()))?;
             // f32-round the scalar result so run/jit agree at f32 precision.
-            Ok(Value::Float(activation_f64(name, x) as f32 as f64))
+            Ok(Value::Float(activation_f64(name, x) as f32 as f64, FW::F64))
         }
         None => Err(RuntimeError::at(format!("{name}: needs 1 argument"), sp)),
     }
@@ -9070,12 +9385,12 @@ impl Tape {
                     let x = self.nodes[n.inputs[0]].value.as_float().unwrap_or(0.0);
                     let y = n.value.as_float().unwrap_or(0.0);
                     let g = g_out.as_float().unwrap_or(0.0);
-                    accumulate(grads, n.inputs[0], Value::Float(g * kind.derivative(x, y)));
+                    accumulate(grads, n.inputs[0], Value::Float(g * kind.derivative(x, y), FW::F64));
                 }
                 TapeOp::Broadcast => {
                     // c = broadcast(s) (scalar → tensor) → dL/ds = sum(dL/dc)
                     let g = as_tensor(&g_out)?;
-                    accumulate(grads, n.inputs[0], Value::Float(g.iter().sum()));
+                    accumulate(grads, n.inputs[0], Value::Float(g.iter().sum(), FW::F64));
                 }
             }
         }
@@ -9143,7 +9458,7 @@ impl Tape {
     fn backward_symbolic(&mut self, loss_node: usize) -> EvalResult<Vec<Option<usize>>> {
         let n = self.nodes.len();
         let mut adj: Vec<Option<usize>> = vec![None; n];
-        let seed = self.push_const(Value::Float(1.0));
+        let seed = self.push_const(Value::Float(1.0, FW::F64));
         adj[loss_node] = Some(seed);
         for i in (0..n).rev() {
             let Some(g) = adj[i] else { continue };
@@ -9352,7 +9667,7 @@ fn grad_add(a: &Value, b: &Value) -> EvalResult<Value> {
             let sf = s.as_float().unwrap_or(0.0);
             Ok(Value::tensor(t.mapv(|x| x + sf)))
         }
-        _ => Ok(Value::Float(a.as_float().unwrap_or(0.0) + b.as_float().unwrap_or(0.0))),
+        _ => Ok(Value::Float(a.as_float().unwrap_or(0.0) + b.as_float().unwrap_or(0.0), FW::F64)),
     }
 }
 
@@ -9367,7 +9682,7 @@ fn grad_mul(x: &Value, y: &Value) -> EvalResult<Value> {
             let sf = s.as_float().unwrap_or(0.0);
             Ok(Value::tensor(t.mapv(|v| v * sf)))
         }
-        _ => Ok(Value::Float(x.as_float().unwrap_or(0.0) * y.as_float().unwrap_or(0.0))),
+        _ => Ok(Value::Float(x.as_float().unwrap_or(0.0) * y.as_float().unwrap_or(0.0), FW::F64)),
     }
 }
 
@@ -9384,7 +9699,7 @@ fn grad_div(x: &Value, y: &Value) -> EvalResult<Value> {
             let sf = s.as_float().unwrap_or(0.0);
             Ok(Value::tensor(t.mapv(|v| sf / v)))
         }
-        _ => Ok(Value::Float(x.as_float().unwrap_or(0.0) / y.as_float().unwrap_or(1.0))),
+        _ => Ok(Value::Float(x.as_float().unwrap_or(0.0) / y.as_float().unwrap_or(1.0), FW::F64)),
     }
 }
 
@@ -9408,7 +9723,7 @@ fn grad_reduce_to(contrib: Value, operand: &Value) -> Value {
         },
         // Scalar operand: collapse any tensor contribution to its scalar sum.
         _ => match contrib {
-            Value::Tensor(t) => Value::Float(t.data.iter().sum()),
+            Value::Tensor(t) => Value::Float(t.data.iter().sum(), FW::F64),
             other => other,
         },
     }
@@ -9439,7 +9754,7 @@ fn reduce_grad_to_shape(mut c: ArrayD<f64>, target: &[usize]) -> ArrayD<f64> {
 fn negate_value(v: &Value) -> EvalResult<Value> {
     match v {
         Value::Tensor(t) => Ok(Value::tensor(t.mapv(|x| -x))),
-        Value::Float(x)  => Ok(Value::Float(-x)),
+        Value::Float(x, w)  => Ok(Value::Float(w.round(-x), *w)),
         Value::Int(n)    => Ok(Value::Int(-n)),
         other => Err(RuntimeError::msg(format!("cannot negate {}", other.type_name()))),
     }
@@ -9448,8 +9763,8 @@ fn negate_value(v: &Value) -> EvalResult<Value> {
 fn scale_value(v: &Value, s: f64) -> EvalResult<Value> {
     match v {
         Value::Tensor(t) => Ok(Value::tensor(t.mapv(|x| x * s))),
-        Value::Float(x)  => Ok(Value::Float(x * s)),
-        Value::Int(n)    => Ok(Value::Float(*n as f64 * s)),
+        Value::Float(x, _)  => Ok(Value::Float(x * s, FW::F64)),
+        Value::Int(n)    => Ok(Value::Float(*n as f64 * s, FW::F64)),
         other => Err(RuntimeError::msg(format!("cannot scale {}", other.type_name()))),
     }
 }
@@ -9469,7 +9784,7 @@ fn json_encode_value(v: &Value) -> String {
         Value::Nil       => "null".to_string(),
         Value::Bool(b)   => if *b { "true".to_string() } else { "false".to_string() },
         Value::Int(n)    => n.to_string(),
-        Value::Float(x)  => {
+        Value::Float(x, _)  => {
             // Produce a compact representation; avoid trailing .0 for whole numbers
             // that the JSON spec allows, but be explicit enough to round-trip.
             if x.fract() == 0.0 && x.abs() < 1e15 {
@@ -9499,7 +9814,7 @@ fn json_encode_value(v: &Value) -> String {
         Value::Tensor(t) => {
             // Serialize as a flat JSON array of its elements (row-major). Reuses
             // the scalar float formatting so 1.5 -> "1.5", 2.0 -> "2" (#190).
-            let parts: Vec<String> = t.iter().map(|x| json_encode_value(&Value::Float(*x))).collect();
+            let parts: Vec<String> = t.iter().map(|x| json_encode_value(&Value::Float(*x, FW::F64))).collect();
             format!("[{}]", parts.join(","))
         }
         // Fns, structs, ranges, etc. — fall back to null per spec.
@@ -9674,7 +9989,7 @@ impl<'a> JsonParser<'a> {
             .map_err(|_| "invalid UTF-8 in number".to_string())?;
         if is_float {
             let x: f64 = s.parse().map_err(|_| format!("invalid float: {}", s))?;
-            Ok(Value::Float(x))
+            Ok(Value::Float(x, FW::F64))
         } else {
             let n: i64 = s.parse().map_err(|_| format!("invalid integer: {}", s))?;
             Ok(Value::Int(n))
@@ -9750,7 +10065,7 @@ fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
         match v {
             Value::Bool(_)  => 0,
             Value::Int(_)   => 1,
-            Value::Float(_) => 2,
+            Value::Float(_, _) => 2,
             Value::Str(_)   => 3,
             _               => 4,
         }
@@ -9763,7 +10078,7 @@ fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Bool(x),  Value::Bool(y))  => x.cmp(y),
         (Value::Int(x),   Value::Int(y))   => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+        (Value::Float(x, _), Value::Float(y, _)) => x.total_cmp(y),
         (Value::Str(x),   Value::Str(y))   => x.cmp(y),
         _                                  => Ordering::Equal,
     }
@@ -9773,9 +10088,9 @@ fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x == y,
-        (Value::Int(x), Value::Float(y)) => (*x as f64) == *y,
-        (Value::Float(x), Value::Int(y)) => *x == (*y as f64),
+        (Value::Float(x, _), Value::Float(y, _)) => x == y,
+        (Value::Int(x), Value::Float(y, _)) => (*x as f64) == *y,
+        (Value::Float(x, _), Value::Int(y)) => *x == (*y as f64),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nil, Value::Nil) => true,

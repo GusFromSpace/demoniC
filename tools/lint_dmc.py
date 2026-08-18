@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples"
 # Raised from 100: the example corpus pervasively exceeds 100 (dense tensor
 # expressions, gradcheck loops). 140 keeps a sane cap without reformatting the
-# whole corpus. See PR #309 / the CI-debt cleanup discussion.
+# whole corpus. See the CI-debt cleanup.
 MAX_LINE = 140
 
 ERRORS: list[str] = []

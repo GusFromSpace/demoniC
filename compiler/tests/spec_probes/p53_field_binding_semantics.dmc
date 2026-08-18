@@ -4,7 +4,7 @@
 # element, whole-binding assignment, or compound op — reaches the field.
 # Previously scalars aliased (snapshots tracked later writes) and whole-binding
 # assignment silently rebound the local, which produced two no-op framebuffer
-# mutators in demoniOS.
+# mutators.
 model Machine {
     !sp: i64
     !fb: Tensor[i64, [4]]

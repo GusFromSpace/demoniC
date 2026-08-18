@@ -1,8 +1,8 @@
 //! #333: UFCS desugaring — rewrite `recv.f(args)` → `f(recv, args)`.
 //!
-//! demoniC has no method-call syntax, but models echoing Rust/Python reach for
-//! `x.sort()`, `x.to_string()`, `x.floor()` constantly (the hallucination
-//! harvest's top *language*-side failure class). This pass — run once after
+//! demoniC has no method-call syntax, but anyone arriving from Rust or Python
+//! reaches for `x.sort()`, `x.to_string()`, `x.floor()` constantly — the most
+//! common way otherwise-correct code fails to compile. This pass — run once after
 //! parse, so every backend (check/interp/jit) inherits it — turns a method call
 //! on a non-`model` receiver into the free-function form the language already
 //! supports, when the method name resolves to a real function.

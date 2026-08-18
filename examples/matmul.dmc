@@ -21,7 +21,7 @@ fn attention[B, S, D](
 fn main() -> nil {
     forge {
         # zeros, not uninit: attention() reads its inputs, and reading
-        # uninitialized memory is a compile-time error (MEMORY §2, #403).
+        # uninitialized memory is a compile-time error.
         let q = forge.zeros[f32, [8, 512, 64]]
         let k = forge.zeros[f32, [8, 512, 64]]
         let v = forge.zeros[f32, [8, 512, 64]]

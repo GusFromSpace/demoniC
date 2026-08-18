@@ -1,2 +1,5 @@
 compiler/target/
 .DS_Store
+
+# Generator bookkeeping — present in a freshly built tree, never committed.
+.demonic-publish-tree

@@ -617,12 +617,22 @@ impl<'src> Lexer<'src> {
 
     fn try_eat_float_suffix(&mut self) -> Option<&'static str> {
         // f16 | bf16 | tf32 | f32 | f64 | fp8_e4m3 | fp8_e5m2
+        //
+        // #464: the boundary check is the same rule #280 gave the integer
+        // suffixes and #401 gave the size suffixes; this matcher predates both
+        // and was the only one still splitting an adjacent identifier, so
+        // `1.0f32abc` lexed as FloatLit(f32) + Ident("abc"). It now stays
+        // FloatLit + Ident("f32abc"), and all three matchers agree.
         let suffixes = ["fp8_e4m3", "fp8_e5m2", "bf16", "tf32", "f16", "f32", "f64"];
         for s in &suffixes {
             let bytes = s.as_bytes();
             if self.src[self.pos..].starts_with(bytes) {
-                for _ in 0..bytes.len() { self.advance(); }
-                return Some(s);
+                let next = self.src.get(self.pos + bytes.len()).copied();
+                let at_boundary = next.map_or(true, |c| !c.is_ascii_alphanumeric() && c != b'_');
+                if at_boundary {
+                    for _ in 0..bytes.len() { self.advance(); }
+                    return Some(s);
+                }
             }
         }
         None
@@ -804,7 +814,7 @@ impl<'src> Lexer<'src> {
                     self.lex_char_lit()?
                 }
                 // `b'x'` — Rust-style byte literal → the byte's integer value
-                // (#334: models echoing Rust/C reach for this). Guarded so it never
+                // (#334: the Rust/C spelling). Guarded so it never
                 // steals `b'` = transpose of a tensor named `b`, which is common in
                 // ML code: only the unambiguous `b' <byte> '` / `b'\<esc>'` shape fires.
                 b'b' if self.looks_like_byte_lit() => {

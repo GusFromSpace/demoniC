@@ -288,6 +288,38 @@ PROBES: dict[str, str] = {
         "    nil\n"
         "}\n"
     ),
+    # #464: numeric suffixes are matched WHOLE and must end at a token
+    # boundary, so a literal butted against a keyword or identifier yields two
+    # tokens, not one. The corpus never writes a literal without a space after
+    # it, which is exactly how the self-hosted lexer's greedy scanner survived.
+    # Both halves are probed: the shapes that must NOT take a suffix, and the
+    # suffixes that must still attach.
+    "numeric_suffix_boundaries": (
+        "fn probe() -> nil {\n"
+        "    1if\n"
+        "    1in\n"
+        "    1i32abc\n"
+        "    1i32_x\n"
+        "    4Gx\n"
+        "    4KiB\n"
+        "    0xffK\n"
+        "    1.0f32abc\n"
+        "    1.0for\n"
+        "    .5f64abc\n"
+        "    nil\n"
+        "}\n"
+    ),
+    "numeric_suffix_whole": (
+        "fn probe() -> nil {\n"
+        "    1i8 1i16 1i32 1i64 1u8 1u16 1u32 1u64\n"
+        "    1.0f16 1.0f32 1.0f64 1.0bf16 1.0tf32\n"
+        "    1.0fp8_e4m3 1.0fp8_e5m2\n"
+        "    .5f64\n"
+        "    4K 4M 4G 4Ki 4Mi 4Gi\n"
+        "    0x65u8 0b1010u8\n"
+        "    nil\n"
+        "}\n"
+    ),
 }
 
 
@@ -452,7 +484,7 @@ def main() -> int:
     else:
         files = sorted(glob.glob(str(REPO / "examples" / "**" / "*.dmc"), recursive=True))
         if args.include_probes:
-            files += sorted(glob.glob(str(REPO / "tests" / "spec_probes" / "**" / "*.dmc"),
+            files += sorted(glob.glob(str(REPO / "compiler" / "tests" / "spec_probes" / "**" / "*.dmc"),
                                       recursive=True))
 
     ok, failed, seen = 0, [], set()

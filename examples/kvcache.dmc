@@ -1,5 +1,5 @@
 # kvcache.dmc — growable shape axis `~` for autoregressive inference.
-# Normative since spec 0.0.2. See SPEC.md §3.6, §4.8 and MEMORY.md §9.
+# See the spec's streaming-types and stream-append sections.
 
 # `~` declares a streaming axis. The Forge reserves trailing capacity for it.
 # `<-` is the append operator: one bump-pointer advance, one hardware copy,

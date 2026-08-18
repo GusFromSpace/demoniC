@@ -3,7 +3,7 @@
 # `typeof` and the `is_*` predicates let demoniC code dispatch on a value's
 # runtime kind — the core operation of any tree-walking evaluator. `is_numeric`
 # and `try_to_*` give non-aborting string→number parsing for tokenizers.
-# Surfaced translating Norvig's lispy.py for the self-hosting corpus (#156).
+# Surfaced while translating a Scheme interpreter.
 
 fn main() -> nil {
     # Heterogeneous list: introspect each element's kind.

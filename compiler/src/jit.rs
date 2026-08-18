@@ -45,7 +45,7 @@ use crate::lexer::Span;
 // codegen) across the whole compile, so compile_program can report the split
 // between dmc-side IR lowering and cranelift codegen. Zero overhead unless
 // DMC_JIT_TIMING is set. Established (#325) that compile is ~25 ms on the full
-// Qwen3-4B decode — the per-run cost is execution, not compilation.
+// transformer decode — the per-run cost is execution, not compilation.
 static JIT_CODEGEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ─── Diagnostics ─────────────────────────────────────────────────────────────
@@ -55,25 +55,69 @@ pub struct JitError {
     pub msg: String,
     pub line: usize,
     pub col: usize,
+    /// Why the JIT stopped (#480). This is the difference between "the JIT does
+    /// not implement this yet" and "the JIT failed on a program `dmc run`
+    /// accepts", and the differential tools need it to tell an expected gap
+    /// from a real defect. It used to be inferred by grepping the message for
+    /// one of five English fragments ("not yet", "not support", "use dmc run",
+    /// "slice 1", "unknown function"), which was wrong in both directions: a
+    /// clean refusal worded differently was scored as a silent miscompile, and
+    /// a genuine miscompile whose text happened to contain "slice 1" would have
+    /// been downgraded to an allowlistable gap.
+    pub kind: JitErrorKind,
+}
+
+/// Whether a `JitError` is a deliberate refusal or a failure (#480).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JitErrorKind {
+    /// The JIT failed on something it is supposed to handle. A defect.
+    #[default]
+    Error,
+    /// The JIT deliberately declines to lower this construct; `dmc run` has the
+    /// full semantics. Expected, and allowlistable by the differential tools.
+    Unsupported,
 }
 
 impl std::fmt::Display for JitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "jit error at {}:{}: {}", self.line, self.col, self.msg)
+        // The leading word is the machine-readable part: tools match on
+        // "jit unsupported" vs "jit error" rather than on the message prose.
+        // It reads better for humans too — "unsupported" says up front that
+        // this is a missing feature, not a mistake in their program.
+        let what = match self.kind {
+            JitErrorKind::Error => "jit error",
+            JitErrorKind::Unsupported => "jit unsupported",
+        };
+        write!(f, "{} at {}:{}: {}", what, self.line, self.col, self.msg)
     }
 }
 
 impl std::error::Error for JitError {}
 
 fn err<T>(span: &Span, msg: impl Into<String>) -> Result<T, JitError> {
-    Err(JitError { msg: msg.into(), line: span.line, col: span.col })
+    Err(JitError {
+        msg: msg.into(), line: span.line, col: span.col,
+        kind: JitErrorKind::Error,
+    })
 }
 
+/// The JIT declines to lower `what`. Always `JitErrorKind::Unsupported`.
 fn unsupported<T>(span: &Span, what: &str) -> Result<T, JitError> {
-    err(span, format!(
-        "jit slice 1 does not support {}; use `dmc run` for full semantics",
-        what,
-    ))
+    Err(JitError {
+        msg: format!("{}; use `dmc run` for full semantics", what),
+        line: span.line, col: span.col,
+        kind: JitErrorKind::Unsupported,
+    })
+}
+
+/// `unsupported` for sites whose message is already a full sentence — used to
+/// reclassify refusals that were historically raised through `err` and so were
+/// scored as divergences by the probe battery (#480).
+fn unsupported_msg<T>(span: &Span, msg: impl Into<String>) -> Result<T, JitError> {
+    Err(JitError {
+        msg: msg.into(), line: span.line, col: span.col,
+        kind: JitErrorKind::Unsupported,
+    })
 }
 
 // ─── Scalar type bridge ──────────────────────────────────────────────────────
@@ -177,6 +221,17 @@ fn cast_directive_is_int_target(directives: &[Directive]) -> bool {
         .filter_map(|d| d.args.first())
         .any(|arg| matches!(arg,
             DArg::Positional(Expr::Ident(name, _)) if is_int_cast_type_name(name)))
+}
+
+/// The f32-family scalar types (#473). `f16`/`bf16`/`tf32`/`fp8_*` are
+/// f32-backed in both backends by the #179 convention — computed in f32 and
+/// retagged, never rounded to their own narrower precision. Mirrors
+/// `interp::scalar_is_f32_family`, which is what makes a suffixed literal lower
+/// to the same number on both sides.
+#[inline]
+fn scalar_is_f32_family(t: &ScalarType) -> bool {
+    matches!(t, ScalarType::F32 | ScalarType::F16 | ScalarType::Bf16
+                | ScalarType::Tf32 | ScalarType::Fp8E4M3 | ScalarType::Fp8E5M2)
 }
 
 fn scalar_from_ast(ty: &Type) -> Result<ScalarKind, JitError> {
@@ -605,7 +660,7 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                     }
                 }
             }
-            let stream_axis = stream_axis.ok_or_else(|| JitError {
+            let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "KV type must contain a streaming `~` axis".into(),
                 line: span.line, col: span.col,
             })?;
@@ -769,10 +824,10 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
             Ok(TyKind::Tensor(TensorTy { elem, shape: dims }))
         }
         // `[ModelName; N]` / `[KV[...]; N]` as a model FIELD type — e.g.
-        // `model Qwen3_4B { layers: [QwenBlock; 36] }`. Reuse the fn-signature
+        // `model Transformer { layers: [Block; 36] }`. Reuse the fn-signature
         // array lowering (ModelArray / KvArray) so the field is a typed array
         // pointer, not an opaque i64 (which broke both the store and indexed
-        // load `qwen.layers[i]`). (#273 follow-up.)
+        // load `model.layers[i]`). (#273 follow-up.)
         Type::Array(..) => ty_from_ast(ty, env),
         _ => Ok(TyKind::Scalar(ScalarKind::I64)),
     }
@@ -823,7 +878,7 @@ fn resolve_shape_expr(
 ) -> Result<i64, JitError> {
     match e {
         Expr::Literal(Literal::Int(n, _), _) => Ok(*n),
-        Expr::Ident(name, ispan) => env.get(name).copied().ok_or_else(|| JitError {
+        Expr::Ident(name, ispan) => env.get(name).copied().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("unbound shape parameter `{}`", name),
             line: ispan.line, col: ispan.col,
         }),
@@ -1170,13 +1225,13 @@ impl Jit {
         // time cost is small (single-digit ms for these kernels) and the
         // runtime win on tight loops / recursion is large.
         flag_builder.set("opt_level", "speed").map_err(setting_err)?;
-        let isa_builder = cranelift_native::builder().map_err(|e| JitError {
+        let isa_builder = cranelift_native::builder().map_err(|e| JitError { kind: JitErrorKind::Error,
             msg: format!("host ISA unsupported: {}", e),
             line: 0, col: 0,
         })?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
-            .map_err(|e| JitError { msg: format!("isa finish: {}", e), line: 0, col: 0 })?;
+            .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("isa finish: {}", e), line: 0, col: 0 })?;
 
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         // Builtins exposed to demoniC source by symbol name.
@@ -1362,7 +1417,7 @@ impl Jit {
                         if !storable {
                             return unsupported(&v.span, &format!(
                                 "a non-scalar payload field in enum variant `{}.{}` \
-                                 (#350 Part 2b supports i32/i64/f32/f64/bool payloads)",
+                                 (payload fields must be i32/i64/f32/f64/bool)",
                                 e.name, v.name));
                         }
                         let k = enumify(lower_ty_for_model(t, &payload_env, &v.span)?, &self.enums);
@@ -1418,7 +1473,7 @@ impl Jit {
 
         let __t_fin = std::time::Instant::now();
         self.module.finalize_definitions()
-            .map_err(|e| JitError { msg: format!("finalize: {}", e), line: 0, col: 0 })?;
+            .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("finalize: {}", e), line: 0, col: 0 })?;
         let __fin = __t_fin.elapsed();
         self.finalized = true;
         if __timing {
@@ -1426,7 +1481,7 @@ impl Jit {
             let codegen = JIT_CODEGEN_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9;
             let finalize = __fin.as_secs_f64();
             let lowering = (total - codegen - finalize).max(0.0);
-            eprintln!("[#325 jit-timing] total={:.3}s  lowering(dmc IR build)={:.3}s ({:.0}%)  \
+            eprintln!("[jit-timing] total={:.3}s  lowering(dmc IR build)={:.3}s ({:.0}%)  \
                        codegen(define_function)={:.3}s ({:.0}%)  finalize/link={:.3}s ({:.0}%)",
                       total,
                       lowering, 100.0 * lowering / total,
@@ -1441,12 +1496,12 @@ impl Jit {
     /// `instantiate_template` at the call site; here we just wire up the
     /// body and shape env so `define_fn` can run.
     fn declare_monomorph(&mut self, p: &PendingMono) -> Result<FnMeta, JitError> {
-        let tmpl = self.templates.get(&p.template_name).ok_or_else(|| JitError {
+        let tmpl = self.templates.get(&p.template_name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("internal: template `{}` missing during monomorphization",
                          p.template_name),
             line: p.call_span.line, col: p.call_span.col,
         })?.clone();
-        let entry = self.fns.get(&p.mangled_name).ok_or_else(|| JitError {
+        let entry = self.fns.get(&p.mangled_name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("internal: entry `{}` missing during monomorphization",
                          p.mangled_name),
             line: p.call_span.line, col: p.call_span.col,
@@ -1498,7 +1553,7 @@ impl Jit {
         if is_public {
             return err(&e.span, format!(
                 "`pub` is not allowed on `extern fn` `{}` — an `extern fn` is always \
-                 exported; the `pub` keyword on it is a compile-time error (SPEC.md §9)",
+                 exported; the `pub` keyword on it is a compile-time error",
                 e.name));
         }
         if let Some(abi) = &e.abi {
@@ -1517,7 +1572,7 @@ impl Jit {
         let mut params: Vec<(String, TyKind, Span)> = Vec::new();
 
         for p in &e.params {
-            let ast_ty = p.ty.as_ref().ok_or_else(|| JitError {
+            let ast_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("extern fn `{}` param `{}` has no type annotation", e.name, p.name),
                 line: p.span.line, col: p.span.col,
             })?;
@@ -1540,7 +1595,7 @@ impl Jit {
         } else {
             let id = self.module
                 .declare_function(&e.name, Linkage::Import, &sig)
-                .map_err(|e_| JitError {
+                .map_err(|e_| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare extern fn `{}`: {}", e.name, e_),
                     line: e.span.line, col: e.span.col,
                 })?;
@@ -1562,7 +1617,7 @@ impl Jit {
     ) -> Result<(), JitError> {
         let id = self.module
             .declare_function(name, Linkage::Local, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare extern trampoline `{}`: {}", name, e),
                 line: span.line, col: span.col,
             })?;
@@ -1596,7 +1651,7 @@ impl Jit {
         builder.finalize(self.module.target_config());
         self.module
             .define_function(id, &mut self.ctx)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("define extern trampoline `{}`: {}", name, e),
                 line: span.line, col: span.col,
             })?;
@@ -1706,7 +1761,7 @@ impl Jit {
         if mut_idxs.is_empty() {
             return err(&f.span,
                 "`@grad fn` with no `!` (mut) parameter has nothing to differentiate \
-                 (AUTODIFF.md §2)");
+                 (see the spec on `@grad`)");
         }
         if !matches!(&f.ret_type, Some(Type::Scalar(ScalarType::F32, _))) {
             return err(&f.span,
@@ -1765,7 +1820,7 @@ impl Jit {
                 }
                 mut_param_idxs.push(idx);
             }
-            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError {
+            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("parameter `{}` needs a type annotation in the JIT", p.name),
                 line: p.span.line, col: p.span.col,
             })?;
@@ -1792,7 +1847,7 @@ impl Jit {
 
         let id = self.module
             .declare_function(mangled_name, Linkage::Export, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare_function `{}`: {}", mangled_name, e),
                 line: f.span.line, col: f.span.col,
             })?;
@@ -1840,7 +1895,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function(name, Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare builtin `{}`: {}", name, e),
                     line: 0, col: 0,
                 })?;
@@ -1863,7 +1918,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_forge_alloc", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare forge_alloc: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_forge_alloc".to_string(), FnEntry {
@@ -1880,7 +1935,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_forge_snapshot", Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare forge_snapshot: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_forge_snapshot".to_string(), FnEntry {
@@ -1893,7 +1948,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_forge_restore", Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare forge_restore: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_forge_restore".to_string(), FnEntry {
@@ -1908,7 +1963,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_print_tensor_1d_f32", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare print_tensor_1d_f32: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_print_tensor_1d_f32".to_string(), FnEntry {
@@ -1924,7 +1979,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_print_tensor_2d_f32", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare print_tensor_2d_f32: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_print_tensor_2d_f32".to_string(), FnEntry {
@@ -1945,7 +2000,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function(sym, Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare {}: {}", sym, e), line: 0, col: 0,
                 })?;
             self.fns.insert(sym.to_string(), FnEntry {
@@ -1967,7 +2022,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function(sym, Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare {}: {}", sym, e), line: 0, col: 0,
                 })?;
             self.fns.insert(sym.to_string(), FnEntry {
@@ -1989,7 +2044,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_capture_grad", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare capture_grad: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_capture_grad".to_string(), FnEntry {
@@ -2005,7 +2060,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_grad_prologue", Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare grad_prologue: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_grad_prologue".to_string(), FnEntry {
@@ -2019,7 +2074,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_grad_epilogue", Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare grad_epilogue: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_grad_epilogue".to_string(), FnEntry {
@@ -2037,7 +2092,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_take_grad_at", Linkage::Import, &sig)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("declare take_grad_at: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_take_grad_at".to_string(), FnEntry {
@@ -2055,7 +2110,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_powf_f32", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare powf: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_powf_f32".to_string(), FnEntry {
@@ -2071,7 +2126,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_powf_f64", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare powf_f64: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_powf_f64".to_string(), FnEntry {
@@ -2087,7 +2142,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_fmod_f64", Linkage::Import, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare fmod_f64: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_fmod_f64".to_string(), FnEntry {
@@ -2104,7 +2159,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_new_from_raw", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_new_from_raw: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_new_from_raw: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_new_from_raw".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2117,7 +2172,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_len", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_len: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_len: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_len".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2131,7 +2186,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_get_char", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_get_char: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_get_char: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_get_char".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2145,7 +2200,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_eq", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_eq: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_eq: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_eq".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2159,7 +2214,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_concat", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_concat: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_concat: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_concat".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2172,7 +2227,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_from_int", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_from_int: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_from_int: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_from_int".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2185,7 +2240,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_from_f64", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_from_f64: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_from_f64: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_from_f64".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2198,7 +2253,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_from_bool", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_str_from_bool: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_from_bool: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_from_bool".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2211,7 +2266,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_chr", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_chr: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_chr: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_chr".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2223,7 +2278,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_sleep_ms", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_sleep_ms: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_sleep_ms: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_sleep_ms".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2234,7 +2289,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_flush", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_flush: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_flush: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_flush".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2245,7 +2300,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_match_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_match_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_match_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_match_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2256,7 +2311,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_nil_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_nil_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_nil_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_nil_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2268,7 +2323,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_print_str", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_print_str: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_print_str: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_print_str".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2280,7 +2335,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_new", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_map_new: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_new: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_new".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Map, mut_param_idxs: vec![],
             });
@@ -2294,7 +2349,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_get", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_map_get: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_get: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_get".to_string(), FnEntry {
                 id, sig,
                 params: vec![
@@ -2313,7 +2368,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_set", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_map_set: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_set: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_set".to_string(), FnEntry {
                 id, sig,
                 params: vec![
@@ -2333,7 +2388,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_contains", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_map_contains: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_contains: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_contains".to_string(), FnEntry {
                 id, sig,
                 params: vec![
@@ -2353,7 +2408,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_vault_load_raw", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_vault_load_raw: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_vault_load_raw: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_vault_load_raw".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2370,7 +2425,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_vault_load_npz", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_vault_load_npz: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_vault_load_npz: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_vault_load_npz".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2383,7 +2438,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_par", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_matmul_par: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_par: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_par".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2396,7 +2451,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_matmul_bf16: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2411,7 +2466,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16_gpu", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_matmul_bf16_gpu: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16_gpu".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2425,7 +2480,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_bf16_upconvert", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_bf16_upconvert: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_bf16_upconvert: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_bf16_upconvert".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2439,7 +2494,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_f32_to_bf16", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_f32_to_bf16: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_f32_to_bf16: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_f32_to_bf16".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2454,7 +2509,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_bf16_transpose_2d", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_bf16_transpose_2d: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_bf16_transpose_2d: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_bf16_transpose_2d".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2468,7 +2523,7 @@ impl Jit {
             sig.returns.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module.declare_function("__dmc_trit_quantize", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_trit_quantize: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_trit_quantize: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_trit_quantize".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2482,7 +2537,7 @@ impl Jit {
             sig.returns.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module.declare_function("__dmc_trit_neg", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_trit_neg: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_trit_neg: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_trit_neg".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2496,7 +2551,7 @@ impl Jit {
             sig.returns.push(AbiParam::new(cl::F64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module.declare_function("__dmc_trit_sparsity", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_trit_sparsity: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_trit_sparsity: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_trit_sparsity".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::F64), mut_param_idxs: vec![],
             });
@@ -2509,7 +2564,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_oob_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_oob_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_oob_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_oob_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2523,7 +2578,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_kv_cap_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_kv_cap_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_kv_cap_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_kv_cap_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2536,7 +2591,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_shift_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_shift_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_shift_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_shift_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2550,7 +2605,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_div_overflow_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { msg: format!("declare __dmc_div_overflow_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_div_overflow_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_div_overflow_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2607,7 +2662,7 @@ impl Jit {
                 .to_string();
             // block_params: [__env, p0, p1, ...]
             // Skip __env (index 0); pass p0..pN to the real function.
-            let real_entry = tr.fns.get(&target_name).cloned().ok_or_else(|| JitError {
+            let real_entry = tr.fns.get(&target_name).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("trampoline: target fn `{}` not found", target_name),
                 line: meta.span.line, col: meta.span.col,
             })?;
@@ -2631,7 +2686,7 @@ impl Jit {
             let __cg = std::time::Instant::now();
             self.module
                 .define_function(meta.id, &mut self.ctx)
-                .map_err(|e| JitError {
+                .map_err(|e| JitError { kind: JitErrorKind::Error,
                     msg: format!("define `{}`: {}", meta.name, e),
                     line: meta.span.line, col: meta.span.col,
                 })?;
@@ -2771,7 +2826,7 @@ impl Jit {
         let __cg = std::time::Instant::now();
         self.module
             .define_function(meta.id, &mut self.ctx)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("define `{}`: {}", meta.name, e),
                 line: meta.span.line, col: meta.span.col,
             })?;
@@ -2789,11 +2844,11 @@ impl Jit {
     /// `nil` test passes iff it runs to completion. The program must already be
     /// compiled (and finalized).
     pub fn run_test_fn(&mut self, name: &str) -> Result<bool, JitError> {
-        let meta = self.fns.get(name).ok_or_else(|| JitError {
+        let meta = self.fns.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("no `fn {}()` to JIT-execute", name), line: 0, col: 0,
         })?.clone();
         if !meta.params.is_empty() {
-            return Err(JitError { msg: format!("`{}` must take no arguments", name), line: 0, col: 0 });
+            return Err(JitError { kind: JitErrorKind::Error, msg: format!("`{}` must take no arguments", name), line: 0, col: 0 });
         }
         let ptr = self.module.get_finalized_function(meta.id);
         match meta.ret {
@@ -2806,16 +2861,16 @@ impl Jit {
                 unsafe { f(); }
                 Ok(true) // ran to completion
             }
-            _ => Err(JitError { msg: format!("test `{}` must return bool or nil", name), line: 0, col: 0 }),
+            _ => Err(JitError { kind: JitErrorKind::Error, msg: format!("test `{}` must return bool or nil", name), line: 0, col: 0 }),
         }
     }
 
     pub fn run_main(&mut self) -> Result<i64, JitError> {
-        let meta = self.fns.get("main").ok_or_else(|| JitError {
+        let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "no `fn main()` to JIT-execute".into(), line: 0, col: 0,
         })?.clone();
         if !meta.params.is_empty() {
-            return Err(JitError {
+            return Err(JitError { kind: JitErrorKind::Error,
                 msg: "`fn main` must take no arguments in the JIT".into(),
                 line: 0, col: 0,
             });
@@ -2842,7 +2897,13 @@ impl Jit {
             TyKind::Scalar(ScalarKind::F32) => {
                 let f: unsafe extern "C" fn() -> f32 = unsafe { mem::transmute(ptr) };
                 let v = unsafe { f() };
-                println!("=> {}", v);
+                // #473: widen before formatting. An f32 renders as the f64
+                // expansion of its value ("0.30000001192092896", not "0.3") —
+                // #368's rule, and what f32 tensor elements and `as str` have
+                // always printed. Printing at f32 width here made every
+                // `fn main() -> f32` echo disagree with `dmc run`, which
+                // `diff_fuzz.py --floats` sees on ~28% of generated programs.
+                println!("=> {}", v as f64);
                 Ok(0)
             }
             TyKind::Scalar(ScalarKind::F64) => {
@@ -2851,23 +2912,23 @@ impl Jit {
                 println!("=> {}", v);
                 Ok(0)
             }
-            TyKind::Tensor(_) => Err(JitError {
+            TyKind::Tensor(_) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a Tensor is not supported (tensor lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::KV(_) => Err(JitError {
+            TyKind::KV(_) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a KV cache is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::DynTensor(_) => Err(JitError {
+            TyKind::DynTensor(_) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a dynamic-shape tensor is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Tuple(_) => Err(JitError {
+            TyKind::Tuple(_) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a tuple is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Model(_, _) => Err(JitError {
+            TyKind::Model(_, _) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a model instance is not supported".into(),
                 line: 0, col: 0,
             }),
@@ -2882,27 +2943,27 @@ impl Jit {
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
                 Ok(unsafe { f() })
             }
-            TyKind::KvArray(_, _) => Err(JitError {
+            TyKind::KvArray(_, _) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a KV array is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::ModelArray(_, _, _) => Err(JitError {
+            TyKind::ModelArray(_, _, _) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a model array is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Fn(_, _) => Err(JitError {
+            TyKind::Fn(_, _) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a function pointer is not supported by the JIT runner".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Scalar(ScalarKind::OptI64) => Err(JitError {
+            TyKind::Scalar(ScalarKind::OptI64) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a maybe-nil value is not supported; compare to nil or guard with map_contains first".into(),
                 line: 0, col: 0,
             }),
-            TyKind::TritTensor(_) => Err(JitError {
+            TyKind::TritTensor(_) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a trit tensor is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Bf16Tensor(_) => Err(JitError {
+            TyKind::Bf16Tensor(_) => Err(JitError { kind: JitErrorKind::Error,
                 msg: "main returning a bf16 tensor is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
@@ -2924,11 +2985,11 @@ impl Jit {
     /// f64 / nil for completeness). Non-scalar returns are outside the scalar
     /// fuzz regime and error cleanly.
     pub fn run_main_scalar(&mut self) -> Result<ScalarRet, JitError> {
-        let meta = self.fns.get("main").ok_or_else(|| JitError {
+        let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "no `fn main()` to JIT-execute".into(), line: 0, col: 0,
         })?.clone();
         if !meta.params.is_empty() {
-            return Err(JitError {
+            return Err(JitError { kind: JitErrorKind::Error,
                 msg: "`fn main` must take no arguments in the JIT".into(),
                 line: 0, col: 0,
             });
@@ -2964,7 +3025,7 @@ impl Jit {
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
                 Ok(ScalarRet::I64(unsafe { f() }))
             }
-            other => Err(JitError {
+            other => Err(JitError { kind: JitErrorKind::Error,
                 msg: format!("selftest: main returns non-scalar type {:?} (outside scalar fuzz regime)", other),
                 line: 0, col: 0,
             }),
@@ -3010,11 +3071,11 @@ fn classify_index_static(ie: &IndexElem, span: &Span) -> Result<StaticIndexCat, 
         // `IndexElem::Expr(Expr::Range)`, not `IndexElem::Slice`. Recognize it as
         // a range with literal bounds (exclusive `a..b`, inclusive `a..=b`).
         IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => {
-            let s = lit_int(start.as_deref()).ok_or_else(|| JitError {
+            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "range slice start must be a literal int in the JIT".into(),
                 line: span.line, col: span.col,
             })?;
-            let e = lit_int(end.as_deref()).ok_or_else(|| JitError {
+            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "range slice end must be a literal int in the JIT".into(),
                 line: span.line, col: span.col,
             })?;
@@ -3026,11 +3087,11 @@ fn classify_index_static(ie: &IndexElem, span: &Span) -> Result<StaticIndexCat, 
             if step.is_some() {
                 return err(span, "strided slices (`a:b:c`) need slice-5 support");
             }
-            let s = lit_int(start.as_deref()).ok_or_else(|| JitError {
+            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "slice start must be a literal int in slice 4".into(),
                 line: span.line, col: span.col,
             })?;
-            let e = lit_int(end.as_deref()).ok_or_else(|| JitError {
+            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "slice end must be a literal int in slice 4".into(),
                 line: span.line, col: span.col,
             })?;
@@ -3115,7 +3176,7 @@ fn as_fwd_bwd_call(e: &Expr) -> Option<(&str, &str, &[CallArg])> {
 /// a forge staging constructor (`forge.uninit[KV[...], [L]]`) and build its KvTy
 /// with capacity unknown — each slot is filled later by `arr[i] = forge.kv(...)`.
 /// Returns None if `e` isn't a `KV[...]` expression. (#273 follow-up: per-layer
-/// KV-cache staging arrays in the Qwen3 port.)
+/// KV-cache staging arrays in a real transformer port.)
 fn kv_ctor_elem_ty(e: &Expr, env: &HashMap<String, i64>, span: &Span)
     -> Option<Result<KvTy, JitError>>
 {
@@ -3193,7 +3254,7 @@ fn type_named_dims(args: &[TypeArg], env: &HashMap<String, i64>) -> Vec<i64> {
         TypeArg::Named { value, .. } => resolve_shape_expr(value, env, &sp).ok(),
         // A bare type-name arg (`Attn[D]`, where D is a shape param) parses as a
         // Type::Named, not an Expr — resolve it via the env so a *nested*
-        // parameterized model field (`attn: QwenAttn[H_q, D, ..]`) keeps its args.
+        // parameterized model field (`attn: Attn[H_q, D, ..]`) keeps its args.
         TypeArg::Type(Type::Named { name, args: ta, .. }) if ta.is_empty() =>
             env.get(name).copied(),
         TypeArg::Type(_) => None,
@@ -3426,7 +3487,7 @@ fn unify_param_type(
             }
             Ok(())
         }
-        // Model param: `m: Qwen3_4B` (or parameterized `Foo[N]`). Bind any ident
+        // Model param: `m: Transformer` (or parameterized `Foo[N]`). Bind any ident
         // type-args positionally from the model's concrete dims. (#273 follow-up.)
         (Type::Named { name, args, .. }, TyKind::Model(mname, mdims)) => {
             if name != mname {
@@ -3555,7 +3616,7 @@ fn declare_template_signature(
     let mut params: Vec<(String, TyKind, Span)> = Vec::with_capacity(tmpl.params.len());
     let mut mut_param_idxs = Vec::new();
     for (idx, p) in tmpl.params.iter().enumerate() {
-        let ty_ast = p.ty.as_ref().ok_or_else(|| JitError {
+        let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("template param `{}` needs a type annotation", p.name),
             line: p.span.line, col: p.span.col,
         })?;
@@ -3578,7 +3639,7 @@ fn declare_template_signature(
     sig.call_conv = CallConv::SystemV;
     let id = module
         .declare_function(mangled, Linkage::Export, &sig)
-        .map_err(|e| JitError {
+        .map_err(|e| JitError { kind: JitErrorKind::Error,
             msg: format!("declare_function `{}`: {}", mangled, e),
             line: tmpl.span.line, col: tmpl.span.col,
         })?;
@@ -3586,7 +3647,7 @@ fn declare_template_signature(
 }
 
 fn setting_err(e: cranelift::codegen::settings::SetError) -> JitError {
-    JitError { msg: format!("cranelift setting: {}", e), line: 0, col: 0 }
+    JitError { kind: JitErrorKind::Error, msg: format!("cranelift setting: {}", e), line: 0, col: 0 }
 }
 
 // ─── Translator: per-function lowering ───────────────────────────────────────
@@ -4032,7 +4093,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "fwd_bwd gradient binding must be an identifier"),
         };
         let bwd = format!("{}${}", fname, method);
-        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError {
+        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: if method == "fwd_bwd_bwd" && self.fns.contains_key(&format!("{}$fwd_bwd", fname)) {
                 format!("`{}.fwd_bwd_bwd` (second-order autodiff) requires \
                          stacked `@grad @grad` on fn `{}`", fname, fname)
@@ -4117,7 +4178,7 @@ impl<'a> Translator<'a> {
     ) -> Result<(), JitError> {
         // Piece count must be a compile-time positive int — the JIT needs a
         // static tuple arity (matching the checker's n-tuple typing).
-        let n = const_int_axis(n_expr).filter(|&k| k > 0).ok_or_else(|| JitError {
+        let n = const_int_axis(n_expr).filter(|&k| k > 0).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`.split` requires a positive integer piece count, e.g. `t.split[3, axis=-1]`".into(),
             line: span.line, col: span.col,
         })? as usize;
@@ -4127,14 +4188,14 @@ impl<'a> Translator<'a> {
                 n, n, pats.len()));
         }
         let (ptr, recv_ty) = self.lower_expr(recv)?;
-        let t = recv_ty.as_tensor().ok_or_else(|| JitError {
+        let t = recv_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`.split` expects a tensor, got `{}`", recv_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
         let ndim = t.rank();
         // axis defaults to -1; negative axes resolve from the end (numpy-style).
         let axis_raw = match axis_expr {
-            Some(e) => const_int_axis(e).ok_or_else(|| JitError {
+            Some(e) => const_int_axis(e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "`.split` axis must be a compile-time integer in the JIT".into(),
                 line: span.line, col: span.col,
             })?,
@@ -4238,7 +4299,7 @@ impl<'a> Translator<'a> {
             Expr::Ident(n, _) => n.clone(),
             _ => return unsupported(span, "assignment to non-identifier targets"),
         };
-        let var = *self.locals.get(&name).ok_or_else(|| JitError {
+        let var = *self.locals.get(&name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("assignment to unknown binding `{}`", name),
             line: span.line, col: span.col,
         })?;
@@ -4253,7 +4314,7 @@ impl<'a> Translator<'a> {
         let new_val = match op {
             AssignOp::Eq | AssignOp::ColonEq => rhs_val,
             AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq => {
-                let sk = ty.as_scalar().ok_or_else(|| JitError {
+                let sk = ty.as_scalar().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "compound assignment requires a scalar binding".into(),
                     line: span.line, col: span.col,
                 })?;
@@ -4377,11 +4438,11 @@ impl<'a> Translator<'a> {
         // Only range iteration is supported.
         let (lo_expr, hi_expr, inclusive) = match iter {
             Expr::Range { start, end, inclusive, .. } => {
-                let lo = start.as_deref().ok_or_else(|| JitError {
+                let lo = start.as_deref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "for-range requires a start bound".into(),
                     line: span.line, col: span.col,
                 })?;
-                let hi = end.as_deref().ok_or_else(|| JitError {
+                let hi = end.as_deref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "for-range requires an end bound".into(),
                     line: span.line, col: span.col,
                 })?;
@@ -4561,7 +4622,7 @@ impl<'a> Translator<'a> {
             .expect("lower_enum_value on a non-payload enum").clone();
         let ord = self.enums.get(enum_name)
             .and_then(|vs| vs.iter().position(|v| v == variant))
-            .ok_or_else(|| JitError {
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("enum `{}` has no variant `{}`", enum_name, variant),
                 line: span.line, col: span.col })? as i64;
         let tys = layout.variant_tys.get(variant).cloned().unwrap_or_default();
@@ -4635,7 +4696,7 @@ impl<'a> Translator<'a> {
             }
             return Ok(scr_val);
         }
-        let scr_sk = scr_ty.as_scalar().ok_or_else(|| JitError {
+        let scr_sk = scr_ty.as_scalar().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "match scrutinee must be a scalar (i64 / bool) or enum; tensors not supported".into(),
             line: span.line, col: span.col,
         })?;
@@ -4805,7 +4866,7 @@ impl<'a> Translator<'a> {
                     let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
                     if let Some(ref rk) = result_ty {
                         if rk != &arm_kind {
-                            return err(&m.span, format!(
+                            return unsupported_msg(&m.span, format!(
                                 "match arms disagree on type: `{}` vs `{}`",
                                 rk.render(), arm_kind.render(),
                             ));
@@ -4833,7 +4894,7 @@ impl<'a> Translator<'a> {
                     let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
                     if let Some(ref rk) = result_ty {
                         if rk != &arm_kind {
-                            return err(&m.span, format!(
+                            return unsupported_msg(&m.span, format!(
                                 "match arms disagree on type: `{}` vs `{}`",
                                 rk.render(), arm_kind.render(),
                             ));
@@ -4889,7 +4950,7 @@ impl<'a> Translator<'a> {
         self.enter(merge);
         self.builder.seal_block(merge);
 
-        let rk = result_ty.ok_or_else(|| JitError {
+        let rk = result_ty.ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "match expression has no arms".into(),
             line: m.span.line, col: m.span.col,
         })?;
@@ -4907,7 +4968,7 @@ impl<'a> Translator<'a> {
     }
 
     fn lower_break(&mut self, span: &Span) -> Result<(), JitError> {
-        let exit = self.loop_stack.last().ok_or_else(|| JitError {
+        let exit = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`break` outside of a loop".into(), line: span.line, col: span.col,
         })?.exit;
         self.jump(exit, &[]);
@@ -4915,7 +4976,7 @@ impl<'a> Translator<'a> {
     }
 
     fn lower_continue(&mut self, span: &Span) -> Result<(), JitError> {
-        let header = self.loop_stack.last().ok_or_else(|| JitError {
+        let header = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`continue` outside of a loop".into(), line: span.line, col: span.col,
         })?.header;
         self.jump(header, &[]);
@@ -4936,14 +4997,14 @@ impl<'a> Translator<'a> {
             Expr::UnOp { op, operand, span } => self.lower_unop(op, operand, span),
             Expr::If(i) => {
                 let v = self.lower_if(i)?;
-                v.ok_or_else(|| JitError {
+                v.ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "if-expression has no value (both branches terminated)".into(),
                     line: i.span.line, col: i.span.col,
                 })
             }
             Expr::Block(b) => {
                 let v = self.lower_block_value(b)?;
-                v.ok_or_else(|| JitError {
+                v.ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "block expression has no tail value".into(),
                     line: b.span.line, col: b.span.col,
                 })
@@ -4999,7 +5060,7 @@ impl<'a> Translator<'a> {
                 // @deterministic and @cast(bf16) are accepted as no-ops: bit-exactness
                 // and bf16-compute semantics are not yet enforced by the JIT.
                 if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
-                    return self.lower_block_value(body)?.ok_or_else(|| JitError {
+                    return self.lower_block_value(body)?.ok_or_else(|| JitError { kind: JitErrorKind::Error,
                         msg: "directive block (@deterministic/@cast) must yield a value".into(),
                         line: span.line, col: span.col,
                     });
@@ -5021,14 +5082,20 @@ impl<'a> Translator<'a> {
                 let v = self.builder.ins().iconst(cl::I64, *n);
                 Ok((v, TyKind::Scalar(ScalarKind::I64)))
             }
-            Literal::Float(f, _) => {
-                // #209: scalar float literals are f64 (the interpreter is
-                // canonical and computes scalar floats in f64). Lowering as f32
-                // silently rounded `let x: f64 = 0.1` to f32 precision. f32 still
-                // exists inside tensors — a literal stored into an f32 tensor is
-                // fdemoted at the store boundary by coerce_to.
-                let v = self.builder.ins().f64const(*f);
-                Ok((v, TyKind::Scalar(ScalarKind::F64)))
+            Literal::Float(f, sfx) => {
+                // #473: the SUFFIX decides the width. `0.1f32` is the f32
+                // number 0.100000001490116119384765625 and computes in f32;
+                // an unsuffixed literal stays f64, which is #209's rule and
+                // must not regress (`let x: f64 = 0.1` keeps full f64
+                // precision). f32 still fdemotes at a tensor-store boundary
+                // via coerce_to, unchanged.
+                if sfx.as_ref().is_some_and(scalar_is_f32_family) {
+                    let v = self.builder.ins().f32const(*f as f32);
+                    Ok((v, TyKind::Scalar(ScalarKind::F32)))
+                } else {
+                    let v = self.builder.ins().f64const(*f);
+                    Ok((v, TyKind::Scalar(ScalarKind::F64)))
+                }
             }
             Literal::Bool(b) => {
                 let v = self.builder.ins().iconst(cl::I8, if *b { 1 } else { 0 });
@@ -5160,7 +5227,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         // Look up model layout.
-        let layout = self.model_layouts.get(name).ok_or_else(|| JitError {
+        let layout = self.model_layouts.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("unknown model `{}`", name),
             line: span.line, col: span.col,
         })?.clone();
@@ -5174,7 +5241,7 @@ impl<'a> Translator<'a> {
         // For each field provided in the struct literal, lower and store it.
         for (fname, fexpr) in fields {
             let field_idx = layout.iter().position(|(n, _)| n == fname)
-                .ok_or_else(|| JitError {
+                .ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: format!("model `{}` has no field `{}`", name, fname),
                     line: span.line, col: span.col,
                 })?;
@@ -5235,7 +5302,7 @@ impl<'a> Translator<'a> {
         let empty_env: HashMap<String, i64> = HashMap::new();
         let mut params: Vec<(String, TyKind, Span)> = Vec::new();
         for p in &lit.params {
-            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError {
+            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("lambda param `{}` needs a type annotation in JIT", p.name),
                 line: lit.span.line, col: lit.span.col,
             })?;
@@ -5274,7 +5341,7 @@ impl<'a> Translator<'a> {
 
         let id = self.module
             .declare_function(&name, cranelift_module::Linkage::Local, &sig)
-            .map_err(|e| JitError {
+            .map_err(|e| JitError { kind: JitErrorKind::Error,
                 msg: format!("declare lambda `{}`: {}", name, e),
                 line: lit.span.line, col: lit.span.col,
             })?;
@@ -5438,7 +5505,7 @@ impl<'a> Translator<'a> {
                     tram_sig.call_conv = cranelift::codegen::isa::CallConv::SystemV;
                     let tram_id = self.module
                         .declare_function(&trampoline_name, cranelift_module::Linkage::Local, &tram_sig)
-                        .map_err(|e| JitError {
+                        .map_err(|e| JitError { kind: JitErrorKind::Error,
                             msg: format!("declare trampoline `{}`: {}", trampoline_name, e),
                             line: span.line, col: span.col,
                         })?;
@@ -5572,7 +5639,9 @@ impl<'a> Translator<'a> {
                          value in the JIT yet; unwrap it first (e.g. `map_get(..) + 0`), \
                          compare to nil, or use `dmc run`"
                     } else { "" };
-                    return err(&i.span, format!(
+                    // #480: a refusal, not a defect — the JIT cannot unify
+                    // these two kinds (#478) and says so cleanly.
+                    return unsupported_msg(&i.span, format!(
                         "if/else branches disagree on type: `{}` vs `{}`{}",
                         jk.render(), k.render(), hint,
                     ));
@@ -5727,7 +5796,7 @@ impl<'a> Translator<'a> {
         let out = self.forge_alloc(ty.nbytes());
         // The fill loop writes f32-width (32-bit) words, so it is only correct
         // where the zero/one bit pattern matches at 32 bits. `uninit` never fills,
-        // so it works for any element type (this is what the bf16/bool qwen3 paths
+        // so it works for any element type (this is what the bf16/bool transformer paths
         // use); for other element types `zeros`/`ones` point at `uninit`.
         match method {
             "uninit" => {}
@@ -5820,7 +5889,7 @@ impl<'a> Translator<'a> {
                 dims.push(v);
             }
         }
-        let stream_axis = stream_axis.ok_or_else(|| JitError {
+        let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`forge.kv` shape must contain a streaming `~` axis".into(),
             line: span.line, col: span.col,
         })?;
@@ -5829,7 +5898,7 @@ impl<'a> Translator<'a> {
         let cap_expr = args.iter().find_map(|a| match a {
             CallArg::Named { name, value, .. } if name == "capacity" => Some(value),
             _ => None,
-        }).ok_or_else(|| JitError {
+        }).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`forge.kv` requires a `capacity = N` argument".into(),
             line: span.line, col: span.col,
         })?;
@@ -5840,7 +5909,7 @@ impl<'a> Translator<'a> {
 
         let kv = KvTy { elem: ScalarKind::F32, dims, stream_axis, cap: Some(cap) };
         let frame = kv.frame_elems();
-        let data_elems = cap.checked_mul(frame).ok_or_else(|| JitError {
+        let data_elems = cap.checked_mul(frame).ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`forge.kv` capacity * frame size overflows i64".into(),
             line: span.line, col: span.col,
         })?;
@@ -5871,7 +5940,7 @@ impl<'a> Translator<'a> {
         rhs: &Expr,
         span: &Span,
     ) -> Result<(), JitError> {
-        let kv = kv_ty.as_kv().ok_or_else(|| JitError {
+        let kv = kv_ty.as_kv().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`<-` stream-append requires a KV stream on the left; \
                           `{}` is `{}`", name, kv_ty.render()),
             line: span.line, col: span.col,
@@ -5890,7 +5959,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(), JitError> {
         let (src, src_ty) = self.lower_expr(rhs)?;
-        let st = src_ty.as_tensor().ok_or_else(|| JitError {
+        let st = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`<-` requires a tensor on the right, got `{}`", src_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -6328,7 +6397,7 @@ impl<'a> Translator<'a> {
         // Resolve shape → TensorTy
         let dims = self.const_dims(type_args[1], span)?;
         let numel: i64 = dims.iter().try_fold(1i64, |a, &d| a.checked_mul(d))
-            .ok_or_else(|| JitError { msg: "vault.load: shape overflow".into(), line: span.line, col: span.col })?;
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "vault.load: shape overflow".into(), line: span.line, col: span.col })?;
 
         // Return type — use F32 as elem placeholder for sub-word dtypes
         let ret_elem = match elem_bytes {
@@ -6351,7 +6420,7 @@ impl<'a> Translator<'a> {
         let numel_v = self.builder.ins().iconst(cl::I64, numel);
         let elem_bytes_v = self.builder.ins().iconst(cl::I64, elem_bytes);
         let entry = self.fns.get("__dmc_vault_load_raw")
-            .ok_or_else(|| JitError { msg: "__dmc_vault_load_raw not registered".into(), line: span.line, col: span.col })?
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "__dmc_vault_load_raw not registered".into(), line: span.line, col: span.col })?
             .clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[path_val, numel_v, elem_bytes_v]);
@@ -6409,7 +6478,7 @@ impl<'a> Translator<'a> {
         // Resolve shape → TensorTy
         let dims = self.const_dims(type_args[1], span)?;
         let numel: i64 = dims.iter().try_fold(1i64, |a, &d| a.checked_mul(d))
-            .ok_or_else(|| JitError { msg: "vault.load_npz: shape overflow".into(), line: span.line, col: span.col })?;
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "vault.load_npz: shape overflow".into(), line: span.line, col: span.col })?;
 
         let ret_ty = if bf16_direct {
             TyKind::Bf16Tensor(Bf16TensorTy { shape: dims })
@@ -6427,10 +6496,10 @@ impl<'a> Translator<'a> {
                 _ => {}
             }
         }
-        let path_expr = path_expr.ok_or_else(|| JitError {
+        let path_expr = path_expr.ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "vault.load_npz requires a path argument".into(), line: span.line, col: span.col,
         })?;
-        let key_expr = key_expr.ok_or_else(|| JitError {
+        let key_expr = key_expr.ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "vault.load_npz requires `key=` argument".into(), line: span.line, col: span.col,
         })?;
 
@@ -6442,7 +6511,7 @@ impl<'a> Translator<'a> {
         let elem_bytes_v = self.builder.ins().iconst(cl::I64, elem_bytes);
         let convert_v = self.builder.ins().iconst(cl::I64, convert);
         let entry = self.fns.get("__dmc_vault_load_npz")
-            .ok_or_else(|| JitError { msg: "__dmc_vault_load_npz not registered".into(), line: span.line, col: span.col })?
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "__dmc_vault_load_npz not registered".into(), line: span.line, col: span.col })?
             .clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[path_val, key_val, numel_v, elem_bytes_v, convert_v]);
@@ -6869,14 +6938,14 @@ impl<'a> Translator<'a> {
                 if let TyKind::Model(model_name, type_args) = &base_ty {
                     let model_name = model_name.clone();
                     let type_args = type_args.clone();
-                    let layout = self.model_layouts.get(model_name.as_str()).ok_or_else(|| JitError {
+                    let layout = self.model_layouts.get(model_name.as_str()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                         msg: format!("unknown model `{}`", model_name),
                         line: span.line, col: span.col,
                     })?.clone();
                     let (field_idx, mut field_ty) = layout.iter().enumerate()
                         .find(|(_, (n, _))| n == field)
                         .map(|(i, (_, t))| (i, t.clone()))
-                        .ok_or_else(|| JitError {
+                        .ok_or_else(|| JitError { kind: JitErrorKind::Error,
                             msg: format!("model `{}` has no field `{}`", model_name, field),
                             line: span.line, col: span.col,
                         })?;
@@ -7056,7 +7125,7 @@ impl<'a> Translator<'a> {
                         TyKind::Scalar(ScalarKind::F64) | TyKind::Scalar(ScalarKind::F32) => "print_f64",
                         TyKind::Scalar(ScalarKind::Bool) => "print_bool",
                         TyKind::Scalar(ScalarKind::Nil)  => "print_nil",
-                        _ => return err(span, format!("print: unsupported type `{}`", ty.render())),
+                        _ => return unsupported_msg(span, format!("print: unsupported type `{}`", ty.render())),
                     };
                     let coerce_ty = match fn_name {
                         "print_i64"  => TyKind::Scalar(ScalarKind::I64),
@@ -7130,7 +7199,7 @@ impl<'a> Translator<'a> {
                     CallArg::Positional(Expr::Literal(Literal::Str(s), _)) => s.clone(),
                     _ => return err(span, "fn_ptr: argument must be a string literal"),
                 };
-                let entry = self.fns.get(&fname).ok_or_else(|| JitError {
+                let entry = self.fns.get(&fname).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: format!("fn_ptr: unknown function `{}`", fname),
                     line: span.line,
                     col: span.col,
@@ -7206,7 +7275,7 @@ impl<'a> Translator<'a> {
         } else if let Some(tmpl) = self.templates.get(&name).cloned() {
             self.instantiate_template(&tmpl, &arg_vals, span)?
         } else {
-            return err(span, format!("unknown function `{}`", name));
+            return unsupported_msg(span, format!("unknown function `{}`", name));
         };
 
         if arg_vals.len() != entry.params.len() {
@@ -7270,7 +7339,7 @@ impl<'a> Translator<'a> {
         // bind shape variables.
         let mut bindings: HashMap<String, i64> = HashMap::new();
         for (p, (_v, k)) in tmpl.params.iter().zip(arg_vals.iter()) {
-            let p_ty = p.ty.as_ref().ok_or_else(|| JitError {
+            let p_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("template param `{}` needs a type annotation", p.name),
                 line: p.span.line, col: p.span.col,
             })?;
@@ -7520,7 +7589,7 @@ impl<'a> Translator<'a> {
             ));
         }
         if t_ty.elem != ScalarKind::F32 {
-            return err(span, "scalar-tensor broadcast is f32-only in slice 4");
+            return unsupported_msg(span, "scalar-tensor broadcast is f32-only");
         }
         // Coerce the scalar to f32 so the kernel is uniform.
         let s_val = self.coerce_scalar(s_val, s_kind, ScalarKind::F32, span)?;
@@ -7584,7 +7653,7 @@ impl<'a> Translator<'a> {
             ));
         }
         if dt.elem != ScalarKind::F32 {
-            return err(span, "scalar/dynamic-tensor broadcast is f32-only");
+            return unsupported_msg(span, "scalar/dynamic-tensor broadcast is f32-only");
         }
         let s_val = self.coerce_scalar(s_val, s_kind, ScalarKind::F32, span)?;
 
@@ -7711,18 +7780,22 @@ impl<'a> Translator<'a> {
         let (r, rk) = if rk == ScalarKind::OptI64 {
             (self.opt_unwrap_or_trap(r), ScalarKind::I64)
         } else { (r, rk) };
-        // #209: all scalar float arithmetic/comparison runs in f64 (the
-        // interpreter is canonical). f32 scalars still arise — from an f32 tensor
-        // element, an f32-returning math builtin, or an f32-annotated binding — so
-        // promote any f32 operand to f64 here. Both the comparison and arithmetic
-        // paths below then see matching f64 floats, and the result is f64. (f32
-        // only lives inside tensor storage; stores fdemote at the boundary.)
-        let (l, lk) = if lk == ScalarKind::F32 {
-            (self.builder.ins().fpromote(cl::F64, l), ScalarKind::F64)
-        } else { (l, lk) };
-        let (r, rk) = if rk == ScalarKind::F32 {
-            (self.builder.ins().fpromote(cl::F64, r), ScalarKind::F64)
-        } else { (r, rk) };
+        // #473: a scalar float's width follows its declared type, so the two
+        // operands can genuinely differ. Join them the way the interpreter's
+        // `FW::join` does — f32 only when BOTH sides are f32, otherwise promote
+        // the f32 side to f64. Mixed arithmetic therefore never silently
+        // narrows, and an all-f32 expression computes in f32 instead of
+        // accumulating in f64 and rounding once at the end (#209's old rule,
+        // which diverged from the interpreter on any chain of two or more ops).
+        let (l, lk, r, rk) = match (lk, rk) {
+            (ScalarKind::F32, ScalarKind::F64) => {
+                (self.builder.ins().fpromote(cl::F64, l), ScalarKind::F64, r, rk)
+            }
+            (ScalarKind::F64, ScalarKind::F32) => {
+                (l, lk, self.builder.ins().fpromote(cl::F64, r), ScalarKind::F64)
+            }
+            _ => (l, lk, r, rk),
+        };
         // Comparisons accept matching int or matching float and return bool.
         let is_cmp = matches!(
             op,
@@ -7804,7 +7877,7 @@ impl<'a> Translator<'a> {
                     self.shift_range_check(r, false);
                     self.builder.ins().sshr(l, r)
                 }
-                _ => return err(span, format!("operator `{:?}` not supported on ints in slice 1", op)),
+                _ => return unsupported_msg(span, format!("operator `{:?}` is not lowered for ints", op)),
             };
             Ok((v, lk))
         } else if lk.is_float() {
@@ -7819,27 +7892,31 @@ impl<'a> Translator<'a> {
                 BinOp::DotSub => self.builder.ins().fsub(l, r),
                 BinOp::DotMul => self.builder.ins().fmul(l, r),
                 BinOp::DotDiv => self.builder.ins().fdiv(l, r),
-                // #261: `**` (and `pow`) on scalar floats -> powf. Scalar floats
-                // run in f64 (#209), so route through the f64 helper to match the
-                // interpreter's `a.powf(b)`. #275: dotted `.^` on scalars too.
-                BinOp::Pow | BinOp::StarStar | BinOp::DotPow | BinOp::DotPow2 => {
-                    let entry = self.fns.get("__dmc_powf_f64")
-                        .expect("__dmc_powf_f64 not registered").clone();
+                // #261: `**` (and `pow`) on scalar floats -> powf. #275: dotted
+                // `.^` on scalars too. #289: scalar float `%` -> Rust's
+                // truncated fmod. Both are libm calls with no f32 entry point,
+                // and the interpreter computes them in f64 too — so an f32 pair
+                // widens, calls the f64 helper, and rounds the result back to
+                // f32, which is exactly `FW::round` on the interpreter's side.
+                // (#241 records `powf` as the one op where round-after-f64 can
+                // differ from native f32 by an ulp; the two backends agree
+                // because they now do the identical thing.)
+                BinOp::Pow | BinOp::StarStar | BinOp::DotPow | BinOp::DotPow2 | BinOp::Mod => {
+                    let sym = if matches!(op, BinOp::Mod) { "__dmc_fmod_f64" } else { "__dmc_powf_f64" };
+                    let entry = self.fns.get(sym)
+                        .unwrap_or_else(|| panic!("{} not registered", sym)).clone();
                     let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-                    let call = self.builder.ins().call(func_ref, &[l, r]);
-                    self.builder.inst_results(call)[0]
+                    let (lw, rw) = if lk == ScalarKind::F32 {
+                        (self.builder.ins().fpromote(cl::F64, l),
+                         self.builder.ins().fpromote(cl::F64, r))
+                    } else { (l, r) };
+                    let call = self.builder.ins().call(func_ref, &[lw, rw]);
+                    let res = self.builder.inst_results(call)[0];
+                    if lk == ScalarKind::F32 {
+                        self.builder.ins().fdemote(cl::F32, res)
+                    } else { res }
                 }
-                // #289: scalar float `%` — the interpreter computes Rust
-                // `a % b` (truncated fmod), so route through the f64 helper
-                // instead of rejecting a program `dmc run` accepts.
-                BinOp::Mod => {
-                    let entry = self.fns.get("__dmc_fmod_f64")
-                        .expect("__dmc_fmod_f64 not registered").clone();
-                    let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-                    let call = self.builder.ins().call(func_ref, &[l, r]);
-                    self.builder.inst_results(call)[0]
-                }
-                _ => return err(span, format!("operator `{:?}` not supported on floats", op)),
+                _ => return unsupported_msg(span, format!("operator `{:?}` is not lowered for floats", op)),
             };
             Ok((v, lk))
         } else {
@@ -8317,7 +8394,7 @@ impl<'a> Translator<'a> {
         // tensor of the full shape (exact while the stream is filled to
         // capacity). The header pointer skips its 16-byte [len, cap] prefix.
         if let TyKind::KV(kv) = &base_ty {
-            let t = kv.as_full_tensor().ok_or_else(|| JitError {
+            let t = kv.as_full_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "indexing a KV parameter of compile-time-unknown capacity \
                       is not yet supported in the JIT (read needs the runtime length)".into(),
                 line: span.line, col: span.col,
@@ -8347,7 +8424,7 @@ impl<'a> Translator<'a> {
             return Ok((result, TyKind::Scalar(ScalarKind::I64)));
         }
         // Tensor load — dispatch to the inner helper with already-lowered ptr+type.
-        let t = base_ty.as_tensor().ok_or_else(|| JitError {
+        let t = base_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("indexing requires a tensor or str, got `{}`", base_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -8741,7 +8818,7 @@ impl<'a> Translator<'a> {
             self.builder.ins().store(flags, rv, elem_addr, 0);
             return Ok(());
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("index-assign requires a tensor, got `{}`", ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -8785,7 +8862,7 @@ impl<'a> Translator<'a> {
     ) -> Result<(), JitError> {
         // Lower destination tensor.
         let (dst_ptr, dst_ty) = self.lower_expr(base)?;
-        let dst_t = dst_ty.as_tensor().ok_or_else(|| JitError {
+        let dst_t = dst_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("slice-assign requires a tensor, got `{}`", dst_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -8798,7 +8875,7 @@ impl<'a> Translator<'a> {
 
         // Lower source tensor.
         let (src_ptr, src_ty) = self.lower_expr(rhs)?;
-        let src_t = src_ty.as_tensor().ok_or_else(|| JitError {
+        let src_t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("slice-assign RHS must be a tensor, got `{}`", src_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -9195,7 +9272,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         if lt.elem != ScalarKind::F32 || rt.elem != ScalarKind::F32 {
-            return err(span, "elementwise op only supports f32 in slice 2");
+            return unsupported_msg(span, "elementwise ops are f32-only");
         }
         // NumPy-style axis broadcasting when shapes differ but are
         // compatible (e.g. ray grid `[1, W] .op [H, 1]` -> `[H, W]`).
@@ -9341,11 +9418,11 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "fwd_bwd gradient binding must be an identifier"),
         };
         let bwd = format!("{}$fwd_bwd", fname);
-        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError {
+        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`{}` is not a `@grad fn` (no fwd_bwd entry)", fname),
             line: span.line, col: span.col,
         })?;
-        let schema = self.grad_schemas.get(&bwd).cloned().ok_or_else(|| JitError {
+        let schema = self.grad_schemas.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`{}.fwd_bwd` has no gradient schema (no `!` mut params?)", fname),
             line: span.line, col: span.col,
         })?;
@@ -9471,7 +9548,7 @@ impl<'a> Translator<'a> {
                 let node = match op {
                     AssignOp::Eq => self.ad_lower_expr(rhs, sp)?.2,
                     AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq => {
-                        let acc_node = *self.ad.as_ref().unwrap().env.get(name).ok_or_else(|| JitError {
+                        let acc_node = *self.ad.as_ref().unwrap().env.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                             msg: format!("@grad: `{}` reassigned before it was bound", name),
                             line: sp.line, col: sp.col,
                         })?;
@@ -9506,11 +9583,11 @@ impl<'a> Translator<'a> {
                     _ => return unsupported(sp,
                         "`@grad fn` for-loop needs a bounded range `for k in lo..hi`"),
                 };
-                let lo = self.ad_const_int(lo_e).ok_or_else(|| JitError {
+                let lo = self.ad_const_int(lo_e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "`@grad fn` for-loop bound must be a compile-time constant (a literal or \
                           shape parameter) — reverse-mode unrolls the loop".into(),
                     line: sp.line, col: sp.col })?;
-                let hi = self.ad_const_int(hi_e).ok_or_else(|| JitError {
+                let hi = self.ad_const_int(hi_e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "`@grad fn` for-loop bound must be a compile-time constant (a literal or \
                           shape parameter) — reverse-mode unrolls the loop".into(),
                     line: sp.line, col: sp.col })?;
@@ -9600,7 +9677,7 @@ impl<'a> Translator<'a> {
             }
             Expr::UnOp { op: UnOp::ReLU, operand: relu_op, span: uspan } => {
                 let (v, ty, inode) = self.ad_lower_expr(relu_op, uspan)?;
-                let t = ty.as_tensor().ok_or_else(|| JitError {
+                let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: "`\\>` in @grad requires a tensor operand".into(),
                     line: uspan.line, col: uspan.col,
                 })?.clone();
@@ -9613,7 +9690,7 @@ impl<'a> Translator<'a> {
                 match op {
                     PostfixOp::Transpose => {
                         let (v, ty, inode) = self.ad_lower_expr(expr, pspan)?;
-                        let t = ty.as_tensor().ok_or_else(|| JitError {
+                        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                             msg: "transpose in @grad requires a tensor".into(),
                             line: pspan.line, col: pspan.col,
                         })?.clone();
@@ -9692,7 +9769,7 @@ impl<'a> Translator<'a> {
         match name.as_str() {
             "relu" | "tanh" | "gelu" | "sigmoid" | "silu" | "elu" | "mish" => {
                 let (inp_v, ty, inode) = self.ad_lower_expr(e, span)?;
-                let t = ty.as_tensor().ok_or_else(|| JitError {
+                let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                     msg: format!("`{}` in @grad requires a tensor argument", name),
                     line: span.line, col: span.col,
                 })?.clone();
@@ -9733,7 +9810,7 @@ impl<'a> Translator<'a> {
             ).as_str()),
         };
         let (_v, ty, inode) = self.ad_lower_expr(e, span)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`{}` requires a tensor argument", name),
             line: span.line, col: span.col,
         })?.clone();
@@ -9766,7 +9843,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "non-positional arg to softmax in @grad"),
         };
         let (inp_v, ty, inode) = self.ad_lower_expr(xe, span)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "softmax in @grad requires a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -9819,10 +9896,10 @@ impl<'a> Translator<'a> {
         let (g_v, g_ty, g_node) = self.ad_lower_expr(g_e, span)?;
         let (eps_raw, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps_raw, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError {
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rms_norm: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError {
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rms_norm: gain must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
         if xt.elem != ScalarKind::F32 || gt.elem != ScalarKind::F32 {
@@ -9884,13 +9961,13 @@ impl<'a> Translator<'a> {
         let (b_v, b_ty, b_node) = self.ad_lower_expr(b_e, span)?;
         let (eps_raw, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps_raw, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError {
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "layer_norm: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError {
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "layer_norm: gain must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let bt = b_ty.as_tensor().ok_or_else(|| JitError {
+        let bt = b_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "layer_norm: bias must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
         if xt.elem != ScalarKind::F32 || gt.elem != ScalarKind::F32 || bt.elem != ScalarKind::F32 {
@@ -9955,13 +10032,13 @@ impl<'a> Translator<'a> {
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (cos_v, cos_ty, cos_node) = self.ad_lower_expr(cos_e, span)?;
         let (sin_v, sin_ty, sin_node) = self.ad_lower_expr(sin_e, span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError {
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rope: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let ct = cos_ty.as_tensor().ok_or_else(|| JitError {
+        let ct = cos_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rope: cos must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let st = sin_ty.as_tensor().ok_or_else(|| JitError {
+        let st = sin_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rope: sin must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
         if xt.elem != ScalarKind::F32 || ct.elem != ScalarKind::F32 || st.elem != ScalarKind::F32 {
@@ -10030,12 +10107,12 @@ impl<'a> Translator<'a> {
             }
             Some(_) => return unsupported(span, "non-positional mask arg to attn in @grad"),
         };
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError {
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("{}: q must be a tensor", name), line: span.line, col: span.col })?.clone();
-        let kt = k_ty.as_tensor().ok_or_else(|| JitError {
+        let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("{}: k must be a tensor (KV-cache operands in @grad need `dmc run`)", name),
             line: span.line, col: span.col })?.clone();
-        let vt = v_ty.as_tensor().ok_or_else(|| JitError {
+        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("{}: v must be a tensor (KV-cache operands in @grad need `dmc run`)", name),
             line: span.line, col: span.col })?.clone();
         if qt.rank() != 4 || kt.rank() != 4 || vt.rank() != 4 {
@@ -10065,7 +10142,7 @@ impl<'a> Translator<'a> {
             .and_then(|x| x.checked_mul(s))
             .and_then(|x| x.checked_mul(s))
             .and_then(|x| x.checked_mul(4))
-            .ok_or_else(|| JitError {
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("{}: B*H*S*S*4 overflows i64 (shape too large for @grad)", name),
                 line: span.line, col: span.col })?;
         let p_buf = self.forge_alloc(p_bytes);
@@ -10157,7 +10234,7 @@ impl<'a> Translator<'a> {
     fn emit_backward(&mut self, span: &Span) -> Result<Vec<(usize, Value)>, JitError> {
         let AdState { nodes, mut adjoint, mut_params, loss, env: _ } =
             self.ad.take().expect("emit_backward without AD state");
-        let loss = loss.ok_or_else(|| JitError {
+        let loss = loss.ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "no loss node recorded".into(), line: span.line, col: span.col,
         })?;
         let one = self.builder.ins().f32const(1.0_f32);
@@ -10476,7 +10553,7 @@ impl<'a> Translator<'a> {
                         // Allocate a zeros tensor as the gradient.
                         self.forge_alloc(tt.nbytes())
                     } else {
-                        return Err(JitError {
+                        return Err(JitError { kind: JitErrorKind::Error,
                             msg: "mut parameter received no gradient (loss does not depend on it?)".into(),
                             line: span.line, col: span.col,
                         });
@@ -10559,7 +10636,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<AdState, JitError> {
         let AdState { nodes: fwd_nodes, mut_params: fwd_mut_params, loss, .. } = forward_ad;
-        let loss = loss.ok_or_else(|| JitError {
+        let loss = loss.ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "tape_backward: no loss node in forward AdState".into(),
             line: span.line, col: span.col,
         })?;
@@ -11076,7 +11153,7 @@ impl<'a> Translator<'a> {
             };
             st.loss = Some(final_loss_node);
         } else {
-            return Err(JitError {
+            return Err(JitError { kind: JitErrorKind::Error,
                 msg: "tape_backward: first mut param has no gradient (loss independent of it?)".into(),
                 line: span.line, col: span.col,
             });
@@ -11329,7 +11406,7 @@ impl<'a> Translator<'a> {
         if let TyKind::Bf16Tensor(bt) = &ty {
             return self.bf16_transpose(ptr, &bt.clone(), span);
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("transpose `'` requires a tensor, got `{}`", ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -11383,7 +11460,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TensorTy), JitError> {
         if t.elem != ScalarKind::F32 {
-            return err(span, "transpose `'` is f32-only");
+            return unsupported_msg(span, "transpose `'` is f32-only");
         }
         match t.rank() {
             1 => {
@@ -11621,7 +11698,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         if lt.elem != ScalarKind::F32 || rt.elem != ScalarKind::F32 {
-            return err(span, "matmul `@` is f32-only");
+            return unsupported_msg(span, "matmul `@` is f32-only");
         }
         match (lt.rank(), rt.rank()) {
             (2, 2) => {
@@ -12107,7 +12184,7 @@ impl<'a> Translator<'a> {
             _ => return Ok(None),
         };
         let (q_ptr, qk) = self.lower_expr(lhs)?;
-        let qt = qk.as_tensor().ok_or_else(|| JitError {
+        let qt = qk.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("attention `q @ k_cache'` requires a dense tensor `q`, got `{}`",
                          qk.render()),
             line: span.line, col: span.col,
@@ -12241,7 +12318,7 @@ impl<'a> Translator<'a> {
             return err(span, "attention `probs @ v_cache` requires rank-4 operands");
         }
         if pdt.elem != ScalarKind::F32 {
-            return err(span, "attention output is f32-only");
+            return unsupported_msg(span, "attention output is f32-only");
         }
         // probs: [B,H,1,len], all of B,H,1 static; axis 3 runtime.
         let (b, h) = match (pdt.dims[0], pdt.dims[1]) {
@@ -12586,8 +12663,13 @@ impl<'a> Translator<'a> {
         let rf   = self.builder.ins().iadd(kkn, j);
         let ro   = self.builder.ins().imul(rf, eb);
         let rv   = self.tensor_load_elem(r, ro, ScalarKind::F32);
-        let prod = self.builder.ins().fmul(lv, rv);
-        let acc2 = self.builder.ins().fadd(acc, prod);
+        // #481: FMA, matching `simd_matmul` and the threaded kernel. This was
+        // the ONLY matmul path that rounded twice, and which path a program got
+        // was decided by `n % 4` — so widening B by one column changed C[0,0],
+        // an element that does not depend on the added column. f32 matmul now
+        // contracts everywhere (SPEC §7.5), so the answer is a property of the
+        // operation rather than of the kernel the shape happened to select.
+        let acc2 = self.builder.ins().fma(lv, rv, acc);
         let kkn2 = self.builder.ins().iadd(kk, one);
         self.jump(kk_hdr, &[kkn2, acc2]);
         self.builder.seal_block(kk_body);
@@ -12709,7 +12791,7 @@ impl<'a> Translator<'a> {
             let result = self.builder.inst_results(call)[0];
             return Ok((result, TyKind::Scalar(ScalarKind::I64)));
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`len` requires a tensor or str argument".into(),
             line: span.line, col: span.col,
         })?;
@@ -12993,7 +13075,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to trit_quantize") };
         let (src, src_ty) = self.lower_expr(e)?;
-        let t = src_ty.as_tensor().ok_or_else(|| JitError {
+        let t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: format!("`trit_quantize` requires a 2-D f32 tensor, got `{}`", src_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -13111,7 +13193,7 @@ impl<'a> Translator<'a> {
                 (d, n)
             }
             TyKind::Tensor(_) | TyKind::KV(_) | TyKind::DynTensor(_) =>
-                return err(span, "`sum` is f32-only"),
+                return unsupported_msg(span, "`sum` is f32-only"),
             _ => return err(span, "`sum` requires a tensor or KV argument"),
         };
         let total = self.fused_sum_v(data_ptr, count);
@@ -13341,7 +13423,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "non-positional arg to `variance`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`variance` requires a tensor argument".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -13424,7 +13506,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "non-positional args to `pull_to_mean`"),
         };
         let (ptr, ty) = self.lower_expr(t_expr)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`pull_to_mean` first arg must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -13717,12 +13799,12 @@ impl<'a> Translator<'a> {
     ) -> Result<(Value, TyKind), JitError> {
         let (t_expr, axis) = self.parse_reduce_args(args, span)?;
         let (ptr, ty) = self.lower_expr(t_expr)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "reduce_along requires a tensor argument".into(),
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return err(span, "per-axis reductions are f32-only");
+            return unsupported_msg(span, "per-axis reductions are f32-only");
         }
         if t.rank() < 2 {
             return err(span, format!(
@@ -14119,7 +14201,7 @@ impl<'a> Translator<'a> {
             _ => {}
         }
 
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "softmax requires a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -14386,11 +14468,11 @@ impl<'a> Translator<'a> {
         };
         let (eps, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError {
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rms_norm: x must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError {
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rms_norm: g must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -14655,15 +14737,15 @@ impl<'a> Translator<'a> {
         let (eps, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
 
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError {
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "layer_norm: x must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError {
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "layer_norm: g must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
-        let bt = b_ty.as_tensor().ok_or_else(|| JitError {
+        let bt = b_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "layer_norm: b must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -14862,7 +14944,7 @@ impl<'a> Translator<'a> {
                 CallArg::Positional(e) => e,
                 _ => return unsupported(span, "softmax: non-positional axis arg"),
             };
-            let axis = const_int_axis(axis_e).ok_or_else(|| JitError {
+            let axis = const_int_axis(axis_e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: "softmax over a dynamic/KV tensor requires a constant axis".into(),
                 line: span.line, col: span.col,
             })?;
@@ -15045,11 +15127,11 @@ impl<'a> Translator<'a> {
             Some(_) => return err(span, "non-positional mask arg to `attn`"),
         };
 
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError {
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn: q must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let kt_in = k_ty.as_tensor().ok_or_else(|| JitError {
+        let kt_in = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn: k must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let vt = v_ty.as_tensor().ok_or_else(|| JitError {
+        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn: v must be a tensor".into(), line: span.line, col: span.col })?.clone();
 
         if qt.rank() != 4 || kt_in.rank() != 4 || vt.rank() != 4 {
@@ -15097,11 +15179,11 @@ impl<'a> Translator<'a> {
         let (cos_ptr, cos_ty) = self.lower_expr(cos_e)?;
         let (sin_ptr, sin_ty) = self.lower_expr(sin_e)?;
 
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError {
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rope: x must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let ct = cos_ty.as_tensor().ok_or_else(|| JitError {
+        let ct = cos_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rope: cos must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let st = sin_ty.as_tensor().ok_or_else(|| JitError {
+        let st = sin_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "rope: sin must be a tensor".into(), line: span.line, col: span.col })?.clone();
 
         if xt.rank() < 2 {
@@ -15486,11 +15568,11 @@ impl<'a> Translator<'a> {
             return self.lower_attn_gqa_cached(q_ptr, &q_ty, k_ptr, &k_ty, v_ptr, &v_ty, mask, span);
         }
 
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError {
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn_gqa: q must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let kt = k_ty.as_tensor().ok_or_else(|| JitError {
+        let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn_gqa: k must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let vt = v_ty.as_tensor().ok_or_else(|| JitError {
+        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn_gqa: v must be a tensor".into(), line: span.line, col: span.col })?.clone();
 
         if qt.rank() != 4 || kt.rank() != 4 || vt.rank() != 4 {
@@ -15744,7 +15826,7 @@ impl<'a> Translator<'a> {
         mask: Option<(Value, TensorTy)>,
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError {
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "attn_gqa: q must be a dense tensor".into(),
             line: span.line, col: span.col })?.clone();
         // Materialize KV caches to contiguous DynTensors [B,H_kv,len,D]; a
@@ -15949,7 +16031,7 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, "non-positional arg to `print_tensor`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError {
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
             msg: "`print_tensor` requires a tensor argument".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -16258,7 +16340,7 @@ impl<'a> Translator<'a> {
         let out_ptr = self.forge_alloc(out_ty.nbytes());
         let n = out_ty.nelems();
         let entry = self.fns.get(sym)
-            .ok_or_else(|| JitError {
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("activation symbol `{}` not registered", sym),
                 line: span.line, col: span.col,
             })?.clone();
@@ -17124,7 +17206,7 @@ impl<'a> Translator<'a> {
             (TyKind::Bf16Tensor(f), TyKind::Bf16Tensor(t))
                 if f.shape == t.shape || f.shape.is_empty() || t.shape.is_empty() => Ok(v),
             // #324: an f32 tensor initializing a bf16 weight field — down-convert
-            // to 2-byte bf16 storage (the general `Tensor[bf16]`-field case; Qwen
+            // to 2-byte bf16 storage (the general `Tensor[bf16]`-field case; real
             // weights instead arrive pre-bf16 from load_npz).
             (TyKind::Tensor(ft), TyKind::Bf16Tensor(tt)) if ft.elem == ScalarKind::F32 => {
                 let n = self.builder.ins().iconst(cl::I64, tt.nelems());
@@ -18314,7 +18396,7 @@ extern "C" fn dmc_matmul_bf16(l: i64, r: i64, out: i64, m: i64, k: i64, n: i64) 
 
     // NB: the m==1 decode GEMV stays SERIAL on purpose. It was tempting to split
     // its output columns across the idle cores (the kk-ascending reduction makes
-    // a column split bit-identical), but measured on Qwen3-4B decode it is a
+    // a column split bit-identical), but measured on a full decode loop it is a
     // *regression* — the serial kernel streams each weight matrix sequentially
     // (row-contiguous, prefetch-friendly), whereas a column split turns that into
     // one strided vertical stripe per thread, and the access-pattern penalty plus
@@ -18365,7 +18447,7 @@ unsafe fn matmul_tile_bf16(a: *const f32, b: *const u16, c: *mut f32,
 /// materializations — the bf16→f32 upconvert and the bf16 transpose of constant
 /// weights. The decode loop snapshot/restores the forge arena every step, so a
 /// forge-allocated result is reclaimed and *recomputed each token*; profiling
-/// Qwen3-4B decode showed this (a 1.5 GB embed upconvert + a 741 MB lm-head
+/// a large-model decode showed this (a multi-GB embed upconvert and lm-head
 /// transpose, every step) dominating decode — ~80% of CPU vs ~17% for the matmul.
 ///
 /// We key on a content fingerprint (not the pointer): the same constant weight
@@ -18458,7 +18540,7 @@ extern "C" fn dmc_bf16_upconvert(src: i64, n: i64) -> i64 {
 
 /// #324: down-convert an f32 forge buffer to a fresh 2-byte bf16 buffer. Lets an
 /// f32 tensor initialize a bf16 weight field (the general `Tensor[bf16]`-field
-/// store; the Qwen weights instead come straight from `load_npz[bf16]`).
+/// store; real model weights instead come straight from `load_npz[bf16]`).
 /// Truncation `(f32_bits >> 16)` is the inverse of `bf16_bits_to_f32`, so a
 /// value that is bf16-representable round-trips exactly.
 extern "C" fn dmc_f32_to_bf16(src: i64, n: i64) -> i64 {
@@ -18772,7 +18854,7 @@ mod tests {
         let v = interp.run(&prog, None).map_err(|e| format!("{:?}", e))?;
         match v {
             crate::interp::Value::Int(n) => Ok(n),
-            crate::interp::Value::Float(f) => Ok(f as i64),
+            crate::interp::Value::Float(f, _) => Ok(f as i64),
             crate::interp::Value::Bool(b) => Ok(b as i64),
             crate::interp::Value::Nil => Ok(0),
             other => Err(format!("interp returned non-scalar: {:?}", other)),
@@ -19246,7 +19328,7 @@ mod tests {
     fn jit_int_tensor_param_and_construct() {
         // #274: i64/i32 element tensors — param binding + indexed read, plus
         // construct/write/read and an embedding gather through an i64 id. At
-        // parity with the interpreter (the last Qwen3 forward-pass blocker).
+        // parity with the interpreter (the last full-forward-pass blocker).
         let param = "fn first[B,S](x: Tensor[i64,[B,S]]) -> i64 { x[0,1] }\n\
                      fn main() -> i64 { first([[5, 6]]) }";
         assert_eq!(jit_run_i64(param).unwrap(), 6);
@@ -19916,7 +19998,7 @@ mod tests {
     #[test]
     fn jit_nested_parameterized_model_field() {
         // #276: a param-shaped tensor field of a NESTED parameterized model,
-        // reached through a model array (the Qwen3 `blk.attn.wq`). The inner
+        // reached through a model array (`blk.attn.wq`). The inner
         // model's args (`attn: Attn[D]`) were dropped because the type-name arg
         // `D` parses as a TypeArg::Type, not an Expr — so the field resolved to
         // opaque i64. Now it keeps its shape; read + matmul work.
@@ -20116,7 +20198,7 @@ fn main() -> i64 { TOK_EQ + SCALE * 10 }
     fn jit_dotted_ops_on_scalars() {
         // #275: a dotted op on two scalars is the scalar op (the checker types it
         // that way); previously the JIT errored and the interp made a rank-0
-        // tensor. `(i as f32) ./ 64.0` is the Qwen3 RoPE pattern.
+        // tensor. `(i as f32) ./ 64.0` is the standard RoPE pattern.
         assert_eq!(jit_run_i64("fn main()->i64{ ((5.0) ./ (2.0)) as i64 }").unwrap(), 2); // 2.5
         assert_jit_eq_interp("fn main()->i64{ (((5.0) .+ (2.0)) .* (3.0)) as i64 }");      // 21
         assert_jit_eq_interp("fn main()->i64{ ((2.0) .^ (10.0)) as i64 }");                // 1024
@@ -20273,7 +20355,7 @@ fn main() -> i64 {
 
     #[test]
     fn diff_reduce_along_rank4_all_axes() {
-        // Per-axis sum_along/mean_along over a rank-4 tensor (the Qwen3 output
+        // Per-axis sum_along/mean_along over a rank-4 tensor (the transformer output
         // projection `sum_along(attn_out @ wo, 1)` collapses the head axis of a
         // rank-4 tensor). Each axis position exercises a different outer/inner
         // split of the row-major decomposition; compares interp vs JIT.
@@ -22002,9 +22084,15 @@ fn main() -> i64 {
     fn as_cast_f32_str_renders_fraction() {
         // Regression (#368 follow-up): `f as str` must render the fractional
         // digits, not truncate to the integer part. The JIT previously routed
-        // every float through __dmc_str_from_int, so 12.368f32 became "12".
-        // "12.368" has length 6; the truncated "12" has length 2. Both backends
-        // must agree, and the length pins that the fraction survives.
+        // every float through __dmc_str_from_int, so 12.368f32 became "12"
+        // (length 2), which is what this pins against.
+        // #473 changed the expected length from 6 to 18: the `f32` suffix is
+        // now real, so this is an f32 and renders as the f64 expansion of its
+        // f32-rounded value, "12.368000030517578" — the same rendering an f32
+        // *tensor* element has always had, and the same one
+        // `as_cast_derived_f32_str_matches_interp` pins for `12.368 as f32`.
+        // Before #473 the suffix was dropped and the literal stayed f64, so it
+        // printed the clean "12.368".
         assert_jit_eq_interp(r#"
             fn main() -> i64 {
                 let s = 12.368f32 as str
@@ -22013,7 +22101,7 @@ fn main() -> i64 {
         "#);
         assert_eq!(
             jit_run_i64("fn main() -> i64 { let s = 12.368f32 as str  len(s) as i64 }").unwrap(),
-            6,
+            18,
         );
     }
 
@@ -23093,7 +23181,7 @@ fn main() -> i64 { 0 }
 
     #[test]
     fn jit_attn_gqa_cached_causal_mask() {
-        // Causal mask on the CACHED attention path (the one the Qwen3 port uses:
+        // Causal mask on the CACHED attention path (the one a real transformer port uses:
         // k/v from forge.kv caches). #292. JIT-only (interp can't build a bool
         // mask). Query 0's causal row allows only key 0, so o[0,0,0,:] == v[0] ==
         // (1.0, 2.0) → 1*1000 + 2 == 1002; unmasked it's a softmax blend (3079).
@@ -23213,6 +23301,436 @@ fn main() -> i64 { 0 }
         "#);
     }
 
+    // ─── scalar f32 (#473) ───────────────────────────────────────────────────
+    //
+    // Every assertion below routes the result through `f32_to_bits`, so it is a
+    // BIT comparison, not a tolerant one. That matters: #241's double-rounding
+    // property makes "compute in f64, round once through f32" bit-exact with
+    // native f32 for a SINGLE `+ - * /`, so a one-op probe agrees under either
+    // model and proves nothing. Chains are what separate them.
+
+    #[test]
+    fn f32_scalar_chain_parity() {
+        // Three f32 terms. Under the pre-#473 JIT model (all scalar floats are
+        // f64, coerce at declared boundaries) this accumulated in f64 and
+        // rounded once at the end; the interpreter rounds every add. The two
+        // answers differ in the low mantissa bits.
+        //
+        // The CONSTANTS matter. `0.1f32 + 0.2f32 + 0.3f32` agrees under both
+        // models — the double rounding happens to land on the same f32 — and a
+        // test built on it passes without the fix. These were picked because
+        // they do not: verified by reverting the literal-suffix change and
+        // watching this fail.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 0.1f32
+                let b = 0.2f32
+                let c = 1.3f32
+                f32_to_bits(a + b + c)
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_scalar_mixed_ops_parity() {
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 0.1f32
+                let b = 0.3f32
+                let c = 0.7f32
+                f32_to_bits((a + b) * c - a / b)
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_scalar_accumulation_loop_parity() {
+        // The `total()` shape from examples/sim/lotka_volterra.dmc, which was
+        // allowlisted in tools/diff_backends.py as a #241 *tensor* residual. It
+        // is a scalar loop, so it belonged to #473 and the allowlist entry went
+        // away when this landed.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !s = 0.0f32
+                for i in 0..360 { s = s + 0.001f32 }
+                f32_to_bits(s)
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_mixed_width_promotes_never_narrows() {
+        // An f32 meeting an f64 promotes: the result is f64 and keeps full
+        // width. Compared as f64 bits (via the i64 cast of a scaled value)
+        // would lose the point, so compare the f64 directly through its own
+        // exact integer image.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 0.1f32
+                let b = 0.2
+                ((a + b) * 1000000000000000.0) as i64
+            }
+        "#);
+        // Reversed operand order takes the other promotion arm.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 0.2
+                let b = 0.1f32
+                ((a + b) * 1000000000000000.0) as i64
+            }
+        "#);
+    }
+
+    #[test]
+    fn unsuffixed_float_literal_stays_f64() {
+        // #209's half of the rule, which #473 must not regress: an unsuffixed
+        // literal is f64. If it silently became f32 this loses ~9 digits.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 0.1
+                let b = 0.2
+                let c = 0.3
+                ((a + b + c) * 1000000000000000.0) as i64
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_through_call_and_return_parity() {
+        // A declared `-> f32` binds the returned value's width even when the
+        // body is an unsuffixed literal — the checker types `g()` as f32, and
+        // the JIT's signature has always carried it, so the interpreter must
+        // agree.
+        //
+        // NOTE the shape: the result is widened to f64 and scaled, NOT passed
+        // through `f32_to_bits`. `f32_to_bits` rounds its argument to f32, so
+        // it erases exactly the width difference under test — an interpreter
+        // that returned the f64 0.1 here would still hand back the same bits.
+        assert_jit_eq_interp(r#"
+            fn g() -> f32 { 0.1 }
+            fn main() -> i64 { ((g() + 0.2f32) * 1000000000000000.0) as i64 }
+        "#);
+        assert_jit_eq_interp(r#"
+            fn g(x: f32) -> f32 { x + 0.1f32 }
+            fn main() -> i64 { ((g(g(g(0.1f32))) + 0.2f32) * 1000000000000000.0) as i64 }
+        "#);
+    }
+
+    #[test]
+    fn f32_tensor_element_reads_stay_f32() {
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [3]]
+                t[0] = 0.1f32
+                t[1] = 0.2f32
+                t[2] = 0.3f32
+                f32_to_bits(t[0] + t[1] + t[2])
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_model_field_binds_width() {
+        // An `f32` field is 4-byte storage in the JIT, so `M { x: 0.1 }` reads
+        // back the f32. The interpreter coerces at construction to match.
+        // Widened-and-scaled rather than `f32_to_bits`ed, for the reason given
+        // in `f32_through_call_and_return_parity`.
+        assert_jit_eq_interp(r#"
+            model M { x: f32 }
+            fn main() -> i64 {
+                let m = M { x: 0.1 }
+                ((m.x + 0.2f32) * 1000000000000000.0) as i64
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_pow_and_mod_parity() {
+        // `**` and `%` are libm calls with no f32 entry point: both backends
+        // widen to f64, call, and round the result back to f32.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 1.1f32
+                let b = 3.0f32
+                f32_to_bits(a ** b)
+            }
+        "#);
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 5.3f32
+                let b = 2.1f32
+                f32_to_bits(a % b)
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_transcendentals_compute_in_f64() {
+        // #209: scalar `sqrt`/`exp`/... run in f64 on BOTH backends and their
+        // result is f64, so the following `+ 0.1f32` promotes rather than
+        // rounding. Pinned because the checker types `sqrt(f32)` as f32 and a
+        // future "follow the declared type" pass could quietly change it.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let a = 2.0f32
+                ((sqrt(a) + 0.1f32) * 1000000000000000.0) as i64
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_family_suffixes_are_f32_backed() {
+        // #179: f16/bf16/tf32 are computed in f32 and retagged, never rounded
+        // to their own narrower precision — so they must equal the f32 answer.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 { f32_to_bits(0.1bf16 + 0.2bf16) }
+        "#);
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { f32_to_bits(0.1bf16 + 0.2bf16) }").unwrap(),
+            jit_run_i64("fn main() -> i64 { f32_to_bits(0.1f32 + 0.2f32) }").unwrap(),
+        );
+    }
+
+    #[test]
+    fn f32_branch_with_unsuffixed_literal_is_a_clean_jit_error() {
+        // The known #473 follow-up gap, pinned so it stays LOUD. The checker
+        // constrains an unsuffixed literal to the other branch's type, so
+        // `if c { x_f32 } else { 0.0 }` type-checks as f32; the JIT lowers an
+        // unsuffixed literal as f64 with no context and the join disagrees.
+        // Neither unification is safe — promoting silently widens a real f32,
+        // demoting silently narrows a real f64 and would undo #209 — so this
+        // errors rather than miscompiling. `dmc run` handles it.
+        let e = jit_compile_err(
+            "fn main() -> i64 { let a = 0.1f32  let z = if a > 0.0f32 { a } else { 0.0 }  f32_to_bits(z) }",
+        );
+        assert!(
+            e.contains("branches disagree on type"),
+            "expected a clean branch-type error, got: {}", e,
+        );
+    }
+
+    // ─── f32 tensor reductions (#481) ────────────────────────────────────────
+    //
+    // `sum(t)` must equal the loop it is documented to mean. Each test compares
+    // the WIDENED f64 value (scaled into an i64), never `f32_to_bits` — that
+    // rounds its argument to f32 and would erase the width difference under
+    // test, which is how two of #473's tests originally proved nothing.
+
+    #[test]
+    fn f32_sum_equals_hand_written_loop() {
+        // The #481 repro. Before the fix the interpreter's `sum` accumulated in
+        // f64 and rounded once, so it disagreed with its OWN loop; the JIT and
+        // the loop already agreed.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [12]]
+                for i in 0..12 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                (sum(t) * 1000000000000.0) as i64
+            }
+        "#);
+        // Same elements, summed by hand — must be the SAME number, in-backend.
+        let via_sum = interp_run_i64(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [12]]
+                for i in 0..12 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                (sum(t) * 1000000000000.0) as i64
+            }
+        "#).expect("interp ok");
+        let via_loop = interp_run_i64(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [12]]
+                for i in 0..12 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                let !s = 0.0f32
+                for i in 0..12 { s = s + t[i] }
+                (s * 1000000000000.0) as i64
+            }
+        "#).expect("interp ok");
+        assert_eq!(
+            via_sum, via_loop,
+            "`sum(t)` and the equivalent loop disagree WITHIN dmc run",
+        );
+    }
+
+    #[test]
+    fn f32_reduction_result_is_f32_wide() {
+        // `max`/`min` select rather than accumulate, so they agreed before the
+        // fix — but they returned an f64-tagged value where the JIT returns
+        // f32, so the very next f32 operation diverged. This is the test that
+        // `max(t)` alone would NOT have caught.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [12]]
+                for i in 0..12 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                ((max(t) + 0.1f32) * 1000000000000.0) as i64
+            }
+        "#);
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [12]]
+                for i in 0..12 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                ((sum(t) + 0.1f32) * 1000000000000.0) as i64
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_mean_and_variance_parity() {
+        // `mean` divides by an f32 count in f32, and `variance` is two passes
+        // at the same width.
+        //
+        // N is 100, not 12. `mean`'s final division rounds through f32, and at
+        // small N that last rounding ABSORBS an f64-accumulated total — the two
+        // models land on the same f32 and the test passes without the fix.
+        // Verified by mutation: at N=12 this survives reverting the
+        // accumulation, at N=100 it fails.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [100]]
+                for i in 0..100 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                (mean(t) * 100000000.0) as i64
+            }
+        "#);
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [100]]
+                for i in 0..100 { t[i] = ((i as f32) * 0.7f32 + 0.1f32) / 3.0f32 }
+                (variance(t) * 100000000.0) as i64
+            }
+        "#);
+    }
+
+    #[test]
+    fn f32_per_axis_reductions_parity() {
+        // The `*_along` family reduces each lane at the source width and keeps
+        // the source dtype on the output, so a reduction OVER the result
+        // reduces at the right width too.
+        for expr in ["sum(sum_along(m, 0))", "sum(sum_along(m, 1))",
+                     "sum(mean_along(m, 0))", "sum(max_along(m, 0))",
+                     "sum(variance_along(m, 1))"] {
+            assert_jit_eq_interp(&format!(r#"
+                fn main() -> i64 {{
+                    let !m = forge.zeros[f32, [3, 4]]
+                    for i in 0..3 {{ for j in 0..4 {{ m[i,j] = ((i*4+j) as f32) * 0.3f32 + 0.1f32 }} }}
+                    ({} * 1000000000000.0) as i64
+                }}
+            "#, expr));
+        }
+    }
+
+    #[test]
+    fn f64_tensor_reductions_keep_full_width() {
+        // #481 must not narrow an f64 tensor's reduction. `zeros` is a 32-bit
+        // fill, so construct via uninit (same reason as
+        // `jit_f64_tensor_store_precision_parity`).
+        let v = interp_run_i64(r#"
+            fn main() -> i64 {
+                let !t = forge.uninit[f64, [3]]
+                t[0] = 0.1
+                t[1] = 0.2
+                t[2] = 0.3
+                (sum(t) * 100000000000000000.0) as i64
+            }
+        "#).expect("interp ok");
+        // 0.1+0.2+0.3 in f64 is 0.6000000000000001; scaled by 1e17 and
+        // truncated that is 60000000000000008. The f32 answer would be
+        // 0.6000000238418579 -> 60000002384185790, five orders of magnitude
+        // away, so the assertion below distinguishes them with room to spare.
+        assert_eq!(v, 60000000000000008, "f64 tensor sum lost width");
+        assert!(
+            v < 60000000000000100,
+            "f64 tensor sum was narrowed to f32: got {}", v,
+        );
+    }
+
+    // ─── f32 matmul contraction (#481) ───────────────────────────────────────
+
+    #[test]
+    fn f32_matmul_result_does_not_depend_on_unrelated_columns() {
+        // THE defect, in its sharpest form. C[0,0] depends only on A's row 0
+        // and B's column 0. Widening B with extra columns cannot change it —
+        // but it did: `n % 4` decided whether the shape reached the vectorized
+        // kernel (which contracts with FMA) or the scalar fallback (which
+        // rounded twice), so adding a column changed an element that does not
+        // depend on the added column.
+        //
+        // B's column 0 is identical in both programs below (the fill indexes
+        // rows by i*97, so j=0 gives the same values for any n).
+        let src = |n: usize| format!(r#"
+            fn main() -> i64 {{
+                let !a = forge.zeros[f32, [8, 16]]
+                let !b = forge.zeros[f32, [16, {n}]]
+                for i in 0..8 {{ for j in 0..16 {{ a[i,j] = (((i*16+j) as f32) * 0.7f32 + 0.1f32) / 3.0f32 }} }}
+                for i in 0..16 {{ for j in 0..{n} {{ b[i,j] = (((i*97+j) as f32) * 0.3f32 + 0.2f32) / 7.0f32 }} }}
+                f32_to_bits((a @ b)[0,0])
+            }}
+        "#, n = n);
+        // 3 and 15 miss the vector path; 4 and 16 take it.
+        let bits: Vec<i64> = [3usize, 4, 15, 16]
+            .iter()
+            .map(|&n| jit_run_i64(&src(n)).expect("jit ok"))
+            .collect();
+        assert!(
+            bits.windows(2).all(|w| w[0] == w[1]),
+            "C[0,0] changed with B's WIDTH — kernel selection is leaking into \
+             results: n=3,4,15,16 gave {:?}", bits,
+        );
+        // And the interpreter must produce that same number.
+        assert_jit_eq_interp(&src(16));
+        assert_jit_eq_interp(&src(15));
+    }
+
+    #[test]
+    fn f32_matmul_contracts_and_says_so() {
+        // Contraction is a real, observable choice: the FMA answer differs from
+        // the two-rounding answer for this data. Pinning both directions means
+        // a future kernel that stops contracting fails here rather than
+        // silently changing everyone's numbers.
+        let contracted = r#"
+            fn main() -> i64 {
+                let !a = forge.zeros[f32, [8, 16]]
+                let !b = forge.zeros[f32, [16, 16]]
+                for i in 0..8 { for j in 0..16 { a[i,j] = (((i*16+j) as f32) * 0.7f32 + 0.1f32) / 3.0f32 } }
+                for i in 0..16 { for j in 0..16 { b[i,j] = (((i*16+j) as f32) * 0.3f32 + 0.2f32) / 7.0f32 } }
+                f32_to_bits((a @ b)[0,0])
+            }
+        "#;
+        let two_rounding = r#"
+            fn main() -> i64 {
+                let !a = forge.zeros[f32, [8, 16]]
+                let !b = forge.zeros[f32, [16, 16]]
+                for i in 0..8 { for j in 0..16 { a[i,j] = (((i*16+j) as f32) * 0.7f32 + 0.1f32) / 3.0f32 } }
+                for i in 0..16 { for j in 0..16 { b[i,j] = (((i*16+j) as f32) * 0.3f32 + 0.2f32) / 7.0f32 } }
+                let !s = 0.0f32
+                for i in 0..16 { s = s + a[0,i] * b[i,0] }
+                f32_to_bits(s)
+            }
+        "#;
+        assert_jit_eq_interp(contracted);
+        assert_jit_eq_interp(two_rounding);
+        assert_ne!(
+            jit_run_i64(contracted).expect("jit ok"),
+            jit_run_i64(two_rounding).expect("jit ok"),
+            "matmul stopped contracting — the spec says `@` fuses each \
+             multiply-add and a hand loop does not, so these must differ",
+        );
+    }
+
+    #[test]
+    fn f32_batched_matmul_contracts_too() {
+        // The batched path is a separate loop in both backends.
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !a = forge.zeros[f32, [2, 4, 8]]
+                let !b = forge.zeros[f32, [2, 8, 4]]
+                for n in 0..2 { for i in 0..4 { for j in 0..8 {
+                    a[n,i,j] = (((n*32+i*8+j) as f32) * 0.7f32 + 0.1f32) / 3.0f32 } } }
+                for n in 0..2 { for i in 0..8 { for j in 0..4 {
+                    b[n,i,j] = (((n*32+i*4+j) as f32) * 0.3f32 + 0.2f32) / 7.0f32 } } }
+                f32_to_bits((a @ b)[1,2,3])
+            }
+        "#);
+    }
+
     #[test]
     fn jit_f64_tensor_store_precision_parity() {
         // Declared-f64 tensors keep full f64 width on both backends (#239
@@ -23241,6 +23759,84 @@ fn main() -> i64 { 0 }
         let prog = Parser::new(toks).parse_program().expect("parse ok");
         let mut jit = Jit::new().expect("jit");
         jit.compile_program(&prog).unwrap_err().msg
+    }
+
+    /// The full `JitError` from a failed compile, so a test can assert its KIND
+    /// and not just its prose (#480).
+    fn jit_compile_jiterr(src: &str) -> JitError {
+        let toks = Lexer::new(src).tokenize().expect("lex ok");
+        let prog = Parser::new(toks).parse_program().expect("parse ok");
+        let mut jit = Jit::new().expect("jit");
+        jit.compile_program(&prog).unwrap_err()
+    }
+
+    // ─── error classification (#480) ─────────────────────────────────────────
+
+    #[test]
+    fn jit_refusals_are_classified_unsupported() {
+        // Each of these is the JIT declining to lower something `dmc run`
+        // handles. They must be `Unsupported`, because the differential tools
+        // treat that as an expected gap — and because before #480 the ones
+        // whose wording missed a five-item substring list were scored as SILENT
+        // MISCOMPILES, which forced working probes out of the battery.
+        // Cover BOTH constructors: `unsupported()` (151 sites, the long-standing
+        // "does not support X" family) and `unsupported_msg()` (the sites #480
+        // reclassified). Testing only the latter left the former unguarded —
+        // found by mutating `unsupported()` and watching this still pass.
+        for src in [
+            // via unsupported(): a range expression.
+            "fn main() -> i64 {\n\
+             let r = 0..5\n\
+             1 }",
+            // via unsupported_msg(), #478: the JIT cannot unify these branch kinds.
+            "fn main() -> i64 { let a = 0.1f32  let z = if a > 0.0f32 { a } else { 0.0 }  f32_to_bits(z) }",
+            // via unsupported_msg(): reductions are f32-only.
+            "fn main() -> f64 { let !t = forge.uninit[f64, [2]]  t[0] = 0.1  t[1] = 0.2  sum(t) }",
+        ] {
+            let e = jit_compile_jiterr(src);
+            assert_eq!(
+                e.kind, JitErrorKind::Unsupported,
+                "expected a classified refusal for:\n{}\ngot `{}`", src, e,
+            );
+            // The rendered form is the machine-readable contract the Python
+            // tools match on; keep it stable.
+            assert!(
+                e.to_string().starts_with("jit unsupported at "),
+                "refusal did not render with the `jit unsupported` prefix: {}", e,
+            );
+        }
+    }
+
+    #[test]
+    fn jit_defects_are_not_classified_as_gaps() {
+        // The inverse, and the direction that actually loses coverage: a
+        // failure the JIT should not have must NOT be downgraded to an
+        // allowlistable gap. A shape error is the program being wrong, not a
+        // missing feature.
+        // NB the newline before `let c`: a `]` immediately followed by `(`
+        // parses as an indirect call, which is a DIFFERENT (and also correctly
+        // classified) refusal — it made the first draft of this test pass for
+        // the wrong reason.
+        let e = jit_compile_jiterr(
+            "fn main() -> i64 {\n\
+             let a = forge.zeros[f32, [2, 3]]\n\
+             let b = forge.zeros[f32, [4, 5]]\n\
+             let c = a @ b\n\
+             c[0,0] as i64 }",
+        );
+        assert_eq!(
+            e.kind, JitErrorKind::Error,
+            "a genuine error was classified as an allowlistable gap: {}", e,
+        );
+        assert!(e.to_string().starts_with("jit error at "), "{}", e);
+    }
+
+    #[test]
+    fn jit_error_kind_defaults_to_error() {
+        // 184 construction sites were given the field mechanically. `Error` is
+        // the safe default: a site that should have been `Unsupported` costs a
+        // noisy divergence, while the reverse silently hides a defect.
+        assert_eq!(JitErrorKind::default(), JitErrorKind::Error);
     }
 
     fn jit_with_extern_sym(src: &str, name: &str, addr: *const u8) -> Result<i64, String> {
@@ -25341,7 +25937,7 @@ fn main() -> i64 {
         assert_jit_eq_interp(src);
     }
 
-    /// #267: multi-param model with a 2-D param-shaped field (the Qwen3
+    /// #267: multi-param model with a 2-D param-shaped field (the transformer
     /// layer-staging shape: `forge.uninit[Attn[H,D],[L]]` then `blocks[i].qkv[..]`).
     #[test]
     fn jit_multiparam_model_2d_field_parity() {

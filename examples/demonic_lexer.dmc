@@ -16,11 +16,11 @@
 #
 # SPANS: every token carries `lo`/`hi` byte offsets AND `line`/`col`, counted
 # the way the reference counts them — both 1-based, and `col` advances per
-# CHARACTER, not per byte (UTF-8 continuation bytes do not bump it, cf. #281).
+# CHARACTER, not per byte (UTF-8 continuation bytes do not bump it, cf.).
 # The self-hosted parser above this lexer needs line:col to report anything
 # useful, so it is part of the token, not a later reconstruction.
 #
-# ERRORS: `lex` returns `(tokens, Err)` per SPEC §3.9 — `Err` is `nil` on
+# ERRORS: `lex` returns `(tokens, Err)` — `Err` is `nil` on
 # success or a `"lex error at L:C: msg"` string on failure. Messages and fault
 # positions mirror compiler/src/lexer.rs, which reports the cursor AFTER the
 # offending byte was consumed (so a fault on byte `p` is reported at `p + 1`).
@@ -42,6 +42,55 @@ fn is_hex(b: i64) -> bool {
 }
 fn is_bin(b: i64) -> bool { b == 48 || b == 49 }
 fn is_ws_horiz(b: i64) -> bool { b == 32 || b == 9 || b == 13 }
+
+# --- numeric suffixes ---
+#
+# A suffix is matched WHOLE and must end at a token boundary. Scanning the
+# trailing alphanumeric run once and then validating it is equivalent to the
+# reference's try-each-suffix-then-check-boundary, and states the rule in one
+# place instead of three: `1if` is `1` + `if`, and `1i32abc` is `1` +
+# `i32abc` rather than a literal that silently splits the identifier.
+#
+# The run includes `_` because the reference's boundary check rejects `_` as a
+# boundary (so `1i32_x` takes no suffix), and because `fp8_e4m3` contains one.
+fn alnum_run_end(src: str, i: i64, n: i64) -> i64 {
+    let !j = i
+    while j < n && (is_alnum(src[j]) || src[j] == 95) { j = j + 1 }
+    j
+}
+
+fn is_int_suffix(s: str) -> bool {
+    s == "i8" || s == "i16" || s == "i32" || s == "i64" ||
+    s == "u8" || s == "u16" || s == "u32" || s == "u64"
+}
+
+fn is_float_suffix(s: str) -> bool {
+    s == "f16" || s == "f32" || s == "f64" || s == "bf16" || s == "tf32" ||
+    s == "fp8_e4m3" || s == "fp8_e5m2"
+}
+
+# binary size multipliers on a byte count, e.g. `@recompute(budget=4G)`.
+fn is_size_suffix(s: str) -> bool {
+    s == "K" || s == "M" || s == "G" || s == "Ki" || s == "Mi" || s == "Gi"
+}
+
+# Returns the index past the suffix, or `i` unchanged when there is none.
+# `allow_size` adds the multipliers, which the reference offers only on
+# decimal integers — `0xffK` stays IntLit + Ident("K"). The two can never both
+# fire: a size suffix directly after a type suffix leaves the type suffix
+# without a boundary, so neither matches.
+fn eat_int_suffix(src: str, i: i64, n: i64, allow_size: bool) -> i64 {
+    let j = alnum_run_end(src, i, n)
+    if j == i { return i }
+    let s = substr(src, i, j)
+    if is_int_suffix(s) || (allow_size && is_size_suffix(s)) { j } else { i }
+}
+
+fn eat_float_suffix(src: str, i: i64, n: i64) -> i64 {
+    let j = alnum_run_end(src, i, n)
+    if j == i { return i }
+    if is_float_suffix(substr(src, i, j)) { j } else { i }
+}
 
 fn is_kw(s: str) -> bool {
     s == "fn" || s == "let" || s == "mut" || s == "match" || s == "if" ||
@@ -107,7 +156,7 @@ fn len_str(s: str) -> i64 { len(s) }
 # bytes rather than a rescan per token.
 #
 # `col` counts characters, not bytes: a UTF-8 continuation byte (0b10xx_xxxx)
-# does not bump it. The reference does the same (#281) — without it, every
+# does not bump it. The reference does the same — without it, every
 # column after a multi-byte identifier or string is wrong in diagnostics.
 fn advance_pos(src: str, from: i64, to: i64, line: i64, col: i64) -> (i64, i64) {
     let !l = line
@@ -126,7 +175,7 @@ fn advance_pos(src: str, from: i64, to: i64, line: i64, col: i64) -> (i64, i64) 
     (l, c)
 }
 
-# --- errors (SPEC §3.9) -----------------------------------------------------
+# --- errors -----------------------------------------------------------------
 
 fn lex_error(msg: str, line: i64, col: i64) -> str {
     "lex error at " + to_str(line) + ":" + to_str(col) + ": " + msg
@@ -169,7 +218,7 @@ fn looks_like_byte_lit(src: str, n: i64, p: i64) -> bool {
 }
 
 # Main lexer. Returns `(tokens, Err)`: a list of token maps, and `nil` or a
-# diagnostic string (SPEC §3.9). Emits "newline" tokens only when they are
+# diagnostic string, errors as values. Emits "newline" tokens only when they are
 # significant (outside ( ) and [ ]).
 fn lex(src: str) -> (list, str) {
     let !toks = list()
@@ -339,7 +388,7 @@ fn lex(src: str) -> (list, str) {
             continue
         }
 
-        # --- byte literal b'x' (Rust-style, #334) ---
+        # --- byte literal b'x' (Rust-style) ---
         # `looks_like_byte_lit` is what keeps `a @ b'` (transpose of a tensor
         # named `b`) lexing as ident + transpose; only the unambiguous
         # `b'<byte>'` / `b'\<esc>'` shape reaches here.
@@ -397,27 +446,27 @@ fn lex(src: str) -> (list, str) {
                 let nx = src[i+1]
                 if nx == 120 || nx == 88 {  # 0x
                     i = i + 2
-                    # #291.6: a hex digit must follow `0x` directly — `_` only
+                    # a hex digit must follow `0x` directly — `_` only
                     # separates digits, so `0x_ff` (and a bare `0x`) is an error.
                     if i >= n || !is_hex(src[i]) {
                         let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
                         return (toks, lex_error("hex literal must start with a hex digit", el, ec))
                     }
                     while i < n && (is_hex(src[i]) || src[i] == 95) { i = i + 1 }
-                    while i < n && is_alnum(src[i]) { i = i + 1 }   # sized suffix (u8/i32/...)
+                    i = eat_int_suffix(src, i, n, false)   # sized suffix (u8/i32/...)
                     let raw = substr(src, start, i)
                     toks = list_push(toks, tok("int", raw, start, i, cur_line, cur_col))
                     continue
                 }
                 if nx == 98 || nx == 66 {  # 0b
                     i = i + 2
-                    # #291.6: same rule as hex — `0b_11` and a bare `0b` are errors.
+                    # same rule as hex — `0b_11` and a bare `0b` are errors.
                     if i >= n || !is_bin(src[i]) {
                         let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
                         return (toks, lex_error("binary literal must start with 0 or 1", el, ec))
                     }
                     while i < n && (is_bin(src[i]) || src[i] == 95) { i = i + 1 }
-                    while i < n && is_alnum(src[i]) { i = i + 1 }   # sized suffix (u8/i32/...)
+                    i = eat_int_suffix(src, i, n, false)   # sized suffix (u8/i32/...)
                     let raw = substr(src, start, i)
                     toks = list_push(toks, tok("int", raw, start, i, cur_line, cur_col))
                     continue
@@ -455,8 +504,13 @@ fn lex(src: str) -> (list, str) {
                     return (toks, lex_error("empty exponent in float literal", el, ec))
                 }
             }
-            # suffix
-            while i < n && is_alnum(src[i]) { i = i + 1 }
+            # suffix — a float takes a float suffix, an integer takes a type
+            # suffix or a size multiplier.
+            if is_f {
+                i = eat_float_suffix(src, i, n)
+            } else {
+                i = eat_int_suffix(src, i, n, true)
+            }
             let raw = substr(src, start, i)
             if is_f {
                 toks = list_push(toks, tok("float", raw, start, i, cur_line, cur_col))
@@ -794,7 +848,7 @@ fn test_dotted_compares() -> bool {
 fn test_sized_hex() -> bool {
     # Hex/binary literals keep their sized suffix inside a single token.
     # Regression: `0x65u8` previously split into `0x65` then `u8`, breaking
-    # raw-parity with the reference across the demoniOS examples.
+    # raw-parity with the reference lexer.
     let toks = lex_ok("0x65u8 0x5000_0000u64 0b1010u8")
     tok_kind(list_get(toks, 0)) == "int" &&
         tok_raw(list_get(toks, 0)) == "0x65u8" &&
@@ -802,7 +856,56 @@ fn test_sized_hex() -> bool {
         tok_raw(list_get(toks, 2)) == "0b1010u8"
 }
 
-# --- #454: keyword, literal, span and error coverage ---
+# --- suffix boundaries ---
+#
+# The suffix scanner used to eat any trailing alphanumerics, so a literal
+# butted against a keyword or identifier produced one wrong token instead of
+# two right ones. Nothing in the corpus reaches these shapes, which is exactly
+# why the defect survived — so they are pinned here as well as in the harness
+# probes.
+
+fn test_suffix_stops_at_keyword() -> bool {
+    # `1if` is `1` + `if`, not a literal with an `i`-flavoured suffix.
+    let toks = lex_ok("1if")
+    list_len(toks) == 3 &&
+        tok_kind(list_get(toks, 0)) == "int" && tok_raw(list_get(toks, 0)) == "1" &&
+        tok_kind(list_get(toks, 1)) == "kw_if"
+}
+
+fn test_suffix_needs_boundary() -> bool {
+    # A suffix that does not end at a token boundary is not a suffix at all.
+    let a = lex_ok("1i32abc")
+    let b = lex_ok("4Gx")
+    let c = lex_ok("1.0f32abc")
+    list_len(a) == 3 && tok_raw(list_get(a, 0)) == "1" &&
+        tok_kind(list_get(a, 1)) == "ident" && tok_raw(list_get(a, 1)) == "i32abc" &&
+        list_len(b) == 3 && tok_raw(list_get(b, 0)) == "4" &&
+        tok_raw(list_get(b, 1)) == "Gx" &&
+        list_len(c) == 3 && tok_kind(list_get(c, 0)) == "float" &&
+        tok_raw(list_get(c, 0)) == "1.0" && tok_raw(list_get(c, 1)) == "f32abc"
+}
+
+fn test_whole_suffixes_still_attach() -> bool {
+    # The boundary rule must not cost us the suffixes that are real.
+    let toks = lex_ok("1i32 1.0f32 2.5bf16 4G 8Ki 1.0fp8_e4m3")
+    tok_raw(list_get(toks, 0)) == "1i32" &&
+        tok_raw(list_get(toks, 1)) == "1.0f32" &&
+        tok_raw(list_get(toks, 2)) == "2.5bf16" &&
+        tok_raw(list_get(toks, 3)) == "4G" &&
+        tok_raw(list_get(toks, 4)) == "8Ki" &&
+        tok_raw(list_get(toks, 5)) == "1.0fp8_e4m3"
+}
+
+fn test_size_suffix_is_decimal_only() -> bool {
+    # The multipliers ride on decimal integers only — the reference does
+    # not offer them after a hex or binary literal, so `0xffK` splits.
+    let toks = lex_ok("0xffK")
+    list_len(toks) == 3 &&
+        tok_raw(list_get(toks, 0)) == "0xff" &&
+        tok_kind(list_get(toks, 1)) == "ident" && tok_raw(list_get(toks, 1)) == "K"
+}
+
+# --- keyword, literal, span and error coverage ---
 
 fn test_enum_keyword() -> bool {
     # `enum` was missing from is_kw(), so it lexed as an identifier while the
@@ -878,7 +981,7 @@ fn test_line_col_basic() -> bool {
 }
 
 fn test_line_col_counts_chars_not_bytes() -> bool {
-    # `é` is two bytes but one column (#281). If col counted bytes, the closing
+    # `é` is two bytes but one column. If col counted bytes, the closing
     # quote here would report 12 instead of 11 and every diagnostic on the line
     # after a non-ASCII string would point at the wrong caret.
     let toks = lex_ok("let s = \"é\"\nlet t = 2")
@@ -889,7 +992,7 @@ fn test_line_col_counts_chars_not_bytes() -> bool {
         tok_line(list_get(toks, 5)) == 2
 }
 
-# --- error path (SPEC §3.9); messages and positions mirror the reference ---
+# --- error path; messages and positions mirror the reference ---
 
 fn test_err_unterminated_string() -> bool {
     lex_err_of("let s = \"oops\n") == "lex error at 2:1: unterminated string literal"
@@ -1089,8 +1192,8 @@ fn test_model_and_directive() -> bool {
 }
 
 # Read examples/hello.dmc tolerantly of the working directory: the in-language
-# `dmc test` gate runs from the repo root locally but from compiler/ in CI, so
-# try both. Returns "" if neither resolves — the two tests below then SKIP rather
+# `dmc test` gate may be run from the repo root or from compiler/, so try
+# both. Returns "" if neither resolves — the two tests below then SKIP rather
 # than hard-fail, since the authoritative real-file parity check is the harness
 # tools/diff_demonic_lexer.py (which drives this lexer over the whole corpus).
 fn read_hello() -> str {

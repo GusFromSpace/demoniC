@@ -1,5 +1,5 @@
 # fused_attn.dmc — stdlib `attn` and the `@fuse` contract.
-# Normative since spec 0.0.3. See STDLIB.md §3.1 and SPEC.md §7.6.
+# See the spec's forced-fusion section.
 
 # `attn` from the stdlib computes softmax((q @ k') / sqrt(D)) @ v in
 # a single FlashAttention-style fused kernel. The [B, H, S, S] score

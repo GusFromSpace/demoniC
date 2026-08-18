@@ -257,7 +257,12 @@ fn mean_nonzero(board: Tensor[i64, [4, 4]]) -> f32 {
 
 fn variance_nonzero(board: Tensor[i64, [4, 4]]) -> f32 {
   let mu = mean_nonzero(board)
-  let mut sum_sq_diff = 0.0
+  # the accumulator is annotated. Unsuffixed `0.0` is f64, so this
+  # accumulated the squared deviations at f64 width while `mu`, `diff` and the
+  # declared return type are all f32 — and `sum_sq_diff / (count as f32)` is
+  # then an f64, which `-> f32` cannot take without a narrowing cast. The
+  # checker never said so: the `if`/`else` tail silently typed as `nil`.
+  let mut sum_sq_diff = 0.0f32
   let mut count = 0
   let mut row = 0
   while row < 4 {

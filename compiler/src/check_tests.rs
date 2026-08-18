@@ -1142,8 +1142,8 @@ fn no_effect_arithmetic_warns() {
 
 #[test]
 fn self_assignment_and_identity_rebind_warn() {
-    // #232: `x = x` and `let !x = x` are dead code — and the signature of LLM
-    // repetition-collapse, which compiles as legal-but-garbage.
+    // #232: `x = x` and `let !x = x` are dead code that compiles clean —
+    // legal-but-garbage, so the checker warns rather than staying silent.
     assert!(warnings("fn f(n: i64) -> i64 { let !x = n  x = x  x }")
             .iter().any(|w| w.contains("self-assignment")),
             "expected #232 self-assignment lint");
@@ -2661,7 +2661,7 @@ fn shape_pattern_in_match_rejected_393() {
             nil
         }
     "#);
-    assert!(errs.iter().any(|e| e.contains("#393") && e.contains("shape pattern")),
+    assert!(errs.iter().any(|e| e.contains("shape pattern")),
             "expected shape-pattern reject, got {:?}", errs);
 }
 
@@ -2829,4 +2829,109 @@ fn cross_arena_error_is_not_demon_suppressed_442() {
     let es: Vec<String> = checker.errors.iter().map(|e| e.msg.clone()).collect();
     assert!(es.iter().any(|e| e.contains("cross-arena write")),
             "demon mode must still reject a cross-arena write, got {:?}", es);
+}
+
+// ─── `if`/`else` branch unification (#479) ───────────────────────────────────
+//
+// `match` has unified its arms since #244; `if` did not, and silently produced
+// `Unit` on a mismatch. Two failures followed: a wrong diagnostic naming `nil`
+// and pointing at the consumer when the value WAS used, and no diagnostic at
+// all when it was not.
+
+fn if_branch_err(src: &str) -> bool {
+    check(src).iter().any(|m| m.contains("`if` branches yield incompatible types"))
+}
+
+#[test]
+fn if_branches_must_unify_in_value_position() {
+    // The #479 repro: a `str` branch and an `i64` branch, previously accepted.
+    assert!(if_branch_err(
+        r#"fn main() { let a: i64 = 1  let z = if a > 0 { "x" } else { a }  print(to_str(z)) }"#
+    ));
+    // A block's trailing value is value position, even written as a statement.
+    assert!(if_branch_err(
+        r#"fn f() -> i64 { let a = 1  if a > 0 { 1 } else { "x" } }"#
+    ));
+    // So is an argument.
+    assert!(if_branch_err(
+        r#"fn k(x: i64) {} fn main() { let a = 1  k(if a > 0 { 1 } else { "x" }) }"#
+    ));
+}
+
+#[test]
+fn if_branch_mismatch_names_if_not_nil() {
+    // The old diagnostic said "value has type nil" AT THE CONSUMER, which sent
+    // the reader looking for a missing return value instead of a branch
+    // mismatch. The error must now name both branch types.
+    let msgs = check(
+        r#"fn main() { let a = 0.1f32  let b: f64 = 0.5
+             let z = if a > 0.0f32 { a } else { b }
+             let w: f64 = z  print(to_str(w)) }"#,
+    );
+    assert!(
+        msgs.iter().any(|m| m.contains("`if` branches yield incompatible types")),
+        "expected a branch-mismatch error, got: {:?}", msgs,
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("value has type nil")),
+        "the `if` still degrades to nil: {:?}", msgs,
+    );
+}
+
+#[test]
+fn else_if_chain_unifies_with_the_leading_branch() {
+    // The `ElseBranch::If` arm used to `return self.check_if(nested)` and
+    // DISCARD the leading branch's type, so the first branch never met the
+    // rest of the chain and this reported nothing at all.
+    //
+    // The REST OF THE CHAIN MUST AGREE WITH ITSELF for this to isolate that
+    // hole: with `else if a < 0 { "x" } else { 2 }` the inner `if` catches the
+    // mismatch on its own and the test passes even with the fix reverted
+    // (verified by mutation). Here `1` and `2` unify fine and only the leading
+    // `"x"` disagrees, so nothing but the leading-branch unification can see it.
+    assert!(if_branch_err(
+        r#"fn main() { let a: i64 = 1
+             let z = if a > 0 { "x" } else if a < 0 { 1 } else { 2 }
+             print(to_str(z)) }"#
+    ));
+    // An all-i64 chain stays clean.
+    assert!(passes(
+        r#"fn main() { let a = 1
+             let z = if a > 2 { 1 } else if a > 1 { 2 } else { 3 }
+             print(to_str(z)) }"#
+    ));
+}
+
+#[test]
+fn if_statement_branches_are_not_unified() {
+    // A bare `if` statement discards its value, so the branch "types" are
+    // incidental — one side calling something for its effect and the other
+    // doing nothing is legal, and must stay legal.
+    assert!(passes(
+        r#"fn g() -> i64 { 1 } fn main() { let a = 1  if a > 0 { g() } else { }  print("ok") }"#
+    ));
+    assert!(passes(
+        r#"fn g() -> i64 { 1 } fn h() -> str { "x" }
+           fn main() { let a = 1  if a > 0 { g() } else { h() }  print("ok") }"#
+    ));
+    assert!(passes(
+        r#"fn g() -> i64 { 1 } fn main() { let a = 1  if a > 0 { g() }  print("ok") }"#
+    ));
+}
+
+#[test]
+fn if_unification_keeps_the_exemptions_match_has() {
+    // Same predicate as `match` (`compatible_with`, `Unknown` exempt as the
+    // diverging/bottom type), so the two forms cannot drift apart.
+    assert!(passes(
+        r#"fn main() { let a = 1  let z = if a > 0 { 5 } else { panic("no") }  print(to_str(z)) }"#
+    ));
+    // An untyped literal adopts the other branch, in either order (#284/#295).
+    assert!(passes(
+        r#"fn main() { let a = 0.1f32  let z = if a > 0.0f32 { a } else { 0.0 }  print(to_str(z)) }"#
+    ));
+    assert!(passes(
+        r#"fn main() { let a = 0.1f32  let z = if a > 0.0f32 { 0.0 } else { a }
+             let w: f32 = z  print(to_str(w)) }"#
+    ));
 }

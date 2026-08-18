@@ -1,4 +1,4 @@
-# jit_transformer_demo.dmc -- Phase 4 JIT slice 5 (issue #15).
+# jit_transformer_demo.dmc -- fused transformer primitives under the JIT.
 #
 # Fused ML primitives composed into a single transformer-style block:
 # `layer_norm`, `softmax`, `rms_norm`, plus per-axis variants of the

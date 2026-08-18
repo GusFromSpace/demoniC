@@ -33,11 +33,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_DMC = REPO / "compiler" / "target" / "release" / "dmc"
 
-# A jit "gap" is a clean error for a feature the JIT doesn't lower yet (not a
-# silent miscompile). These substrings identify one; tracked gaps are allowlisted.
-_GAP_MARKERS = ("not yet", "not support", "use dmc run", "slice 1", "unknown function")
+# A jit "gap" is a clean REFUSAL to lower a feature (not a silent miscompile).
+# #480: the JIT states which it is — `jit unsupported at L:C:` vs `jit error at
+# L:C:` — so this matches one structural prefix instead of grepping the message
+# for five English fragments. The old guess was wrong in both directions: a
+# clean refusal worded differently ("`sum` is f32-only") was scored as a
+# DIVERGENCE and could not be allowlisted, and a genuine miscompile whose text
+# happened to contain "slice 1" would have been downgraded to a gap.
+_UNSUPPORTED = "jit unsupported"
 GAP_ALLOWLIST = {
     "pow_int": "#215 — integer `**` not lowered in the JIT",
+    "f32_branch_mixed_literal": "#478 — unsuffixed float literal in one branch, f32 in the other",
+    "f64r_sum_keeps_width": "#481 follow-up — the JIT's `sum` is f32-only",
 }
 
 # name -> (source, note on what it probes). Every program returns a scalar.
@@ -126,6 +133,73 @@ PROBES = {
     "relu_tensor":    ("fn main()->i64{\n  let t=[3.0,1.5,2.0]\n  let r=sum(relu(t))*1000.0\n  r as i64 }", "relu tensor sum -> 6500"),
     "gelu_tensor":    ("fn main()->i64{\n  let t=[3.0,1.5,2.0]\n  let r=sum(gelu(t))*1000.0\n  r as i64 }", "gelu tensor sum ~6350"),
     "silu_tensor":    ("fn main()->i64{\n  let t=[3.0,1.5,2.0]\n  let r=sum(silu(t))*1000.0\n  r as i64 }", "silu tensor sum ~5845"),
+    # ── scalar f32 (#473) ────────────────────────────────────────────────────
+    # The corpus reaches no multi-op f32 scalar chain, so nothing here was
+    # gated before: `diff_backends.py` was green while `dmc run` and `dmc jit`
+    # disagreed on `0.1f32 + 0.2f32`. Each probe returns the f64 widening of an
+    # f32 result, so the comparison is on all 17 digits — a one-ulp f32
+    # disagreement (~1e-8 relative) shows, which is exactly the scale at which
+    # "accumulate in f64, round once" parts company with true f32.
+    # A SINGLE `+ - * /` is NOT enough: #241's double-rounding property makes
+    # f64-then-round bit-exact with native f32 for one op. Chains are the test.
+    "f32_add_two":        ("fn main()->f64{ (0.1f32 + 0.2f32) as f64 }", "#473 the issue's repro: one add"),
+    "f32_chain_three":    ("fn main()->f64{ let a=0.1f32\n let b=0.2f32\n let c=0.3f32\n (a+b+c) as f64 }", "#473 three-term chain — diverges under f64 accumulation"),
+    "f32_chain_mixed_ops":("fn main()->f64{ let a=0.1f32\n let b=0.3f32\n let c=0.7f32\n ((a+b)*c-a/b) as f64 }", "#473 + - * / in one f32 expression"),
+    "f32_horner":         ("fn main()->f64{ let a=1.1f32\n let b=1.3f32\n (((a*b+a)*b+a)*b+a) as f64 }", "#473 nested multiply-add, 6 ops"),
+    "f32_accum_loop":     ("fn main()->f64{ let !s=0.0f32\n for i in 0..100 { s = s + 0.01f32 }\n s as f64 }", "#473 100-step f32 accumulation (the `total()` shape)"),
+    "f32_accum_mul":      ("fn main()->f64{ let !s=1.0f32\n for i in 0..20 { s = s * 1.1f32 }\n s as f64 }", "#473 multiplicative accumulation"),
+    "f32_accum_elems":    ("fn main()->f64{ let !t=forge.zeros[f32,[8]]\n for i in 0..8 { t[i]=0.1f32 }\n let !s=0.0f32\n for i in 0..8 { s = s + t[i] }\n s as f64 }", "#473 summing f32 tensor elements in a scalar loop"),
+    "f32_mixed_f64":      ("fn main()->f64{ let a=0.1f32\n let b=0.2\n a + b }", "#473 f32 meets f64 -> promotes, never narrows"),
+    "f32_mixed_rev":      ("fn main()->f64{ let a=0.2\n let b=0.1f32\n a + b }", "#473 f64 meets f32, other order"),
+    "f32_mixed_tail":     ("fn main()->f64{ let a=0.1f32\n let b=0.2f32\n let c=0.3\n a + b + c }", "#473 f32 chain then an f64 tail"),
+    "f32_call_ret":       ("fn g(x:f32)->f32{ x*x+x }\nfn main()->f64{ g(0.1f32) as f64 }", "#473 f32 through a parameter and a return"),
+    "f32_call_nested":    ("fn g(x:f32)->f32{ x+0.1f32 }\nfn main()->f64{ g(g(g(0.1f32))) as f64 }", "#473 f32 across three nested calls"),
+    "f32_ret_unsuffixed": ("fn g()->f32{ 0.1 }\nfn main()->f64{ g() as f64 }", "#473 a declared f32 RETURN binds an unsuffixed literal's width"),
+    "f32_tensor_read":    ("fn main()->f64{ let !t=forge.zeros[f32,[3]]\n t[0]=0.1f32\n t[1]=0.2f32\n t[2]=0.3f32\n (t[0]+t[1]+t[2]) as f64 }", "#473 reads out of an f32 tensor stay f32"),
+    "f32_tensor_mixed":   ("fn main()->f64{ let !a=forge.zeros[f32,[1]]\n let !b=forge.uninit[f64,[1]]\n a[0]=0.1f32\n b[0]=0.2\n a[0]+b[0] }", "#473 f32 element + f64 element promotes"),
+    "f32_cast_chain":     ("fn main()->f64{ let a=0.1 as f32\n let b=0.2 as f32\n (a+b) as f64 }", "#473 `as f32` produces a true f32"),
+    "f32_let_annotated":  ("fn main()->f64{ let a: f32 = 0.1\n let b: f32 = 0.2\n let c: f32 = 0.3\n (a+b+c) as f64 }", "#473 a typed `let` binds width (#209: the literal itself stays f64)"),
+    "f32_model_field":    ("model M { x: f32 }\nfn main()->f64{ let m = M { x: 0.1 }\n (m.x + 0.2f32) as f64 }", "#473 a declared f32 FIELD binds width"),
+    "f32_unary_neg":      ("fn main()->f64{ let a=0.1f32\n let b=0.0f32-a\n (b+a+a) as f64 }", "#473 negation keeps f32"),
+    # ── f32 tensor reductions (#481) ────────────────────────────────────────
+    # `sum(t)` used to disagree with the loop it is documented to mean, WITHIN
+    # `dmc run`. Each returns the f64 widening so all 17 digits are compared.
+    "f32r_sum":           ("fn main()->f64{ let !t=forge.zeros[f32,[12]]\n for i in 0..12 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n sum(t) as f64 }", "#481 sum accumulates at f32 width"),
+    "f32r_sum_vs_loop":   ("fn main()->f64{ let !t=forge.zeros[f32,[12]]\n for i in 0..12 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n let !s=0.0f32\n for i in 0..12 { s=s+t[i] }\n (sum(t)-s) as f64 }", "#481 sum(t) - hand loop == 0 on both backends"),
+    "f32r_mean":          ("fn main()->f64{ let !t=forge.zeros[f32,[100]]\n for i in 0..100 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n mean(t) as f64 }", "#481 mean divides by an f32 count in f32"),
+    "f32r_variance":      ("fn main()->f64{ let !t=forge.zeros[f32,[100]]\n for i in 0..100 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n variance(t) as f64 }", "#481 variance is two passes at f32 width"),
+    "f32r_sum_then_add":  ("fn main()->f64{ let !t=forge.zeros[f32,[12]]\n for i in 0..12 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n (sum(t)+0.1f32) as f64 }", "#481 the reduction RESULT is f32-wide"),
+    "f32r_max_then_add":  ("fn main()->f64{ let !t=forge.zeros[f32,[12]]\n for i in 0..12 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n (max(t)+0.1f32) as f64 }", "#481 max selects an f32 — `max(t)` alone agreed even before"),
+    "f32r_sum_along":     ("fn main()->f64{ let !m=forge.zeros[f32,[3,4]]\n for i in 0..3 { for j in 0..4 { m[i,j]=((i*4+j) as f32)*0.3f32+0.1f32 } }\n sum(sum_along(m,1)) as f64 }", "#481 per-axis lanes reduce at f32 width"),
+    "f32r_mean_along":    ("fn main()->f64{ let !m=forge.zeros[f32,[3,4]]\n for i in 0..3 { for j in 0..4 { m[i,j]=((i*4+j) as f32)*0.3f32+0.1f32 } }\n sum(mean_along(m,0)) as f64 }", "#481 mean_along keeps the source dtype"),
+    "f32r_variance_along":("fn main()->f64{ let !m=forge.zeros[f32,[3,4]]\n for i in 0..3 { for j in 0..4 { m[i,j]=((i*4+j) as f32)*0.3f32+0.1f32 } }\n sum(variance_along(m,1)) as f64 }", "#481 variance_along is two-pass, matching the JIT's formula"),
+    "f32r_softmax_sum":   ("fn main()->f64{ let !t=forge.zeros[f32,[12]]\n for i in 0..12 { t[i]=((i as f32)*0.7f32+0.1f32)/3.0f32 }\n sum(softmax(t)) as f64 }", "#481 reducing a derived f32 tensor"),
+    # Restored by #480: the JIT's `sum` is f32-only, and that refusal is now a
+    # classified `jit unsupported` rather than a message this battery had to
+    # score as a DIVERGENCE. Before #480 this probe could not live here at all.
+    "f64r_sum_keeps_width":("fn main()->f64{ let !t=forge.uninit[f64,[3]]\n t[0]=0.1\n t[1]=0.2\n t[2]=0.3\n sum(t) }", "#481 must NOT narrow an f64 tensor's reduction (jit gap: sum is f32-only)"),
+    # ── f32 matmul contraction (#481) ───────────────────────────────────────
+    # C[0,0] depends only on A's row 0 and B's column 0, which are identical in
+    # both probes below. Before #481 the JIT answered differently depending on
+    # B's WIDTH, because `n % 4` picked the kernel and the kernel picked the
+    # rounding. These two must now agree with each other AND across backends.
+    "f32mm_width3":       ("fn main()->f64{ let !a=forge.zeros[f32,[8,16]]\n let !b=forge.zeros[f32,[16,3]]\n for i in 0..8 { for j in 0..16 { a[i,j]=(((i*16+j) as f32)*0.7f32+0.1f32)/3.0f32 } }\n for i in 0..16 { for j in 0..3 { b[i,j]=(((i*97+j) as f32)*0.3f32+0.2f32)/7.0f32 } }\n (a@b)[0,0] as f64 }", "#481 matmul, B width 3 (scalar kernel)"),
+    "f32mm_width4":       ("fn main()->f64{ let !a=forge.zeros[f32,[8,16]]\n let !b=forge.zeros[f32,[16,4]]\n for i in 0..8 { for j in 0..16 { a[i,j]=(((i*16+j) as f32)*0.7f32+0.1f32)/3.0f32 } }\n for i in 0..16 { for j in 0..4 { b[i,j]=(((i*97+j) as f32)*0.3f32+0.2f32)/7.0f32 } }\n (a@b)[0,0] as f64 }", "#481 matmul, B width 4 (vector kernel) — same C[0,0] as width 3"),
+    "f32mm_batched":      ("fn main()->f64{ let !a=forge.zeros[f32,[2,4,8]]\n let !b=forge.zeros[f32,[2,8,4]]\n for n in 0..2 { for i in 0..4 { for j in 0..8 { a[n,i,j]=(((n*32+i*8+j) as f32)*0.7f32+0.1f32)/3.0f32 } } }\n for n in 0..2 { for i in 0..8 { for j in 0..4 { b[n,i,j]=(((n*32+i*4+j) as f32)*0.3f32+0.2f32)/7.0f32 } } }\n (a@b)[1,2,3] as f64 }", "#481 batched matmul contracts too"),
+    # Restored by #480, for the same reason: the branch-join refusal (#478) is
+    # `jit unsupported`, so it classifies as a gap and can be allowlisted.
+    "f32_branch_mixed_literal": ("fn main()->f64{ let a=0.1f32\n let z=if a>0.0f32 {a} else {0.0}\n (z+0.2f32) as f64 }", "#478 f32 branch vs unsuffixed-f64 branch (tracked jit gap)"),
+    "f32_branch_join":    ("fn main()->f64{ let a=0.1f32\n let z=if a>0.0f32 {a+0.2f32} else {0.0f32}\n (z+0.3f32) as f64 }", "#473 both if-branches f32"),
+    "f32_match_join":     ("fn main()->f64{ let n=1\n let a=0.1f32\n let z=match n { 1 => a+0.2f32, _ => 0.0f32 }\n (z+0.3f32) as f64 }", "#473 both match arms f32"),
+    "f32_pow":            ("fn main()->f64{ let a=1.1f32\n let b=3.0f32\n (a**b) as f64 }", "#473 `**` widens to the f64 libm call and rounds back"),
+    "f32_mod":            ("fn main()->f64{ let a=5.3f32\n let b=2.1f32\n (a%b) as f64 }", "#473 `%` widens to the f64 fmod and rounds back"),
+    "f32_sqrt_chain":     ("fn main()->f64{ let a=2.0f32\n (sqrt(a)+0.1f32) as f64 }", "#473 transcendentals compute in f64 on BOTH backends (#209)"),
+    "f32_from_bits":      ("fn main()->f64{ let a=f32_from_bits(1036831949)\n (a+0.2f32) as f64 }", "#473 f32_from_bits yields an f32, not an f64"),
+    "f32_bf16_suffix":    ("fn main()->f64{ let a=0.1bf16\n let b=0.2bf16\n (a+b) as f64 }", "#473/#179 bf16 is f32-backed"),
+    "f32_f16_suffix":     ("fn main()->f64{ let a=0.1f16\n let b=0.2f16\n (a+b) as f64 }", "#473/#179 f16 is f32-backed"),
+    "f32_deep_chain":     ("fn main()->f64{ let !s=1.0f32\n for i in 0..50 { s = s * 1.01f32 + 0.001f32 }\n s as f64 }", "#473 50 fused multiply-adds — drift is unmissable here"),
+    "f32_loop_predicate": ("fn main()->i64{ let !s=0.0f32\n let !n=0\n while s < 1.0f32 { s = s + 0.1f32\n n = n + 1 }\n n }", "#473 f32 rounding decides the trip count"),
+    "f64_unsuffixed_keeps_width": ("fn main()->f64{ let a=0.1\n let b=0.2\n let c=0.3\n a+b+c }", "#209 must NOT regress: unsuffixed literals stay f64"),
 }
 
 _VAL = re.compile(r"=>\s*(-?[\d.]+(?:e[-+]?\d+)?|true|false|NaN|inf)")
@@ -175,11 +249,17 @@ def main() -> int:
         elif rs == "ok" and js == "ok":
             diverged.append(name)
             verdict = f"DIVERGE: run={rv!r} jit={jv!r}"
-        elif rs == "ok" and any(k in jv for k in _GAP_MARKERS):
+        elif rs == "ok" and _UNSUPPORTED in jv:
             gaps += 1
             verdict = f"jit-gap: {jv[:60]}"
             if name not in GAP_ALLOWLIST:
                 new_gaps.append((name, jv[:80]))
+        elif rs == "ok" and js != "ok" and name in GAP_ALLOWLIST:
+            # A jit FAILURE (not a refusal) on a program `dmc run` accepts is a
+            # defect — but an explicitly tracked one is allowlistable, so a known
+            # issue does not force the probe out of the battery (#480).
+            gaps += 1
+            verdict = f"jit-gap (tracked failure): {jv[:60]}"
         elif rs != "ok" and js != "ok":
             verdict = f"both-fail (run={rs} jit={js})"
         else:

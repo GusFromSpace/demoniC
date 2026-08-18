@@ -821,14 +821,16 @@ that could not be collapsed.
 
 ### 7.5 Comptime evaluation (`@comptime`)
 
-`@comptime { expr }` evaluates `expr` at compile time; the result is a
-compile-time constant in the surrounding monomorphization. All operands must
-be comptime-known (shape parameters, literals, or other comptime values);
-control flow is unrolled; a body that cannot be fully evaluated at compile
-time is a compile-time error citing the first non-comptime operand.
+Shape parameters in `[ ]` and integer literals are implicitly comptime: a
+function monomorphizes over its shape parameters, so shape arithmetic folds per
+instantiation.
 
-Shape parameters in `[ ]` and integer literals are implicitly comptime;
-`@comptime` is the explicit form for derived values.
+`@comptime { expr }` is the explicit form for derived values. In this version it
+evaluates `expr` and yields its value, but does not yet force compile-time
+folding: a body whose operands are not comptime-known is evaluated like any
+other block rather than rejected. On a function declaration (`@comptime fn`) it
+is inert, and the compiler warns that it has no effect. Read the directive as
+declared intent until folding lands.
 
 ## 8. Errors and diagnostics
 

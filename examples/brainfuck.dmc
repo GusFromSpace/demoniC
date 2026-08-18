@@ -1,7 +1,7 @@
 # brainfuck.dmc — A Brainfuck interpreter written in demoniC.
 #
-# demoniC is a language designed for high-performance tensor computing,
-# sharded model execution, and autodiff. It is absolutely NOT designed for
+# demoniC is a language designed for high-performance tensor computing
+# and autodiff. It is absolutely NOT designed for
 # writing string-based esoteric language virtual machines.
 #
 # But using @cast(u8) string-to-tensor casting, dynamic maps for bracket jumps,

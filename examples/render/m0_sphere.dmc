@@ -4,9 +4,9 @@
 # directional light, written to a real 24-bit-color PPM image. A coarse
 # ASCII preview prints to the terminal for a quick sanity check.
 #
-# This is the substrate the rest of examples/render/ builds on. See
-# examples/render/DESIGN.md (§3 combinators, §4 march, §5 normals,
-# §6 shading, §7.B PPM output). Unlike tinyraytracer.dmc (a single
+# This is the substrate the rest of examples/render/ builds on: SDF
+# combinators, the march, normals from the field gradient, shading,
+# and PPM output. Unlike tinyraytracer.dmc (a single
 # analytic ray-sphere solve), this *marches* the SDF and takes the
 # surface normal from the field gradient — the method that generalizes
 # to arbitrary scenes.
@@ -57,7 +57,7 @@ fn main() -> nil {
     let dy = ry ./ rl
     let dz = rz ./ rl
 
-    # ── 2. Sphere-trace march (DESIGN.md §4) ──────────────────────────
+    # ── 2. Sphere-trace march ─────────────────────────────────────────
     # Accumulators allocated before the loop so they survive each step.
     let !t    = forge.zeros[f32, [120, 160]]
     let !done = forge.zeros[f32, [120, 160]]
@@ -120,7 +120,7 @@ fn main() -> nil {
     let G = hitmask .* (0.45 .* shade) .+ (1.0 .- hitmask) .* bgG
     let B = hitmask .* (0.30 .* shade) .+ (1.0 .- hitmask) .* bgB
 
-    # ── 5. Serialize to a P3 (text) PPM (DESIGN.md §7.B) ──────────────
+    # ── 5. Serialize to a P3 (text) PPM ───────────────────────────────
     # Accumulate one row at a time: the growing buffer is touched once
     # per row, not once per pixel, to keep string building near-linear.
     let !ppm = "P3\n" + to_str(W) + " " + to_str(H) + "\n255\n"
@@ -141,7 +141,7 @@ fn main() -> nil {
     let werr = write_file("m0_out.ppm", ppm)
     print("wrote m0_out.ppm (" + to_str(W) + "x" + to_str(H) + " P3 PPM)")
 
-    # ── 6. Coarse ASCII preview — debug sink only (DESIGN.md §7.A) ─────
+    # ── 6. Coarse ASCII preview — debug sink only ──────────────────────
     # Stride the framebuffer so the preview fits a terminal at any res.
     let sr = H / 30
     let sc = W / 70
