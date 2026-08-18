@@ -36,6 +36,12 @@ jobs:
         # Every JIT-eligible example test additionally runs on both backends
         # and the results are compared.
         run: compiler/target/release/dmc test --jit examples
+      - name: example_runner.py (per-example conformance)
+        # Each example gated individually against tools/example_baseline.json
+        # by its executable test results on both backends. To record a
+        # genuinely-new passing example: python3 tools/example_runner.py
+        # --accept-new, and commit the baseline change.
+        run: python3 tools/example_runner.py
       - name: diff_backends.py (run-vs-jit whole-example diff)
         # Diffs full program output between the interpreter and the JIT. The
         # interpreter is the reference semantics, so any unexplained
@@ -44,3 +50,16 @@ jobs:
       - name: jit_probes.py (run-vs-jit edge-case battery)
         # Curated edge cases the example corpus does not reach.
         run: python3 tools/jit_probes.py
+      - name: lint_dmc.py
+        # Style/consistency lints over the shipped .dmc corpus.
+        run: python3 tools/lint_dmc.py
+      - name: diff_fuzz.py (smoke)
+        # Structure-aware interp-vs-jit differential fuzzer: generates
+        # well-typed scalar programs, runs both backends, diffs.
+        run: python3 tools/diff_fuzz.py --iters 2000 --meta-test
+      - name: Install numpy
+        run: pip install numpy
+      - name: numpy_oracle.py
+        # External source of truth: tensor ops checked against an independent
+        # NumPy reimplementation (catches bugs shared by both backends).
+        run: python3 tools/numpy_oracle.py --meta-test

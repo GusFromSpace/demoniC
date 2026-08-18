@@ -125,9 +125,11 @@ parser:
 ```
 
 Semantics-carrying directives are specified in §6.2 (`@grad`) and §7
-(`@cast`, `@host`, `@deterministic`, `@fuse`, `@comptime`). The remaining
-members of the set (`@recompute`, `@inplace`, `@shard`, `@tp`, `@pp`) parse
-but do not alter code generation in this version.
+(`@cast`, `@host`, `@deterministic`, `@fuse`, `@comptime`). `@pp` functions
+are body-validated and their stages execute sequentially in the interpreter
+(threading `_` between stages), without pipeline parallelism. The remaining
+members of the set (`@recompute`, `@inplace`, `@shard`, `@tp`) parse but do
+not alter code generation in this version.
 
 ## 3. Types
 

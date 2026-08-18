@@ -181,6 +181,46 @@ fn best_move_bounded(board: Tensor[i64, [3, 3]], player: i64, depth_param: i64) 
   (best_row, best_col)
 }
 
+fn test_ack_small_values() -> bool {
+  # ack(0, n) = n + 1;  ack(1, n) = n + 2;  ack(2, n) = 2n + 3
+  ack(0, 0) == 1 && ack(1, 3) == 5 && ack(2, 2) == 7 && ack(2, 3) == 9
+}
+
+fn test_check_winner_lines() -> bool {
+  let row_win  = [[1, 1, 1], [2, 2, 0], [0, 0, 0]];
+  let col_win  = [[2, 1, 0], [2, 1, 0], [2, 0, 0]];
+  let diag_win = [[1, 2, 0], [2, 1, 0], [0, 0, 1]];
+  let anti_win = [[0, 2, 2], [1, 2, 0], [2, 1, 0]];
+  let open     = [[1, 0, 0], [0, 2, 0], [0, 0, 0]];
+  let draw     = [[1, 2, 1], [1, 2, 2], [2, 1, 1]];
+  check_winner(row_win) == 1
+    && check_winner(col_win) == 2
+    && check_winner(diag_win) == 1
+    && check_winner(anti_win) == 2
+    && check_winner(open) == 0
+    && check_winner(draw) == 3
+}
+
+fn test_count_pieces() -> bool {
+  let board = [[1, 2, 1], [0, 2, 0], [0, 0, 1]];
+  count_pieces(board, 1) == 3 && count_pieces(board, 2) == 2
+}
+
+fn test_best_move_takes_win() -> bool {
+  # X has two in the top row and moves; (0, 2) completes it.
+  let board = [[1, 1, 0], [2, 2, 0], [0, 0, 0]];
+  let (r, c) = best_move_bounded(board, 1, 2);
+  r == 0 && c == 2
+}
+
+fn test_best_move_blocks_win() -> bool {
+  # O to move; X threatens (2, 2) on the diagonal. O must take it, since
+  # O has no immediate win of its own.
+  let board = [[1, 2, 0], [2, 1, 0], [0, 0, 0]];
+  let (r, c) = best_move_bounded(board, 2, 2);
+  r == 2 && c == 2
+}
+
 fn main() -> nil {
   let mut board = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
 

@@ -1,0 +1,406 @@
+{
+  "examples/abacus.dmc": {
+    "jit_ran": 4,
+    "pass": 4
+  },
+  "examples/abacus_anim.dmc": {
+    "jit_ran": 1,
+    "pass": 1
+  },
+  "examples/activations_elu_mish.dmc": {
+    "jit_ran": 4,
+    "pass": 4
+  },
+  "examples/activations_elu_mish_autodiff.dmc": {
+    "jit_ran": 0,
+    "pass": 3
+  },
+  "examples/activations_grad_jit.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/any_type.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/ast_eval.dmc": {
+    "jit_ran": 1,
+    "pass": 1
+  },
+  "examples/attn_grad_jit.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/autograd.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/blends/battleship_sqrt.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
+  "examples/blends/g2048_variance.dmc": {
+    "jit_ran": 0,
+    "pass": 12
+  },
+  "examples/blends/mastermind_matvec.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
+  "examples/blends/reversi_sort.dmc": {
+    "jit_ran": 5,
+    "pass": 5
+  },
+  "examples/blends/tictactoe_ackermann.dmc": {
+    "jit_ran": 5,
+    "pass": 5
+  },
+  "examples/brainfuck.dmc": {
+    "jit_ran": 0,
+    "pass": 5
+  },
+  "examples/caesar.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/calculator.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/calendar.dmc": {
+    "jit_ran": 9,
+    "pass": 9
+  },
+  "examples/cast_bf16_boundary.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/cast_int_block_boundary.dmc": {
+    "jit_ran": 0,
+    "pass": 2
+  },
+  "examples/char_demo.dmc": {
+    "jit_ran": 0,
+    "pass": 9
+  },
+  "examples/collatz.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/comptime.dmc": {
+    "jit_ran": 0,
+    "pass": 5
+  },
+  "examples/console/asm.dmc": {
+    "jit_ran": 0,
+    "pass": 8
+  },
+  "examples/console/dv2.dmc": {
+    "jit_ran": 0,
+    "pass": 8
+  },
+  "examples/console/raycart.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/console/snake.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/decode_varint.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/demonic_lexer.dmc": {
+    "jit_ran": 0,
+    "pass": 36
+  },
+  "examples/demonivm.dmc": {
+    "jit_ran": 0,
+    "pass": 9
+  },
+  "examples/diogenes.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/diogenes_cup.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/diogenes_lantern.dmc": {
+    "jit_ran": 5,
+    "pass": 5
+  },
+  "examples/diogenes_wish.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/dmg_raymarch.dmc": {
+    "jit_ran": 0,
+    "pass": 8
+  },
+  "examples/doom_fire.dmc": {
+    "jit_ran": 0,
+    "pass": 1
+  },
+  "examples/enum_shape.dmc": {
+    "jit_ran": 8,
+    "pass": 8
+  },
+  "examples/enum_traffic.dmc": {
+    "jit_ran": 4,
+    "pass": 4
+  },
+  "examples/fibonacci.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/fizzbuzz.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/fused_attn.dmc": {
+    "jit_ran": 0,
+    "pass": 4
+  },
+  "examples/games/battleship.dmc": {
+    "jit_ran": 8,
+    "pass": 8
+  },
+  "examples/games/connect_four.dmc": {
+    "jit_ran": 11,
+    "pass": 11
+  },
+  "examples/games/g2048.dmc": {
+    "jit_ran": 10,
+    "pass": 10
+  },
+  "examples/games/mastermind.dmc": {
+    "jit_ran": 8,
+    "pass": 8
+  },
+  "examples/games/reversi.dmc": {
+    "jit_ran": 8,
+    "pass": 8
+  },
+  "examples/games/tictactoe.dmc": {
+    "jit_ran": 10,
+    "pass": 10
+  },
+  "examples/grad_control_flow.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/grad_control_flow_jit.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/grad_lifetime.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/gradcheck.dmc": {
+    "jit_ran": 0,
+    "pass": 21
+  },
+  "examples/haruspex.dmc": {
+    "jit_ran": 0,
+    "pass": 9
+  },
+  "examples/impossible_attention.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/jit_autodiff_demo.dmc": {
+    "jit_ran": 8,
+    "pass": 8
+  },
+  "examples/jit_scalar_demo.dmc": {
+    "jit_ran": 13,
+    "pass": 13
+  },
+  "examples/jit_slicing_demo.dmc": {
+    "jit_ran": 8,
+    "pass": 8
+  },
+  "examples/jit_tensor_demo.dmc": {
+    "jit_ran": 6,
+    "pass": 6
+  },
+  "examples/jit_training_demo.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
+  "examples/jit_transformer_demo.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
+  "examples/jit_variance_demo.dmc": {
+    "jit_ran": 0,
+    "pass": 8
+  },
+  "examples/kvcache.dmc": {
+    "jit_ran": 0,
+    "pass": 3
+  },
+  "examples/layer_norm_grad_jit.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/life.dmc": {
+    "jit_ran": 0,
+    "pass": 1
+  },
+  "examples/lispy_vm.dmc": {
+    "jit_ran": 0,
+    "pass": 4
+  },
+  "examples/mandelbrot.dmc": {
+    "jit_ran": 6,
+    "pass": 6
+  },
+  "examples/matmul.dmc": {
+    "jit_ran": 0,
+    "pass": 4
+  },
+  "examples/min_along.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/my_tensor_demo.dmc": {
+    "jit_ran": 0,
+    "pass": 4
+  },
+  "examples/package_manifest.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/pagerank.dmc": {
+    "jit_ran": 5,
+    "pass": 5
+  },
+  "examples/plotter.dmc": {
+    "jit_ran": 0,
+    "pass": 5
+  },
+  "examples/port_bridge.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/reel_to_reel.dmc": {
+    "jit_ran": 0,
+    "pass": 14
+  },
+  "examples/relu.dmc": {
+    "jit_ran": 0,
+    "pass": 5
+  },
+  "examples/render/m0_jit.dmc": {
+    "jit_ran": 5,
+    "pass": 5
+  },
+  "examples/render/m0_sphere.dmc": {
+    "jit_ran": 0,
+    "pass": 5
+  },
+  "examples/render/m1_csg.dmc": {
+    "jit_ran": 0,
+    "pass": 13
+  },
+  "examples/ring_buffer.dmc": {
+    "jit_ran": 0,
+    "pass": 2
+  },
+  "examples/rms_norm_grad_jit.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/rope.dmc": {
+    "jit_ran": 0,
+    "pass": 3
+  },
+  "examples/rope_grad_jit.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/row_slice_lab.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/rule30.dmc": {
+    "jit_ran": 4,
+    "pass": 4
+  },
+  "examples/sieve.dmc": {
+    "jit_ran": 2,
+    "pass": 2
+  },
+  "examples/sim/lotka_volterra.dmc": {
+    "jit_ran": 11,
+    "pass": 11
+  },
+  "examples/sim/lotka_volterra_meso.dmc": {
+    "jit_ran": 13,
+    "pass": 13
+  },
+  "examples/sim/lotka_volterra_variance.dmc": {
+    "jit_ran": 13,
+    "pass": 13
+  },
+  "examples/sim/lotka_volterra_variance_meso.dmc": {
+    "jit_ran": 14,
+    "pass": 14
+  },
+  "examples/slice.dmc": {
+    "jit_ran": 0,
+    "pass": 5
+  },
+  "examples/softmax_grad_jit.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/spreadsheet.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
+  "examples/stats.dmc": {
+    "jit_ran": 0,
+    "pass": 3
+  },
+  "examples/synth.dmc": {
+    "jit_ran": 0,
+    "pass": 25
+  },
+  "examples/tests/smoke_test.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/text_pipeline.dmc": {
+    "jit_ran": 0,
+    "pass": 9
+  },
+  "examples/tiny_mlp.dmc": {
+    "jit_ran": 0,
+    "pass": 6
+  },
+  "examples/tiny_transformer_step.dmc": {
+    "jit_ran": 0,
+    "pass": 3
+  },
+  "examples/tinyraytracer.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/train_step.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/transformer.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/xor_net.dmc": {
+    "jit_ran": 0,
+    "pass": 1
+  }
+}
