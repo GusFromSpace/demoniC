@@ -1,0 +1,21 @@
+{
+  "schema": "demoni.package.v0",
+  "name": "demonic-examples",
+  "version": "0.0.1",
+  "root": ".",
+  "entry": "examples/hello.dmc",
+  "modules": {
+    "hello": "examples/hello.dmc",
+    "package_manifest": "examples/package_manifest.dmc",
+    "ring_buffer": "examples/ring_buffer.dmc",
+    "row_slice_lab": "examples/row_slice_lab.dmc",
+    "text_pipeline": "examples/text_pipeline.dmc"
+  },
+  "exports": [
+    "hello",
+    "package_manifest",
+    "ring_buffer",
+    "row_slice_lab",
+    "text_pipeline"
+  ]
+}

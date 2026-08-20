@@ -418,6 +418,29 @@ cannot be bound outside an `extern fn` call site, and cannot be dereferenced
 in source. The JIT materializes `*T` values from demoniC tensors at the call
 site; the source program never constructs one.
 
+### 3.11 Ports
+
+```
+Port[python]
+```
+
+A `Port[L]` is a handle to a foreign runtime `L`. The foreign language never
+enters demoniC's type system: values cross the boundary as canonical JSON
+strings, through three builtins that return errors as values (§3.8):
+
+```
+port_open(lang: str) -> (Port[lang], Err)
+port_call(p: Port[L], name: str, payload: str) -> (str, Err)
+port_close(p: Port[L]) -> (nil, Err)
+```
+
+The interpreter implements the `python` process port: `name` is a dotted
+import path (`math.sqrt`, `json.dumps`) or a bare builtin name, the
+JSON-decoded `payload` is the single argument, and the result is re-encoded
+to canonical JSON. Other runtimes report a `port-open` error. The JIT does
+not lower port calls. Semantics, the value boundary, and the error tags are
+specified in `docs/PORTS.md`.
+
 ## 4. Expressions
 
 ### 4.1 Literals and identifiers

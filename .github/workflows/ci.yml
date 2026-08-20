@@ -36,6 +36,13 @@ jobs:
         # Every JIT-eligible example test additionally runs on both backends
         # and the results are compared.
         run: compiler/target/release/dmc test --jit examples
+      - name: validate_manifest.py
+        # demoni.json stays consistent with the tree it ships in. The
+        # existence test keeps this from passing vacuously if the manifest
+        # ever drops out of the tree (the validator exits 0 on no matches).
+        run: |
+          test -s demoni.json
+          python3 tools/validate_manifest.py
       - name: example_runner.py (per-example conformance)
         # Each example gated individually against tools/example_baseline.json
         # by its executable test results on both backends. To record a

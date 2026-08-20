@@ -4,6 +4,20 @@ This file tracks releases of the public demoniC repository. Releases are
 periodic snapshots of ongoing development, so each entry batches multiple
 changes rather than corresponding to a single commit.
 
+## 2026-08-19 — docs: memory model, ports, package manifests, the grammar
+
+### Added
+
+- `docs/MEMORY.md` (arenas, copy-on-write, snapshots, the Stream arena),
+  `docs/PORTS.md` (the foreign-runtime boundary), and `docs/PACKAGES.md`
+  (the `demoni.json` manifest format), alongside `demoni.json` itself and
+  `tools/validate_manifest.py`, which now runs in CI.
+- `docs/GRAMMAR.ebnf` — the full grammar, verified production-by-production
+  against the parser (the audit's one finding: the grammar *omitted* the
+  implemented elementwise comparisons `.>` `.<` `.>=` `.<=`; now included).
+- The spec gains §3.11 (Ports): the `Port[L]` type and the three port
+  builtins were implemented but unspecified.
+
 ## 2026-08-18 — docs: five reference docs, this changelog, per-example conformance gate
 
 ### Added

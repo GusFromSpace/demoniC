@@ -1,0 +1,247 @@
+(* demoniC grammar, version 0.0.4-draft.                                  *)
+(* Companion to SPEC.md. The spec wins where this disagrees.              *)
+(* Notation: ISO EBNF.                                                    *)
+(*   { x } = zero or more x                                               *)
+(*   [ x ] = optional x                                                   *)
+(*   x | y = alternation                                                  *)
+(*   "lit" = terminal                                                     *)
+
+program       = { item } ;
+
+item          = fn_decl
+              | extern_decl
+              | model_decl
+              | type_alias
+              | enum_decl
+              | arena_block
+              | let_stmt
+              | directive_item
+              | pub_item
+              | use_decl ;
+
+pub_item      = "pub" ( fn_decl | extern_decl | model_decl | type_alias | enum_decl ) ;
+use_decl      = "use" str_lit [ "as" ident ] ;
+
+directive_item = directive fn_decl                          (* e.g. @grad fn ... *)
+              |  directive model_decl
+              |  directive_block ;
+
+directive      = "@" ident [ "(" [ darg { "," darg } ] ")" ] ;
+darg           = ident "=" comptime_expr | comptime_expr ;
+
+(* ---------- declarations ---------- *)
+
+fn_decl       = "fn" ident [ shape_params ] "(" [ params ] ")"
+                [ "->" type ] block ;
+
+extern_decl   = "extern" [ str_lit ] "fn" ident
+                "(" [ extern_params ] ")" [ "->" extern_type ] ;
+extern_params = extern_param { "," extern_param } ;
+extern_param  = ident ":" extern_type ;
+extern_type   = scalar_type | ptr_type | "nil" ;
+
+shape_params  = "[" shape_param { "," shape_param } "]" ;
+shape_param   = ident [ "=" comptime_expr ] ;
+
+params        = param { "," param } ;
+param         = [ "!" ] ( "self" | ident ) [ ":" type ] ;
+
+type_alias    = "type" ident [ shape_params ] "=" type ;
+enum_decl     = "enum" ident "{" enum_variant { "," enum_variant } [ "," ] "}" ;
+enum_variant  = ident [ "(" type { "," type } ")" ] ;
+
+comptime_expr = expr ;        (* a comptime-evaluable expression          *)
+                              (* enforced by the type-checker, not parser *)
+
+arena_block   = ( "vault" | "forge" | "stream" ) block ;
+
+model_decl    = "model" ident [ shape_params ] "{" { model_member } "}" ;
+model_member  = ident ":" type             (* field *)
+              | fn_decl ;                  (* method (incl. `forward`) *)
+
+(* ---------- statements ---------- *)
+
+stmt          = let_stmt
+              | expr_stmt
+              | if_stmt
+              | match_stmt
+              | for_stmt
+              | while_stmt
+              | loop_stmt
+              | stage_stmt
+              | directive_stmt
+              | "break"
+              | "continue"
+              | "return" [ expr ] ;
+
+let_stmt      = "let" [ "!" | "mut" ] pattern [ ":" type ] "=" expr ;
+
+expr_stmt     = expr [ assign_op expr | "<-" expr ] ;
+assign_op     = "=" | ":=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^=" ;
+
+if_stmt       = "if" expr block [ "else" ( if_stmt | block ) ] ;
+match_stmt    = "match" expr "{" match_arm { "," match_arm } [ "," ] "}" ;
+match_arm     = pattern [ "if" expr ] "=>" expr ;
+
+for_stmt      = "for" pattern "in" expr block ;
+while_stmt    = "while" expr block ;
+loop_stmt     = "loop" block ;
+stage_stmt    = "stage" int_lit ":" expr ;          (* inside @pp fn *)
+directive_stmt = directive ( block | stmt ) ;
+
+directive_block = directive block ;
+
+block         = "{" { stmt ( ";" | NEWLINE ) } [ expr ] "}" ;
+
+(* ---------- patterns ---------- *)
+
+pattern       = "_"
+              | ".."                        (* rest — parsed, not yet matched *)
+              | ident                       (* binding, or bare enum variant *)
+              | ident "." ident             (* qualified enum variant `Enum.Variant` *)
+              | ident "." ident "(" pattern { "," pattern } ")"   (* payload destructure *)
+              | literal
+              | "(" pattern { "," pattern } ")"
+              | shape_pattern
+              | pattern "@" pattern ;       (* bind — parsed, not yet matched *)
+
+shape_pattern = "[" [ shape_elem { "," shape_elem } ] "]" ;
+shape_elem    = "_" | ".." | int_lit | ident | "~" ;
+
+(* ---------- expressions ---------- *)
+(* Precedence encoded in the layered productions.                         *)
+(* See OPERATORS.md §1 for the table.                                     *)
+
+expr          = pipe_expr ;
+
+pipe_expr     = logic_or { ( "|>" | ">>" ) logic_or } ;
+logic_or      = logic_and { "||" logic_and } ;
+logic_and     = compare   { "&&" compare } ;
+compare       = equality    { ("<"|"<="|">"|">="|".<"|".<="|".>"|".>=") equality } ;
+equality      = range_e     { ("=="|"!=") range_e } ;
+range_e       = bitwise_or  [ ( ".." | "..=" ) bitwise_or ] ;
+bitwise_or    = bitwise_xor { "|" bitwise_xor } ;
+bitwise_xor   = bitwise_and { "^" bitwise_and } ;
+bitwise_and   = bitshift    { "&" bitshift } ;
+bitshift      = sum         { "<<" sum } ;
+sum           = product   { ( "+" | "-" | ".+" | ".-" ) product } ;
+product       = matmul    { ( "*" | "/" | "%" | ".*" | "./" ) matmul } ;
+matmul        = power     { "@" power } ;
+power         = unary     { ( "**" | ".^" | ".**" ) unary } ;
+unary         = [ "-" | "!" | "~" | "*" | "\\>" | "\\<" ] as_expr ;
+as_expr       = postfix_expr { "as" type } ;
+postfix_expr  = primary { postfix_op } ;
+postfix       = postfix_expr ;                          (* alias kept for cross-references *)
+postfix_op    = "'"
+              | "?"
+              | "[" index_list "]"
+              | "(" [ arg_list ] ")"
+              | "." ident ;                          (* field access on models and gradient tuples *)
+
+index_list    = index_elem { "," index_elem } ;
+index_elem    = ".." | expr [ ":" expr [ ":" expr ] ] ;
+
+arg_list      = expr { "," expr } ;
+
+primary       = literal
+              | ident
+              | "(" expr { "," expr } ")"           (* tuple or grouping *)
+              | tensor_lit
+              | struct_lit
+              | block
+              | if_stmt
+              | match_stmt
+              | fn_lit
+              | directive_block ;                   (* @cast(bf16) { ... } as expr *)
+
+struct_lit    = ident [ "[" type_args "]" ] "{" field_init { "," field_init } [ "," ] "}" ;
+field_init    = ident ":" expr ;
+(* Disambiguation: struct_lit is only parsed when ident is a known model name
+   and "{" follows with "ident :" inside — see SPEC.md §3.9 (Models) and
+   parser disambiguation. *)
+
+fn_lit        = "fn" [ shape_params ] "(" [ params ] ")"
+                [ "->" type ] block ;
+
+tensor_lit    = "[" [ expr { "," expr } ] "]" ;
+
+(* ---------- types ---------- *)
+
+type          = scalar_type
+              | array_type
+              | tensor_type
+              | view_type
+              | kv_type
+              | mesh_type
+              | port_type
+              | model_type
+              | fn_type
+              | tuple_type
+              | ptr_type
+              | ident [ "[" type_args "]" ] ;
+
+array_type    = "[" type ";" comptime_expr "]" ;    (* SPEC.md §3.9 (Models) — model arrays; e.g. [Block[D,H]; L] *)
+
+ptr_type      = "*" ( scalar_type | "nil" ) ;       (* extern fn only; SPEC.md §3.10 (Raw pointers) *)
+
+scalar_type   = "i8"|"i16"|"i32"|"i64"
+              | "u8"|"u16"|"u32"|"u64"
+              | "int4" | "int8"
+              | "f16"|"bf16"|"tf32"|"f32"|"f64"
+              | "fp8_e4m3"|"fp8_e5m2"
+              | "bool"|"str"|"nil" ;
+
+tensor_type   = "Tensor" "[" type "," shape "]" ;
+view_type     = "View"   "[" type "," shape "]" ;
+kv_type       = "KV"     "[" type "," shape "]" ;     (* must contain `~` *)
+mesh_type     = "Mesh"   "[" mesh_axis { "," mesh_axis } "]" ;   (* parsed; semantics unspecified in this version *)
+mesh_axis     = ident "=" int_lit ;
+port_type     = "Port"   "[" ident "]" ;     (* SPEC.md §3.11 (Ports) *)
+model_type    = ident [ "[" type_args "]" ] ;
+shape         = "[" shape_elem { "," shape_elem } "]" ;
+
+fn_type       = "fn" "(" [ type { "," type } ] ")" "->" type ;
+tuple_type    = "(" type { "," type } ")" ;
+type_args     = type { "," type } ;
+
+(* ---------- lexical ---------- *)
+
+NEWLINE       = ? context-sensitive newline token; see SPEC.md §0 (Conventions)
+                  for statement termination and signature wrapping ? ;
+
+ident         = ( XID_START | "_" ) { XID_CONTINUE } [ "!" ] ;
+
+literal       = int_lit | float_lit | str_lit | char_lit | byte_lit | "true" | "false" | "nil" ;
+
+int_lit       = digit { digit | "_" } [ int_suffix ]
+              | "0x" hex_digit { hex_digit | "_" }
+              | "0b" bin_digit { bin_digit | "_" } ;
+int_suffix    = "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64" ;
+
+float_lit     = digit { digit | "_" } "." { digit | "_" } [ exp ] [ flt_suffix ]
+              | "." digit { digit | "_" } [ exp ] [ flt_suffix ]
+              | digit { digit | "_" } exp [ flt_suffix ] ;
+exp           = ( "e" | "E" ) [ "+" | "-" ] digit { digit } ;
+flt_suffix    = "f16" | "bf16" | "tf32" | "f32" | "f64"
+              | "fp8_e4m3" | "fp8_e5m2" ;
+
+str_lit       = '"' { str_char | escape } '"' ;
+char_lit      = "c" '"' ( str_char | escape ) '"' ;   (* exactly one Unicode scalar *)
+byte_lit      = "b" "'" ( str_char | escape ) "'" ;   (* one byte 0-255; SPEC.md §2.4 (Literals) *)
+escape        = "\\" ( "n" | "r" | "t" | "\\" | '"' | "0" ) ;
+
+(* Newline / expression-continuation rules:                                *)
+(*   • Newlines act as statement terminators inside blocks.                *)
+(*   • A binary operator MAY lead a continuation line; the parser skips   *)
+(*     newlines before checking for an infix operator at all precedence    *)
+(*     levels EXCEPT matmul (`@`).                                         *)
+(*   • `@` must appear on the SAME line as its LHS, because `@ident` at   *)
+(*     the start of a line is a directive, not a matmul continuation.      *)
+(*   • Example (valid — `.-` leads the second line):                       *)
+(*       let nx = sdf(px + e, py)                                          *)
+(*             .- sdf(px - e, py)                                          *)
+(*   • See also: pipe operators `|>` and `>>` — these also cross newlines. *)
+
+(* Whitespace, comments, newline handling and tokenizer-stability         *)
+(* requirements are in SPEC.md §0 (Conventions), §2.1 (Comments), and     *)
+(* TOKENIZER.md.                                                          *)
