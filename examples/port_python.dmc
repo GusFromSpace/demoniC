@@ -1,0 +1,149 @@
+# port_python.dmc -- the process-port floor (PORTS.md §7.1) end to end.
+# Demonstrates: open a python runtime, call stdlib functions across every
+# argument mode of the JSON ABI, read the canonical-JSON results back, handle
+# the error tags, and close. No new syntax -- port_open/port_call/port_close
+# are ordinary fallible builtins (SPEC.md §4.11).
+#
+# The argument ABI (PORTS.md §2). The `payload` str decodes to:
+#   - null / empty  -> the function is called with no arguments.
+#   - a JSON array  -> its elements are the positional arguments, spread.
+#   - a JSON object -> the {args, kwargs} envelope: `args` spread positionally,
+#                      `kwargs` spread by name.
+#   - anything else (a bare number/string/bool) -> `port-protocol`: wrap it.
+# A single argument is therefore a one-element array; a top-level object is
+# always the envelope, so an object *argument* nests inside the array and is
+# never mistaken for it.
+#
+# Run: dmc run examples/port_python.dmc   (python3 is a dev prerequisite)
+
+# Encode a two-element positional argument vector [a, b] as canonical JSON.
+fn pos2(a: i64, b: i64) -> str {
+    let xs = list()
+    let xs = list_push(xs, a)
+    let xs = list_push(xs, b)
+    json_encode(xs)
+}
+
+fn main() -> str {
+    let (p, e1) = port_open("python")
+    if e1 != nil {
+        print("port open failed: " + e1)
+        return e1
+    }
+
+    # Two positional arguments, spread from the array: math.gcd(462, 1071).
+    # demoniC owns tensor kernels; the integer stdlib it ports out for.
+    let (g, e2) = port_call(p, "math.gcd", pos2(462, 1071))
+    if e2 != nil {
+        print("gcd failed: " + e2)
+        let (_, _) = port_close(p)
+        return e2
+    }
+    print("gcd(462, 1071) = " + g)     # -> 21
+
+    # A keyword argument through the envelope: sorted([3, 1, 2], reverse=true).
+    # The list is one positional arg, so it nests one level inside `args`.
+    let inner = list()
+    let inner = list_push(inner, 3)
+    let inner = list_push(inner, 1)
+    let inner = list_push(inner, 2)
+    let args = list()
+    let args = list_push(args, inner)
+    let kwargs = map()
+    let kwargs = map_set(kwargs, "reverse", true)
+    let env = map()
+    let env = map_set(env, "args", args)
+    let env = map_set(env, "kwargs", kwargs)
+    let (s, e3) = port_call(p, "sorted", json_encode(env))
+    if e3 != nil {
+        print("sort failed: " + e3)
+        let (_, _) = port_close(p)
+        return e3
+    }
+    print("sorted desc = " + s)        # -> [3,2,1]
+
+    let (_, e4) = port_close(p)
+    if e4 != nil { return e4 }
+    g
+}
+
+# --- tests ---
+# Every assertion below opens its own port, so each is a self-contained
+# statement about one ABI mode or one error tag. The result str is always
+# canonical JSON, re-encoded by demoniC's own writer, so whole floats print
+# without a trailing `.0` (1024.0 -> "1024") -- assertions rely on that.
+
+# No arguments: a null/empty payload calls the function with no args.
+# `list()` in python (a bare builtin) yields the empty list.
+fn test_no_args_calls_niladic() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "list", nil)
+    let (_, _) = port_close(p)
+    err == nil && out == "[]"
+}
+
+# One positional argument is a one-element array: sum([1, 2, 3]) == 6.
+# The list is the single argument, so it nests inside the payload array.
+fn test_single_arg_nests_in_array() -> bool {
+    let one = list()
+    let one = list_push(one, 1)
+    let one = list_push(one, 2)
+    let one = list_push(one, 3)
+    let payload = list()
+    let payload = list_push(payload, one)     # [[1,2,3]]
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "sum", json_encode(payload))
+    let (_, _) = port_close(p)
+    err == nil && out == "6"
+}
+
+# Multiple positional arguments spread from the array: math.pow(2, 10).
+# The whole-float result 1024.0 re-encodes as "1024".
+fn test_multi_arg_spreads() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.pow", pos2(2, 10))
+    let (_, _) = port_close(p)
+    err == nil && out == "1024"
+}
+
+# Keyword arguments through the {args, kwargs} envelope:
+# round(3.14159, ndigits=2) == 3.14.
+fn test_kwargs_envelope() -> bool {
+    let args = list()
+    let args = list_push(args, 3.14159)
+    let kwargs = map()
+    let kwargs = map_set(kwargs, "ndigits", 2)
+    let env = map()
+    let env = map_set(env, "args", args)
+    let env = map_set(env, "kwargs", kwargs)
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "round", json_encode(env))
+    let (_, _) = port_close(p)
+    err == nil && out == "3.14"
+}
+
+# A foreign exception (sqrt of a string) surfaces as a `port-call` tag and
+# leaves the port alive -- code matches only the tag prefix (PORTS.md §6).
+fn test_foreign_exception_tags_port_call() -> bool {
+    let bad = list()
+    let bad = list_push(bad, "sixteen")
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.sqrt", json_encode(bad))  # ["sixteen"]
+    let (_, _) = port_close(p)
+    err != nil && err.starts_with("port-call")
+}
+
+# A bare scalar payload is not an argument vector: the ABI rejects it with
+# `port-protocol` rather than guessing. Wrapping it in `[...]` is the fix.
+fn test_bare_scalar_tags_port_protocol() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.sqrt", "16")   # scalar, not [16]
+    let (_, _) = port_close(p)
+    err != nil && err.starts_with("port-protocol")
+}
+
+# An unsupported runtime is reported, not faked: only `python` is wired up.
+fn test_unsupported_runtime_tags_port_open() -> bool {
+    let (p, err) = port_open("lua")
+    err != nil && err.starts_with("port-open")
+}

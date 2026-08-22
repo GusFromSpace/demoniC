@@ -2935,3 +2935,45 @@ fn if_unification_keeps_the_exemptions_match_has() {
              let w: f32 = z  print(to_str(w)) }"#
     ));
 }
+
+// PORTS.md §5: a port call inside a `@grad fn` is an effect boundary the
+// gradient cannot cross — the checker rejects it with a `port-forbidden` tag.
+#[test]
+fn port_call_inside_grad_fn_is_forbidden() {
+    let errs = check(r#"
+        @grad fn loss(!w: Tensor[f32, [4]]) -> f32 {
+            let (p, e) = port_open("python")
+            sum(w .* w)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("port-forbidden") && e.contains("@grad")),
+        "got: {:?}", errs);
+}
+
+// The same call in an ordinary fn is fine — the restriction is scoped to the
+// gradient tape, not ports in general.
+#[test]
+fn port_call_outside_grad_fn_is_allowed() {
+    let errs = check(r#"
+        fn talk() -> str {
+            let (p, e) = port_open("python")
+            let (out, e2) = port_call(p, "len", "[[1,2,3]]")
+            let (_, e3) = port_close(p)
+            out
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
+}
+
+// The restriction reaches into a closure checked within the `@grad fn` body:
+// a port call there is still inside the tape.
+#[test]
+fn port_call_in_closure_within_grad_fn_is_forbidden() {
+    let errs = check(r#"
+        @grad fn loss(!w: Tensor[f32, [4]]) -> f32 {
+            let f = fn() -> nil { let (p, e) = port_open("python")  nil }
+            sum(w .* w)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
+}

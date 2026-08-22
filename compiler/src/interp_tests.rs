@@ -2553,12 +2553,14 @@ fn exec_cmd_echo() {
 fn port_roundtrip_python() {
     // #402: process-port floor — open a python port, call through the JSON
     // ABI, close. python3 is a dev prerequisite here, same as
-    // examples/port_bridge.dmc. `len` avoids float-formatting assumptions.
+    // examples/port_python.dmc. The payload is the positional argument vector
+    // (PORTS.md §2), so a single list argument nests: `[[1,2,3]]` -> len([1,2,3]).
+    // `len` avoids float-formatting assumptions.
     let v = run(r#"
         fn main() -> str {
             let (p, e1) = port_open("python")
             if e1 != nil { return "open failed" }
-            let (out, e2) = port_call(p, "len", "[1, 2, 3]")
+            let (out, e2) = port_call(p, "len", "[[1, 2, 3]]")
             if e2 != nil { return "call failed" }
             let (_, e3) = port_close(p)
             if e3 != nil { return "close failed" }
@@ -2602,17 +2604,88 @@ fn port_open_unsupported_runtime_tags_port_open() {
 #[test]
 fn port_call_foreign_exception_tags_port_call() {
     // A python-side exception (sqrt of a string) must surface as a
-    // `port-call` tag, not kill the port or the interpreter.
+    // `port-call` tag, not kill the port or the interpreter. The string is a
+    // single positional arg, so it rides inside the payload array.
     let v = run(r#"
         fn main() -> str {
             let (p, e1) = port_open("python")
-            let (out, e2) = port_call(p, "math.sqrt", json_encode("sixteen"))
+            let (out, e2) = port_call(p, "math.sqrt", "[\"sixteen\"]")
             let (_, e3) = port_close(p)
             if e2 == nil { "no error" } else { e2 }
         }
     "#);
     match &v {
         Value::Str(s) => assert!(s.starts_with("port-call"), "got {:?}", s),
+        other => panic!("expected Str, got {:?}", other),
+    }
+}
+
+#[test]
+fn port_multi_arg_spreads_positionally() {
+    // #402 / PORTS.md §2: a JSON array payload spreads as positional args.
+    // math.gcd(462, 1071) == 21 exercises a two-argument call.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            if e1 != nil { return "open failed" }
+            let (out, e2) = port_call(p, "math.gcd", "[462, 1071]")
+            let (_, e3) = port_close(p)
+            if e2 != nil { return e2 }
+            out
+        }
+    "#);
+    assert_eq!(as_str(&v), "21");
+}
+
+#[test]
+fn port_kwargs_envelope_binds_by_name() {
+    // #402 / PORTS.md §2: a JSON object payload is the {args, kwargs} envelope.
+    // round(3.14159, ndigits=2) == 3.14 binds a keyword argument by name.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            if e1 != nil { return "open failed" }
+            let (out, e2) = port_call(p, "round", "{\"args\":[3.14159],\"kwargs\":{\"ndigits\":2}}")
+            let (_, e3) = port_close(p)
+            if e2 != nil { return e2 }
+            out
+        }
+    "#);
+    assert_eq!(as_str(&v), "3.14");
+}
+
+#[test]
+fn port_bare_scalar_payload_tags_port_protocol() {
+    // #402 / PORTS.md §6: a bare scalar is not an argument vector. The ABI
+    // rejects it with `port-protocol` instead of guessing an arity.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            let (out, e2) = port_call(p, "math.sqrt", "16")
+            let (_, e3) = port_close(p)
+            if e2 == nil { "no error" } else { e2 }
+        }
+    "#);
+    match &v {
+        Value::Str(s) => assert!(s.starts_with("port-protocol"), "got {:?}", s),
+        other => panic!("expected Str, got {:?}", other),
+    }
+}
+
+#[test]
+fn port_unknown_envelope_key_tags_port_protocol() {
+    // #402 / PORTS.md §6: a top-level object must be a valid {args, kwargs}
+    // envelope; a stray key is a malformed ABI, not a runtime failure.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            let (out, e2) = port_call(p, "len", "{\"nope\":[]}")
+            let (_, e3) = port_close(p)
+            if e2 == nil { "no error" } else { e2 }
+        }
+    "#);
+    match &v {
+        Value::Str(s) => assert!(s.starts_with("port-protocol"), "got {:?}", s),
         other => panic!("expected Str, got {:?}", other),
     }
 }
@@ -5562,6 +5635,53 @@ fn main() -> i64 {
     assert_eq!(as_int(&v), 15);
 }
 
+// ── Named shape args on fn calls: `f[S=4]()` ────────────────────────────────
+// The named form used to fall through to a silent `<opaque bracket(...)>`
+// instead of binding the shape param (only the positional `f[4]()` worked).
+
+#[test]
+fn named_shape_arg_binds_zero_arg_fn() {
+    let v = run(r#"
+fn f[S]() -> i64 {
+    let m = forge.zeros[f32, [S, S]]
+    (sum(m) as i64) + S
+}
+
+fn main() -> i64 { f[S=4]() }
+"#);
+    assert_eq!(as_int(&v), 4);
+}
+
+#[test]
+fn mixed_positional_and_named_shape_args() {
+    let v = run(r#"
+fn g[A, B]() -> i64 { A * 10 + B }
+
+fn main() -> i64 { g[3, B=7]() }
+"#);
+    assert_eq!(as_int(&v), 37);
+}
+
+#[test]
+fn named_shape_arg_unknown_param_errors() {
+    let e = run_err(r#"
+fn f[S]() -> i64 { S }
+
+fn main() -> i64 { f[X=4]() }
+"#);
+    assert!(e.contains("not a shape parameter"), "got: {e}");
+}
+
+#[test]
+fn named_shape_arg_bound_twice_errors() {
+    let e = run_err(r#"
+fn f[S]() -> i64 { S }
+
+fn main() -> i64 { f[4, S=5]() }
+"#);
+    assert!(e.contains("bound twice"), "got: {e}");
+}
+
 // ── Issue #87: bool↔int cast ──────────────────────────────────────────────────
 
 #[test]
@@ -6518,6 +6638,56 @@ fn forge_trit_constructor() {
             sum(w as f32)
         }
     "#)), 0.0);
+}
+
+// ─── Bool tensors ────────────────────────────────────────────────────────
+// The JIT has always supported element assignment into bool tensors (1-byte
+// 0/1 lanes; `m[i,j]` reads back a real bool). The interpreter rejected the
+// write outright ("cannot assign value of type bool to tensor slice"), so no
+// mask built by element assignment — e.g. a causal attention mask — could run
+// under `dmc run`/`dmc test`. These pin the parity: DType::Bool tensors accept
+// bool element writes and yield Value::Bool on element reads.
+
+#[test]
+fn bool_tensor_element_assign_and_read() {
+    let v = run(r#"
+        fn main() -> bool {
+            let !m = forge.uninit[bool, [2, 2]]
+            m[0, 0] = true
+            m[0, 1] = false
+            m[0, 0] && !m[0, 1]
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "expected Bool(true), got {:?}", v);
+}
+
+#[test]
+fn bool_tensor_assign_from_comparison() {
+    // The qwen3 causal-mask shape: the RHS is a comparison, not a literal.
+    let v = run(r#"
+        fn main() -> bool {
+            let !m = forge.uninit[bool, [4, 4]]
+            for r in 0..4 {
+                for c in 0..4 {
+                    m[r, c] = (c <= r)
+                }
+            }
+            m[3, 0] && m[3, 3] && !m[0, 3] && !m[2, 3]
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "expected Bool(true), got {:?}", v);
+}
+
+#[test]
+fn bool_tensor_zeros_reads_false() {
+    // forge.zeros[bool] elements read back as Value::Bool(false), not Float(0.0).
+    let v = run(r#"
+        fn main() -> bool {
+            let m = forge.zeros[bool, [2, 2]]
+            m[1, 1]
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(false)), "expected Bool(false), got {:?}", v);
 }
 
 #[test]

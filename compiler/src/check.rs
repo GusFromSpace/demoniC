@@ -69,6 +69,10 @@ pub struct Checker {
     /// #442 (MEMORY §3.1): the lexically enclosing arena blocks, innermost
     /// last. Empty = the default Forge context (MEMORY §3 rule 3).
     arena_stack: Vec<ArenaKind>,
+    /// PORTS.md §5: set while checking a `@grad fn` body (closures included).
+    /// A port call inside the tape is an effect the gradient cannot cross, so
+    /// `port_open`/`port_call`/`port_close` are rejected here (`port-forbidden`).
+    in_grad_fn: bool,
     pub checked_modules: HashMap<PathBuf, ModuleEnv>,
     /// Demon mode: the Control Art Restriction released. When set, the
     /// safe-mode lint family (`warn()`) is suppressed entirely — raw, full
@@ -88,6 +92,7 @@ impl Checker {
             grad_fn_counts: HashMap::new(),
             fn_mut_params: HashMap::new(),
             arena_stack: Vec::new(),
+            in_grad_fn: false,
             checked_modules: HashMap::new(),
             demon: false,
         }
@@ -520,7 +525,13 @@ impl Checker {
         // Track the current fn's return type for ? context validation (pass 2 / arena coherence).
         let declared_ret = f.ret_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(TyType::Unit);
         let outer_fn_ret = self.current_fn_ret.replace(declared_ret.clone());
+        // PORTS.md §5: port calls are an effect boundary a gradient cannot
+        // cross. Track the `@grad fn` body (and any closures it checks) so the
+        // call site can reject them.
+        let outer_in_grad = self.in_grad_fn;
+        self.in_grad_fn = f.directives.iter().any(|d| d.name == "grad");
         let body_ty = self.check_block(&f.body);
+        self.in_grad_fn = outer_in_grad;
         self.current_fn_ret = outer_fn_ret;
         // #398: a captured mutable binding (a module-level `let !`) referenced in
         // a `@grad fn` is NOT differentiable — only the fn's `!` params enter the
@@ -2338,6 +2349,22 @@ impl Checker {
                 let is_builtin = if let Expr::Ident(name, _) = expr {
                     self.env.is_builtin(name)
                 } else { false };
+
+                // PORTS.md §5: no `@grad fn` may call a port. The call is an
+                // effect boundary the tape cannot record, so a gradient through
+                // it would be silently wrong — reject it at compile time.
+                if self.in_grad_fn {
+                    if let Expr::Ident(name, _) = expr {
+                        if matches!(name.as_str(), "port_open" | "port_call" | "port_close") {
+                            self.error(
+                                format!("port-forbidden: `{}` is illegal inside a `@grad fn` \
+                                         — a port call is an effect boundary the gradient \
+                                         cannot cross (PORTS.md §5)", name),
+                                span.clone(),
+                            );
+                        }
+                    }
+                }
 
                 // Divergent builtins: `panic` / `exit` never return. They have
                 // type ⊥ (bottom), modelled here as `Unknown` (compatible with

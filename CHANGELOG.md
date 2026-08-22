@@ -4,6 +4,36 @@ This file tracks releases of the public demoniC repository. Releases are
 periodic snapshots of ongoing development, so each entry batches multiple
 changes rather than corresponding to a single commit.
 
+## 2026-08-22 — compiler: assimilation, the port argument ABI, decode performance
+
+### Added
+
+- `dmc assimilate`: generate port-wrapper bindings from a JSON descriptor,
+  or introspect a live python module (`dmc assimilate python:<module>`) into
+  a draft descriptor — `--bindings` carries it through to wrappers in one
+  command. Specified in `docs/ASSIMILATE.md`; generation is deterministic
+  and descriptor-stamped.
+- The port argument ABI (`docs/PORTS.md` §2): a `port_call` payload decodes
+  as a positional array, an `{args, kwargs}` envelope, or a bare value.
+- `examples/port_python.dmc` — the process-port floor end to end: every
+  argument mode of the ABI, the error tags, and close, against a live
+  python runtime.
+- Port-effect enforcement: a port call inside a `@grad fn` is a
+  compile-time error on both backends (`docs/PORTS.md` §5).
+
+### Changed
+
+- `dmc jit` type-checks the program before lowering, so an ill-typed
+  program is refused with a diagnostic instead of failing mid-lowering.
+- bool tensors support element assignment and element reads identically
+  under the interpreter and the JIT.
+- Explicit shape arguments bind the named form too, instead of silently
+  falling back to an opaque tensor.
+- Decode-path performance: GPU matmul dispatches are batched and
+  pipelined, and the CPU bf16 decode GEMV is column-split across cores.
+  Outputs are bit-identical to the previous kernels.
+- Dependencies: cranelift 0.134.3, ureq 3.4.
+
 ## 2026-08-19 — docs: memory model, ports, package manifests, the grammar
 
 ### Added

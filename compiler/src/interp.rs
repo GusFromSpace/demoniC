@@ -83,8 +83,11 @@ pub type EvalResult<T> = Result<T, RuntimeError>;
 /// matches `dmc jit` numerics by default. `F64` keeps full f64, which is what
 /// the JIT does for declared-f64 tensors. `F32` is the default float tag —
 /// tensor literals, op results, and rng constructors are f32 on the JIT too.
+/// `Bool` is f64-backed like everything else (0.0/1.0), but element reads
+/// yield `Value::Bool` and element writes accept one — matching the JIT,
+/// where a bool tensor is a 1-byte 0/1 lane and `m[i,j]` is a real bool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DType { Int, F32, F64, Trit }
+pub enum DType { Int, F32, F64, Trit, Bool }
 
 /// Width of a scalar float (#473) — the scalar counterpart of `DType`'s
 /// `F32`/`F64` split for tensors.
@@ -218,8 +221,6 @@ impl TensorVal {
         }
         TensorVal { data, dtype }
     }
-    pub fn is_int(&self) -> bool { self.dtype == DType::Int }
-
     /// Width a scalar read out of this tensor carries (#473). Elements of an
     /// `F32` tensor are already f32-rounded by #241's store-time rule; the
     /// width is what keeps them f32 through the arithmetic that follows.
@@ -982,6 +983,9 @@ impl Interpreter {
             }
             Value::Float(val, _) => {
                 assign_scalar_to_selection(arr, &selections, val);
+            }
+            Value::Bool(b) => {
+                assign_scalar_to_selection(arr, &selections, if b { 1.0 } else { 0.0 });
             }
             other => return Err(RuntimeError::at(format!(
                 "cannot assign value of type {} to tensor slice",
@@ -3746,20 +3750,50 @@ impl Interpreter {
                 )? {
                     return Ok(v);
                 }
-                // `f[N]` with user fn: bind explicit shape params
+                // `f[N]` / `f[S=4]` with user fn: bind explicit shape params.
+                // Positional args bind in declaration order; named args bind
+                // by name. A binding that can't be made errors loudly here —
+                // falling through to the opaque stand-in would silently poison
+                // the trailing call (the `<opaque bracket(...)>` failure mode).
                 if let Expr::Ident(fn_name, _) = expr {
                     if let Some(f) = self.fns.get(fn_name).cloned() {
                         if !f.shape_params.is_empty() {
-                            let mut shape_bindings = Vec::new();
-                            for (sp, arg) in f.shape_params.iter().zip(args.iter().filter_map(|a| match a {
-                                CallArg::Positional(e) => Some(e),
-                                _ => None,
-                            })) {
-                                if let Ok(v) = self.eval_expr(arg) {
-                                    if let Some(n) = v.as_int() {
-                                        shape_bindings.push((sp.name.clone(), n));
+                            let mut shape_bindings: Vec<(String, i64)> = Vec::new();
+                            let mut pos_idx = 0usize;
+                            for a in args {
+                                let (sp_name, value_expr, aspan) = match a {
+                                    CallArg::Positional(e) => {
+                                        let Some(sp) = f.shape_params.get(pos_idx) else {
+                                            return Err(RuntimeError::at(format!(
+                                                "`{}` declares {} shape parameter(s), got more bracket args",
+                                                fn_name, f.shape_params.len()), span));
+                                        };
+                                        pos_idx += 1;
+                                        (sp.name.clone(), e, span.clone())
                                     }
+                                    CallArg::Named { name, value, span: nspan } => {
+                                        if !f.shape_params.iter().any(|sp| sp.name == *name) {
+                                            return Err(RuntimeError::at(format!(
+                                                "`{}` is not a shape parameter of `{}` (declared: {})",
+                                                name, fn_name,
+                                                f.shape_params.iter().map(|sp| sp.name.as_str())
+                                                    .collect::<Vec<_>>().join(", ")), nspan.clone()));
+                                        }
+                                        (name.clone(), value, nspan.clone())
+                                    }
+                                    CallArg::Spread(_) => continue,
+                                };
+                                if shape_bindings.iter().any(|(n, _)| *n == sp_name) {
+                                    return Err(RuntimeError::at(format!(
+                                        "shape parameter `{}` of `{}` bound twice", sp_name, fn_name), aspan));
                                 }
+                                let v = self.eval_expr(value_expr)?;
+                                let Some(n) = v.as_int() else {
+                                    return Err(RuntimeError::at(format!(
+                                        "shape argument `{}` of `{}` must be an integer, got {}",
+                                        sp_name, fn_name, v.type_name()), aspan));
+                                };
+                                shape_bindings.push((sp_name, n));
                             }
                             if !shape_bindings.is_empty() {
                                 return Ok(Value::BoundFn { name: fn_name.clone(), shape_bindings });
@@ -3876,7 +3910,11 @@ impl Interpreter {
                             // an Int so downstream `/`, `%`, `&`, range bounds etc.
                             // keep integer semantics (#125).
                             let x = arr[IxDyn(&idx)];
-                            if arr.is_int() { Ok(Value::Int(x as i64)) } else { Ok(Value::Float(x, arr.float_width())) }
+                            match arr.dtype {
+                                DType::Int  => Ok(Value::Int(x as i64)),
+                                DType::Bool => Ok(Value::Bool(x != 0.0)),
+                                _ => Ok(Value::Float(x, arr.float_width())),
+                            }
                         } else if idx.len() < arr.ndim() {
                             // Partial index → sub-tensor slice along first axes;
                             // a sub-tensor keeps its parent's dtype.
@@ -4385,6 +4423,7 @@ fn arena_ctor_dtype(pos: &[&Expr]) -> DType {
             if is_int_type_name(name)  { return DType::Int; }
             if is_trit_type_name(name) { return DType::Trit; }
             if name == "f64"           { return DType::F64; }
+            if name == "bool"          { return DType::Bool; }
         }
     }
     DType::F32
@@ -5474,9 +5513,14 @@ fn expand_iter(v: &Value) -> EvalResult<Vec<Value>> {
         Value::List(vs) => Ok((**vs).clone()),
         Value::Tensor(t) => {
             // Iterate along the first axis as nested tensors / scalars,
-            // preserving the dtype so iterating an integer tensor yields Ints.
-            let is_int = t.is_int();
-            let scalar = |x: f64| if is_int { Value::Int(x as i64) } else { Value::Float(x, FW::F64) };
+            // preserving the dtype so iterating an integer tensor yields Ints
+            // (and a bool tensor yields Bools).
+            let dtype = t.dtype;
+            let scalar = move |x: f64| match dtype {
+                DType::Int  => Value::Int(x as i64),
+                DType::Bool => Value::Bool(x != 0.0),
+                _ => Value::Float(x, FW::F64),
+            };
             let mut out = Vec::new();
             if t.ndim() == 0 { return Ok(vec![scalar(t[IxDyn(&[])])]); }
             for slice in t.axis_iter(Axis(0)) {
@@ -5595,6 +5639,8 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
 /// `{"ok": result}` or `{"err": message}`.
 const PY_PORT_HARNESS: &str = r#"
 import sys, json, importlib, builtins
+class _ABI(Exception):
+    pass  # signals a malformed payload -> port-protocol, not port-call
 def _resolve(name):
     parts = name.split('.')
     if len(parts) == 1 and hasattr(builtins, parts[0]):
@@ -5603,17 +5649,42 @@ def _resolve(name):
     for p in parts[1:]:
         obj = getattr(obj, p)
     return obj
+def _unpack(payload):
+    # (args, kwargs) from the JSON payload per PORTS.md §2. null/empty -> no
+    # args; array -> positional; object -> {args, kwargs} envelope; a bare
+    # scalar is not an argument vector and is an ABI error.
+    if payload in (None, ''):
+        return (), {}
+    try:
+        p = json.loads(payload)
+    except Exception as e:
+        raise _ABI('payload is not valid JSON: %s' % e)
+    if isinstance(p, list):
+        return tuple(p), {}
+    if isinstance(p, dict):
+        extra = set(p) - {'args', 'kwargs'}
+        if extra:
+            raise _ABI('payload object must contain only "args"/"kwargs", got %s'
+                       % ', '.join(sorted(extra)))
+        a = p.get('args', [])
+        k = p.get('kwargs', {})
+        if not isinstance(a, list):
+            raise _ABI('"args" must be a JSON array')
+        if not isinstance(k, dict):
+            raise _ABI('"kwargs" must be a JSON object')
+        return tuple(a), k
+    raise _ABI('payload must be a JSON array, an {args, kwargs} object, or null')
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
     try:
         req = json.loads(line)
+        args, kwargs = _unpack(req.get('payload'))
         fn = _resolve(req['name'])
-        payload = req.get('payload')
-        arg = json.loads(payload) if payload not in (None, '') else None
-        res = fn() if arg is None else fn(arg)
-        out = json.dumps({'ok': res})
+        out = json.dumps({'ok': fn(*args, **kwargs)})
+    except _ABI as e:
+        out = json.dumps({'perr': str(e)})
     except Exception as e:
         out = json.dumps({'err': str(e)})
     sys.stdout.write(out + '\n')
@@ -7498,12 +7569,20 @@ impl Interpreter {
             match json_decode_str(line.trim()) {
                 Ok(Value::Map(m)) => {
                     let m = m.borrow();
-                    if let Some(err) = m.get("err") {
-                        let msg = match err {
+                    let tagged = |tag: &str, v: &Value| {
+                        let msg = match v {
                             Value::Str(s) => s.clone(),
                             other => json_encode_value(other),
                         };
-                        call_err(format!("port-call: {}", msg))
+                        format!("{}: {}", tag, msg)
+                    };
+                    // `perr` is a malformed-payload signal from the harness
+                    // (PORTS.md §6 port-protocol); `err` is a foreign-runtime
+                    // failure (port-call). Distinguished so code can match tags.
+                    if let Some(perr) = m.get("perr") {
+                        call_err(tagged("port-protocol", perr))
+                    } else if let Some(err) = m.get("err") {
+                        call_err(tagged("port-call", err))
                     } else if let Some(ok) = m.get("ok") {
                         // Re-encode through the crate's canonical JSON writer,
                         // so the result str is canonical regardless of the
@@ -10038,7 +10117,7 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn json_decode_str(s: &str) -> Result<Value, String> {
+pub(crate) fn json_decode_str(s: &str) -> Result<Value, String> {
     let mut parser = JsonParser::new(s);
     let v = parser.parse_value()?;
     parser.skip_ws();

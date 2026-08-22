@@ -43,10 +43,23 @@ port_close(p: Port[L]) -> (nil, Err)
 
 For the python process port, `name` is a dotted import path
 (`math.sqrt`, `json.dumps`, or a bare `builtins` name like `len`). The
-JSON-decoded `payload` is passed as the function's single argument; a
-`null` or empty payload calls with no arguments. The result is
-re-encoded to canonical JSON before `port_call` returns it. A runtime
-other than `python` reports `port-open`.
+`payload` str is the call's argument vector, decoded from JSON:
+
+| `payload` decodes to | binding                                          |
+| -------------------- | ------------------------------------------------ |
+| `null` or empty      | called with no arguments                         |
+| a JSON array         | the elements are the positional arguments        |
+| a JSON object        | the `{args, kwargs}` envelope (below)            |
+| any other JSON value | `port-protocol` — a bare scalar is not a vector  |
+
+A single argument is therefore a one-element array (`[x]`), and a single
+`array`/`object` argument nests one level inside it. A top-level object
+is always the envelope, so an `object` argument is never mistaken for
+it. The envelope carries `args` (a JSON array, spread positionally) and
+`kwargs` (a JSON object, spread by name); both are optional and any
+other key is a `port-protocol` error. The result is re-encoded to
+canonical JSON before `port_call` returns it. A runtime other than
+`python` reports `port-open`.
 
 `payload` and the returned `str` are canonical JSON unless the port was
 opened with an implementation-specific binary channel. JSON is the
@@ -113,9 +126,13 @@ Port calls are effect boundaries.
 A deterministic port has a manifest naming the runtime, version,
 environment variables, files, and command arguments that affect output.
 Without that manifest, the compiler is specified to emit a directive
-diagnostic when the port is called inside `@deterministic`. *(Specified,
-not yet enforced: today no port has a manifest and the checker accepts
-port calls in every context listed above.)*
+diagnostic when the port is called inside `@deterministic`.
+
+The `@grad fn` restriction is enforced: the checker rejects a port call
+inside a `@grad fn` — closures it encloses included — with a
+`port-forbidden` diagnostic. The `@comptime`, `@fuse`, and
+`@deterministic` restrictions are specified but not yet enforced: those
+directives parse but do not yet gate, and no port carries a manifest.
 
 ---
 

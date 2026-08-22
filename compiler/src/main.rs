@@ -18,6 +18,7 @@ mod fmt;
 mod resolver;
 mod jit;
 mod selftest;
+mod assimilate;
 // #326 GPU/Metal backend — compiled only on macOS with `--features gpu`.
 #[cfg(all(target_os = "macos", feature = "gpu"))]
 mod gpu;
@@ -58,6 +59,8 @@ fn print_usage() {
     eprintln!("  dmc selftest [opts]               interp-vs-JIT differential fuzzer over generated scalar programs");
     eprintln!("                                    opts: --iters N --seed S --repro SEED --floats --meta-test --verbose --timeout SECS");
     eprintln!("  dmc fmt <file.dmc>                pretty-print with canonical formatting (to stdout)");
+    eprintln!("  dmc assimilate <desc.json> [-o f] generate port-wrapper bindings from a descriptor (ASSIMILATE.md)");
+    eprintln!("  dmc assimilate python:<module>    introspect a live runtime into a draft descriptor (add --bindings for wrappers)");
     eprintln!("  dmc --profile <file.dmc>          run with op-count profiling (emits summary to stderr)");
     eprintln!("  dmc --profile run <file.dmc>      run mode with profiling");
     eprintln!("  dmc --demon <file.dmc>            demon mode: release the safe-mode lints (raw, no guardrails)");
@@ -82,6 +85,90 @@ fn print_warnings(warnings: &[check::TypeError]) {
             eprint!("\n  hint: {}", h);
         }
         eprintln!();
+    }
+}
+
+/// `dmc assimilate <descriptor.json> [-o <out.dmc>]` — generate the port-wrapper
+/// module and write it to stdout (or `-o` file). Returns a process exit code.
+fn run_assimilate(args: &[String]) -> i32 {
+    // Target is either a descriptor file, or a `runtime:module` introspection
+    // target (e.g. `python:math`) that assimilate reads from the live runtime.
+    let mut target: Option<&str> = None;
+    let mut out_path: Option<&str> = None;
+    let mut to_bindings = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => out_path = Some(p),
+                    None => { eprintln!("assimilate: -o needs a file path"); return 1; }
+                }
+            }
+            // For an introspection target, emit wrappers instead of the draft
+            // descriptor (fns whose types were all inferred; the rest reported).
+            "--bindings" => to_bindings = true,
+            other if target.is_none() => target = Some(other),
+            other => { eprintln!("assimilate: unexpected argument `{}`", other); return 1; }
+        }
+        i += 1;
+    }
+    let Some(target) = target else {
+        eprintln!("assimilate: missing target (usage: dmc assimilate <desc.json | python:module> [--bindings] [-o out])");
+        return 1;
+    };
+
+    // `runtime:module` (an introspection target) vs. a descriptor path. A target
+    // whose scheme is a bare identifier and which is not an existing file is an
+    // introspection target — so `lua:math` reaches introspect()'s "only wired
+    // for python" diagnostic instead of a misleading "no such file".
+    let is_scheme = |t: &str| matches!(t.split_once(':'),
+        Some((rt, _)) if !rt.is_empty()
+            && rt.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+            && rt.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    let introspected: Option<String> = if is_scheme(target) && !std::path::Path::new(target).exists() {
+        let (rt, module) = target.split_once(':').unwrap();
+        match assimilate::introspect(rt, module) {
+            Ok(desc) => Some(desc),
+            Err(e) => { eprintln!("assimilate: {}", e); return 1; }
+        }
+    } else {
+        None
+    };
+
+    let output = match introspected {
+        // Introspection: default output is the reviewable draft descriptor;
+        // --bindings pipes it straight through the generator.
+        Some(desc) if to_bindings => match assimilate::generate(&desc) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("assimilate: {}", e); return 1; }
+        },
+        Some(desc) => desc + "\n",
+        // A descriptor file → wrappers.
+        None => {
+            if to_bindings {
+                eprintln!("assimilate: --bindings applies to an introspection target; a \
+                           descriptor file already generates bindings");
+                return 1;
+            }
+            let src = match std::fs::read_to_string(target) {
+                Ok(s) => s,
+                Err(e) => { eprintln!("assimilate: error reading {}: {}", target, e); return 1; }
+            };
+            match assimilate::generate(&src) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("assimilate: {}", e); return 1; }
+            }
+        }
+    };
+
+    match out_path {
+        Some(p) => match std::fs::write(p, &output) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("assimilate: error writing {}: {}", p, e); 1 }
+        },
+        None => { print!("{}", output); 0 }
     }
 }
 
@@ -455,6 +542,11 @@ fn real_main() {
             let code = run_selftest(&args[2..]);
             std::process::exit(code);
         }
+        "assimilate" => {
+            // ASSIMILATE.md — generate port-wrapper bindings from a JSON
+            // descriptor. `assimilate <descriptor.json> [-o <out.dmc>]`.
+            std::process::exit(run_assimilate(&args[2..]));
+        }
         "fmt" => {
             if args.len() < 3 { eprintln!("missing file"); std::process::exit(1); }
             ("fmt", PathBuf::from(&args[2]))
@@ -623,15 +715,35 @@ fn real_main() {
             print!("{}", pretty_print_program(&program));
         }
         "jit" => {
-            // Single-file JIT path: lex, parse, lower to Cranelift, invoke
-            // `main`. Slice 1 of issue #15 — multi-file `use` imports and
-            // pre-JIT type checking are deferred (the JIT does its own
-            // per-fn validation at lowering time, with diagnostics).
+            // Single-file JIT path: lex, parse, TYPE-CHECK, lower to Cranelift,
+            // invoke `main`. Multi-file `use` imports are still deferred (issue
+            // #15 slice 1); only one example in the corpus imports at all, and
+            // it is outside the JIT subset.
             let mut parser = Parser::new(tokens);
             let program = match parser.parse_program() {
                 Ok(p) => p,
                 Err(e) => { eprintln!("{}", e); std::process::exit(1); }
             };
+            // #478 step 1: `dmc jit` type-checks, like `dmc run` already did.
+            // It used to lower raw AST and rely on the JIT's own per-function
+            // validation, so it accepted programs the checker rejects —
+            // `fn main() -> i64 { let z: str = 5  1 }` compiled and ran. That
+            // made `--check` necessary-but-not-sufficient in BOTH directions
+            // and left the JIT unable to trust any property the checker
+            // establishes, which is what a type-directed fix for #478 needs.
+            // Measured at f8affbe: every corpus example passes `--check`, so
+            // this rejects nothing that used to work.
+            let mut checker = Checker::new();
+            checker.demon = demon_mode;
+            checker.check_program(&program, Some(&path));
+            if !checker.errors.is_empty() {
+                for err in &checker.errors {
+                    eprintln!("{}", err);
+                }
+                eprintln!("\n⚠ {} type error(s) — refusing to run", checker.errors.len());
+                std::process::exit(1);
+            }
+            print_warnings(&checker.warnings);
             let mut jit = match Jit::new() {
                 Ok(j) => j,
                 Err(e) => { eprintln!("{}", e); std::process::exit(1); }

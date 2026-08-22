@@ -1301,6 +1301,12 @@ impl Jit {
         // #326: GPU/Metal bf16 decode GEMV — only present on macOS + `--features gpu`.
         #[cfg(all(target_os = "macos", feature = "gpu"))]
         builder.symbol("__dmc_matmul_bf16_gpu", crate::gpu::dmc_matmul_bf16_gpu as *const u8);
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        builder.symbol("__dmc_matmul_bf16_gpu_batched", crate::gpu::dmc_matmul_bf16_gpu_batched as *const u8);
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        builder.symbol("__dmc_matmul_bf16_gpu_batched_deferred", crate::gpu::dmc_matmul_bf16_gpu_batched_deferred as *const u8);
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        builder.symbol("__dmc_matmul_bf16_gpu_flush", crate::gpu::dmc_matmul_bf16_gpu_flush as *const u8);
         builder.symbol("__dmc_bf16_upconvert", dmc_bf16_upconvert as *const u8);
         builder.symbol("__dmc_f32_to_bf16", dmc_f32_to_bf16 as *const u8);
         builder.symbol("__dmc_bf16_transpose_2d", dmc_bf16_transpose_2d as *const u8);
@@ -2471,6 +2477,48 @@ impl Jit {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
+        // #326: __dmc_matmul_bf16_gpu_batched(l, r, out, m, k, n, batch, ls, rs)
+        // — a whole affine-strided batched projection in one command buffer /
+        // one dispatch (see `lower_matmul_general`). Declared only when the
+        // symbol is present (macOS + `--features gpu`).
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        {
+            let mut sig = self.module.make_signature();
+            for _ in 0..9 { sig.params.push(AbiParam::new(cl::I64)); }
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_matmul_bf16_gpu_batched", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu_batched: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_matmul_bf16_gpu_batched".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // #326: deferred variant (same ABI — commits without waiting; the next
+        // sync batched call or the flush below materializes its output), and
+        // the zero-arg flush.
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        {
+            let mut sig = self.module.make_signature();
+            for _ in 0..9 { sig.params.push(AbiParam::new(cl::I64)); }
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_matmul_bf16_gpu_batched_deferred", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu_batched_deferred: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_matmul_bf16_gpu_batched_deferred".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        {
+            let mut sig = self.module.make_signature();
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_matmul_bf16_gpu_flush", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu_flush: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_matmul_bf16_gpu_flush".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
         // #324: __dmc_bf16_upconvert(src: i64, n: i64) -> i64 (f32 buffer ptr)
         {
             let mut sig = self.module.make_signature();
@@ -2643,6 +2691,8 @@ impl Jit {
             local_tys: HashMap::new(),
             ret: meta.ret.clone(),
             gpu: self.gpu,
+            gpu_defer_hint: false,
+            gpu_defer_pending: false,
             loop_stack: Vec::new(),
             shape_env: meta.shape_env.clone(),
             block_filled: false,
@@ -3688,6 +3738,20 @@ struct Translator<'a> {
     ret: TyKind,
     /// #326: copied from `Jit::gpu` — route the m==1 bf16 decode GEMV to Metal.
     gpu: bool,
+    /// #326 dispatch pipelining: true while lowering a statement whose NEXT
+    /// sibling is also a `gpu_defer_candidate` — tells the bf16-GPU batched
+    /// fast path to emit the *deferred* call (commit without wait), keeping
+    /// the GPU queue non-empty across back-to-back projections. Set per
+    /// statement by `lower_block_value`.
+    #[allow(dead_code)] // read only on macOS + `--features gpu`
+    gpu_defer_hint: bool,
+    /// Compile-time mirror of the GPU runtime's deferred-work state: set when
+    /// a deferred batched call was emitted, cleared by the next sync batched
+    /// call (which flushes at runtime) or by `emit_gpu_flush_if_pending`.
+    /// While set, only a `gpu_defer_candidate` statement is being lowered, so
+    /// every matmul route that does NOT reach the batched GPU runtime must
+    /// emit a flush.
+    gpu_defer_pending: bool,
     loop_stack: Vec<LoopFrame>,
     /// Shape parameter bindings from the enclosing fn's monomorphization.
     /// Empty for non-generic fns. Used to resolve idents in tensor type
@@ -3953,10 +4017,18 @@ impl<'a> Translator<'a> {
             && b.stmts.last().map(|s| matches!(s,
                 Stmt::If(_) | Stmt::Match(_) | Stmt::DirectiveBlock { .. })).unwrap_or(false);
         let body_len = if last_is_value { b.stmts.len() - 1 } else { b.stmts.len() };
-        for stmt in &b.stmts[..body_len] {
+        for (i, stmt) in b.stmts[..body_len].iter().enumerate() {
+            // #326 dispatch pipelining: a run of adjacent candidate `let`s
+            // (q/k/v-style back-to-back projections) may defer each GPU
+            // dispatch until the run's last statement, which waits for all of
+            // them. Hint = "my successor is also a candidate"; only the bf16
+            // batched-GPU fast path acts on it.
+            self.gpu_defer_hint = Self::gpu_defer_candidate(stmt)
+                && b.stmts.get(i + 1).is_some_and(Self::gpu_defer_candidate);
             self.lower_stmt(stmt)?;
             if self.is_filled() { return Ok(None); }
         }
+        self.gpu_defer_hint = false;
         if last_is_value {
             match b.stmts.last() {
                 Some(Stmt::If(i)) => return self.lower_if(i),
@@ -3984,6 +4056,34 @@ impl<'a> Translator<'a> {
             return Ok(Some(val));
         }
         Ok(None)
+    }
+
+    /// #326: is this statement shaped `let x = a @ w` with both operands
+    /// plain identifiers or field chains? Those operands lower to pointer
+    /// loads only — no tensor-data reads — which is what makes it safe to
+    /// leave the *previous* candidate's GPU output unmaterialized while this
+    /// one is lowered (the GPU runtime itself flushes if a pointer overlap
+    /// says this call depends on a deferred output). Mutating (`let !`),
+    /// `mut`, annotated, and destructuring lets are excluded: their binding
+    /// paths may copy or coerce the value, i.e. read it.
+    fn gpu_defer_candidate(stmt: &Stmt) -> bool {
+        fn simple(e: &Expr) -> bool {
+            match e {
+                Expr::Ident(..) => true,
+                Expr::Postfix { expr, op: PostfixOp::Field(_), .. } => simple(expr),
+                _ => false,
+            }
+        }
+        match stmt {
+            Stmt::Let(l) => !l.mutating && !l.is_mut && l.ty.is_none()
+                && matches!(l.pattern, Pattern::Ident(..))
+                && match &l.value {
+                    Expr::BinOp { op: BinOp::Matmul, lhs, rhs, .. } =>
+                        simple(lhs) && simple(rhs),
+                    _ => false,
+                },
+            _ => false,
+        }
     }
 
     fn lower_stmt(&mut self, stmt: &Stmt) -> Result<(), JitError> {
@@ -7035,13 +7135,38 @@ impl<'a> Translator<'a> {
             }
             // Non-Fn callee expression — will fall through to unsupported below.
         }
+        // Explicit shape args from a bracketed callee (`f[4](..)`, `f[S=4]()`):
+        // (None, expr) positional in declaration order, (Some(name), expr) named.
+        // Seeded into instantiate_template — required for zero-arg templates,
+        // where nothing can be inferred from the call args.
+        let mut explicit_shape_args: Vec<(Option<String>, &Expr)> = Vec::new();
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
-            // Generic call with explicit shape args: `f[H, W](..)`. The
-            // brackets are redundant here — instantiate_template infers the
-            // shape params from the argument tensors — so take the name and
-            // proceed.
-            Expr::Postfix { expr: inner, op: PostfixOp::Index(_) | PostfixOp::BracketArgs(_), .. } => {
+            // Generic call with explicit shape args: `f[H, W](..)` (Index form)
+            // or `f[H=2, W=3](..)` (BracketArgs form).
+            Expr::Postfix { expr: inner, op, .. }
+                if matches!(op, PostfixOp::Index(_) | PostfixOp::BracketArgs(_)) =>
+            {
+                match op {
+                    PostfixOp::Index(elems) => {
+                        for e in elems {
+                            if let IndexElem::Expr(x) = e {
+                                explicit_shape_args.push((None, x));
+                            }
+                        }
+                    }
+                    PostfixOp::BracketArgs(bargs) => {
+                        for a in bargs {
+                            match a {
+                                CallArg::Positional(e) => explicit_shape_args.push((None, e)),
+                                CallArg::Named { name, value, .. } =>
+                                    explicit_shape_args.push((Some(name.clone()), value)),
+                                CallArg::Spread(_) => {}
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
                 match inner.as_ref() {
                     Expr::Ident(n, _) => n.clone(),
                     _ => return unsupported(span, "indirect / dynamic calls"),
@@ -7273,7 +7398,42 @@ impl<'a> Translator<'a> {
         let entry = if let Some(e) = self.fns.get(&name) {
             e.clone()
         } else if let Some(tmpl) = self.templates.get(&name).cloned() {
-            self.instantiate_template(&tmpl, &arg_vals, span)?
+            // Resolve the explicit bracket args (if any) to concrete dims
+            // against the current shape env. Named args must name a declared
+            // shape param; positional args bind in declaration order. An arg
+            // that doesn't resolve to a compile-time dim is skipped — type-arg
+            // brackets were always ignored here, and inference still errors
+            // below if the param ends up unbound.
+            let mut explicit: Vec<(String, i64)> = Vec::new();
+            let mut pos_idx = 0usize;
+            for (arg_name, e) in &explicit_shape_args {
+                let sp_name = match arg_name {
+                    Some(n) => {
+                        if !tmpl.shape_params.iter().any(|sp| sp.name == *n) {
+                            return err(span, format!(
+                                "`{}` is not a shape parameter of `{}`", n, tmpl.name));
+                        }
+                        n.clone()
+                    }
+                    None => {
+                        let Some(sp) = tmpl.shape_params.get(pos_idx) else {
+                            return err(span, format!(
+                                "`{}` declares {} shape parameter(s), got more bracket args",
+                                tmpl.name, tmpl.shape_params.len()));
+                        };
+                        pos_idx += 1;
+                        sp.name.clone()
+                    }
+                };
+                if explicit.iter().any(|(n, _)| *n == sp_name) {
+                    return err(span, format!(
+                        "shape parameter `{}` of `{}` bound twice", sp_name, tmpl.name));
+                }
+                if let Ok(dim) = resolve_shape_expr(e, &self.shape_env, span) {
+                    explicit.push((sp_name, dim));
+                }
+            }
+            self.instantiate_template(&tmpl, &arg_vals, &explicit, span)?
         } else {
             return unsupported_msg(span, format!("unknown function `{}`", name));
         };
@@ -7327,6 +7487,7 @@ impl<'a> Translator<'a> {
         &mut self,
         tmpl: &FnDecl,
         arg_vals: &[(Value, TyKind)],
+        explicit: &[(String, i64)],
         span: &Span,
     ) -> Result<FnEntry, JitError> {
         if arg_vals.len() != tmpl.params.len() {
@@ -7336,8 +7497,20 @@ impl<'a> Translator<'a> {
             ));
         }
         // Unify each param's declared type against the actual arg type to
-        // bind shape variables.
+        // bind shape variables. Explicit bracket bindings (`f[4]()`,
+        // `f[S=4]()`) seed the map first — the only source of dims for a
+        // zero-arg template — and unify_param_type rejects an arg tensor
+        // whose shape contradicts them.
         let mut bindings: HashMap<String, i64> = HashMap::new();
+        for (n, d) in explicit {
+            if let Some(prev) = bindings.insert(n.clone(), *d) {
+                if prev != *d {
+                    return err(span, format!(
+                        "shape parameter `{}` of `{}` bound to both {} and {}",
+                        n, tmpl.name, prev, d));
+                }
+            }
+        }
         for (p, (_v, k)) in tmpl.params.iter().zip(arg_vals.iter()) {
             let p_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
                 msg: format!("template param `{}` needs a type annotation", p.name),
@@ -7444,6 +7617,7 @@ impl<'a> Translator<'a> {
         // (only ever produced by a KV read) matmul'd with a KV/DynTensor RHS.
         if *op == BinOp::Matmul {
             if let TyKind::DynTensor(pdt) = &lk {
+                self.emit_gpu_flush_if_pending(); // #326: reads tensor data inline
                 let pdt = pdt.clone();
                 let (v_ptr, vdt) = match self.lower_expr(rhs)? {
                     (p, TyKind::KV(kv)) if kv.elem == ScalarKind::F32 => self.kv_materialize(p, &kv),
@@ -7461,6 +7635,7 @@ impl<'a> Translator<'a> {
         // only accepts TyKind::Tensor on both sides.
         if *op == BinOp::Matmul {
             if let TyKind::TritTensor(wt) = &rk {
+                self.emit_gpu_flush_if_pending(); // #326: reads tensor data inline
                 let wt = wt.clone();
                 let xt = match &lk {
                     TyKind::Tensor(t) if t.elem == ScalarKind::F32 => t.clone(),
@@ -11697,6 +11872,10 @@ impl<'a> Translator<'a> {
         r: Value, rt: &TensorTy,
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
+        // #326: the f32 kernels read operand data inline — a deferred GPU
+        // neighbor must be materialized first. (The bf16 route flushes inside
+        // `lower_matmul_general` instead, after its fast-path check.)
+        self.emit_gpu_flush_if_pending();
         if lt.elem != ScalarKind::F32 || rt.elem != ScalarKind::F32 {
             return unsupported_msg(span, "matmul `@` is f32-only");
         }
@@ -11857,6 +12036,73 @@ impl<'a> Translator<'a> {
         let ob_strides = row_major_strides(&ob);
         let lb_strides = row_major_strides(lb);
         let rb_strides = row_major_strides(rb);
+
+        // #326 dispatch batching: when `--gpu` is on and every slice's lhs/rhs
+        // offset is an AFFINE function of the flat batch index p — true for
+        // all the decode projections, including the broadcast `[B,1,S,K] @
+        // [H,K,N]` attention ones — collapse the per-slice loop below into ONE
+        // runtime call that encodes the whole projection as a single command
+        // buffer with a single 3D-grid dispatch. This is what makes the many
+        // small per-head GEMVs (k*n ~= 327K MACs each) profitable on the GPU:
+        // measured per-dispatch cost is dominated by a fixed ramp, not by the
+        // command-buffer round trip, so one big dispatch wins. The shapes are
+        // compile-time constants, so the affinity check just replays the
+        // loop's p -> (lflat, rflat) mapping here in the compiler.
+        #[cfg(all(target_os = "macos", feature = "gpu"))]
+        {
+            // Worth a dispatch when the whole projection clears ~1M MACs
+            // (~2 MB of weights); per-slice k*n may be far smaller.
+            const GPU_BATCH_MIN_MACS: i128 = 1_000_000;
+            let total_macs = (batch_total as i128) * (m as i128) * (k as i128) * (n as i128);
+            if self.gpu && rhs_bf16 && m == 1 && n % 4 == 0
+                && batch_total <= 65_536 && total_macs >= GPU_BATCH_MIN_MACS
+            {
+                let flat = |p: i64, b: &[i64], b_strides: &[i64]| -> i64 {
+                    let mut f = 0;
+                    for ax in 0..ob.len() {
+                        let coord = (p / ob_strides[ax]) % ob[ax];
+                        if ax + b.len() >= ob.len() {
+                            let a = ax + b.len() - ob.len();
+                            if b[a] > 1 { f += coord * b_strides[a]; }
+                        }
+                    }
+                    f
+                };
+                let ls = if batch_total > 1 { flat(1, lb, &lb_strides) * lmat } else { 0 };
+                let rs = if batch_total > 1 { flat(1, rb, &rb_strides) * rmat } else { 0 };
+                let affine = rs % 4 == 0 && (0..batch_total).all(|p| {
+                    flat(p, lb, &lb_strides) * lmat == p * ls
+                        && flat(p, rb, &rb_strides) * rmat == p * rs
+                });
+                if affine {
+                    // Defer (commit without wait) when the next statement is
+                    // a candidate too — its batched call, or the flush any
+                    // other path emits, materializes this output. Not inside
+                    // autodiff, whose tape replays reads we can't see here.
+                    let defer = self.gpu_defer_hint && self.ad.is_none();
+                    let sym = if defer { "__dmc_matmul_bf16_gpu_batched_deferred" }
+                              else { "__dmc_matmul_bf16_gpu_batched" };
+                    let entry = self.fns.get(sym)
+                        .unwrap_or_else(|| panic!("{sym} not registered")).clone();
+                    let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+                    let m_v = self.builder.ins().iconst(cl::I64, m);
+                    let k_v = self.builder.ins().iconst(cl::I64, k);
+                    let n_v = self.builder.ins().iconst(cl::I64, n);
+                    let b_v = self.builder.ins().iconst(cl::I64, batch_total);
+                    let ls_v = self.builder.ins().iconst(cl::I64, ls);
+                    let rs_v = self.builder.ins().iconst(cl::I64, rs);
+                    self.builder.ins().call(func_ref, &[l, r, out_ptr, m_v, k_v, n_v, b_v, ls_v, rs_v]);
+                    // the sync call flushes every pending deferred call at runtime
+                    self.gpu_defer_pending = defer;
+                    return Ok((out_ptr, TyKind::Tensor(out_ty)));
+                }
+            }
+        }
+        // Any fall-through (f32 RHS, prefill m > 1, non-affine, too small)
+        // lowers to per-slice kernels that read memory directly — a deferred
+        // neighbor must be materialized first.
+        self.emit_gpu_flush_if_pending();
+
         let four = self.builder.ins().iconst(cl::I64, 4);
         // #324: the RHS weight matrix is 2 bytes/elem when bf16, 4 when f32.
         let rhs_eb = self.builder.ins().iconst(cl::I64, if rhs_bf16 { 2 } else { 4 });
@@ -12735,6 +12981,23 @@ impl<'a> Translator<'a> {
     /// in-register (threaded for m>=2, serial GEMV for m==1). A future micro-opt
     /// could inline the m==1 decode GEMV like `simd_matmul`, but the extern call
     /// overhead is negligible against the per-slice MACs.
+    /// #326: if a deferred GPU batched call is outstanding (its output not
+    /// yet materialized), emit a runtime flush — required before any lowering
+    /// path that reads tensor data without going through the batched GPU
+    /// runtime (which flushes on its own). No-op when nothing is pending.
+    fn emit_gpu_flush_if_pending(&mut self) {
+        if self.gpu_defer_pending {
+            self.gpu_defer_pending = false;
+            #[cfg(all(target_os = "macos", feature = "gpu"))]
+            {
+                let entry = self.fns.get("__dmc_matmul_bf16_gpu_flush")
+                    .expect("__dmc_matmul_bf16_gpu_flush not registered").clone();
+                let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+                self.builder.ins().call(func_ref, &[]);
+            }
+        }
+    }
+
     fn emit_2d_matmul_bf16_at(&mut self, l: Value, r: Value, out: Value, m: i64, k: i64, n: i64) {
         let m_v = self.builder.ins().iconst(cl::I64, m);
         let k_v = self.builder.ins().iconst(cl::I64, k);
@@ -18394,14 +18657,60 @@ extern "C" fn dmc_matmul_bf16(l: i64, r: i64, out: i64, m: i64, k: i64, n: i64) 
     let b = r as *const u16;
     let c = out as *mut f32;
 
-    // NB: the m==1 decode GEMV stays SERIAL on purpose. It was tempting to split
-    // its output columns across the idle cores (the kk-ascending reduction makes
-    // a column split bit-identical), but measured on a full decode loop it is a
-    // *regression* — the serial kernel streams each weight matrix sequentially
-    // (row-contiguous, prefetch-friendly), whereas a column split turns that into
-    // one strided vertical stripe per thread, and the access-pattern penalty plus
-    // per-call spawn cost outweighs the extra cores. Decode is single-core memory-
-    // latency bound here, not core-starved; #326 (GPU) is the real lever. (#327)
+    // #327 revisited (re-measured on M5 Air, 2026-08): the m==1 decode GEMV
+    // *does* profit from a column split here. The original keep-it-serial
+    // measurement came from a machine where one core saturates the memory
+    // fabric; on M5 the vector-issue-limited kernel gets ~37 GB/s of a
+    // ~73 GB/s single-core load ceiling (~153 GB/s fabric), and a 2-/4-way
+    // split of disjoint contiguous column ranges measured 66 / 75 GB/s
+    // (`cpu_bf16_gemv_bench`). The ascending-kk per-element accumulation
+    // makes any column partition bit-identical to serial, and chunks are
+    // 32-column aligned so no cache line is shared. Gated to big weights so
+    // small matmuls don't pay the spawn cost.
+    if m == 1 {
+        // machine-dependent policy — `DMC_BF16_COLSPLIT=0` restores serial
+        static COLSPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let split_on = *COLSPLIT.get_or_init(|| {
+            std::env::var("DMC_BF16_COLSPLIT").map(|v| v != "0").unwrap_or(true)
+        });
+        // `DMC_CPU_TIME=1`: per-decode-step wall clock, delimited by the
+        // lm-head GEMV (the only n >= 100k call, which closes every step)
+        static CPU_TIME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let timing = *CPU_TIME.get_or_init(|| std::env::var("DMC_CPU_TIME").is_ok());
+        if timing && n >= 100_000 {
+            thread_local! {
+                static STEP: std::cell::Cell<Option<std::time::Instant>> =
+                    const { std::cell::Cell::new(None) };
+            }
+            STEP.with(|t| {
+                if let Some(prev) = t.get() {
+                    eprintln!("[cpu] step: {}us", prev.elapsed().as_micros());
+                }
+                t.set(Some(std::time::Instant::now()));
+            });
+        }
+        let bytes = k * n * 2;
+        let ways = if !split_on { 1 }
+            else if bytes >= 16 << 20 { 4 } else if bytes >= 2 << 20 { 2 } else { 1 };
+        if ways == 1 {
+            unsafe { matmul_tile_bf16(a, b, c, k, n, 0, 1); }
+            return;
+        }
+        let (pa, pb, pc) = (a as usize, b as usize, c as usize);
+        let chunk = (n.div_ceil(ways) + 31) & !31;
+        std::thread::scope(|s| {
+            let mut j0 = 0;
+            while j0 < n {
+                let j1 = (j0 + chunk).min(n);
+                s.spawn(move || unsafe {
+                    matmul_tile_bf16_cols(
+                        pa as *const f32, pb as *const u16, pc as *mut f32, k, n, j0, j1);
+                });
+                j0 = j1;
+            }
+        });
+        return;
+    }
     let workers = matmul_threads(m, k, n);
     if workers <= 1 {
         unsafe { matmul_tile_bf16(a, b, c, k, n, 0, m); }
@@ -18421,25 +18730,110 @@ extern "C" fn dmc_matmul_bf16(l: i64, r: i64, out: i64, m: i64, k: i64, n: i64) 
     });
 }
 
-/// Single-threaded bf16-RHS kernel over output rows [i0,i1). kk-outer / j-inner,
-/// upconverting each weight to f32 before the FMA. Mirrors `matmul_tile` exactly
-/// (same accumulation order) so f32 and bf16 paths agree bit-for-bit.
+/// One fused-multiply-add row pass `c[j] += av * bf16(b[j])` over columns
+/// [j0, j1). NEON on aarch64 (8 columns per iteration: the lane widen
+/// `(h as u32) << 16` and per-lane vfmaq are bit-identical to the scalar
+/// `bf16_bits_to_f32` + `mul_add`, and each c[j] keeps its own single fma
+/// chain), scalar elsewhere. The kernels below call this per k-row, so the
+/// ascending-kk accumulation order — the bit-exactness contract with the
+/// interpreter — is untouched.
 #[inline]
+unsafe fn bf16_fma_row(av: f32, brow: *const u16, crow: *mut f32, j0: usize, j1: usize) {
+    let mut j = j0;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use core::arch::aarch64::*;
+        let vav = vdupq_n_f32(av);
+        while j + 8 <= j1 {
+            let h = vld1q_u16(brow.add(j));
+            let lo = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_low_u16(h))));
+            let hi = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_high_u16(h))));
+            let c0 = vld1q_f32(crow.add(j));
+            let c1 = vld1q_f32(crow.add(j + 4));
+            vst1q_f32(crow.add(j), vfmaq_f32(c0, lo, vav));
+            vst1q_f32(crow.add(j + 4), vfmaq_f32(c1, hi, vav));
+            j += 8;
+        }
+    }
+    while j < j1 {
+        let bv = bf16_bits_to_f32(*brow.add(j));
+        let cj = crow.add(j);
+        *cj = av.mul_add(bv, *cj);
+        j += 1;
+    }
+}
+
+/// Four k-rows per column pass: `c[j] += a0*b0[j]; c[j] += a1*b1[j]; ...` —
+/// per element the four fmas apply in ascending-k order in one register, so
+/// the result is bit-identical to four single-row passes while touching the
+/// c row a quarter as often (the single-row loop is op-bound, not
+/// bandwidth-bound: measured 37 -> ~60+ GB/s from this). aarch64 only; the
+/// caller falls back to `bf16_fma_row` per row elsewhere.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn bf16_fma_rows4(av: [f32; 4], b: [*const u16; 4], crow: *mut f32,
+                         j0: usize, j1: usize) {
+    use core::arch::aarch64::*;
+    let z = vdupq_n_u16(0);
+    let va: [float32x4_t; 4] = [
+        vdupq_n_f32(av[0]), vdupq_n_f32(av[1]), vdupq_n_f32(av[2]), vdupq_n_f32(av[3]),
+    ];
+    let mut j = j0;
+    while j + 8 <= j1 {
+        let mut c0 = vld1q_f32(crow.add(j));
+        let mut c1 = vld1q_f32(crow.add(j + 4));
+        // per lane: (h as u32) << 16 == zip with a zero u16 below it
+        for r in 0..4 {
+            let h = vld1q_u16(b[r].add(j));
+            let lo = vreinterpretq_f32_u16(vzip1q_u16(z, h));
+            let hi = vreinterpretq_f32_u16(vzip2q_u16(z, h));
+            c0 = vfmaq_f32(c0, lo, va[r]);
+            c1 = vfmaq_f32(c1, hi, va[r]);
+        }
+        vst1q_f32(crow.add(j), c0);
+        vst1q_f32(crow.add(j + 4), c1);
+        j += 8;
+    }
+    while j < j1 {
+        let cj = crow.add(j);
+        let mut v = *cj;
+        for r in 0..4 {
+            v = av[r].mul_add(bf16_bits_to_f32(*b[r].add(j)), v);
+        }
+        *cj = v;
+        j += 1;
+    }
+}
+
+/// #327: m==1 GEMV over a COLUMN range [j0, j1) — the unit of the decode
+/// column split. Same ascending-kk per-element fma accumulation as
+/// `matmul_tile_bf16`, so any disjoint column partition is bit-identical to
+/// the serial kernel.
+#[inline]
+unsafe fn matmul_tile_bf16_cols(a: *const f32, b: *const u16, c: *mut f32,
+                                k: usize, n: usize, j0: usize, j1: usize) {
+    for j in j0..j1 { *c.add(j) = 0.0; }
+    let mut kk = 0;
+    #[cfg(target_arch = "aarch64")]
+    while kk + 4 <= k {
+        bf16_fma_rows4(
+            [*a.add(kk), *a.add(kk + 1), *a.add(kk + 2), *a.add(kk + 3)],
+            [b.add(kk * n), b.add((kk + 1) * n), b.add((kk + 2) * n), b.add((kk + 3) * n)],
+            c, j0, j1);
+        kk += 4;
+    }
+    while kk < k {
+        let av = *a.add(kk);
+        let brow = b.add(kk * n);
+        bf16_fma_row(av, brow, c, j0, j1);
+        kk += 1;
+    }
+}
+
 unsafe fn matmul_tile_bf16(a: *const f32, b: *const u16, c: *mut f32,
                            k: usize, n: usize, i0: usize, i1: usize) {
     for i in i0..i1 {
-        let crow = c.add(i * n);
-        for j in 0..n { *crow.add(j) = 0.0; }
-        let arow = a.add(i * k);
-        for kk in 0..k {
-            let av = *arow.add(kk);
-            let brow = b.add(kk * n);
-            for j in 0..n {
-                let bv = bf16_bits_to_f32(*brow.add(j));
-                let cj = crow.add(j);
-                *cj = av.mul_add(bv, *cj);
-            }
-        }
+        matmul_tile_bf16_cols(a.add(i * k), b, c.add(i * n), k, n, 0, n);
     }
 }
 
@@ -18704,6 +19098,115 @@ fn npz_fill(dst: *mut u8, src: &[u8], convert: i64) {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+/// #327 re-measure on M5: single-core bf16 GEMV bandwidth and the 2-way
+/// column split (`cargo test --release -- --ignored --nocapture
+/// cpu_bf16_gemv_bench`). The original keep-it-serial decision was measured
+/// on a machine where one core saturates the fabric; on M5 Air one core gets
+/// ~74 of ~153 GB/s, so re-check before trusting it.
+#[cfg(test)]
+mod bf16_bench {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn cpu_bf16_gemv_bench() {
+        let (k, n) = (2560usize, 9728usize); // the FFN GEMV shape
+        let bytes = k * n * 2;
+        let a: Vec<f32> = (0..k).map(|i| (i % 13) as f32 * 0.1).collect();
+        let b: Vec<u16> = (0..k * n).map(|i| 0x3f00 | (i as u16 & 0x7f)).collect();
+        let mut c: Vec<f32> = vec![0.0; n];
+
+        // streaming-read ceiling: sum all weight bytes as u64 words
+        {
+            let mut acc = 0u64;
+            let words = bytes / 8;
+            let p = b.as_ptr() as *const u64;
+            let t0 = Instant::now();
+            let reps = 20;
+            for _ in 0..reps {
+                for i in 0..words { acc = acc.wrapping_add(unsafe { p.add(i).read() }); }
+            }
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            eprintln!("streaming u64 read ceiling: {:.1} GB/s (acc={acc})",
+                bytes as f64 / 1e9 / (us / 1e6));
+        }
+
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            f();
+            let t0 = Instant::now();
+            let reps = 50;
+            for _ in 0..reps { f(); }
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            eprintln!("{label}: {us:.1} us, {:.1} GB/s", bytes as f64 / 1e9 / (us / 1e6));
+        };
+
+        // NEON wide-load read ceiling: 64B/iter, 4 independent accumulators
+        #[cfg(target_arch = "aarch64")]
+        time("neon vld1q x4 read ceiling", &mut || unsafe {
+            use core::arch::aarch64::*;
+            let mut acc0 = vdupq_n_u16(0);
+            let mut acc1 = vdupq_n_u16(0);
+            let mut acc2 = vdupq_n_u16(0);
+            let mut acc3 = vdupq_n_u16(0);
+            let words = (k * n) & !31;
+            let mut i = 0;
+            while i < words {
+                let p = b.as_ptr().add(i);
+                acc0 = veorq_u16(acc0, vld1q_u16(p));
+                acc1 = veorq_u16(acc1, vld1q_u16(p.add(8)));
+                acc2 = veorq_u16(acc2, vld1q_u16(p.add(16)));
+                acc3 = veorq_u16(acc3, vld1q_u16(p.add(24)));
+                i += 32;
+            }
+            std::hint::black_box((acc0, acc1, acc2, acc3));
+        });
+
+        time("gemv serial (matmul_tile_bf16)", &mut || unsafe {
+            matmul_tile_bf16(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), k, n, 0, 1);
+        });
+
+        // bit-exactness pin: the (possibly NEON) kernel must match the plain
+        // scalar chain exactly, element for element
+        {
+            let mut cref: Vec<f32> = vec![0.0; n];
+            for kk in 0..k {
+                let av = a[kk];
+                for j in 0..n {
+                    cref[j] = av.mul_add(bf16_bits_to_f32(b[kk * n + j]), cref[j]);
+                }
+            }
+            for j in 0..n {
+                assert_eq!(c[j].to_bits(), cref[j].to_bits(), "mismatch at column {j}");
+            }
+            eprintln!("bit-exactness vs scalar reference: OK");
+        }
+
+        // 2- and 4-way column split: disjoint contiguous j-ranges, ascending-kk
+        // accumulation per element — bit-identical to serial by construction
+        for ways in [2usize, 4] {
+            let label = format!("gemv {ways}-way column split");
+            time(&label, &mut || {
+                let (pa, pb, pc) = (a.as_ptr() as usize, b.as_ptr() as usize, c.as_mut_ptr() as usize);
+                std::thread::scope(|s| {
+                    let chunk = (n / ways + 15) & !15;
+                    let mut j0 = 0;
+                    while j0 < n {
+                        let j1 = (j0 + chunk).min(n);
+                        s.spawn(move || unsafe {
+                            matmul_tile_bf16_cols(
+                                pa as *const f32, pb as *const u16, pc as *mut f32,
+                                k, n, j0, j1);
+                        });
+                        j0 = j1;
+                    }
+                });
+            });
+        }
+        eprintln!("checksum c[0]={} c[n-1]={}", c[0], c[n - 1]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -22902,6 +23405,20 @@ fn main() -> i64 {
     }
 
     #[test]
+    fn jit_zero_arg_explicit_shape_brackets() {
+        // Zero-arg templates have no call args to infer from — the explicit
+        // brackets (positional and named forms) are the only dim source.
+        // Both backends must bind them: 4*10 + 5 = 45.
+        assert_jit_eq_interp(r#"
+            fn f[S]() -> i64 {
+                let m = forge.zeros[f32, [S, S]]
+                (sum(m) as i64) + S
+            }
+            fn main() -> i64 { f[4]() * 10 + f[S=5]() }
+        "#);
+    }
+
+    #[test]
     fn jit_mini_raymarch_matches_interp() {
         // forge.zeros + reshape + both-axis broadcast + `.^` + comparison
         // mask + `\>` + `while` tensor accumulator + sum — the whole
@@ -25079,8 +25596,15 @@ fn main() -> i64 {
     fn jit_match_no_arm_exits_cleanly() {
         // A non-exhaustive match with no matching arm must exit(1) with a
         // diagnostic, not SIGILL (exit 132). Subprocess like the OOB trap test.
+        //
+        // The arms are GUARDED, and that is deliberate. This used to be
+        // `match x { 0 => 10, 1 => 11 }`, which `dmc jit` no longer reaches:
+        // since #478 step 1 it type-checks first, and the checker rejects a
+        // statically non-exhaustive match before lowering. Guards are opaque to
+        // the exhaustiveness analysis, so this still gets all the way to the
+        // runtime trap — which is the thing under test.
         use std::process::Command;
-        let src = "fn main() -> i64 { let x = 5  match x { 0 => 10, 1 => 11 } }";
+        let src = "fn main() -> i64 { let x = 5  match x { n if n > 100 => 10, n if n > 200 => 11 } }";
         let tmp = std::env::temp_dir().join("dmc_match_trap_test.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
         let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
@@ -25090,6 +25614,50 @@ fn main() -> i64 {
             "expected exit 1 (clean no-arm error), got {:?}\nstderr: {}",
             out.status.code(), String::from_utf8_lossy(&out.stderr));
         assert!(String::from_utf8_lossy(&out.stderr).contains("no arm matched"));
+
+        // And the statically-provable case is now caught BEFORE lowering.
+        let src2 = "fn main() -> i64 { let x = 5  match x { 0 => 10, 1 => 11 } }";
+        let tmp2 = std::env::temp_dir().join("dmc_match_static_test.dmc");
+        std::fs::write(&tmp2, src2).expect("write temp file");
+        let out2 = Command::new(&bin).args(["jit", tmp2.to_str().unwrap()]).output().expect("run dmc");
+        assert_eq!(out2.status.code(), Some(1));
+        let err2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            err2.contains("not exhaustive"),
+            "`dmc jit` should type-check before lowering (#478 step 1), got: {}", err2,
+        );
+    }
+
+    #[test]
+    fn jit_cli_refuses_type_invalid_programs() {
+        // #478 step 1. `dmc jit` used to lower raw AST with no type check, so
+        // it ACCEPTED AND RAN programs `dmc --check` rejects — this one printed
+        // `=> 1`. That made `--check` necessary-but-not-sufficient in both
+        // directions, and left the JIT unable to rely on any property the
+        // checker establishes, which is what a type-directed fix for #478
+        // needs. Measured before the change: every corpus example passes
+        // `--check`, so nothing that used to work was rejected.
+        //
+        // Subprocess, because the hole was in the CLI path specifically — the
+        // in-process `Jit` API still lowers unchecked AST by design (that is
+        // what `jit_run_i64` and the whole test battery above rely on).
+        use std::process::Command;
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
+        if !bin.exists() { return; }
+        let tmp = std::env::temp_dir().join("dmc_jit_typecheck_test.dmc");
+        std::fs::write(&tmp, "fn main() -> i64 { let z: str = 5  1 }").expect("write temp file");
+        let out = Command::new(&bin).args(["jit", tmp.to_str().unwrap()]).output().expect("run dmc");
+        assert_eq!(
+            out.status.code(), Some(1),
+            "`dmc jit` ran a type-invalid program; stdout: {}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("type error"), "expected a type error, got: {}", err);
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("=> "),
+            "the program still produced a value",
+        );
     }
 
     #[test]

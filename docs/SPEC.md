@@ -436,10 +436,11 @@ port_close(p: Port[L]) -> (nil, Err)
 
 The interpreter implements the `python` process port: `name` is a dotted
 import path (`math.sqrt`, `json.dumps`) or a bare builtin name, the
-JSON-decoded `payload` is the single argument, and the result is re-encoded
-to canonical JSON. Other runtimes report a `port-open` error. The JIT does
-not lower port calls. Semantics, the value boundary, and the error tags are
-specified in `docs/PORTS.md`.
+JSON-decoded `payload` is the call's argument vector — a JSON array of
+positional arguments, or an `{args, kwargs}` object — and the result is
+re-encoded to canonical JSON. Other runtimes report a `port-open` error. The
+JIT does not lower port calls. Semantics, the value boundary, and the error
+tags are specified in `docs/PORTS.md`.
 
 ## 4. Expressions
 

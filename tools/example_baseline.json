@@ -287,6 +287,10 @@
     "jit_ran": 0,
     "pass": 6
   },
+  "examples/port_python.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
   "examples/reel_to_reel.dmc": {
     "jit_ran": 0,
     "pass": 14
