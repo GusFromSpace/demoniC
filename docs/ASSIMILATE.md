@@ -472,9 +472,6 @@ Not yet built:
 - **Introspectors for other runtimes** — only `python` is wired. A `c`
   header parser and others follow.
 - **The §5.2 extern altitude** — `runtime: c` → `extern fn` bindings.
-- **JIT lowering of port calls.** Generated wrappers run on the
-  interpreter; the JIT does not lower `port_open`/`port_call`/`port_close`
-  yet (`PORTS.md §2`).
 
 ---
 

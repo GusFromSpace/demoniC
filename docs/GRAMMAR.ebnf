@@ -119,11 +119,10 @@ shape_elem    = "_" | "?"        (* dynamic dim (SPEC.md §3.2 (Tensors)) — tw
 
 expr          = pipe_expr ;
 
-pipe_expr     = logic_or { ( "\\|>" | "|>" | ">>" ) logic_or } ;
-                              (* one operator, three spellings. `\|>` is        *)
+pipe_expr     = logic_or { ( "\\|>" | "|>" ) logic_or } ;
+                              (* one operator, two spellings. `\|>` is          *)
                               (* canonical (TOKENIZER.md §2); the lexer folds   *)
-                              (* the bare `|>` onto the same token and the      *)
-                              (* parser folds `>>` onto the same node.          *)
+                              (* the bare `|>` onto the same token.             *)
 logic_or      = logic_and { "||" logic_and } ;
 logic_and     = compare   { "&&" compare } ;
 compare       = equality    { ("<"|"<="|">"|">="|".<"|".<="|".>"|".>=") equality } ;
@@ -132,7 +131,9 @@ range_e       = bitwise_or  [ ( ".." | "..=" ) bitwise_or ] ;
 bitwise_or    = bitwise_xor { "|" bitwise_xor } ;
 bitwise_xor   = bitwise_and { "^" bitwise_and } ;
 bitwise_and   = bitshift    { "&" bitshift } ;
-bitshift      = sum         { "<<" sum } ;
+bitshift      = sum         { ( "<<" | ">>" ) sum } ;
+                              (* `>>` is the arithmetic right shift;            *)
+                              (* neither shift has a compound-assign form.      *)
 sum           = product   { ( "+" | "-" | ".+" | ".-" ) product } ;
 product       = matmul    { ( "*" | "/" | "%" | ".*" | "./" ) matmul } ;
 matmul        = power     { "@" power } ;
@@ -238,7 +239,7 @@ flt_suffix    = "f16" | "bf16" | "tf32" | "f32" | "f64"
 str_lit       = '"' { str_char | escape } '"' ;
 char_lit      = "c" '"' ( str_char | escape ) '"' ;   (* exactly one Unicode scalar *)
 byte_lit      = "b" "'" ( str_char | escape ) "'" ;   (* one byte 0-255; SPEC.md §2.4 (Literals) *)
-escape        = "\\" ( "n" | "r" | "t" | "\\" | '"' | "0" ) ;
+escape        = "\\" ( "n" | "r" | "t" | "\\" | '"' | "'" | "0" ) ;
 
 (* Newline / expression-continuation rules:                                *)
 (*   • Newlines act as statement terminators inside blocks.                *)
@@ -250,7 +251,7 @@ escape        = "\\" ( "n" | "r" | "t" | "\\" | '"' | "0" ) ;
 (*   • Example (valid — `.-` leads the second line):                       *)
 (*       let nx = sdf(px + e, py)                                          *)
 (*             .- sdf(px - e, py)                                          *)
-(*   • See also: pipe operators `|>` and `>>` — these also cross newlines. *)
+(*   • See also: the pipe operator `\|>` — it also crosses newlines.      *)
 
 (* Whitespace, comments, newline handling and tokenizer-stability         *)
 (* requirements are in SPEC.md §0 (Conventions), §2.1 (Comments), and     *)

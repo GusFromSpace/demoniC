@@ -60,7 +60,7 @@ fn main() -> nil {
 
 ```
 $ dmc run example.dmc
-0.003987707299529575
+0.003987707197666168
 ```
 
 `@grad` generates the backward pass; `loss.fwd_bwd` returns the loss and a
@@ -74,7 +74,7 @@ Points where demoniC differs from what its syntax may suggest:
   data are immutable.
 - Elementwise tensor arithmetic is dotted (`.+ .- .* ./`); bare `+` on
   tensors is an error. `@` is matrix multiply, `'` is postfix transpose.
-- `**` is power; `^` is XOR. `>>` is a pipe operator, not right shift.
+- `**` is power; `^` is XOR. `>>` is the arithmetic right shift, not a pipe.
 - Allocation goes through arenas (`forge`, `vault`, `stream`) with
   bump-pointer semantics; there is no garbage collector.
 

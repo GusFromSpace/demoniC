@@ -113,7 +113,7 @@
   },
   "examples/demonic_lexer.dmc": {
     "jit_ran": 0,
-    "pass": 36
+    "pass": 38
   },
   "examples/demonivm.dmc": {
     "jit_ran": 0,
@@ -203,13 +203,17 @@
     "jit_ran": 3,
     "pass": 3
   },
+  "examples/grad_fit_jit.dmc": {
+    "jit_ran": 4,
+    "pass": 4
+  },
   "examples/grad_lifetime.dmc": {
     "jit_ran": 2,
     "pass": 2
   },
   "examples/gradcheck.dmc": {
     "jit_ran": 0,
-    "pass": 21
+    "pass": 28
   },
   "examples/haruspex.dmc": {
     "jit_ran": 0,
@@ -218,6 +222,10 @@
   "examples/impossible_attention.dmc": {
     "jit_ran": 3,
     "pass": 3
+  },
+  "examples/int_widths.dmc": {
+    "jit_ran": 10,
+    "pass": 10
   },
   "examples/jit_autodiff_demo.dmc": {
     "jit_ran": 8,
@@ -300,8 +308,8 @@
     "pass": 9
   },
   "examples/port_python.dmc": {
-    "jit_ran": 11,
-    "pass": 11
+    "jit_ran": 17,
+    "pass": 17
   },
   "examples/reel_to_reel.dmc": {
     "jit_ran": 0,

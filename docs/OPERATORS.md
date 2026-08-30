@@ -22,7 +22,7 @@ third column.
 |   15 | `@`                                          | left  |
 |   14 | `.*` `./` `*` `/` `%`                        | left  |
 |   13 | `.+` `.-` `+` `-`                            | left  |
-|   12 | `<<` (bitwise left shift)                    | left  |
+|   12 | `<<` `>>` (bitwise shifts)                   | left  |
 |   11 | `&` (bitwise AND)                            | left  |
 |   10 | `^` (bitwise XOR)                            | left  |
 |    9 | `\|` (bitwise OR)                            | left  |
@@ -31,7 +31,7 @@ third column.
 |    6 | `<` `<=` `>` `>=`                            | none  |
 |    5 | `&&`                                         | left  |
 |    4 | `\|\|`                                       | left  |
-|    3 | `>>` `\|>`                                   | left  |
+|    3 | `\|>` (pipe / chain)                         | left  |
 |    2 | `<-` (stream append)                         | right |
 |    1 | `=` `:=` `+=` `-=` `*=` `/=` `&=` `\|=` `^=` | right |
 
@@ -98,15 +98,18 @@ documented in `STDLIB.md`.
 
 ---
 
-## 4. Pipe / chain: `\|>` and `>>`
+## 4. Pipe / chain: `\|>`
 
 ```
 y = x \|> ln \|> linear[d, 4d] \|> \> \|> linear[4d, d]
 ```
 
 `x \|> f` ≡ `f(x)`. Chained elementwise ops fuse into a single kernel
-pass. `\|>` and `>>` are identical; pick the one that reads better in
-context.
+pass. `\|>` is canonical; the bare `|>` is the same operator and the same
+node — `dmcfmt` normalizes it to `\|>` (`TOKENIZER.md §2–§3`).
+
+`>>` is not a pipe spelling. It is the arithmetic right shift (§8a), so
+`x >> f` is a shift on an integer, never a pipe.
 
 ---
 
@@ -161,19 +164,43 @@ let y_f32 = y as f32
 
 ---
 
-## 8a. Bitwise operators: `&`, `|`, `^`, `<<`
+## 8a. Bitwise operators: `&`, `|`, `^`, `<<`, `>>`
 
-Operate on integer scalar types only (`i8`–`i64`, `u8`–`u64`).
+Operate on integer scalar types only (`i8`–`i64`, `u8`–`u64`). Scalar only —
+neither shift broadcasts over a tensor.
 
 | Op   | Math           | Notes                                  |
 | ---- | -------------- | -------------------------------------- |
 | `~`  | bitwise NOT    | prefix; integer types only             |
 | `<<` | left shift     | fills zeros on the right               |
+| `>>` | right shift    | **arithmetic**: the sign bit is copied in on the left, so `-8 >> 1` is -4 and `-1 >> n` is -1. It floors; `-7 >> 1` is -4 while `-7 / 2` is -3. |
 | `&`  | bitwise AND    |                                        |
 | `^`  | bitwise XOR    | **not** power; power is `**` / `.^`    |
 | `\|` | bitwise OR     |                                        |
 
-Compound assignment forms: `&=`, `|=`, `^=`. There is no `<<=` compound-assignment form.
+The **shift amount must be in `0..=w-1`**, where `w` is the width of the left
+operand's type: `0..=63` for an `i64` — the type an unsuffixed integer literal
+adopts — and `0..=31` for an `i32`. Outside that range the JIT rejects a
+literal count at compile time and traps a computed one, naming the range it
+judged that count against; never a silent mod-`w` wrap. The interpreter raises
+a clean runtime error against the same range.
+
+**A shift is performed at the left operand's width.** An `i32` shift is a
+32-bit shift and keeps the low 32 bits, exactly as `i32` `+` and `*` already
+wrap:
+
+```dmc
+let a: i32 = 1
+let n: i32 = 31
+let x = a << n        # -2147483648 — i32::MIN, on both backends
+```
+
+Both backends answer at the operand's width, so a narrow shift is a parity
+case and not a backend split. `i32` and `i64` are the only integer widths the
+JIT compiles; the narrower kinds are refused outright, never silently widened.
+
+Compound assignment forms: `&=`, `|=`, `^=`. There is no `<<=` or `>>=`
+compound-assignment form.
 
 ---
 
@@ -235,7 +262,7 @@ The lexer accepts no-space variants; the formatter normalizes.
 | `::`            | Unused; modules ship via `use ... as alias` + dot access (`SPEC.md §6.6`, Modules and imports). |
 | `++` `--`       | Use `+= 1`.                                               |
 | `*` on tensors  | Scalar multiply — gives a type error on tensors. Use `.*` |
-| `>>` bitshift   | `>>` is the compose-pipe, not right-shift (no right-shift exists). |
+| `>>=` `<<=`     | No compound-assignment form for either shift. Write `x = x >> n`. |
 
 ---
 
@@ -273,8 +300,7 @@ idiom `x .- \>x` (i.e., `x - max(x,0) = min(x,0)`).
 | You want                | Operator | Example                      |
 | ----------------------- | -------- | ---------------------------- |
 | Pipe value into fn      | `\|>`    | `x \|> softmax`              |
-| Same, alternate form    | `>>`     | `x >> softmax` (NOT bitshift) |
 | Matmul                  | `@`      | `q @ k'`                     |
 | Transpose               | `'`      | `k'` (postfix)               |
 
-**`>>` is NOT right-shift** — demoniC has no right-shift operator. `>>` is the compose-pipe, identical to `|>`. Writing `x >> 2` (a value, not a callable, on the right) is a **check-time error** with a hint, instead of failing at runtime. For an elementwise stage, pipe into a `_`-placeholder: `x |> _ .+ y`.
+**`>>` is the right shift, not a pipe** — it is the arithmetic right shift (§8a), so `x >> 2` means what it looks like. Piping into a *value* rather than a callable (`x \|> 2`) is a check-time error with a hint; for an elementwise stage, pipe into a `_`-placeholder: `x \|> _ .+ y`.

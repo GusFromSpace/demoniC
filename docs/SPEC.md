@@ -109,7 +109,8 @@ Recognized as single tokens by the lexer:
 - `?` — **propagate**, on `(T, Err)`-returning calls (§4.9).
 - `~` — **streaming axis marker** inside a shape literal (§3.6); in expression
   position, prefix **bitwise NOT** on integer scalars.
-- `**` is power; `^` is XOR. `>>` is the pipe operator (§4.6), not right shift.
+- `**` is power; `^` is XOR. `>>` is the arithmetic right shift
+  (`OPERATORS.md §8a`), not a pipe.
 
 ### 2.6 Directives
 
@@ -321,9 +322,12 @@ let f: fn(i64, i64) -> i64 = map_get(env, "+")
 f(10, 3)   # => 13
 ```
 
-Without the annotation, `map_get` returns a plain `i64` and a call expression
-is rejected at compile time. Both non-capturing and capturing closures are
-supported in `dmc run` and `dmc jit`.
+The annotation is **required for `dmc jit`** and optional under `dmc run`.
+Without it, `map_get` returns a plain `i64`: `dmc --check` still passes and
+the interpreter still dispatches the call (the example above prints `13`
+unannotated), but the JIT refuses the program with `jit unsupported: unknown
+function`. Annotate it, and both backends accept it. Both non-capturing and
+capturing closures are supported in `dmc run` and `dmc jit`.
 
 ### 3.6 Streaming types (KV caches)
 
@@ -540,7 +544,9 @@ panic.
 - `.+  .-  .*  ./` — broadcasted elementwise arithmetic. Bare `+ - * /` on
   tensors is an error; elementwise tensor ops are always dotted.
 - `.>  .<  .>=  .<=` — elementwise comparison, producing a 0.0/1.0 mask.
-- `\>(x)` — ReLU (prefix). `\<(x)` — inverted ReLU.
+- `\>(x)` — ReLU (prefix). `\<(x)` — GeLU (prefix), the tanh
+  approximation; **not** min-with-zero. For the negative clamp write
+  `x .- \>x` (`OPERATORS.md §3`).
 - `**` — power on scalars. `^` is XOR, not power.
 
 ### 4.5 Pattern matching
@@ -610,8 +616,12 @@ everything and binds a new `TOK_EQ`. Discriminate with literal arms
 
 ### 4.6 Pipe / chain
 
-`x \|> f` and `x >> f` are equivalent: they pass `x` as `f`'s argument.
-Chains of elementwise ops fuse into a single kernel pass.
+`x \|> f` ≡ `f(x)`. `\|>` is canonical; the bare `|>` is an accepted
+alternate spelling the formatter normalizes (`TOKENIZER.md §2–§3`). Chains
+of elementwise ops fuse into a single kernel pass.
+
+`>>` is not a spelling of this operator. It is the arithmetic right shift
+(`OPERATORS.md §8a`).
 
 ### 4.7 Control flow as expressions
 

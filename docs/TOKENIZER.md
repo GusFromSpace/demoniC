@@ -44,9 +44,9 @@ sequence:
 | `.^`     | `.^`            |                                          |
 | `.**`    | `.**`           |                                          |
 | `\|>`    | ` \|> ` (spaces required) | reads as pipe in every Julia-aware tokenizer |
-| `>>`     | ` >> ` (spaces required) | otherwise risks fusing into `>>=` or shift |
+| `>>`     | ` >> ` (spaces required) | right shift; the spaces keep it off `>>=`, which is not a demoniC token |
 | `<-`     | ` <- ` (spaces required) | distinct from `<=` and `->`              |
-| `?`      | `?`             | postfix only; the lexer rejects `??`     |
+| `?`      | `?`             | postfix only. `??` is not an operator: it parses as two postfix `?` applications, so it passes `--check` and fails at runtime on the second one |
 | `~`      | `~`             | legal inside shape literals; also a prefix bitwise-NOT in expression position (`~x` on an integer scalar) |
 | `<<`     | `<<`            | left shift; always 2 tokens             |
 | `..` `..=` | `..` / `..=` | distinct from `.+`, `.*` by following char |
