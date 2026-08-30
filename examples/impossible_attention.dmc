@@ -1,8 +1,9 @@
 # impossible_attention.dmc
 # Demonstrates:
 # 1. Native KV cache streams with zero-allocation `<-` appends.
-# 2. Stacked directives: bit-exact (@deterministic), mixed-precision (@cast),
-#    and guaranteed single-pass execution without main memory roundtrips (@fuse).
+# 2. Stacked directives: bit-exact (@deterministic) and mixed-precision (@cast).
+#    (`@fuse` is absent on purpose: its single-kernel contract is enforced, and
+#    this body — matmuls, softmax, `let` intermediates — is `fuse-infeasible`.)
 
 fn attention_step[B, H, D](
     q: Tensor[f32, [B, H, 1, D]],
@@ -21,8 +22,10 @@ fn attention_step[B, H, D](
     # 2. Stacked JIT Directives:
     #   @deterministic: Guarantees bit-exact math (forces fixed reduction orders).
     #   @cast(bf16): Automatically dequantizes inputs if needed, runs all math in bf16, casts back out.
-    #   @fuse: Refuses to compile if the JIT can't collapse this block into a single kernel pass.
-    @deterministic @cast(bf16) @fuse {
+    # No @fuse here: the enforced fuse-infeasible analysis refuses a body
+    # the JIT cannot collapse into one kernel — and matmul +
+    # softmax with `let` intermediates is exactly that.
+    @deterministic @cast(bf16) {
         # `q @ k_cache'` does Batched Matmul. The `'` operator transposes the last two dims.
         # The KV stream implicitly converts to a frozen View for this read-only math.
         let scores = (q @ k_cache') .* (1.0 / sqrt(D as f32))

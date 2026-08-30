@@ -71,6 +71,52 @@ fn precedence_matmul_then_dotmul() {
     } else { panic!() }
 }
 
+/// #530: `>>` parses as `BinOp::BitShr` — the mirror of `<<`/`BitShl`, and
+/// NOT the pipe-era `BinOp::RShift`, which ruling S16 keeps unconstructible.
+#[test]
+fn right_shift_parses_as_bitshr() {
+    let p = parse("fn t() -> nil { let _ = a >> b; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            match &l.value {
+                Expr::BinOp { op: BinOp::BitShr, .. } => {}
+                other => panic!("expected BitShr at top, got {:?}", other),
+            }
+        } else { panic!() }
+    } else { panic!() }
+}
+
+/// `>>` sits at the bitshift level with `<<` (OPERATORS §1, row 12): looser
+/// than `+`, tighter than `&`. Both neighbours are asserted, so a `>>` arm
+/// added at the wrong rung — the pipe level it used to occupy, say — fails.
+#[test]
+fn right_shift_binds_below_sum_and_above_bitand() {
+    // `a + b >> c` is `(a + b) >> c`.
+    let p = parse("fn t() -> nil { let _ = a + b >> c; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            match &l.value {
+                Expr::BinOp { op: BinOp::BitShr, lhs, .. } =>
+                    assert!(matches!(**lhs, Expr::BinOp { op: BinOp::Add, .. }),
+                            "expected `+` under the shift, got {:?}", lhs),
+                other => panic!("expected BitShr at top, got {:?}", other),
+            }
+        } else { panic!() }
+    } else { panic!() }
+    // `a & b >> c` is `a & (b >> c)`.
+    let p = parse("fn t() -> nil { let _ = a & b >> c; nil }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Stmt::Let(l) = &f.body.stmts[0] {
+            match &l.value {
+                Expr::BinOp { op: BinOp::BitAnd, rhs, .. } =>
+                    assert!(matches!(**rhs, Expr::BinOp { op: BinOp::BitShr, .. }),
+                            "expected the shift under `&`, got {:?}", rhs),
+                other => panic!("expected BitAnd at top, got {:?}", other),
+            }
+        } else { panic!() }
+    } else { panic!() }
+}
+
 #[test]
 fn transpose_postfix() {
     let p = parse("fn t() -> nil { let _ = k'; nil }");
@@ -203,6 +249,120 @@ fn b3_dynamic_shape_wildcard() {
     } else {
         panic!("expected fn");
     }
+}
+
+// ── S3: `_` is not a dimension (#501) ────────────────────────────────────────
+
+/// `_` in a *type*'s shape was a second spelling of `?`. It is gone; the
+/// diagnostic names the survivor.
+#[test]
+fn underscore_dim_in_type_is_rejected_501() {
+    let e = parse_err("fn rows(x: Tensor[f32, [_, _]]) -> i64 { 1 }");
+    assert_eq!(e, "`_` is not a dimension; a dynamic dim is `?`");
+}
+
+/// The rejection is about shape position, not about `Tensor`: `View` and `KV`
+/// share the production and reject it identically.
+#[test]
+fn underscore_dim_rejected_in_view_and_kv_501() {
+    for src in [
+        "fn v(x: View[f32, [_, 4]]) -> i64 { 1 }",
+        "fn k(c: KV[f32, [_, ~, 4]]) -> i64 { 1 }",
+    ] {
+        assert_eq!(parse_err(src), "`_` is not a dimension; a dynamic dim is `?`", "for {src}");
+    }
+}
+
+/// The break is about the spelling, not about first position: `_` is rejected
+/// wherever it hides inside a type's shape element, not only as its lead token.
+#[test]
+fn underscore_dim_rejected_in_non_leading_position_501() {
+    for src in [
+        "fn f(x: Tensor[f32, [(_), 2]]) -> i64 { 1 }",
+        "fn f(x: Tensor[f32, [1 + _, 2]]) -> i64 { 1 }",
+        "fn f(x: Tensor[f32, [2, -_]]) -> i64 { 1 }",
+        "fn f(x: Tensor[f32, [2 * (3 + _)]]) -> i64 { 1 }",
+    ] {
+        assert_eq!(parse_err(src), "`_` is not a dimension; a dynamic dim is `?`", "for {src}");
+    }
+}
+
+/// …and the guard is scoped to types: the same shapes in *pattern* position are
+/// a different production and keep parsing.
+#[test]
+fn underscore_inside_shape_pattern_expr_still_parses_501() {
+    parse(r#"
+        fn t[S](x: Tensor[f32, [2, S, 768]]) -> nil {
+            match x.shape {
+                [1 + _, S, 768] => print("ok"),
+                _               => panic("drift"),
+            }
+            nil
+        }
+    "#);
+}
+
+/// The survivor still parses to the same node it always did.
+#[test]
+fn query_dim_still_parses_501() {
+    let p = parse("fn rows(x: Tensor[f32, [?, 4]]) -> i64 { 1 }");
+    if let Item::Fn(f) = &p.items[0] {
+        match f.params[0].ty.as_ref().expect("param is annotated") {
+            Type::Tensor(_, shape, _) => {
+                assert!(matches!(shape.elems[0], ShapeElem::Wildcard(_)));
+                assert!(matches!(shape.elems[1], ShapeElem::Expr(_)));
+            }
+            other => panic!("expected a tensor type, got {other:?}"),
+        }
+    } else { panic!("expected fn") }
+}
+
+/// Regression: `_` in *shape-pattern* position is a different production and is
+/// untouched — `examples/slice.dmc:20` matches on `x.shape` this way.
+#[test]
+fn underscore_in_shape_pattern_still_parses_501() {
+    let p = parse(r#"
+        fn t[S](x: Tensor[f32, [2, S, 768]]) -> nil {
+            match x.shape {
+                [_, S, 768] => print("ok"),
+                _           => panic("drift"),
+            }
+            nil
+        }
+    "#);
+    if let Item::Fn(f) = &p.items[0] {
+        if let Some(Stmt::Match(me)) = f.body.stmts.first() {
+            match &me.arms[0].pattern {
+                Pattern::Shape(elems, _) => {
+                    assert!(matches!(elems[0], ShapeElem::Wildcard(_)), "leading `_` stays a wildcard");
+                    assert_eq!(elems.len(), 3);
+                }
+                other => panic!("expected a shape pattern, got {other:?}"),
+            }
+        } else { panic!("expected match stmt") }
+    } else { panic!("expected fn") }
+}
+
+/// Regression: the bare `_` catch-all pattern is untouched.
+#[test]
+fn underscore_catchall_pattern_still_parses_501() {
+    let p = parse("fn t(n: i64) -> i64 { match n { 0 => 1, _ => 2 } }");
+    if let Item::Fn(f) = &p.items[0] {
+        if let Some(Stmt::Match(me)) = f.body.stmts.first() {
+            assert!(matches!(me.arms[1].pattern, Pattern::Wildcard(_)));
+        } else { panic!("expected match stmt") }
+    } else { panic!("expected fn") }
+}
+
+/// Regression: `_` as an *expression* — the pipe-stage placeholder (SPEC §7.6)
+/// — is untouched.
+#[test]
+fn underscore_expr_still_parses_501() {
+    let p = parse("fn t(x: i64) -> i64 { x |> add(_, 1) }");
+    let printed = crate::fmt::pretty_print_program(&p);
+    assert!(printed.contains("add(_, 1)"),
+            "the stage placeholder must survive parse and print, got: {printed}");
+    parse(&printed);
 }
 
 /// B4: `..` rest pattern in match arms (Spec §4.5)
@@ -676,4 +836,56 @@ fn missing_body_brace_names_the_signature_446() {
     let e = parse_err("fn f(a: i64) -> i64\n{\n    a\n}");
     assert!(e.contains("`f`"), "diagnostic must name the fn, got: {e}");
     assert!(e.contains("signature"), "diagnostic must point at the signature, got: {e}");
+}
+
+// ── slicing seam (#501 S6/S7) ────────────────────────────────────────────────
+// Both slicing families are permanent surface (SPEC §4.3, OPERATORS §9), but
+// they do not mix: `..`/`..=` is the unstepped range form, `:` is the
+// stepped/full form. A `..` range in a `:` slice bound used to parse into
+// `IndexElem::Slice { start: Expr::Range, .. }` — check-clean, and fatal only
+// at run time ("slice start must be integer, got range") or in the JIT.
+
+#[test]
+fn range_as_slice_start_is_a_parse_error_501() {
+    let e = parse_err("fn f() -> nil { let b = a[0..100:2]\n nil }");
+    assert!(e.contains("`a[0:100:2]`"), "diagnostic must name the colon form, got: {e}");
+    assert!(e.contains("`a[0..100:2]`"), "diagnostic must name the rejected form, got: {e}");
+}
+
+#[test]
+fn range_as_colon_colon_slice_start_is_a_parse_error_501() {
+    // `x[-1..0::2]` takes the `start::step` shorthand branch.
+    let e = parse_err("fn f() -> nil { let b = a[-1..0::2]\n nil }");
+    assert!(e.contains("`a[0:100:2]`"), "diagnostic must name the colon form, got: {e}");
+}
+
+#[test]
+fn range_as_slice_end_or_step_is_a_parse_error_501() {
+    let end = parse_err("fn f() -> nil { let b = a[0:1..2]\n nil }");
+    assert!(end.contains("`a[0:100:2]`"), "range in end bound must be rejected, got: {end}");
+    let step = parse_err("fn f() -> nil { let b = a[0:4:1..2]\n nil }");
+    assert!(step.contains("`a[0:100:2]`"), "range in step must be rejected, got: {step}");
+    let no_start = parse_err("fn f() -> nil { let b = a[:1..2]\n nil }");
+    assert!(no_start.contains("`a[0:100:2]`"), "start-less form must be rejected, got: {no_start}");
+}
+
+#[test]
+fn both_slicing_families_still_parse_501() {
+    // The ruling keeps both. Neither the range form nor the colon form moves.
+    for src in [
+        "fn f() -> nil { let b = a[0..100]\n nil }",
+        "fn f() -> nil { let b = a[0..=99]\n nil }",
+        "fn f() -> nil { let b = a[0..]\n nil }",
+        "fn f() -> nil { let b = a[.., 3]\n nil }",
+        "fn f() -> nil { let b = a[0:100]\n nil }",
+        "fn f() -> nil { let b = a[0:100:2]\n nil }",
+        "fn f() -> nil { let b = a[:]\n nil }",
+        "fn f() -> nil { let b = a[:50]\n nil }",
+        "fn f() -> nil { let b = a[10:]\n nil }",
+        "fn f() -> nil { let b = a[0::2]\n nil }",
+        "fn f() -> nil { let b = a[.., n - 1::-1, ..]\n nil }",
+    ] {
+        let p = parse(src);
+        assert_eq!(p.items.len(), 1, "must parse: {src}");
+    }
 }

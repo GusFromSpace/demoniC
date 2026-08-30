@@ -44,12 +44,12 @@ fn with_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> 
 }
 
 fn as_int(v: &Value) -> i64 {
-    if let Value::Int(n) = v { *n } else { panic!("expected int, got {:?}", v) }
+    if let Value::Int(n, _) = v { *n } else { panic!("expected int, got {:?}", v) }
 }
 fn as_float(v: &Value) -> f64 {
     match v {
         Value::Float(x, _) => *x,
-        Value::Int(n)   => *n as f64,
+        Value::Int(n, _)   => *n as f64,
         _ => panic!("expected numeric, got {:?}", v),
     }
 }
@@ -579,6 +579,48 @@ fn batched_matmul_with_transpose() {
 }
 
 #[test]
+fn grad_fwd_bwd_loss_honors_the_declared_return_width() {
+    // #473 established that a declared return type is a binding site: an
+    // ordinary call narrows its result to it, so `-> f32 { .. + 0.1 }` hands
+    // back the f32. The `@grad` entry returned the raw tape value instead, so
+    // ONE function produced two different numbers depending on how it was
+    // called — and the JIT, whose tape is f32 throughout, matched only the
+    // plain call. Pin both halves against the same f32 literal.
+    let v = run(r#"
+        @grad fn f(!w: Tensor[f32, [3]]) -> f32 {
+            let s = sum(w)
+            s + 0.1
+        }
+        fn main() -> f32 {
+            let !w = vault.zeros[f32, [3]]
+            w[0] = 1.0  w[1] = 2.0  w[2] = 3.0
+            let (l, _g) = f.fwd_bwd(w)
+            l - f(w)
+        }
+    "#);
+    assert_eq!(as_float(&v), 0.0,
+        "`.fwd_bwd` loss and the plain call must be the same number");
+
+    // And the number itself is the f32 one, not the f64 one: 6 + 0.1 rounds to
+    // 6.0999999046325684 at f32 width, which is NOT 6.1.
+    let l = run(r#"
+        @grad fn f(!w: Tensor[f32, [3]]) -> f32 {
+            let s = sum(w)
+            s + 0.1
+        }
+        fn main() -> f32 {
+            let !w = vault.zeros[f32, [3]]
+            w[0] = 1.0  w[1] = 2.0  w[2] = 3.0
+            let (l, _g) = f.fwd_bwd(w)
+            l
+        }
+    "#);
+    assert_eq!(as_float(&l), 6.1_f32 as f64,
+        "loss must be the f32 value, got {:?}", l);
+    assert_ne!(as_float(&l), 6.1_f64, "loss must not be the f64 value");
+}
+
+#[test]
 fn grad_returns_loss_and_struct_with_param_shaped_tensors() {
     // forward.fwd_bwd(...) → (loss, {!param: grad})
     // Verify the struct has a field named after each `!` param, shaped to match.
@@ -614,6 +656,533 @@ fn grad_reverse_mode_produces_exact_gradients() {
         }
     "#);
     assert!((as_float(&v) - (-8.0)).abs() < 1e-9, "got {:?}", v);
+}
+
+// ── #398: captured `mut` bindings are differentiable inputs ──────────────────
+//          AUTODIFF.md §2. A module-level `let !` read directly in a `@grad fn`
+//          body becomes a tape input; its adjoint comes back in `Grads` under
+//          the binding's own name, alongside the `!` params.
+
+/// The captured-bias program used by the tests below. `tail` is the expression
+/// `main` returns; `l` and `g` are already bound from `loss.fwd_bwd(w, x)`.
+///
+/// L = s · sum((w .* x .+ b)³) with **both** a captured tensor `b` and a
+/// captured scalar `s`, plus the `!` param `w`. At w = [1,2,3], x = [.5,-1,2],
+/// b = [.25,.5,-.75], s = 2: y = [0.75, -1.5, 5.25], sum(y³) = 141.75.
+fn captured_bias_src(tail: &str) -> String {
+    format!(r#"
+        let !b = [0.25f32, 0.5f32, -0.75f32]
+        let !s = 2.0f32
+        fn absf(v: f32) -> f32 {{ if v < 0.0f32 {{ 0.0f32 - v }} else {{ v }} }}
+        @grad fn loss(!w: Tensor[f32,[3]], x: Tensor[f32,[3]]) -> f32 {{
+            let y = w .* x .+ b
+            sum(y .* y .* y) * s
+        }}
+        fn fwd() -> f32 {{
+            let w = [1.0f32, 2.0f32, 3.0f32]
+            let x = [0.5f32, -1.0f32, 2.0f32]
+            loss(w, x)
+        }}
+        fn main() -> f32 {{
+            let w = [1.0f32, 2.0f32, 3.0f32]
+            let x = [0.5f32, -1.0f32, 2.0f32]
+            let (l, g) = loss.fwd_bwd(w, x)
+            {tail}
+        }}
+    "#, tail = tail)
+}
+
+#[test]
+fn grad_captured_mut_tensor_gets_real_gradient_398() {
+    // dL/db = 3y²·s = [3.375, 13.5, 165.375]; dL/ds = sum(y³) = 141.75;
+    // dL/dw = 3y²·x·s = [1.6875, -13.5, 330.75]. All three come back together,
+    // each under its own name — element-exact (every value here is a dyadic
+    // rational, so f32 holds it without rounding).
+    assert!((as_float(&run(&captured_bias_src("l"))) - 283.5).abs() < 1e-9, "loss");
+    assert!((as_float(&run(&captured_bias_src("g.b[0]"))) -   3.375).abs() < 1e-9, "g.b[0]");
+    assert!((as_float(&run(&captured_bias_src("g.b[1]"))) -  13.5  ).abs() < 1e-9, "g.b[1]");
+    assert!((as_float(&run(&captured_bias_src("g.b[2]"))) - 165.375).abs() < 1e-9, "g.b[2]");
+    assert!((as_float(&run(&captured_bias_src("g.s")))    - 141.75 ).abs() < 1e-9, "g.s");
+    assert!((as_float(&run(&captured_bias_src("g.w[0]"))) -   1.6875).abs() < 1e-9, "g.w[0]");
+    assert!((as_float(&run(&captured_bias_src("g.w[1]"))) - (-13.5)).abs() < 1e-9, "g.w[1]");
+    assert!((as_float(&run(&captured_bias_src("g.w[2]"))) - 330.75 ).abs() < 1e-9, "g.w[2]");
+    // The gradient tensor keeps the captured binding's shape.
+    assert_eq!(as_int(&run(&captured_bias_src("let (n,) = g.b.shape  n"))), 3);
+}
+
+#[test]
+fn grad_captured_mut_tensor_matches_finite_differences_398() {
+    // Numeric oracle: central differences taken by perturbing the captured
+    // binding itself, (L(b+h) - L(b-h)) / 2h per element, compared against the
+    // analytic adjoint. h = 1/64 is exact in f32, so the residual is the cubic's
+    // O(h²) truncation (~2e-4·s) plus f32 rounding of L≈283 — comfortably inside
+    // 1e-2, while the gradients being checked are 3.4 … 165.
+    let max_err = as_float(&run(&captured_bias_src(r#"
+        let h = 0.015625f32
+        let !max_err = 0.0f32
+        for i in 0..3 {
+            let base = b[i]
+            b[i] = base + h
+            let lp = fwd()
+            b[i] = base - h
+            let lm = fwd()
+            b[i] = base
+            let numeric = (lp - lm) / (2.0f32 * h)
+            let e = absf(numeric - g.b[i])
+            if e > max_err { max_err = e }
+        }
+        max_err
+    "#)));
+    assert!(max_err < 1e-2,
+            "captured-tensor gradcheck: max |numeric - analytic| = {}", max_err);
+
+    // Teeth: the same finite differences against a deliberately wrong adjoint
+    // (zero — the pre-#398 answer, when the field was absent entirely) must
+    // *exceed* the tolerance. Reported as the smallest per-element |numeric|.
+    let min_numeric = as_float(&run(&captured_bias_src(r#"
+        let h = 0.015625f32
+        let !min_num = 1000000.0f32
+        for i in 0..3 {
+            let base = b[i]
+            b[i] = base + h
+            let lp = fwd()
+            b[i] = base - h
+            let lm = fwd()
+            b[i] = base
+            let numeric = absf((lp - lm) / (2.0f32 * h))
+            if numeric < min_num { min_num = numeric }
+        }
+        min_num
+    "#)));
+    assert!(min_numeric > 1e-2,
+            "gradcheck has no teeth: a zero adjoint would pass (min |numeric| = {})",
+            min_numeric);
+}
+
+#[test]
+fn grad_captured_mut_scalar_matches_finite_differences_398() {
+    // Same oracle for the captured *scalar* `s`: dL/ds = sum(y³) = 141.75.
+    let err = as_float(&run(&captured_bias_src(r#"
+        let h = 0.015625f32
+        let base = s
+        s = base + h
+        let lp = fwd()
+        s = base - h
+        let lm = fwd()
+        s = base
+        let numeric = (lp - lm) / (2.0f32 * h)
+        absf(numeric - g.s)
+    "#)));
+    assert!(err < 1e-2, "captured-scalar gradcheck: |numeric - analytic| = {}", err);
+
+    // Teeth: the numeric slope is nowhere near zero, so a missing/zero `g.s`
+    // could not have passed the comparison above.
+    let numeric = as_float(&run(&captured_bias_src(r#"
+        let h = 0.015625f32
+        let base = s
+        s = base + h
+        let lp = fwd()
+        s = base - h
+        let lm = fwd()
+        s = base
+        absf((lp - lm) / (2.0f32 * h))
+    "#)));
+    assert!(numeric > 1e-2,
+            "gradcheck has no teeth: a zero adjoint would pass (|numeric| = {})", numeric);
+}
+
+#[test]
+fn grad_captured_and_param_land_under_their_own_names_398() {
+    // Param and capture gradients are different numbers here, so a field mixed
+    // up between them fails: L = sum((w .* x .+ b)^2) with x = [2, 2] gives
+    // dL/dw = 2y·x = 2·[4, 8]·2 = [16, 32] and dL/db = 2y = [8, 16].
+    let src = |tail: &str| format!(r#"
+        let !b = [2.0f64, 4.0f64]
+        @grad fn loss(!w: Tensor[f64,[2]], x: Tensor[f64,[2]]) -> f64 {{
+            let y = w .* x .+ b
+            sum(y .* y)
+        }}
+        fn main() -> f64 {{
+            let w = [1.0f64, 2.0f64]
+            let x = [2.0f64, 2.0f64]
+            let (l, g) = loss.fwd_bwd(w, x)
+            {tail}
+        }}
+    "#, tail = tail);
+    assert!((as_float(&run(&src("g.w[0]"))) - 16.0).abs() < 1e-12);
+    assert!((as_float(&run(&src("g.w[1]"))) - 32.0).abs() < 1e-12);
+    assert!((as_float(&run(&src("g.b[0]"))) -  8.0).abs() < 1e-12);
+    assert!((as_float(&run(&src("g.b[1]"))) - 16.0).abs() < 1e-12);
+}
+
+#[test]
+fn grad_param_shadows_same_named_capture_398() {
+    // A `!` param named like a module-level mutable is NOT a capture — the
+    // param shadows it. `g.b` must be the parameter's gradient (computed from
+    // the *argument*, [10, 10]), not the module binding's ([99, 99]) and there
+    // must be exactly one `b` field. dL/db = 2b_arg = [20, 20] → sum 40.
+    let v = run(r#"
+        let !b = [99.0f64, 99.0f64]
+        @grad fn loss(!b: Tensor[f64,[2]]) -> f64 { sum(b .* b) }
+        fn main() -> f64 {
+            let arg = [10.0f64, 10.0f64]
+            let (l, g) = loss.fwd_bwd(arg)
+            sum(g.b)
+        }
+    "#);
+    assert!((as_float(&v) - 40.0).abs() < 1e-12,
+            "param must shadow the same-named capture, got {:?}", v);
+}
+
+#[test]
+fn grad_captured_untaken_branch_is_zero_398() {
+    // Define-by-run (AUTODIFF.md §6.1): the branch that did not execute
+    // contributes nothing, so a capture read only there gets a real zero
+    // gradient of its own shape — not a missing field, and not the other
+    // branch's value.
+    let zero = run(r#"
+        let !b = [3.0f64, 5.0f64]
+        @grad fn loss(!w: Tensor[f64,[2]], take: bool) -> f64 {
+            if take { sum(w .* b) } else { sum(w .* w) }
+        }
+        fn main() -> f64 {
+            let w = [1.0f64, 2.0f64]
+            let (l, g) = loss.fwd_bwd(w, false)
+            sum(g.b)
+        }
+    "#);
+    assert!(as_float(&zero).abs() < 1e-12,
+            "untaken-branch capture must be zero, got {:?}", zero);
+    // The taken branch does give it a gradient: dL/db = w → sum = 3.
+    let taken = run(r#"
+        let !b = [3.0f64, 5.0f64]
+        @grad fn loss(!w: Tensor[f64,[2]], take: bool) -> f64 {
+            if take { sum(w .* b) } else { sum(w .* w) }
+        }
+        fn main() -> f64 {
+            let w = [1.0f64, 2.0f64]
+            let (l, g) = loss.fwd_bwd(w, true)
+            sum(g.b)
+        }
+    "#);
+    assert!((as_float(&taken) - 3.0).abs() < 1e-12,
+            "taken-branch capture gradient, got {:?}", taken);
+}
+
+#[test]
+fn grad_captured_reassigned_in_body_is_wrt_entry_value_398() {
+    // The body reassigns the capture (`b = b .+ b`, which the forward really
+    // performs). The gradient owed is the one w.r.t. the value the call started
+    // from: L = sum(w .* 2b) → dL/db = 2w = [2, 6], sum = 8. Reading the
+    // adjoint off the post-reassignment node would give sum(w) = 4 instead.
+    let v = run(r#"
+        let !b = [1.0f64, 2.0f64]
+        @grad fn loss(!w: Tensor[f64,[2]]) -> f64 {
+            b = b .+ b
+            sum(w .* b)
+        }
+        fn main() -> f64 {
+            let w = [1.0f64, 3.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            sum(g.b)
+        }
+    "#);
+    assert!((as_float(&v) - 8.0).abs() < 1e-12,
+            "capture gradient must be w.r.t. the entry value, got {:?}", v);
+}
+
+#[test]
+fn grad_captured_mut_second_order_398() {
+    // `@grad @grad` + `fwd_bwd_bwd`: with L = s·sum(w·w), the first backward
+    // gives dL/dw = 2sw; the second-order pass reduces it (sum) and
+    // differentiates again, so g.w = 2s = [6, 6] and g.s = 2·sum(w) = 6.
+    let src = |tail: &str| format!(r#"
+        let !s = 3.0f64
+        @grad @grad fn q(!w: Tensor[f64,[2]]) -> f64 {{ sum(w .* w) * s }}
+        fn main() -> f64 {{
+            let w = [1.0f64, 2.0f64]
+            let (l, g) = q.fwd_bwd_bwd(w)
+            {tail}
+        }}
+    "#, tail = tail);
+    assert!((as_float(&run(&src("l"))) - 15.0).abs() < 1e-12, "loss");
+    assert!((as_float(&run(&src("g.w[0]"))) - 6.0).abs() < 1e-12, "g.w[0]");
+    assert!((as_float(&run(&src("g.w[1]"))) - 6.0).abs() < 1e-12, "g.w[1]");
+    assert!((as_float(&run(&src("g.s"))) - 6.0).abs() < 1e-12, "g.s");
+}
+
+#[test]
+fn grad_captured_mut_second_order_without_mut_param_398() {
+    // With no `!` param, the second-order reduction is seeded from the first
+    // captured binding. L = sum(x .* cb .* cb) → dL/dcb = 2x·cb, whose sum
+    // differentiates back to 2x = [2, 6].
+    let src = |tail: &str| format!(r#"
+        let !cb = [1.0f32, 2.0f32]
+        @grad @grad fn q(x: Tensor[f32,[2]]) -> f32 {{ sum(x .* cb .* cb) }}
+        fn main() -> f32 {{
+            let x = [1.0f32, 3.0f32]
+            let (l, g) = q.fwd_bwd_bwd(x)
+            {tail}
+        }}
+    "#, tail = tail);
+    assert!((as_float(&run(&src("l"))) - 13.0).abs() < 1e-9, "loss");
+    assert!((as_float(&run(&src("g.cb[0]"))) - 2.0).abs() < 1e-9, "g.cb[0]");
+    assert!((as_float(&run(&src("g.cb[1]"))) - 6.0).abs() < 1e-9, "g.cb[1]");
+}
+
+#[test]
+fn grad_second_order_seed_without_gradient_is_named_398() {
+    // The second-order seed can legitimately have no first-order adjoint — here
+    // because the capture reaches the loss only as the scalar operand of `*`,
+    // which `backward_symbolic` does not route through (a pre-existing
+    // second-order gap, unrelated to the first-order capture gradients above).
+    // The diagnostic must say which input it was seeding from and admit the
+    // gap, rather than blaming a `!` param that does not exist.
+    let err = run_err(r#"
+        let !s = 3.0f32
+        @grad @grad fn q(x: Tensor[f32,[2]]) -> f32 { sum(x .* x) * s * s }
+        fn main() -> f32 {
+            let x = [1.0f32, 2.0f32]
+            let (l, g) = q.fwd_bwd_bwd(x)
+            l
+        }
+    "#);
+    assert_eq!(
+        err,
+        "@grad `q`: the second-order pass found no first-order gradient for \
+         captured `mut` binding `s` to differentiate again — either the loss \
+         does not depend on it, or its only path to the loss is one the \
+         second-order replay does not cover (the scalar `*` multiplier operand \
+         is the known gap; first order is unaffected)",
+        "unexpected second-order diagnostic",
+    );
+    // First order through exactly the same program is unaffected: dL/ds = 2s·sum(x²) = 30.
+    let v = run(r#"
+        let !s = 3.0f32
+        @grad fn q(x: Tensor[f32,[2]]) -> f32 { sum(x .* x) * s * s }
+        fn main() -> f32 {
+            let x = [1.0f32, 2.0f32]
+            let (l, g) = q.fwd_bwd(x)
+            g.s
+        }
+    "#);
+    assert!((as_float(&v) - 30.0).abs() < 1e-9, "first-order dL/ds, got {:?}", v);
+}
+
+#[test]
+fn grad_capture_resolves_to_the_module_binding_not_a_caller_local_398() {
+    // The interpreter shares one scope stack across calls, so a caller's local
+    // of the capture's name used to be what got taped: the same `@grad fn` over
+    // the same module state returned a different gradient depending on who
+    // called it. `cap` here is [1, 1, 1] in the module and [100, 100, 100] in
+    // `go`'s frame, and dL/dcap = 2·w·cap makes the taped value visible in the
+    // answer — 2 from the module binding, 200 from the caller's local.
+    let src = |caller: &str| format!(r#"
+        let !cap = [1.0f64, 1.0f64, 1.0f64]
+        @grad fn loss(!w: Tensor[f64,[3]]) -> f64 {{ sum(w .* cap .* cap) }}
+        fn direct() -> f64 {{
+            let w = [1.0f64, 1.0f64, 1.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            g.cap[0]
+        }}
+        fn go() -> f64 {{
+            let cap = [100.0f64, 100.0f64, 100.0f64]
+            let w = [1.0f64, 1.0f64, 1.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            g.cap[0]
+        }}
+        fn main() -> f64 {{ {caller}() }}
+    "#, caller = caller);
+    let direct = as_float(&run(&src("direct")));
+    let via_go = as_float(&run(&src("go")));
+    assert!((direct - 2.0).abs() < 1e-12, "module binding is what gets taped, got {}", direct);
+    assert!((via_go - 2.0).abs() < 1e-12,
+            "a caller's same-named local must not be taped under the capture's \
+             name — expected 2.0 (module `cap`), got {} (the caller's local)", via_go);
+}
+
+#[test]
+fn grad_capture_forward_also_reads_the_module_binding_398() {
+    // The companion to the test above: it is not enough for the tape node to
+    // hold the module value while the forward pass reads the caller's local —
+    // that would put a value on the tape that the recorded computation never
+    // used. Both must resolve to the module binding, so the loss agrees too.
+    let src = |caller: &str| format!(r#"
+        let !cap = [1.0f64, 1.0f64, 1.0f64]
+        @grad fn loss(!w: Tensor[f64,[3]]) -> f64 {{ sum(w .* cap) }}
+        fn direct() -> f64 {{
+            let w = [1.0f64, 1.0f64, 1.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            l
+        }}
+        fn go() -> f64 {{
+            let cap = [100.0f64, 100.0f64, 100.0f64]
+            let w = [1.0f64, 1.0f64, 1.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            l
+        }}
+        fn main() -> f64 {{ {caller}() }}
+    "#, caller = caller);
+    assert!((as_float(&run(&src("direct"))) - 3.0).abs() < 1e-12);
+    assert!((as_float(&run(&src("go"))) - 3.0).abs() < 1e-12,
+            "the traced forward must read the module `cap`, not the caller's local");
+}
+
+#[test]
+fn grad_capture_masking_restores_the_callers_local_398() {
+    // Masking the caller's local is scoped to the grad call: `go`'s own `cap`
+    // has to be intact on the line after `fwd_bwd`, and still be its own value.
+    let v = run(r#"
+        let !cap = [1.0f64, 1.0f64, 1.0f64]
+        @grad fn loss(!w: Tensor[f64,[3]]) -> f64 { sum(w .* cap) }
+        fn go() -> f64 {
+            let cap = [100.0f64, 100.0f64, 100.0f64]
+            let w = [1.0f64, 1.0f64, 1.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            sum(cap)
+        }
+        fn main() -> f64 { go() }
+    "#);
+    assert!((as_float(&v) - 300.0).abs() < 1e-12,
+            "the caller's local must survive the grad call unchanged, got {:?}", v);
+}
+
+#[test]
+fn grad_body_local_let_shadows_the_capture_so_no_grads_field_398() {
+    // A body-local `let cap` shadows the module binding: the body never reads
+    // the capture, so there is nothing to tape and no `g.cap` to return. The
+    // old scan looked only at "is this name a module mutable?", so it produced
+    // a phantom field full of zeros for a binding the body never touched.
+    let v = run(r#"
+        let !cap = [5.0f64, 5.0f64, 5.0f64]
+        @grad fn loss(!w: Tensor[f64,[3]]) -> f64 {
+            let cap = [1.0f64, 1.0f64, 1.0f64]
+            sum(w .* cap)
+        }
+        fn main() -> f64 {
+            let w = [1.0f64, 2.0f64, 3.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            sum(g.w)
+        }
+    "#);
+    // The param gradient is the local's value ([1,1,1] → sum 3), not the
+    // module binding's ([5,5,5] → sum 15).
+    assert!((as_float(&v) - 3.0).abs() < 1e-12,
+            "shadowed capture must not reach the tape, got {:?}", v);
+    // And `g.cap` is simply not a field: absent fields read back opaque.
+    let absent = run(r#"
+        let !cap = [5.0f64, 5.0f64, 5.0f64]
+        @grad fn loss(!w: Tensor[f64,[3]]) -> f64 {
+            let cap = [1.0f64, 1.0f64, 1.0f64]
+            sum(w .* cap)
+        }
+        fn main() -> f64 {
+            let w = [1.0f64, 2.0f64, 3.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            g.cap
+        }
+    "#);
+    assert!(matches!(absent, Value::Opaque(_)),
+            "a shadowed module binding must not appear in `Grads`, got {:?}", absent);
+}
+
+#[test]
+fn grad_capture_is_scoped_to_the_fns_own_module_398() {
+    // A flat cross-module name list made an unrelated module's `let !alpha`
+    // enough to turn THIS module's immutable `alpha` into a `Grads` field —
+    // a differentiable input no checker rule ever admitted (the checker does
+    // not even put an imported `pub let !` in scope under its bare name).
+    // `g.alpha` must simply not exist here.
+    let v = run_multi(&[
+        ("lib.dmc", "pub let !alpha = 9.0f64\npub fn touch() -> f64 { alpha }"),
+        ("main.dmc", r#"use "lib.dmc"
+let alpha = 3.0f64
+@grad fn loss(!w: Tensor[f64,[3]]) -> f64 { sum(w .* w) * alpha }
+fn main() -> f64 {
+    let w = [1.0f64, 2.0f64, 3.0f64]
+    let (l, g) = loss.fwd_bwd(w)
+    g.alpha
+}"#),
+    ], "main.dmc");
+    assert!(matches!(v, Value::Opaque(_)),
+            "an immutable local binding must not be differentiable just because \
+             another module declares `let !alpha`, got {:?}", v);
+}
+
+#[test]
+fn grad_own_module_capture_still_works_alongside_an_import_398() {
+    // The other side of the scoping fix: narrowing to the fn's own module must
+    // not cost the module its OWN captures. `beta` is main's `let !`, and it
+    // keeps its gradient with lib.dmc's unrelated `!alpha` in the graph.
+    // dL/dbeta = sum(w .* w) = 14.
+    let v = run_multi(&[
+        ("lib.dmc", "pub let !alpha = 9.0f64\npub fn touch() -> f64 { alpha }"),
+        ("main.dmc", r#"use "lib.dmc"
+let !beta = 2.0f64
+@grad fn loss(!w: Tensor[f64,[3]]) -> f64 { sum(w .* w) * beta }
+fn main() -> f64 {
+    let w = [1.0f64, 2.0f64, 3.0f64]
+    let (l, g) = loss.fwd_bwd(w)
+    g.beta
+}"#),
+    ], "main.dmc");
+    assert!((as_float(&v) - 14.0).abs() < 1e-12,
+            "the fn's own module capture must survive the scoping fix, got {:?}", v);
+}
+
+#[test]
+fn grad_capture_only_fn_needs_no_mut_param_398() {
+    // No `!` parameter at all: the captured mut is the whole differentiable
+    // input set (AUTODIFF.md §2). dL/ds = sum(x .* x) = 14.
+    let v = run(r#"
+        let !s = 2.0f64
+        @grad fn loss(x: Tensor[f64,[3]]) -> f64 { sum(x .* x) * s }
+        fn main() -> f64 {
+            let x = [1.0f64, 2.0f64, 3.0f64]
+            let (l, g) = loss.fwd_bwd(x)
+            g.s
+        }
+    "#);
+    assert!((as_float(&v) - 14.0).abs() < 1e-12, "capture-only @grad fn, got {:?}", v);
+}
+
+#[test]
+fn grad_immutable_module_binding_is_not_captured_398() {
+    // §2: a captured *immut* binding has no gradient. `k` is a plain `let`, so
+    // it stays a constant on the tape and never becomes a `Grads` field — only
+    // the `!` param's gradient comes back (dL/dw = 2kw = [6, 12], sum 18).
+    let v = run(r#"
+        let k = 3.0f64
+        @grad fn loss(!w: Tensor[f64,[2]]) -> f64 { sum(w .* w) * k }
+        fn main() -> f64 {
+            let w = [1.0f64, 2.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            sum(g.w)
+        }
+    "#);
+    assert!((as_float(&v) - 18.0).abs() < 1e-12, "immut capture, got {:?}", v);
+}
+
+#[test]
+fn grad_capture_inside_closure_is_not_taped_398() {
+    // The checker rejects this program (`check_tests::
+    // captured_mut_hidden_in_closure_errors_398`); the interpreter must agree
+    // that it has no gradient rather than inventing one — the tape does not
+    // enter closure bodies, so `b` is not a tape input and `g.b` is not a
+    // field. Only `g.w` exists: dL/dw = 2w = [2, 4], sum 6.
+    let v = run(r#"
+        let !b = [7.0f64, 7.0f64]
+        @grad fn loss(!w: Tensor[f64,[2]]) -> f64 {
+            let hook = fn() -> f64 { sum(b) }
+            sum(w .* w)
+        }
+        fn main() -> f64 {
+            let w = [1.0f64, 2.0f64]
+            let (l, g) = loss.fwd_bwd(w)
+            sum(g.w)
+        }
+    "#);
+    assert!((as_float(&v) - 6.0).abs() < 1e-12, "closure capture, got {:?}", v);
 }
 
 // ── #299: gradient of a broadcast operand (bias add) must be reduced back ─────
@@ -847,6 +1416,437 @@ fn grad_min_traces() {
     assert!((as_float(&v) - 1.0).abs() < 1e-6, "min grad should route 1 to the argmin, got {:?}", v);
 }
 
+// ── #420 / #434: gradient checks against a central finite difference ─────────
+//
+// Every VJP rule those two issues added is checked here against a *central*
+// difference of the interpreter's own forward pass,
+//
+//     ∂L/∂x  ≈  (L(x+h) − L(x−h)) / 2h,
+//
+// which is the only check that can catch a rule that is self-consistently
+// wrong. The interpreter evaluates at f32 (≈1e-7 relative), so the step is
+// squeezed from both ends: cancellation grows as ε/h, truncation as h²·L‴/6.
+// h = 1e-2 sits near the f32 optimum (≈ε^⅓) for the smooth rules and is the
+// default below; the tolerances are the *measured* agreement at that step.
+
+/// An f32 tensor literal (rank 1 or 2) from row-major data.
+fn tensor_lit(data: &[f64], shape: &[usize]) -> String {
+    let f = |x: f64| format!("{:?}f32", x);
+    match shape {
+        [n] => {
+            assert_eq!(data.len(), *n, "tensor_lit: data/shape mismatch");
+            format!("[{}]", data.iter().map(|&x| f(x)).collect::<Vec<_>>().join(", "))
+        }
+        [r, c] => {
+            assert_eq!(data.len(), r * c, "tensor_lit: data/shape mismatch");
+            let rows: Vec<String> = (0..*r)
+                .map(|i| format!("[{}]", (0..*c)
+                    .map(|j| f(data[i * c + j])).collect::<Vec<_>>().join(", ")))
+                .collect();
+            format!("[{}]", rows.join(", "))
+        }
+        _ => panic!("tensor_lit: rank {} unsupported", shape.len()),
+    }
+}
+
+/// Subscript selecting flat element `i` of a tensor with `shape`.
+fn idx_lit(i: usize, shape: &[usize]) -> String {
+    match shape {
+        [_] => format!("[{}]", i),
+        [_, c] => format!("[{}, {}]", i / c, i % c),
+        _ => panic!("idx_lit: rank {} unsupported", shape.len()),
+    }
+}
+
+/// Analytic ∂L/∂w (from `fwd_bwd`) and the central difference of `fwd`, both
+/// flattened row-major, for `@grad fn f(!w: Tensor[f32, shape]<extra_params>)`.
+/// `extra_params` / `extra_args` carry any additional (non-`!`) operands and
+/// must lead with a comma, or both be empty.
+fn grad_and_fd(
+    shape: &[usize],
+    extra_params: &str,
+    extra_args: &str,
+    body: &str,
+    data: &[f64],
+    h: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let dims = shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
+    let decl = format!(
+        "@grad fn f(!w: Tensor[f32, [{dims}]]{extra_params}) -> f32 {{ {body} }}");
+    let fwd = |d: &[f64]| as_float(&run(&format!(
+        "{decl}\nfn main() -> f32 {{ f.fwd({t}{extra_args}) }}",
+        t = tensor_lit(d, shape))));
+    let mut analytic = Vec::with_capacity(data.len());
+    let mut numeric = Vec::with_capacity(data.len());
+    for i in 0..data.len() {
+        analytic.push(as_float(&run(&format!(
+            "{decl}\nfn main() -> f32 {{\n\
+             \tlet (_l, g) = f.fwd_bwd({w}{extra_args})\n\
+             \tg.w{idx}\n}}",
+            w = tensor_lit(data, shape), idx = idx_lit(i, shape)))));
+        let mut up = data.to_vec(); up[i] += h;
+        let mut dn = data.to_vec(); dn[i] -= h;
+        numeric.push((fwd(&up) - fwd(&dn)) / (2.0 * h));
+    }
+    (analytic, numeric)
+}
+
+/// Same, for a scalar `!a: f32` parameter (#420 item 2).
+fn grad_and_fd_scalar(body: &str, x: f64, h: f64) -> (f64, f64) {
+    let decl = format!("@grad fn f(!a: f32) -> f32 {{ {body} }}");
+    let analytic = as_float(&run(&format!(
+        "{decl}\nfn main() -> f32 {{\n\tlet (_l, g) = f.fwd_bwd({x:?}f32)\n\tg.a\n}}")));
+    let fwd = |v: f64| as_float(&run(&format!(
+        "{decl}\nfn main() -> f32 {{ f.fwd({v:?}f32) }}")));
+    (analytic, (fwd(x + h) - fwd(x - h)) / (2.0 * h))
+}
+
+/// Assert two gradient vectors agree to `tol`, relative to the larger
+/// magnitude (floored at 1 so near-zero components use an absolute bound).
+fn assert_gradcheck(label: &str, analytic: &[f64], numeric: &[f64], tol: f64) {
+    assert_eq!(analytic.len(), numeric.len(), "{label}: length mismatch");
+    for (i, (&a, &n)) in analytic.iter().zip(numeric).enumerate() {
+        let scale = a.abs().max(n.abs()).max(1.0);
+        assert!((a - n).abs() <= tol * scale,
+            "{label}[{i}]: analytic {a} vs central difference {n} \
+             (allowed {} at rel tol {tol})", tol * scale);
+    }
+}
+
+// ── #420 item 1: scalar-math builtins on a traced scalar ─────────────────────
+//
+// Domain note: each function is checked strictly inside its domain. `sqrt` and
+// `log` are undefined for x < 0 and have an infinite derivative at x = 0, so
+// the "near-edge" point is x = 0.01 (sqrt′ = 5, log′ = 100) rather than 0 —
+// a central difference has no meaning where the one-sided limit is +∞. `tan`
+// is checked away from its ±π/2 poles.
+
+#[test]
+fn grad_scalar_sqrt_gradchecks() {
+    let (a, n) = grad_and_fd_scalar("sqrt(a)", 2.25, 1e-2);
+    assert_gradcheck("sqrt @ 2.25", &[a], &[n], 1e-3);
+    assert!((a - 1.0 / 3.0).abs() < 1e-5, "sqrt'(2.25) = 1/3, got {a}");
+}
+
+#[test]
+fn grad_scalar_sqrt_near_zero_gradchecks() {
+    // Near-edge: x = 0.01, where sqrt′ = 5 and the curvature is already large.
+    // The step has to shrink with the domain — h = 1e-3 keeps x ± h positive
+    // and truncation under control.
+    let (a, n) = grad_and_fd_scalar("sqrt(a)", 0.01, 1e-3);
+    assert_gradcheck("sqrt @ 0.01", &[a], &[n], 2e-2);
+    assert!((a - 5.0).abs() < 1e-3, "sqrt'(0.01) = 5, got {a}");
+}
+
+#[test]
+fn grad_scalar_exp_gradchecks() {
+    for &x in &[0.5, -1.25] {
+        let (a, n) = grad_and_fd_scalar("exp(a)", x, 1e-2);
+        assert_gradcheck(&format!("exp @ {x}"), &[a], &[n], 1e-3);
+        assert!((a - x.exp()).abs() < 1e-4, "exp'({x}) = exp({x}), got {a}");
+    }
+}
+
+#[test]
+fn grad_scalar_log_gradchecks() {
+    for &x in &[2.0, 0.25] {
+        let (a, n) = grad_and_fd_scalar("log(a)", x, 1e-3);
+        assert_gradcheck(&format!("log @ {x}"), &[a], &[n], 5e-3);
+        assert!((a - 1.0 / x).abs() < 1e-3, "log'({x}) = 1/{x}, got {a}");
+    }
+}
+
+#[test]
+fn grad_scalar_sin_cos_gradcheck() {
+    let (a, n) = grad_and_fd_scalar("sin(a)", 0.7, 1e-2);
+    assert_gradcheck("sin @ 0.7", &[a], &[n], 1e-3);
+    assert!((a - 0.7f64.cos()).abs() < 1e-4, "sin'(0.7) = cos(0.7), got {a}");
+    let (a, n) = grad_and_fd_scalar("cos(a)", 0.7, 1e-2);
+    assert_gradcheck("cos @ 0.7", &[a], &[n], 1e-3);
+    assert!((a + 0.7f64.sin()).abs() < 1e-4, "cos'(0.7) = -sin(0.7), got {a}");
+}
+
+#[test]
+fn grad_scalar_tan_gradchecks() {
+    let (a, n) = grad_and_fd_scalar("tan(a)", 0.5, 1e-2);
+    assert_gradcheck("tan @ 0.5", &[a], &[n], 2e-3);
+    let want = 1.0 + 0.5f64.tan().powi(2);
+    assert!((a - want).abs() < 1e-3, "tan'(0.5) = 1+tan²(0.5) = {want}, got {a}");
+}
+
+// ── #420 item 2: scalar `!` parameters ───────────────────────────────────────
+
+#[test]
+fn grad_scalar_mut_param_traces_420() {
+    // The issue's first probe verbatim: `@grad fn f(!a: f32) { a*a*a }`.
+    // Refused outright before — the body "doesn't participate in the gradient
+    // graph" because only tensor params became tape inputs.
+    let v = run(r#"
+        @grad fn f(!a: f32) -> f32 { a * a * a }
+        fn main() -> f32 {
+            let (_l, g) = f.fwd_bwd(2.0f32)
+            g.a
+        }
+    "#);
+    assert!((as_float(&v) - 12.0).abs() < 1e-5, "3a² at a=2 is 12, got {:?}", v);
+}
+
+#[test]
+fn grad_scalar_mut_param_gradchecks() {
+    let (a, n) = grad_and_fd_scalar("a * a * a", 2.0, 1e-2);
+    assert_gradcheck("a³ @ 2", &[a], &[n], 1e-3);
+    let (a, n) = grad_and_fd_scalar("exp(a * a) / (a + 3.0)", -1.25, 1e-2);
+    assert_gradcheck("exp(a²)/(a+3) @ -1.25", &[a], &[n], 5e-3);
+}
+
+#[test]
+fn grad_scalar_mut_param_mixed_with_tensor() {
+    // A scalar `!` param alongside a tensor one: both fields come back.
+    // L = s * sum(w .* w); ∂L/∂s = sum(w²) = 5, ∂L/∂w = 2sw = [4, 8].
+    let v = run(r#"
+        @grad fn f(!s: f32, !w: Tensor[f32, [2]]) -> f32 { s * sum(w .* w) }
+        fn main() -> f32 {
+            let w = [1.0f32, 2.0f32]
+            let (_l, g) = f.fwd_bwd(2.0f32, w)
+            g.s * 100.0 + sum(g.w)
+        }
+    "#);
+    assert!((as_float(&v) - 512.0).abs() < 1e-3, "expected 5*100 + 12, got {:?}", v);
+}
+
+#[test]
+fn grad_scalar_mut_param_unused_is_zero() {
+    // A `!` scalar the loss doesn't depend on gets 0.0 — not its own value,
+    // which would read as a gradient.
+    let v = run(r#"
+        @grad fn f(!a: f32, !w: Tensor[f32, [2]]) -> f32 { sum(w .* w) }
+        fn main() -> f32 {
+            let w = [1.0f32, 2.0f32]
+            let (_l, g) = f.fwd_bwd(7.0f32, w)
+            g.a
+        }
+    "#);
+    assert!(as_float(&v).abs() < 1e-9, "unused scalar `!` param grad must be 0, got {:?}", v);
+}
+
+// ── #420 item 3: indexed reads `x[i]` scatter their gradient back ────────────
+
+#[test]
+fn grad_indexed_read_traces_420() {
+    // The issue's second probe: component math on a tensor, no reduction.
+    // L = w[0]² + w[1]²; ∂L/∂w = 2w = [6, 8].
+    let v = run(r#"
+        @grad fn f(!w: Tensor[f32, [2]]) -> f32 { w[0]*w[0] + w[1]*w[1] }
+        fn main() -> f32 {
+            let w = [3.0f32, 4.0f32]
+            let (_l, g) = f.fwd_bwd(w)
+            g.w[0] * 100.0 + g.w[1]
+        }
+    "#);
+    assert!((as_float(&v) - 608.0).abs() < 1e-3, "expected 6*100 + 8, got {:?}", v);
+}
+
+#[test]
+fn grad_indexed_read_gradchecks() {
+    let data = [3.0, 4.0, -1.5];
+    let (a, n) = grad_and_fd(&[3], "", "",
+        "w[0]*w[1] + w[2]*w[2]*w[0]", &data, 1e-2);
+    assert_gradcheck("indexed read, rank 1", &a, &n, 1e-3);
+}
+
+#[test]
+fn grad_indexed_read_rank2_gradchecks() {
+    // A full index into a rank-2 tensor; only the addressed slot gets gradient.
+    let data = [1.0, 2.0, 3.0, -4.0, 0.5, 6.0];
+    let (a, n) = grad_and_fd(&[2, 3], "", "",
+        "w[0, 1] * w[1, 2] + w[1, 0] * w[1, 0]", &data, 1e-2);
+    assert_gradcheck("indexed read, rank 2", &a, &n, 1e-3);
+    // Untouched slots must be exactly zero, not merely small.
+    for i in [0usize, 2, 4] {
+        assert_eq!(a[i], 0.0, "element {i} is not read; its gradient must be 0");
+    }
+}
+
+// ── #420: the SDF-shaped composite the issue was filed from ──────────────────
+
+#[test]
+fn grad_sdf_norm_of_scalar_components_gradchecks() {
+    // `sqrt` of a sum of squares of traced *scalars* — the Euclidean norm at
+    // the end of every SDF primitive. At (1, 2, 2) the radius is 3 and the
+    // gradient is the unit vector (1/3, 2/3, 2/3).
+    let decl = "@grad fn sdf(!x: f32, !y: f32, !z: f32) -> f32 { sqrt(x*x + y*y + z*z) }";
+    let grad_of = |field: &str| as_float(&run(&format!(
+        "{decl}\nfn main() -> f32 {{\n\
+         \tlet (_l, g) = sdf.fwd_bwd(1.0f32, 2.0f32, 2.0f32)\n\tg.{field}\n}}")));
+    let fwd = |x: f64, y: f64, z: f64| as_float(&run(&format!(
+        "{decl}\nfn main() -> f32 {{ sdf.fwd({x:?}f32, {y:?}f32, {z:?}f32) }}")));
+    let h = 1e-2;
+    let analytic = [grad_of("x"), grad_of("y"), grad_of("z")];
+    let numeric = [
+        (fwd(1.0 + h, 2.0, 2.0) - fwd(1.0 - h, 2.0, 2.0)) / (2.0 * h),
+        (fwd(1.0, 2.0 + h, 2.0) - fwd(1.0, 2.0 - h, 2.0)) / (2.0 * h),
+        (fwd(1.0, 2.0, 2.0 + h) - fwd(1.0, 2.0, 2.0 - h)) / (2.0 * h),
+    ];
+    assert_gradcheck("sdf norm (scalar params)", &analytic, &numeric, 1e-3);
+    let want = [1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0];
+    for (i, (&a, &w)) in analytic.iter().zip(&want).enumerate() {
+        assert!((a - w).abs() < 1e-5, "∂r/∂({i}) should be {w}, got {a}");
+    }
+}
+
+#[test]
+fn grad_sdf_norm_of_indexed_components_gradchecks() {
+    // The same norm written over tensor components — the issue's own probe
+    // `sqrt(w[0]*w[0] + w[1]*w[1])`, generalized to 3D and offset by a centre
+    // so the gradient isn't a pure unit vector by symmetry.
+    let data = [3.0, -4.0, 1.0];
+    let (a, n) = grad_and_fd(&[3], "", "",
+        "sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]) - 1.5", &data, 1e-2);
+    assert_gradcheck("sdf norm (indexed reads)", &a, &n, 1e-3);
+    let r = (9.0f64 + 16.0 + 1.0).sqrt();
+    for (i, &want) in [3.0 / r, -4.0 / r, 1.0 / r].iter().enumerate() {
+        assert!((a[i] - want).abs() < 1e-5, "∂r/∂w[{i}] should be {want}, got {}", a[i]);
+    }
+}
+
+// ── #434 item 1: comparison-masked select ────────────────────────────────────
+
+#[test]
+fn grad_masked_select_traces_434() {
+    // The issue's probe verbatim — `DotLt` inside @grad used to be a hard
+    // "no VJP rule yet". The mask is stop-gradient; the cotangent goes to
+    // whichever operand the mask selected.
+    // w = [1, 5, 3] vs t = [2, 1, 9] → mask (w < t) = [1, 0, 1], so
+    // ∂L/∂w = [1, 0, 1] and sum = 2.
+    let v = run(r#"
+        @grad fn f(!w: Tensor[f32, [3]], t: Tensor[f32, [3]]) -> f32 {
+            let m = w .< t
+            sum(m .* w .+ (w .>= t) .* t)
+        }
+        fn main() -> f32 {
+            let w = [1.0f32, 5.0f32, 3.0f32]
+            let t = [2.0f32, 1.0f32, 9.0f32]
+            let (_l, g) = f.fwd_bwd(w, t)
+            sum(g.w)
+        }
+    "#);
+    assert!((as_float(&v) - 2.0).abs() < 1e-6,
+        "mask selects w at elements 0 and 2, got {:?}", v);
+}
+
+#[test]
+fn grad_masked_select_gradchecks_both_branches() {
+    // The same select, gradchecked. The mask [1, 0, 1] exercises both
+    // branches; every point sits at least 1.0 away from its kink, so the
+    // h = 1e-2 difference never crosses one and the check is meaningful.
+    let data = [1.0, 5.0, 3.0];
+    let t = "[2.0f32, 1.0f32, 9.0f32]";
+    let (a, n) = grad_and_fd(&[3], ", t: Tensor[f32, [3]]", &format!(", {t}"),
+        "sum((w .< t) .* w .+ (w .>= t) .* t)", &data, 1e-2);
+    assert_gradcheck("masked select, selected operand", &a, &n, 1e-3);
+    assert_eq!(a, vec![1.0, 0.0, 1.0], "gradient must route exactly by the mask");
+}
+
+#[test]
+fn grad_masked_select_routes_to_the_other_branch() {
+    // Symmetric check: differentiate w.r.t. the operand the mask *rejects*
+    // at elements 0 and 2 and selects at element 1 → [0, 1, 0].
+    let data = [2.0, 1.0, 9.0];
+    let d0 = "[1.0f32, 5.0f32, 3.0f32]";
+    let (a, n) = grad_and_fd(&[3], ", d0: Tensor[f32, [3]]", &format!(", {d0}"),
+        "sum((d0 .< w) .* d0 .+ (d0 .>= w) .* w)", &data, 1e-2);
+    assert_gradcheck("masked select, rejected operand", &a, &n, 1e-3);
+    assert_eq!(a, vec![0.0, 1.0, 0.0], "gradient must route exactly by the mask");
+}
+
+#[test]
+fn grad_masked_select_nearest_of_two_gradchecks() {
+    // Hard nearest-of-K assignment, the shape #434 actually wants: pick the
+    // smaller of two distance rows and weight it. Non-trivial gradient
+    // values (not just 0/1) so the check has teeth.
+    let data = [1.0, 5.0, 3.0, 2.5];
+    let d1 = "[2.0f32, 1.0f32, 9.0f32, 4.0f32]";
+    let (a, n) = grad_and_fd(&[4], ", d1: Tensor[f32, [4]]", &format!(", {d1}"),
+        "sum(((w .< d1) .* w .+ (w .>= d1) .* d1) .* w)", &data, 1e-2);
+    assert_gradcheck("masked nearest-of-two", &a, &n, 1e-3);
+}
+
+// ── #434 item 2: row-wise (axis) reductions ──────────────────────────────────
+
+#[test]
+fn grad_min_along_traces_434() {
+    // min_along over axis 1 of [[1,5,3],[4,2,6]] → [1, 2]; the subgradient
+    // routes each row's cotangent to that row's argmin, so sum(g.w) = 2.
+    let v = run(r#"
+        @grad fn f(!w: Tensor[f32, [2, 3]]) -> f32 { sum(min_along(w, 1)) }
+        fn main() -> f32 {
+            let w = [[1.0f32, 5.0f32, 3.0f32], [4.0f32, 2.0f32, 6.0f32]]
+            let (_l, g) = f.fwd_bwd(w)
+            sum(g.w)
+        }
+    "#);
+    assert!((as_float(&v) - 2.0).abs() < 1e-6, "one unit per row, got {:?}", v);
+}
+
+#[test]
+fn grad_min_along_gradchecks_each_axis() {
+    // Distinct entries, so no lane has a tie and the argmin is stable under a
+    // ±1e-2 perturbation — the precondition for a finite difference to mean
+    // anything at a piecewise-linear reduction.
+    let data = [1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+    let t0 = "[2.0f32, 3.0f32, 0.5f32]";      // [3] — reducing axis 0 leaves 3
+    let t1 = "[2.0f32, 3.0f32]";              // [2] — reducing axis 1 leaves 2
+    for (axis, t) in [(0, t0), (1, t1)] {
+        let dims = if axis == 0 { 3 } else { 2 };
+        let (a, n) = grad_and_fd(&[2, 3],
+            &format!(", t: Tensor[f32, [{dims}]]"), &format!(", {t}"),
+            &format!("sum(min_along(w, {axis}) .* t)"), &data, 1e-2);
+        // The reduction is piecewise linear, so the only error is the f32
+        // rounding of the two forward evaluations (~1e-4 absolute at h = 1e-2).
+        assert_gradcheck(&format!("min_along axis {axis}"), &a, &n, 1e-3);
+    }
+}
+
+#[test]
+fn grad_max_along_gradchecks_each_axis() {
+    let data = [1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+    let t0 = "[2.0f32, 3.0f32, 0.5f32]";
+    let t1 = "[2.0f32, 3.0f32]";
+    for (axis, t) in [(0, t0), (1, t1)] {
+        let dims = if axis == 0 { 3 } else { 2 };
+        let (a, n) = grad_and_fd(&[2, 3],
+            &format!(", t: Tensor[f32, [{dims}]]"), &format!(", {t}"),
+            &format!("sum(max_along(w, {axis}) .* t)"), &data, 1e-2);
+        assert_gradcheck(&format!("max_along axis {axis}"), &a, &n, 1e-3);
+    }
+}
+
+#[test]
+fn grad_softmax_along_axis_gradchecks_each_axis() {
+    // The row-wise softmax #434 asks for is `softmax(x, axis)` — there is no
+    // separate `softmax_along`. Gradcheck it along *both* axes of a 2D
+    // tensor, which is what a per-item soft assignment over K options needs.
+    let data = [0.5, -1.0, 2.0, 1.5, 0.25, -0.5];
+    let t = "[[0.3f32, 1.0f32, -0.7f32], [0.2f32, -0.4f32, 0.9f32]]";
+    for axis in [0, 1] {
+        let (a, n) = grad_and_fd(&[2, 3],
+            ", t: Tensor[f32, [2, 3]]", &format!(", {t}"),
+            &format!("sum(softmax(w, {axis}) .* t)"), &data, 1e-2);
+        assert_gradcheck(&format!("softmax axis {axis}"), &a, &n, 5e-3);
+    }
+}
+
+#[test]
+fn grad_soft_min_assignment_gradchecks() {
+    // The workload behind #434: a soft-min assignment over the K axis of an
+    // [N, K] distance matrix, spelled `softmax(-d, 1)` and reduced with
+    // `sum_along`. This is the differentiable relaxation of `min_along`.
+    let data = [1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+    let (a, n) = grad_and_fd(&[2, 3], "", "",
+        "sum(sum_along(softmax(0.0 .- w, 1) .* w, 1))", &data, 1e-2);
+    assert_gradcheck("soft-min assignment", &a, &n, 5e-3);
+}
+
 // ── #252: product/quotient VJP must not drop the gradient through a ──────────
 //          scalar / reduction operand (silent wrong/zero gradients).
 
@@ -911,14 +1911,15 @@ fn grad_mean_of_squares() {
 
 #[test]
 fn grad_untraced_reduction_hint_is_honest() {
-    // A value that exits the gradient graph (an indexed read) still errors —
-    // and the hint must name the traced reductions and flag what doesn't trace
-    // (#253). max/min/variance now trace (#307 Tier C), so they're no longer
-    // in the "don't trace yet" set — use an indexed read to trigger the hint.
+    // A value that exits the gradient graph still errors — and the hint must
+    // name the traced reductions and flag what doesn't trace (#253). The set
+    // has shrunk twice: max/min/variance trace (#307 Tier C) and full element
+    // reads `w[i]` trace (#420 item 3). What is left is the *partial* index,
+    // which yields a sub-tensor rather than an element.
     let e = run_err(r#"
-        @grad fn f[N](!w: Tensor[f32, [N]]) -> f32 { w[0] }
+        @grad fn f(!w: Tensor[f32, [2, 2]]) -> f32 { sum(w[0]) }
         fn main() -> f32 {
-            let !w = forge.zeros[f32, [2]]
+            let w = [[1.0f32, 2.0f32], [3.0f32, 4.0f32]]
             let (_l, g) = f.fwd_bwd(w)
             sum(g.w)
         }
@@ -1107,22 +2108,23 @@ fn grad_sgd_actually_reduces_loss() {
 }
 
 #[test]
-fn grad_indexed_reduction_gives_helpful_hint() {
-    // Regression for #71: using indexed reads (sq[0]+sq[1]+...) breaks the
-    // gradient graph. The error must mention tensor reductions as the fix.
-    let msg = run_err(r#"
+fn grad_indexed_reduction_differentiates() {
+    // #71 filed this as a hard break: `sq[0] + sq[1] + ...` left the gradient
+    // graph and the best the compiler could do was point at `sum`. #420 item 3
+    // put element reads on the tape, so the hand-rolled reduction now
+    // differentiates identically to `sum(x .* x)` — grad 2x = [2, 4, 6, 8].
+    let v = run(r#"
         @grad fn loss(!x: Tensor[f32, [4]]) -> f32 {
             let sq = x .* x
             sq[0] + sq[1] + sq[2] + sq[3]
         }
-        fn main() -> nil {
+        fn main() -> f32 {
             let x = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
-            let (_v, _g) = loss.fwd_bwd(x)
-            nil
+            let (_v, g) = loss.fwd_bwd(x)
+            sum(g.x)
         }
     "#);
-    assert!(msg.contains("indexed") || msg.contains("sum") || msg.contains("reduction"),
-        "expected hint about reductions in error, got: {}", msg);
+    assert!((as_float(&v) - 20.0).abs() < 1e-5, "sum(2x) over [1,2,3,4] = 20, got {:?}", v);
 }
 
 #[test]
@@ -2214,6 +3216,175 @@ fn json_decode_error() {
     assert!(matches!(v, Value::Str(ref s) if s.contains("parse error")), "got {:?}", v);
 }
 
+// ── Typed JSON decode (PORTS.md §6) ──────────────────────────────────────────
+
+#[test]
+fn json_decode_typed_returns_the_declared_type() {
+    // Each primitive hands back a real value of its type, not a dynamic one:
+    // `v * 2` below is integer arithmetic on a decoded JSON number.
+    let v = run(r#"
+        fn main() -> i64 {
+            let (v, e) = json_decode_i64("21")
+            if e != nil { return -1 }
+            v * 2
+        }
+    "#);
+    assert_eq!(as_int(&v), 42);
+
+    let v = run(r#"fn main() -> f64 { let (v, e) = json_decode_f64("1.5") v + 1.0 }"#);
+    assert_eq!(as_float(&v), 2.5);
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str("\"hi\"") v + "!" }"#);
+    assert_eq!(as_str(&v), "hi!");
+    let v = run(r#"fn main() -> bool { let (v, e) = json_decode_bool("false") !v }"#);
+    assert!(matches!(v, Value::Bool(true)), "got {:?}", v);
+    let v = run(r#"fn main() -> i64 { let (v, e) = json_decode_list("[1,2,3]") list_len(v) }"#);
+    assert_eq!(as_int(&v), 3);
+}
+
+#[test]
+fn json_decode_typed_mismatch_is_a_decode_type_tag() {
+    // The whole point: a wrong-typed JSON value is an Err, never a coercion.
+    // `"7"` does not become 7, `2.5` does not truncate, `1` is not true.
+    for (call, src, want) in [
+        ("json_decode_i64",  r#"\"7\""#,   "expected i64, got str"),
+        ("json_decode_i64",  "2.5",        "expected i64, got f64"),
+        ("json_decode_i64",  "null",       "expected i64, got nil"),
+        ("json_decode_bool", "1",          "expected bool, got i64"),
+        ("json_decode_str",  "7",          "expected str, got i64"),
+        ("json_decode_f64",  r#"\"1.5\""#, "expected f64, got str"),
+        ("json_decode_list", r#"{\"a\":1}"#, "expected list, got map"),
+    ] {
+        let v = run(&format!(
+            "fn main() -> str {{ let (v, e) = {}(\"{}\") e }}", call, src));
+        let got = as_str(&v);
+        assert!(got.starts_with("decode-type: ") && got.contains(want),
+            "{}({}) -> {:?}, wanted `decode-type` with `{}`", call, src, got, want);
+    }
+}
+
+#[test]
+fn json_decode_typed_zero_rides_the_error_path() {
+    // `(T, Err)` stays well-typed on failure: T's zero, not nil.
+    let v = run(r#"fn main() -> i64 { let (v, e) = json_decode_i64("\"x\"") v }"#);
+    assert_eq!(as_int(&v), 0);
+    let v = run(r#"fn main() -> f64 { let (v, e) = json_decode_f64("\"x\"") v }"#);
+    assert_eq!(as_float(&v), 0.0);
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str("7") v }"#);
+    assert_eq!(as_str(&v), "");
+    let v = run(r#"fn main() -> bool { let (v, e) = json_decode_bool("7") v }"#);
+    assert!(matches!(v, Value::Bool(false)), "got {:?}", v);
+    let v = run(r#"fn main() -> i64 { let (v, e) = json_decode_list("7") list_len(v) }"#);
+    assert_eq!(as_int(&v), 0);
+}
+
+#[test]
+fn json_decode_f64_accepts_a_json_integer() {
+    // The widening every port result depends on: JSON has a single number
+    // type and the canonical writer prints a whole float without its fraction
+    // (2.0 -> `2`, PORTS.md §2), so a port's f64 result usually arrives as an
+    // integer literal. The reverse is caught only for non-whole values —
+    // json_decode_i64_cannot_see_a_whole_valued_float pins that gap.
+    let v = run(r#"fn main() -> f64 { let (v, e) = json_decode_f64("2") v + 0.5 }"#);
+    assert_eq!(as_float(&v), 2.5);
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_f64("2") to_str(e) }"#);
+    assert_eq!(as_str(&v), "nil");
+}
+
+#[test]
+fn json_decode_f64_takes_whole_numbers_past_i64() {
+    // A fraction-less token wider than i64 is still a well-formed JSON number,
+    // so it decodes — as f64 — instead of being called a parse error. This is
+    // not a corner case: the canonical writer emits every whole float without
+    // its fraction (PORTS.md §2), so a port returning 1e20 hands the decode 21
+    // digits. Walk the boundary, since it used to sit at 1e15.
+    for (src, want) in [
+        ("100000000000000",       1e14),                    // 1e14
+        ("1000000000000000",      1e15),                    // 1e15 — old cliff
+        ("100000000000000000000", 1e20),                    // 1e20
+        ("9223372036854775807",   i64::MAX as f64),         // i64::MAX
+        ("9223372036854775808",   9223372036854775808.0),   // i64::MAX + 1
+    ] {
+        let v = run(&format!(
+            "fn main() -> f64 {{ let (v, e) = json_decode_f64(\"{}\") v }}", src));
+        assert_eq!(as_float(&v), want, "json_decode_f64({})", src);
+        let e = run(&format!(
+            "fn main() -> str {{ let (v, e) = json_decode_f64(\"{}\") to_str(e) }}", src));
+        assert_eq!(as_str(&e), "nil", "json_decode_f64({}) should not error", src);
+    }
+}
+
+#[test]
+fn json_decode_i64_past_its_range_is_decode_type_not_decode_parse() {
+    // Out of range is a mismatch of kind, not a broken payload. `decode-parse`
+    // means the text is not JSON (PORTS.md §6) and a long integer is JSON, so
+    // claiming otherwise would send a caller hunting a corrupt result that is
+    // in fact a descriptor promising the wrong width.
+    for src in ["100000000000000000000", "9223372036854775808"] {
+        let v = run(&format!(
+            "fn main() -> str {{ let (v, e) = json_decode_i64(\"{}\") e }}", src));
+        assert_eq!(as_str(&v), "decode-type: expected i64, got f64",
+            "json_decode_i64({})", src);
+    }
+    // Inside the range it stays an ordinary i64, top of the range included.
+    for (src, want) in [
+        ("100000000000000",     100_000_000_000_000_i64),
+        ("1000000000000000",    1_000_000_000_000_000_i64),
+        ("9223372036854775807", i64::MAX),
+    ] {
+        let v = run(&format!(
+            "fn main() -> i64 {{ let (v, e) = json_decode_i64(\"{}\") v }}", src));
+        assert_eq!(as_int(&v), want, "json_decode_i64({})", src);
+    }
+}
+
+#[test]
+fn json_decode_i64_cannot_see_a_whole_valued_float() {
+    // Documented behavior, not an aspiration (PORTS.md §3.1, ASSIMILATE.md
+    // §5.1 and §7). The canonical writer drops a whole float's fraction, so
+    // 5.0 reaches the decode as the same one byte the integer 5 would. A
+    // descriptor promising `ret: "i64"` over a float-returning function is
+    // wrong and this boundary cannot say so. Pinned here so the gap stays
+    // disclosed instead of drifting back into a no-coercion claim the code
+    // does not back.
+    let v = run(r#"fn main() -> str { json_encode(5.0) }"#);
+    assert_eq!(as_str(&v), "5");
+    let v = run(r#"fn main() -> i64 { let (v, e) = json_decode_i64(json_encode(5.0)) v }"#);
+    assert_eq!(as_int(&v), 5);
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_i64(json_encode(5.0)) to_str(e) }"#);
+    assert_eq!(as_str(&v), "nil");
+
+    // The other half of the disclosure: a fraction survives the writer, so the
+    // same wrong descriptor is caught the moment the result is not whole.
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_i64(json_encode(5.5)) e }"#);
+    assert_eq!(as_str(&v), "decode-type: expected i64, got f64");
+}
+
+#[test]
+fn json_decode_typed_parse_failure_is_a_decode_parse_tag() {
+    // Malformed JSON is distinct from a type mismatch — the caller can tell a
+    // broken payload from a descriptor that lied.
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_i64("{oops") e }"#);
+    assert!(as_str(&v).starts_with("decode-parse: "), "got {:?}", v);
+}
+
+#[test]
+fn json_decode_typed_propagates_through_question_mark() {
+    // SPEC §4.9: the `(T, Err)` shape is the point — `?` lifts the Err out and
+    // the caller sees a real i64.
+    let v = run(r#"
+        fn twice(s: str) -> (i64, str) {
+            let n = json_decode_i64(s)?
+            (n * 2, nil)
+        }
+        fn main() -> str {
+            let (a, ea) = twice("21")
+            let (b, eb) = twice("true")
+            to_str(a) + "|" + to_str(ea) + "|" + to_str(b) + "|" + eb
+        }
+    "#);
+    assert_eq!(as_str(&v), "42|nil|0|decode-type: expected i64, got bool");
+}
+
 #[test]
 fn json_roundtrip() {
     let v = run(r#"
@@ -2224,6 +3395,151 @@ fn json_roundtrip() {
         }
     "#);
     assert_eq!(as_str(&v), r#"{"x":1}"#);
+}
+
+// ── JSON string decoding is UTF-8 (#509) ─────────────────────────────────────
+//
+// JSON text is UTF-8 by definition, and a writer may leave any non-ASCII
+// scalar unescaped. The parser used to push each raw byte as a `char`, reading
+// the text as latin-1: an em dash arrived as three mojibake chars. These pin
+// both spellings of the same scalar against each other, because a reader that
+// disagrees with itself about `—` and `\u2014` is the bug restated.
+
+#[test]
+fn json_decode_raw_multibyte_scalar_is_not_latin1() {
+    // The regression itself: three raw bytes are one em dash, not three chars.
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str("\"a—b\"") v }"#);
+    assert_eq!(as_str(&v), "a—b");
+    // `len` on a str is bytes, which is the sharpest witness available here:
+    // the em dash is its own three bytes, not three latin-1 chars re-encoded
+    // as two bytes each (`a` + 6 + `b` = 8 was the old answer).
+    let v = run(r#"fn main() -> i64 { let (v, e) = json_decode_str("\"a—b\"") len(v) }"#);
+    assert_eq!(as_int(&v), 5);
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str("\"a—b\"") to_str(e) }"#);
+    assert_eq!(as_str(&v), "nil");
+
+    // Same through the dynamic decoder, and nested inside a container so the
+    // object/array paths get the fixed `parse_string` too — keys included.
+    let v = run(r#"
+        fn main() -> str {
+            let (m, e) = json_decode("{\"kø\": [\"ü—ß\"]}")
+            list_get(map_get(m, "kø"), 0)
+        }
+    "#);
+    assert_eq!(as_str(&v), "ü—ß");
+}
+
+#[test]
+fn json_decode_raw_and_escaped_spellings_agree() {
+    // A writer picks a spelling; a reader must not. `—` and `\u2014` are the
+    // same scalar, so the two decodes are the same demoniC str.
+    let v = run(r#"
+        fn main() -> str {
+            let (raw, e1) = json_decode_str("\"a—b\"")
+            let (esc, e2) = json_decode_str("\"a\\u2014b\"")
+            if raw == esc { raw } else { "differ: " + raw + " vs " + esc }
+        }
+    "#);
+    assert_eq!(as_str(&v), "a—b");
+}
+
+#[test]
+fn json_decode_four_byte_scalar_joins_a_surrogate_pair() {
+    // A code point past the BMP has no four-digit escape, so JSON spells it as
+    // a UTF-16 surrogate pair — which is exactly what an ASCII-only writer
+    // (python's `json.dumps`) emits for an emoji. Reading the halves apart
+    // rejected valid JSON: neither half is a scalar value. Both spellings of
+    // U+1F600 must land on the same one-char str.
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str("\"😀\"") v }"#);
+    assert_eq!(as_str(&v), "😀");
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str("\"\\ud83d\\ude00\"") v }"#);
+    assert_eq!(as_str(&v), "😀");
+    let v = run(r#"
+        fn main() -> str {
+            let (raw, e1) = json_decode_str("\"go 😀 od\"")
+            let (esc, e2) = json_decode_str("\"go \\ud83d\\ude00 od\"")
+            if raw == esc { raw } else { "differ: " + raw + " vs " + esc }
+        }
+    "#);
+    assert_eq!(as_str(&v), "go 😀 od");
+    // One scalar in four UTF-8 bytes — not two BMP chars from the two halves,
+    // which would have been six.
+    let v = run(r#"fn main() -> i64 { let (v, e) = json_decode_str("\"\\ud83d\\ude00\"") len(v) }"#);
+    assert_eq!(as_int(&v), 4);
+}
+
+#[test]
+fn json_decode_lone_surrogate_is_a_decode_parse_tag() {
+    // A surrogate outside a pair is not a Unicode scalar value, so there is
+    // nothing honest to decode it to. It is a text failure, not a kind
+    // mismatch: `decode-parse`, per PORTS.md §6. Full messages, so the
+    // diagnostics stay one line and stay specific.
+    let cases = [
+        (r#"\"\\ud83d\""#,          "decode-parse: unpaired high surrogate U+D83D"),
+        (r#"\"\\ude00\""#,          "decode-parse: unpaired low surrogate U+DE00"),
+        (r#"\"\\ud83dx\""#,         "decode-parse: unpaired high surrogate U+D83D"),
+        (r#"\"\\ud83d\\u0041\""#,   "decode-parse: expected low surrogate after U+D83D, got U+0041"),
+    ];
+    for (src, want) in cases {
+        let v = run(&format!(
+            "fn main() -> str {{ let (v, e) = json_decode_str(\"{}\") e }}", src));
+        assert_eq!(as_str(&v), want, "json_decode_str({})", src);
+    }
+}
+
+#[test]
+fn json_parse_rejects_an_ill_formed_utf8_sequence() {
+    // The guard behind the fix, reached through the byte entry point because
+    // nothing in the language can hand it these bytes: a demoniC `str` is
+    // UTF-8 by construction and the port's `read_line` rejects an ill-formed
+    // response before the parser sees it. Pinned anyway — the parser's own
+    // contract is that it decodes UTF-8, and "decodes" includes refusing.
+    use super::interp::json_parse_bytes;
+    let cases: [&[u8]; 4] = [
+        b"\"a\xFFb\"",         // 0xFF is never a UTF-8 byte
+        b"\"a\xE2\x80b\"",     // truncated three-byte sequence
+        b"\"a\xC0\x80b\"",     // overlong encoding of NUL
+        b"\"a\xED\xA0\xBDb\"", // a surrogate spelled as raw bytes (CESU-8)
+    ];
+    for src in cases {
+        assert_eq!(json_parse_bytes(src).unwrap_err(), "invalid UTF-8 in string",
+            "bytes {:?}", src);
+    }
+    // A well-formed sequence through the same entry point still decodes.
+    assert!(json_parse_bytes("\"a—b\"".as_bytes()).is_ok());
+}
+
+#[test]
+fn json_parse_diagnostics_name_a_stray_byte_as_a_byte() {
+    // The same misreading one layer up: a byte at or above 0x80 is a fragment
+    // of a UTF-8 sequence, and printing it with `as char` claimed it was a
+    // latin-1 letter — `unexpected byte 'â'` for an em dash. Show the byte.
+    // ASCII messages are unchanged, which the second half pins.
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode("—") to_str(e) }"#);
+    assert_eq!(as_str(&v), "parse error: unexpected byte 0xE2 at position 0");
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode("[1—]") to_str(e) }"#);
+    assert_eq!(as_str(&v), "parse error: expected ',' or ']', got 0xE2");
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode("\"\\—\"") to_str(e) }"#);
+    assert_eq!(as_str(&v), "parse error: unknown escape \\0xE2");
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode("\"\\u20—4\"") to_str(e) }"#);
+    assert_eq!(as_str(&v), "parse error: invalid \\u escape: 0xE2 is not a hex digit");
+
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode("[1;]") to_str(e) }"#);
+    assert_eq!(as_str(&v), "parse error: expected ',' or ']', got ';'");
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode("\"\\q\"") to_str(e) }"#);
+    assert_eq!(as_str(&v), "parse error: unknown escape \\q");
+}
+
+#[test]
+fn json_encode_decode_roundtrips_non_ascii() {
+    // The encoder writes non-ASCII raw (only quotes, backslash and controls
+    // are escaped) — that is the canonical writer PORTS.md §2 makes the port
+    // ABI, so it is the decoder's job to meet it. Before the fix this pair did
+    // not round-trip at all: the writer's own output came back as mojibake.
+    let v = run(r#"fn main() -> str { json_encode("a—b😀") }"#);
+    assert_eq!(as_str(&v), "\"a—b😀\"");
+    let v = run(r#"fn main() -> str { let (v, e) = json_decode_str(json_encode("a—b😀")) v }"#);
+    assert_eq!(as_str(&v), "a—b😀");
 }
 
 // ── Group 1: List functional combinators ─────────────────────────────────────
@@ -2549,6 +3865,47 @@ fn exec_cmd_echo() {
     }
 }
 
+/// `nil` is not indexable, and a `Port` handle has no elements.
+///
+/// Both used to take the interpreter's forward-compat path and hand back a
+/// `Value::Opaque` — `e[0]` on a nil `Err` printed `<opaque index>` and exited
+/// 0. The JIT had raised on the same program, so the disagreement was the
+/// silent backend answering. Located errors now, in the JIT's words.
+#[test]
+fn indexing_nil_or_a_handle_is_a_located_error() {
+    assert_eq!(
+        run_err("fn main() -> nil {\n    let e = nil\n    let c = e[0]\n}\n"),
+        "cannot index nil",
+    );
+    if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+    let msg = run_err(
+        "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+         let c = p[0]\n    let (_, _) = port_close(p)\n}\n");
+    assert!(msg.starts_with("cannot index a Port handle"), "{}", msg);
+}
+
+/// A live handle has no methods either. `p.starts_with("port#")` answered with
+/// a falsy opaque and exit 0 — the handle-forging check that opacity exists to
+/// make impossible, quietly reported as "no".
+#[test]
+fn a_method_call_on_a_live_handle_is_a_located_error() {
+    if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+    let msg = run_err(
+        "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+         let b = p.starts_with(\"port#\")\n    let (_, _) = port_close(p)\n}\n");
+    assert!(msg.starts_with("cannot call method `starts_with` on a Port handle"), "{}", msg);
+}
+
+/// `len(nil)` said the right thing in the wrong place: unlocated, while the
+/// JIT's `dmc_str_len` names the span. Same program, same words, same span.
+#[test]
+fn len_of_a_non_container_is_located() {
+    assert_eq!(
+        run_err("fn main() -> nil {\n    let e = nil\n    let n = len(e)\n}\n"),
+        "len: requires tensor, tuple, str, list, or map",
+    );
+}
+
 #[test]
 fn port_roundtrip_python() {
     // #402: process-port floor — open a python port, call through the JSON
@@ -2568,6 +3925,54 @@ fn port_roundtrip_python() {
         }
     "#);
     assert_eq!(as_str(&v), "3");
+}
+
+#[test]
+fn port_roundtrip_carries_non_ascii_both_directions() {
+    // #509 through the real boundary. Outbound, the canonical writer leaves
+    // non-ASCII raw (PORTS.md §2) and python reads it as UTF-8. Inbound, the
+    // harness's `json.dumps` is ASCII-only, so the same text comes back as
+    // `—` and, for the emoji, a surrogate pair — the spelling the old
+    // parser rejected outright with `invalid codepoint U+D83D`. Both halves
+    // have to work for the text to survive one call.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            if e1 != nil { return "open failed" }
+            let (out, e2) = port_call(p, "str", "[\"a—b😀\"]")
+            let (_, e3) = port_close(p)
+            if e2 != nil { return e2 }
+            let (s, e4) = json_decode_str(out)
+            if e4 != nil { return e4 }
+            s
+        }
+    "#);
+    assert_eq!(as_str(&v), "a—b😀");
+}
+
+#[test]
+fn port_response_written_as_raw_utf8_decodes() {
+    // The other producer shape the issue names: a runtime that writes its
+    // response with non-ASCII unescaped. The stock harness never does — its
+    // `json.dumps` escapes everything — so the runtime is made to emit the
+    // response line itself, through `sys.stdout.write`, ahead of the harness's
+    // own. That is the raw-UTF-8 line `port_call` then reads and parses. The
+    // port is desynchronised afterwards (the harness's reply is still queued),
+    // so it gets its own port and is closed immediately.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            if e1 != nil { return "open failed" }
+            let line = "[\"{\\\"ok\\\": \\\"raw—😀\\\"}\\n\"]"
+            let (out, e2) = port_call(p, "sys.stdout.write", line)
+            let (_, e3) = port_close(p)
+            if e2 != nil { return e2 }
+            out
+        }
+    "#);
+    // `port_call` re-encodes through the canonical writer, which leaves
+    // non-ASCII raw — so a correct decode returns the scalars unchanged.
+    assert_eq!(as_str(&v), "\"raw—😀\"");
 }
 
 #[test]
@@ -2690,6 +4095,151 @@ fn port_unknown_envelope_key_tags_port_protocol() {
     }
 }
 
+// ── Tensor copy mode (PORTS.md §3.2) ─────────────────────────────────────────
+
+#[test]
+fn port_tensor_encode_writes_the_copy_mode_envelope() {
+    // PORTS.md §3.2: a tensor does not become a JSON array — it crosses as the
+    // envelope, metadata and payload buffer together, in canonical key order.
+    let v = run(r#"
+        fn main() -> str {
+            let !g = forge.zeros[i64, [2, 3]]
+            g[0, 0] = 1  g[0, 1] = 2  g[0, 2] = 3
+            g[1, 0] = -4 g[1, 1] = 5  g[1, 2] = 6
+            port_tensor_encode(g)
+        }
+    "#);
+    assert_eq!(as_str(&v),
+        "{\"data\":\"AQAAAAAAAAACAAAAAAAAAAMAAAAAAAAA/P////////8FAAAAAAAAAAYAAAAAAAAA\",\
+         \"dmc_tensor\":1,\"dtype\":\"i64\",\"layout\":\"row_major\",\"shape\":[2,3]}");
+}
+
+#[test]
+fn port_tensor_round_trips_through_the_envelope() {
+    // Values, shape and dtype all survive; the decode's `like` tensor is what
+    // declares what was expected.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !g = forge.zeros[i64, [2, 2]]
+            g[0, 0] = 10  g[0, 1] = -20  g[1, 0] = 30  g[1, 1] = -40
+            let (back, e) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2, 2]])
+            if e != nil { -1 } else { back[1, 0] - back[0, 1] }
+        }
+    "#);
+    assert_eq!(as_int(&v), 50);
+    // bool keeps its 1-byte payload and comes back as bools, not numbers.
+    let v = run(r#"
+        fn main() -> bool {
+            let !b = forge.zeros[bool, [3]]
+            b[0] = true  b[1] = false  b[2] = true
+            let (back, e) = port_tensor_decode(port_tensor_encode(b), forge.zeros[bool, [3]])
+            e == nil && back[0] && !back[1] && back[2]
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "{:?}", v);
+}
+
+#[test]
+fn port_tensor_decode_mismatch_is_a_decode_type_tag() {
+    // The §3.1 discipline at tensor granularity: a shape the caller did not
+    // declare is a `decode-type`, and the value half is the declared zero.
+    let v = run(r#"
+        fn main() -> str {
+            let !g = forge.zeros[i64, [4]]
+            let (back, e) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2]])
+            e
+        }
+    "#);
+    assert_eq!(as_str(&v), "decode-type: expected tensor shape [2], got [4]");
+    // A float tensor is not an integer one, however whole its values.
+    let v = run(r#"
+        fn main() -> str {
+            let !g = forge.zeros[f32, [2]]
+            let (back, e) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2]])
+            e
+        }
+    "#);
+    assert_eq!(as_str(&v), "decode-type: expected a `i64` tensor, got `f32`");
+    // Text that is not JSON at all is the other tag.
+    let v = run(r#"
+        fn main() -> bool {
+            let (back, e) = port_tensor_decode("{oops", forge.zeros[i64, [2]])
+            e.starts_with("decode-parse") && back[0] == 0 && back[1] == 0
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "{:?}", v);
+}
+
+#[test]
+fn port_tensor_encode_refuses_a_non_tensor() {
+    // The boundary is explicit (§3.2): there is no implicit array form, so a
+    // scalar or a list is a program bug, not a quietly-encoded value.
+    let e = run_err(r#"fn main() -> str { port_tensor_encode(7) }"#);
+    assert!(e.contains("port_tensor_encode: arg must be a tensor"), "{}", e);
+    let e = run_err(r#"
+        fn main() -> str {
+            let (v, e) = port_tensor_decode("{}", 7)
+            v
+        }
+    "#);
+    assert!(e.contains("second arg must be a tensor"), "{}", e);
+}
+
+#[test]
+fn port_tensor_encode_failures_carry_no_wire_tag() {
+    // Encoding is local: no runtime is involved and there is no `Err` half, so
+    // a tensor that has no envelope is an ordinary runtime error. `§6`'s
+    // `port-` tags belong to a runtime that failed, and none was reached.
+    let e = run_err(r#"fn main() -> str { let !t = forge.trit[2, 2]  port_tensor_encode(t) }"#);
+    assert!(e.contains("a `trit` tensor has no copy-mode wire dtype (PORTS.md §3.2)"), "{}", e);
+    assert!(!e.contains("port-"), "{}", e);
+    let e = run_err(r#"
+        fn main() -> str {
+            let !z = forge.zeros[i64, [0]]
+            port_tensor_encode(z)
+        }
+    "#);
+    assert!(e.contains("1 to 8 extents, every one positive"), "{}", e);
+    assert!(!e.contains("port-protocol"), "{}", e);
+}
+
+#[test]
+fn port_tensor_crosses_a_real_port_by_copy() {
+    // The whole §3.2 loop through the process port: encode, send as the single
+    // positional argument, let python hand the envelope back, decode it. The
+    // harness rehydrates the envelope on the way in and re-encodes it on the
+    // way out, so this is copy mode in both directions.
+    if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+    let v = run(r#"
+        fn main() -> i64 {
+            let (p, e1) = port_open("python")
+            if e1 != nil { return -1 }
+            let !g = forge.zeros[i64, [2, 2]]
+            g[0, 0] = 1  g[0, 1] = 2  g[1, 0] = 3  g[1, 1] = 4
+            let (out, e2) = port_call(p, "dmc.echo", "[" + port_tensor_encode(g) + "]")
+            let (_, e3) = port_close(p)
+            if e2 != nil { return -2 }
+            let (back, e4) = port_tensor_decode(out, forge.zeros[i64, [2, 2]])
+            if e4 != nil { return -3 }
+            back[0, 0] + back[0, 1] + back[1, 0] + back[1, 1]
+        }
+    "#);
+    assert_eq!(as_int(&v), 10);
+    // The harness really parsed the envelope — it can answer questions about
+    // the tensor, not just hand the JSON object back.
+    let v = run(r#"
+        fn main() -> str {
+            let (p, e1) = port_open("python")
+            let !g = forge.zeros[i64, [2, 3]]
+            let (sh, e2) = port_call(p, "dmc.shape", "[" + port_tensor_encode(g) + "]")
+            let (dt, e3) = port_call(p, "dmc.dtype", "[" + port_tensor_encode(g) + "]")
+            let (_, e4) = port_close(p)
+            sh + " " + dt
+        }
+    "#);
+    assert_eq!(as_str(&v), "[2,3] \"i64\"");
+}
+
 #[test]
 fn list_dir_tmp() {
     let v = run(r#"
@@ -2710,13 +4260,21 @@ fn pipe_right_basic() {
     assert_eq!(as_int(&v), 6);
 }
 
+/// #501 ruling S1a took `>>` off the pipe; #530 gave it to the right shift.
+/// The old pipe program is not merely rejected — it now means something else,
+/// so `5 >> inc` asks to shift by a function and is refused as a shift.
 #[test]
-fn pipe_compose_basic() {
-    let v = run(r#"
+fn pipe_compose_spelling_is_gone() {
+    let e = run_err(r#"
         fn inc(x: i64) -> i64 { x + 1 }
         fn main() -> i64 { 5 >> inc }
     "#);
-    assert_eq!(as_int(&v), 6);
+    assert!(e.contains(">> requires int"), "got: {}", e);
+    // The surviving pipe spellings still reach `inc`.
+    assert_eq!(as_int(&run(r#"
+        fn inc(x: i64) -> i64 { x + 1 }
+        fn main() -> i64 { 5 |> inc }
+    "#)), 6);
 }
 
 #[test]
@@ -2730,13 +4288,14 @@ fn pipe_chain() {
 }
 
 #[test]
-fn pipe_and_compose_equivalent() {
+fn pipe_spellings_equivalent() {
+    // `\|>` is canonical; the bare `|>` survives the #501 sweep (ruling S1b).
     let v = run(r#"
         fn inc(x: i64) -> i64 { x + 1 }
         fn double(x: i64) -> i64 { x * 2 }
         fn main() -> i64 {
             let a = 5 |> inc |> double
-            let b = 5 >> inc >> double
+            let b = 5 \|> inc \|> double
             if a == b { a } else { 0 }
         }
     "#);
@@ -4921,7 +6480,7 @@ fn run_multi_err(files: &[(&str, &str)], main: &str) -> String {
     let main_path = dir.path().join(main);
     let mut resolver = Resolver::new();
     if let Err(e) = resolver.resolve_all(&main_path) {
-        return e;
+        return e.to_string();
     }
     let canonical = main_path.canonicalize().expect("canonicalize");
     // typecheck — collect errors first
@@ -5956,7 +7515,7 @@ fn early(n: i64) -> i64 {
 }
 fn main() -> i64 { early(-7) }
 "#);
-    assert!(matches!(v, Value::Int(-7)), "expected -7, got {:?}", v);
+    assert!(matches!(v, Value::Int(-7, _)), "expected -7, got {:?}", v);
 }
 
 #[test]
@@ -5975,7 +7534,7 @@ fn gcd(a: i64, b: i64) -> i64 {
 }
 fn main() -> i64 { gcd(462, 1071) }
 "#);
-    assert!(matches!(v, Value::Int(21)), "gcd(462,1071) expected 21, got {:?}", v);
+    assert!(matches!(v, Value::Int(21, _)), "gcd(462,1071) expected 21, got {:?}", v);
 }
 
 #[test]
@@ -6016,7 +7575,7 @@ fn main() -> f32 {
 "#);
     match v {
         Value::Float(f, _) => assert!((f - 9.0).abs() < 1e-6, "expected 9.0, got {f}"),
-        Value::Int(n)   => assert_eq!(n, 9, "expected 9"),
+        Value::Int(n, _)   => assert_eq!(n, 9, "expected 9"),
         other           => panic!("expected numeric, got {:?}", other),
     }
 }
@@ -6047,7 +7606,7 @@ fn main() -> f32 {
 "#);
     match v {
         Value::Float(f, _) => assert!((f - 3.0).abs() < 1e-6, "expected x[0]=3.0 after swap, got {f}"),
-        Value::Int(n)   => assert_eq!(n, 3, "expected x[0]=3 after swap"),
+        Value::Int(n, _)   => assert_eq!(n, 3, "expected x[0]=3 after swap"),
         other           => panic!("expected numeric, got {:?}", other),
     }
 }
@@ -6075,7 +7634,7 @@ fn main() -> f32 {
 "#);
     match v {
         Value::Float(f, _) => assert!((f - 30.0).abs() < 1e-6, "expected v[2]=30.0, got {f}"),
-        Value::Int(n)   => assert_eq!(n, 30, "expected v[2]=30"),
+        Value::Int(n, _)   => assert_eq!(n, 30, "expected v[2]=30"),
         other           => panic!("expected numeric, got {:?}", other),
     }
 }
@@ -6097,9 +7656,280 @@ fn main() -> f32 {
 "#);
     match v {
         Value::Float(f, _) => assert!((f - 1.0).abs() < 1e-6, "non-! param should NOT write back, got {f}"),
-        Value::Int(n)   => assert_eq!(n, 1, "non-! param should NOT write back"),
+        Value::Int(n, _)   => assert_eq!(n, 1, "non-! param should NOT write back"),
         other           => panic!("expected numeric, got {:?}", other),
     }
+}
+
+// ── Issue #475: `!` tensor params on METHODS alias like they do on free fns ──
+//
+// Tensors are value-copies in the interpreter, so a `!` param only aliases by
+// virtue of the post-call writeback. The two model-method dispatch paths used
+// to return straight out of `call_fn_with_shapes` without performing it, so a
+// method's writes through a tensor out-parameter vanished — silently, with the
+// right return value. The scope table in the issue is pinned below.
+
+#[test]
+fn mut_tensor_param_on_generic_model_method_475() {
+    // The issue's headline repro: `fill_method!` on a shape-generic model must
+    // fill the caller's tensor, exactly as the identical free-function body does.
+    let v = run(r#"
+model Box[N] {
+    !vals: Tensor[i64, [N]]
+    fn fill_method!(self, !order: Tensor[i64, [4]]) -> i64 {
+        for i in 0..N { order[i] = self.vals[i] }
+        N
+    }
+}
+fn main() -> i64 {
+    let !b = Box[3] { vals: forge.zeros[i64, [3]] }
+    let !v = b.vals
+    v[0] = 7  v[1] = 8  v[2] = 9
+    let !order = forge.zeros[i64, [4]]
+    let n = b.fill_method!(order)
+    n * 1000 + order[0] * 100 + order[2]
+}
+"#);
+    // n=3, order[0]=7, order[2]=9
+    assert_eq!(as_int(&v), 3709, "writes through a `!` tensor param on a generic model method were lost");
+}
+
+#[test]
+fn mut_tensor_param_on_non_generic_model_method_475() {
+    // Same loss on a plain model — the bug was never about generics.
+    let v = run(r#"
+model Box {
+    !k: i64
+    fn fill_method!(self, !order: Tensor[i64, [4]]) -> i64 {
+        order[0] = self.k
+        order[3] = self.k * 2
+        self.k
+    }
+}
+fn main() -> i64 {
+    let !b = Box { k: 6 }
+    let !order = forge.zeros[i64, [4]]
+    let n = b.fill_method!(order)
+    n * 1000 + order[0] * 100 + order[3]
+}
+"#);
+    assert_eq!(as_int(&v), 6612, "writes through a `!` tensor param on a non-generic model method were lost");
+}
+
+#[test]
+fn mut_tensor_param_on_free_fn_still_writes_back_475() {
+    // The row of the table that always worked. Kept so a future change to the
+    // writeback offset cannot fix methods by breaking free functions.
+    let v = run(r#"
+model Box[N] { !vals: Tensor[i64, [N]] }
+fn fill_free![N](b: Box[N], !order: Tensor[i64, [4]]) -> i64 {
+    for i in 0..N { order[i] = b.vals[i] }
+    N
+}
+fn main() -> i64 {
+    let !b = Box[3] { vals: forge.zeros[i64, [3]] }
+    let !v = b.vals
+    v[0] = 7  v[1] = 8  v[2] = 9
+    let !order = forge.zeros[i64, [4]]
+    let n = fill_free![3](b, order)
+    n * 1000 + order[0] * 100 + order[2]
+}
+"#);
+    assert_eq!(as_int(&v), 3709);
+}
+
+#[test]
+fn mut_model_param_on_method_still_mutates_475() {
+    // The other row that already worked: a `!` MODEL parameter aliases through
+    // its `Rc<RefCell<..>>` regardless of the writeback. The inconsistency
+    // between this and the tensor row is what made the bug so sharp.
+    let v = run(r#"
+model Sink { !n: i64 }
+model Driver {
+    !step: i64
+    fn push!(self, !s: Sink) -> i64 {
+        s.n = s.n + self.step
+        s.n
+    }
+}
+fn main() -> i64 {
+    let !d = Driver { step: 5 }
+    let !s = Sink { n: 1 }
+    let r = d.push!(s)
+    r * 100 + s.n
+}
+"#);
+    assert_eq!(as_int(&v), 606, "a `!` model param on a method must still mutate in place");
+}
+
+#[test]
+fn mut_tensor_param_on_method_probe_475() {
+    // The issue's probe case, pinning all three observations at once: the
+    // callee reads what the caller wrote (5), sees its own write internally
+    // (9), and — the part that was broken — the caller sees that write too.
+    let v = run(r#"
+model Box {
+    !k: i64
+    fn probe!(self, !out: Tensor[i64, [4]]) -> i64 {
+        let seen_in = out[0]
+        out[1] = 9
+        let seen_own = out[1]
+        seen_in * 100 + seen_own
+    }
+}
+fn main() -> i64 {
+    let !b = Box { k: 0 }
+    let !out = forge.zeros[i64, [4]]
+    out[0] = 5
+    let r = b.probe!(out)
+    r * 10 + out[1]
+}
+"#);
+    // r == 509 (read-in 5, write visible internally 9), out[1] == 9 for the caller.
+    assert_eq!(as_int(&v), 5099, "probe: caller must observe the method's write through `!out`");
+}
+
+#[test]
+fn non_mut_tensor_param_on_method_not_written_back_475() {
+    // The fix must not make every method parameter alias: without `!` the
+    // callee still works on a copy.
+    let v = run(r#"
+model Box {
+    !k: i64
+    fn touch(self, t: Tensor[i64, [2]]) -> i64 {
+        t[0] = 99
+        t[0]
+    }
+}
+fn main() -> i64 {
+    let !b = Box { k: 0 }
+    let !x = forge.zeros[i64, [2]]
+    x[0] = 1
+    let r = b.touch(x)
+    r * 10 + x[0]
+}
+"#);
+    assert_eq!(as_int(&v), 991, "a non-`!` tensor param on a method must NOT write back");
+}
+
+#[test]
+fn mut_tensor_param_through_forward_desugar_475() {
+    // `m(x)` ≡ `m.forward(x)` is a second dispatch path with the receiver
+    // prepended to the argument vector; it needs the same writeback offset.
+    // Spelled `forward`, not `forward!`: the lexer folds a trailing `!` into
+    // the identifier, so a method declared `forward!` registers under that
+    // name and the desugar — which looks up `forward` — never reaches it.
+    let v = run(r#"
+model Filler {
+    !k: i64
+    fn forward(self, !out: Tensor[i64, [3]]) -> i64 {
+        out[0] = self.k
+        out[2] = self.k + 1
+        self.k
+    }
+}
+fn main() -> i64 {
+    let !f = Filler { k: 4 }
+    let !out = forge.zeros[i64, [3]]
+    let n = f(out)
+    n * 100 + out[0] * 10 + out[2]
+}
+"#);
+    assert_eq!(as_int(&v), 445, "forward-desugar must write back `!` tensor params too");
+}
+
+// ── Issue #476: model arrays held in a model field ───────────────────────────
+
+#[test]
+fn model_array_field_indexed_assign_works_476() {
+    // Spelling 3. `h.cells[i] = Cell { .. }` used to fail at runtime with
+    // "indexed assignment requires a tensor, got list" — a message about
+    // tensors and lists, neither of which the author wrote. The local form
+    // (`cs[i] = ..`) had always worked; only the through-a-field path hit the
+    // tensor-only branch. Writing through the struct's own Rc, it now lands.
+    let v = run(r#"
+model Cell { !n: i64 }
+model Holder { !cells: [Cell; 3] }
+fn main() -> i64 {
+    let !h = Holder { cells: forge.uninit[Cell, [3]] }
+    for i in 0..3 { h.cells[i] = Cell { n: i * 10 } }
+    let a = h.cells[0]
+    let b = h.cells[2]
+    a.n * 100 + b.n
+}
+"#);
+    assert_eq!(as_int(&v), 20, "a[0].n=0, b[2].n=20 — the writes must reach the field");
+}
+
+#[test]
+fn model_array_field_indexed_assign_is_not_a_copy_476() {
+    // The point of writing through the field: neighbouring slots survive, and
+    // an element aliased out afterwards sees the stored value.
+    let v = run(r#"
+model Cell { !n: i64 }
+model Holder { !cells: [Cell; 3] }
+fn main() -> i64 {
+    let !h = Holder { cells: forge.uninit[Cell, [3]] }
+    for i in 0..3 { h.cells[i] = Cell { n: 1 } }
+    h.cells[1] = Cell { n: 7 }
+    let a = h.cells[0]
+    let b = h.cells[1]
+    let c = h.cells[2]
+    a.n * 100 + b.n * 10 + c.n
+}
+"#);
+    assert_eq!(as_int(&v), 171);
+}
+
+#[test]
+fn model_array_field_negative_and_oob_index_476() {
+    // Same index discipline as the local model-array store: negatives wrap,
+    // out of bounds is an error rather than a silent no-op.
+    let v = run(r#"
+model Cell { !n: i64 }
+model Holder { !cells: [Cell; 3] }
+fn main() -> i64 {
+    let !h = Holder { cells: forge.uninit[Cell, [3]] }
+    for i in 0..3 { h.cells[i] = Cell { n: 0 } }
+    h.cells[-1] = Cell { n: 5 }
+    let c = h.cells[2]
+    c.n
+}
+"#);
+    assert_eq!(as_int(&v), 5);
+
+    let e = run_err(r#"
+model Cell { !n: i64 }
+model Holder { !cells: [Cell; 3] }
+fn main() -> i64 {
+    let !h = Holder { cells: forge.uninit[Cell, [3]] }
+    h.cells[7] = Cell { n: 0 }
+    0
+}
+"#);
+    assert!(e.contains("out of bounds"), "expected an out-of-bounds error, got {e:?}");
+}
+
+#[test]
+fn uninit_model_array_element_read_names_its_cause_476() {
+    // Fix (2). An unwritten slot is `nil`, so a field read off one used to
+    // yield a silent `Opaque` — the program then died at whatever line first
+    // USED the value ("comparison requires numeric, str, or bool operands; got
+    // opaque and int"), naming neither the field, nor the array, nor
+    // initialization. `--check` catches the field spelling now, but not every
+    // path reaches the checker, so the runtime says what actually happened.
+    let e = run_err(r#"
+model Cell { !n: i64 }
+fn main() -> i64 {
+    let !cs = forge.uninit[Cell, [3]]
+    cs[0] = Cell { n: 1 }
+    let c = cs[1]
+    c.n
+}
+"#);
+    assert!(e.contains("uninitialized model-array element"),
+            "the runtime must name the real cause, got {e:?}");
+    assert!(!e.contains("opaque"), "must not surface as an `opaque` complaint: {e:?}");
 }
 
 // ── Issue #115: solve / inv / lstsq stdlib primitives ────────────────────────
@@ -6107,7 +7937,7 @@ fn main() -> f32 {
 fn approx(v: &Value, expected: f64, tol: f64, label: &str) {
     let got = match v {
         Value::Float(f, _) => *f,
-        Value::Int(n) => *n as f64,
+        Value::Int(n, _) => *n as f64,
         other => panic!("{}: expected numeric, got {:?}", label, other),
     };
     assert!((got - expected).abs() < tol, "{}: expected {}, got {}", label, expected, got);
@@ -6760,6 +8590,47 @@ fn trit_pack_returns_masks() {
     "#)), 3.0);  // sum(pos)=2 (elems 0,2), sum(neg)=1 (elem 3)
 }
 
+// ─── #530: `>>` — arithmetic right shift ────────────────────────────────
+
+/// The shift is **arithmetic** (sign-propagating), matching the JIT's `sshr`:
+/// a negative left operand keeps its sign bit, so `-8 >> 1` is -4 and `-1 >> n`
+/// is -1 for every in-range n. A logical shift would give huge positives here.
+#[test]
+fn right_shift_is_arithmetic_on_negatives() {
+    assert_eq!(as_int(&run("fn main() -> i64 { 256 >> 2 }")), 64);
+    assert_eq!(as_int(&run("fn main() -> i64 { -8 >> 1 }")), -4);
+    assert_eq!(as_int(&run("fn main() -> i64 { -1 >> 1 }")), -1);
+    assert_eq!(as_int(&run("fn main() -> i64 { -1 >> 63 }")), -1);
+    // Floor, not truncate-toward-zero: `-7 >> 1` is -4, while `-7 / 2` is -3.
+    assert_eq!(as_int(&run("fn main() -> i64 { -7 >> 1 }")), -4);
+    assert_eq!(as_int(&run("fn main() -> i64 { -7 / 2 }")), -3);
+}
+
+/// The 0 and 63 boundaries of the `0..=63` range, in i64 — 63 is the only
+/// count that can reach the sign bit, and 0 must be the identity.
+#[test]
+fn right_shift_range_boundaries() {
+    assert_eq!(as_int(&run("fn main() -> i64 { 256 >> 0 }")), 256);
+    assert_eq!(as_int(&run("fn main() -> i64 { -256 >> 0 }")), -256);
+    // 1 << 63 is i64::MIN; arithmetic-shifting it right by 63 gives -1.
+    assert_eq!(as_int(&run("fn main() -> i64 { (1 << 63) >> 63 }")), -1);
+    assert_eq!(as_int(&run("fn main() -> i64 { 9223372036854775807 >> 63 }")), 0);
+}
+
+/// #215: the shift amount is range-guarded exactly as `<<` is. Outside
+/// `0..=63` Rust's `>>` panics in debug and masks mod-64 in release; the
+/// interpreter raises a clean error instead, and the JIT matches it.
+#[test]
+fn right_shift_amount_out_of_range_errors() {
+    let e = run_err("fn main() -> i64 { 1 >> 64 }");
+    assert!(e.contains(">> shift amount 64 out of range"), "got: {}", e);
+    let e = run_err("fn main() -> i64 { 1 >> -1 }");
+    assert!(e.contains(">> shift amount -1 out of range"), "got: {}", e);
+    // Non-integer operands are rejected the way `<<`'s are.
+    let e = run_err("fn main() -> i64 { 1 >> 2.0 }");
+    assert!(e.contains(">> requires int"), "got: {}", e);
+}
+
 #[test]
 fn compound_assign_star_slash_bitwise() {
     // #222: `*=`, `/=`, `&=`, `|=`, `^=` silently no-op'd in the interpreter (only
@@ -6900,7 +8771,7 @@ fn rng_uniform_int_draws_in_range_395() {
              }\n\
              bad\n\
          }");
-    assert!(matches!(v, Value::Int(0)), "all draws must be in [3, 7), got {:?}", v);
+    assert!(matches!(v, Value::Int(0, _)), "all draws must be in [3, 7), got {:?}", v);
     // An empty range must still be loud.
     let e = run_err("fn main() -> nil { let rng = Rng.seed(1)  let (r2, i) = rng.uniform_int[i32,[3]](5, 5)  nil }");
     assert!(e.contains("uniform_int") && e.contains("greater"), "got: {}", e);
@@ -6916,7 +8787,7 @@ fn field_binding_scalar_copies_444() {
     let v = run("model B { !n: i64\n\
                  fn probe(self) -> i64 { let !snap = self.n  self.n = 99  snap } }\n\
                  fn main() -> i64 { let !b = B { n: 7 }  b.probe() }");
-    assert!(matches!(v, Value::Int(7)), "snapshot must hold 7, got {:?}", v);
+    assert!(matches!(v, Value::Int(7, _)), "snapshot must hold 7, got {:?}", v);
 }
 
 #[test]
@@ -7484,4 +9355,1368 @@ fn list_reassignment_with_the_target_read_in_a_later_arg_452() {
         }
     "#);
     assert_eq!(as_int(&v), 32);
+}
+
+// ── #474: shape-generic model methods, and model shape args in every position ─
+//
+// The headline of #474 is the ghost method: a method that declares its own
+// shape params passed `--check` and then did nothing at all — no error, no
+// mutation, not even a `print` from inside the body. A test that asserts a
+// call did nothing cannot catch that (the issue has one that passed for
+// months while `blit` was a no-op for every input), so every repro below
+// asserts the *effect*, and the ones that come straight from the issue check
+// first, so "passes --check and never runs" cannot come back one half at a
+// time.
+
+/// Type-check `src` and then run it — the pairing #474 is about. A test that
+/// only runs cannot see a check-time regression, and one that only checks
+/// cannot see the ghost method.
+fn run_checked(src: &str) -> Value {
+    use super::check::Checker;
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.check_program(&program, None);
+    assert!(checker.errors.is_empty(), "unexpected type errors: {:?}",
+            checker.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    Interpreter::new().run(&program, None).expect("run failed")
+}
+
+
+#[test]
+fn model_field_of_parameterized_model_type_474() {
+    // #474's field position, from the issue comment: `Console[ROWS, COLS, H, W]`
+    // holding a `Surface[H, W]`. The comment records this as unwritable — the
+    // literal typed bare and never unified — so demoniOS split the console in
+    // two. Construct it, mutate through the nested field, and read back.
+    let v = run_checked(r#"
+        model Surface[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+            fn plot!(self, y: i64, x: i64, v: u32) -> nil {
+                let !p = self.px
+                p[y, x] = v
+                self.n = self.n + 1
+            }
+        }
+        model Console[ROWS, COLS, H, W] {
+            !text: Tensor[u32, [ROWS, COLS]]
+            !surface: Surface[H, W]
+            fn render!(self) -> i64 {
+                self.surface.plot!(1, 2, 0x41u32)
+                self.surface.n
+            }
+        }
+        fn main() -> i64 {
+            vault {
+                let !c = Console[2, 3, 4, 5] {
+                    text: vault.zeros[u32, [2, 3]],
+                    surface: Surface[4, 5] { px: vault.zeros[u32, [4, 5]], n: 0 }
+                }
+                c.render!() * 1000 + c.surface.px[1, 2] as i64
+            }
+        }
+    "#);
+    // One plot!, and 0x41 == 65 landed at [1, 2] of the nested surface.
+    assert_eq!(as_int(&v), 1065);
+}
+
+#[test]
+fn shape_generic_method_actually_runs_474() {
+    // #474's repro verbatim, with the two prints replaced by the values they
+    // printed. `plain!` (no shape params of its own) always worked; `generic!`
+    // was the ghost. Both halves of its body have to land: the `n` bump and
+    // the write through `self.cells`.
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+
+            fn plain!(self, v: u32) -> nil {
+                self.n = self.n + 100
+            }
+
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> nil {
+                self.n = self.n + 1
+                let !c = self.cells
+                c[0, 0] = src[0, 0]
+            }
+        }
+
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]], n: 0 }
+                let !s = vault.zeros[u32, [2, 2]]
+                s[0, 0] = 0x7Au32
+
+                b.plain!(1u32)
+                b.generic![2, 2](s)
+                b.n * 1000 + b.cells[0, 0] as i64
+            }
+        }
+    "#);
+    // n == 101 (100 from plain!, 1 from generic!), cells[0,0] == 0x7A == 122.
+    assert_eq!(as_int(&v), 101 * 1000 + 122);
+}
+
+#[test]
+fn shape_generic_method_reads_its_own_shape_params_474() {
+    // The bracket is not decoration: SH and SW are in scope in the body and
+    // hold what the call site wrote. A no-op could not tell 4 and 5 apart.
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn area![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH * 10 + SW }
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [4, 5]]
+                b.area![4, 5](s)
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 45);
+}
+
+#[test]
+fn shape_generic_method_reads_the_models_shape_params_too_474() {
+    // Both halves of the body's shape scope: the model's H comes off the
+    // receiver, the method's SH and W off the bracket — and a method shape
+    // param that reuses a model name is shadowed by what the call site wrote,
+    // the only reading that makes writing the bracket mean anything.
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn mix![SH, W](self, src: Tensor[u32, [SH, W]]) -> i64 { H * 100 + SH * 10 + W }
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]] }
+                let !s = vault.zeros[u32, [4, 5]]
+                b.mix![4, 5](s)
+            }
+        }
+    "#);
+    // H = 2 from the instance; SH = 4 and W = 5 from the bracket, W = 3 shadowed.
+    assert_eq!(as_int(&v), 245);
+}
+
+#[test]
+fn shape_generic_method_without_a_bracket_infers_from_the_args_474() {
+    // No bracket at all: the method's shape params bind from the tensor
+    // argument exactly as a free function's do.
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn area![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH * 10 + SW }
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [4, 5]]
+                b.area!(s)
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 45);
+}
+
+#[test]
+fn named_shape_bracket_on_a_method_474() {
+    // The `[SH=4, SW=5]` spelling binds by name, in any order.
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn area![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH * 10 + SW }
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [4, 5]]
+                b.area![SW = 5, SH = 4](s)
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 45);
+}
+
+#[test]
+fn shape_generic_method_reached_through_a_field_474() {
+    // The receiver need not be a plain identifier. `h.surf.bump![…]` is the
+    // shape demoniOS's compositor wants.
+    let v = run_checked(r#"
+        model Inner[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+            fn bump![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> nil {
+                self.n = self.n + SH * 10 + SW
+            }
+        }
+        model Holder { !surf: Inner[2, 3] }
+        fn main() -> i64 {
+            vault {
+                let !i = Inner[2, 3] { px: vault.zeros[u32, [2, 3]], n: 0 }
+                let !h = Holder { surf: i }
+                let !s = vault.zeros[u32, [4, 5]]
+                h.surf.bump![4, 5](s)
+                h.surf.bump!(s)
+                h.surf.n
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 90);
+}
+
+#[test]
+fn undefined_method_behind_a_shape_bracket_errors_441() {
+    // #441's rule, in the bracketed spelling. The interpreter must refuse on
+    // its own — `run()` does not type-check — rather than fall through to an
+    // opaque that swallows the call.
+    let msg = run_err(r#"
+        model Box[H, W] { !cells: Tensor[u32, [H, W]] }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                b.nope![2, 2](1)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "no method `nope!` on model `Box`");
+}
+
+#[test]
+fn a_bracket_on_a_model_field_is_still_indexing_474() {
+    // The dispatch must not eat `b.cells[0, 1]` — a field of that name being
+    // indexed is indexing, not a shape-bracketed method call.
+    let v = run_checked(r#"
+        model Box[H, W] { !cells: Tensor[u32, [H, W]] }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !c = b.cells
+                c[0, 1] = 7u32
+                b.cells[0, 1] as i64
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 7);
+}
+
+// ── #459 / #474: shape params bind from more than tensor arguments ──────────
+//
+// The harvest during call binding used to read tensor arguments and nothing
+// else, so a model array never bound its length and a model argument never
+// handed over the shape args it was built with.
+
+#[test]
+fn shape_param_binds_from_model_array_length_459() {
+    // #459's repro, inferred form: `N` comes from the arena's own length.
+    // Before the harvest learned about `[T; N]` this type-checked and then
+    // died at the call site.
+    let v = run(r#"
+        model Node { kind: i64 }
+        fn build[N](!ns: [Node; N], n: i64) -> i64 {
+            ns[0] = Node { kind: 7 }
+            ns[0].kind
+        }
+        fn main() -> i64 {
+            let !arena = forge.uninit[Node, [8]]
+            build(arena, 8)
+        }
+    "#);
+    assert_eq!(as_int(&v), 7);
+}
+
+#[test]
+fn model_array_length_is_readable_as_the_shape_param_459() {
+    // The bound `N` is the real length, not merely something that stopped
+    // erroring — the point of #459 is a parametric capacity the body computes
+    // with.
+    let v = run_checked(r#"
+        model Node { kind: i64 }
+        fn cap[N](!ns: [Node; N]) -> i64 { N * 2 }
+        fn main() -> i64 {
+            let !arena = forge.uninit[Node, [6]]
+            cap(arena)
+        }
+    "#);
+    assert_eq!(as_int(&v), 12);
+}
+
+#[test]
+fn shape_param_workaround_form_still_works_459() {
+    // #459's passing workaround — a named top-level capacity, no shape param
+    // on the array at all. It must keep working unchanged.
+    let v = run_checked(r#"
+        model Node { kind: i64 }
+        let AST_CAP = 8
+        fn build(!ns: [Node; AST_CAP], n: i64) -> i64 {
+            ns[0] = Node { kind: 7 }
+            ns[0].kind
+        }
+        fn main() -> i64 {
+            let !arena = forge.uninit[Node, [8]]
+            build(arena, 8)
+        }
+    "#);
+    assert_eq!(as_int(&v), 7);
+}
+
+#[test]
+fn model_array_length_conflict_errors_459() {
+    // Two arrays want the same `N` at different lengths. The new binding
+    // source reports through the same path the tensor one does.
+    let msg = run_err(r#"
+        model Node { kind: i64 }
+        fn twin[N](!a: [Node; N], !b: [Node; N]) -> i64 { N }
+        fn main() -> i64 {
+            let !x = forge.uninit[Node, [8]]
+            let !y = forge.uninit[Node, [4]]
+            twin(x, y)
+        }
+    "#);
+    assert!(msg.contains("`N`") && msg.contains("both 8 and 4"),
+            "expected an N=8-vs-4 conflict, got: {msg}");
+}
+
+#[test]
+fn parameterized_model_param_binds_its_shape_args_474() {
+    // #474, parameter position: `!b: Box[H, W]` binds H and W from the
+    // instance itself. Before this the call needed every shape spelled out
+    // (`free_generic![2, 2, 2, 2](b, s)`).
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        fn area[H, W](!b: Box[H, W]) -> i64 { H * W }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]], n: 0 }
+                area(b)
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 6);
+}
+
+#[test]
+fn parameterized_model_param_mixes_with_tensor_inference_474() {
+    // The model argument and a tensor argument bind different params of the
+    // same signature — the issue's `free_generic!` shape, minus the brackets.
+    // The body runs and the mutation writes back.
+    let v = run(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        fn blit[H, W, SH, SW](!b: Box[H, W], src: Tensor[u32, [SH, SW]]) -> nil {
+            b.n = b.n + H * 1000 + W * 100 + SH * 10 + SW
+            nil
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]], n: 0 }
+                let !s = vault.zeros[u32, [4, 5]]
+                blit(b, s)
+                b.n
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 2345);
+}
+
+#[test]
+fn a_bracketed_field_call_evaluates_its_receiver_once_474() {
+    // `recv.name[i](args)` cannot be told apart from a shape-bracketed method
+    // call until `recv` has been evaluated, so the dispatch evaluates it — and
+    // then, on deciding `subs` is a field rather than a method, used to hand
+    // the expression back to the ordinary postfix path, which walked it again.
+    // Every side effect ran twice: `tick` bumped `hits` twice, and a receiver
+    // built in an arena was built twice.
+    //
+    // `hits` is the whole assertion. One evaluation, one bump.
+    let v = run_checked(r#"
+        model Elem {
+            !v: i64
+            fn forward(self, x: i64) -> i64 { self.v + x }
+        }
+        model Holder { !subs: [Elem; 2] !hits: i64 }
+        fn tick(!h: Holder) -> Holder { h.hits = h.hits + 1  h }
+        fn main() -> i64 {
+            forge {
+                let !es = forge.uninit[Elem, [2]]
+                es[0] = Elem { v: 10 }
+                es[1] = Elem { v: 20 }
+                let !h = Holder { subs: es, hits: 0 }
+                let r = tick(h).subs[1](5)
+                h.hits * 1000 + r
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 1025, "expected one receiver evaluation (hits=1) and r=25");
+}
+
+#[test]
+fn parameterized_model_param_mixes_with_tensor_inference_through_brackets_474() {
+    // The same signature reached through the bang-method bracket spelling the
+    // issue actually uses. The inferred call and the fully-explicit one must
+    // agree on every dim, so the bracket is a restatement, never a second
+    // source of truth.
+    let v = run_checked(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        fn blit![H, W, SH, SW](!b: Box[H, W], src: Tensor[u32, [SH, SW]]) -> nil {
+            b.n = b.n + H * 1000 + W * 100 + SH * 10 + SW
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]], n: 0 }
+                let !s = vault.zeros[u32, [4, 5]]
+                blit!(b, s)
+                blit![2, 3, 4, 5](b, s)
+                b.n
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 2 * 2345);
+}
+
+#[test]
+fn explicit_shape_args_still_win_over_inference_474() {
+    // The explicit-bracket call the issue documents as the workaround stays
+    // valid: same program, brackets spelled out, same answer.
+    let v = run(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        fn area[H, W](!b: Box[H, W]) -> i64 { H * W }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]], n: 0 }
+                area[2, 3](b)
+            }
+        }
+    "#);
+    assert_eq!(as_int(&v), 6);
+}
+
+#[test]
+fn model_shape_arg_conflict_errors_474() {
+    // The model argument says H=2, the tensor argument says H=3. Same class of
+    // diagnostic as the tensor-vs-tensor conflict.
+    let msg = run_err(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        fn wide[H, W](!b: Box[H, W], src: Tensor[u32, [H, W]]) -> i64 { H }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]], n: 0 }
+                let !s = vault.zeros[u32, [3, 2]]
+                wide(b, s)
+            }
+        }
+    "#);
+    assert!(msg.contains("`H`") && msg.contains("both 2 and 3"),
+            "expected an H=2-vs-3 conflict, got: {msg}");
+}
+
+#[test]
+fn unbindable_shape_param_still_errors() {
+    // Widening the harvest must not let an uninferable param quietly bind to
+    // something. A param no argument mentions is still an error at the call.
+    let msg = run_err(r#"
+        fn lonely[Q](x: i64) -> i64 { Q }
+        fn main() -> i64 { lonely(1) }
+    "#);
+    assert!(msg.contains("`Q`") && msg.contains("cannot be inferred"),
+            "expected an uninferable-shape-param error, got: {msg}");
+}
+
+// ─── #478: unsuffixed float literals adopt their branch's type ───────────────
+//
+// The checker constrains an untyped float literal to its context, and a
+// sibling `if`/`match` branch IS context (SPEC.md §"Untyped numeric literals"
+// — "the other operand at its use site"). The interpreter used to ignore that:
+// the literal evaluated as an f64 value, so the answer depended on which
+// branch the condition happened to take. These pin the width the literal now
+// carries; `jit.rs`'s tests pin the same programs against the JIT.
+
+/// `0.1f32 + 0.2f32` is 0.30000001192092896; the f64 0.1 plus an f32 0.2 is
+/// 0.3000000029802322. Only a literal whose value differs between the two
+/// widths can tell a fixed backend from a reverted one — which is why the
+/// tests below use `0.1` and not the issue's exactly-representable `0.0`.
+///
+/// The VALUE is the assertion, never the `FW` tag: `fn main() -> f64` widens
+/// whatever it returns, so the tag says f64 either way and would pass for a
+/// backend that had reverted to computing in f64.
+/// NB the parens: the addition happens IN f32 and is widened once. Widening
+/// each operand first and adding in f64 gives 0.30000000447034836 — a third
+/// answer, and neither backend's.
+const F32_SUM_478: f64 = (0.1f32 + 0.2f32) as f64;
+
+#[test]
+fn unsuffixed_literal_in_an_f32_branch_is_f32_478() {
+    for cond in ["0.0f32", "1.0f32"] {   // then taken, else taken
+        let src = format!(r#"
+            fn main() -> f64 {{
+                let a = 0.1f32
+                let z = if a > {cond} {{ a }} else {{ 0.1 }}
+                z + 0.2f32
+            }}
+        "#);
+        assert_eq!(as_float(&run(&src)), F32_SUM_478, "wrong width taking `{}`", cond);
+    }
+}
+
+#[test]
+fn unsuffixed_literal_in_an_f32_match_arm_is_f32_478() {
+    for n in [1, 2] {                     // ident arm taken, literal arm taken
+        let src = format!(r#"
+            fn main() -> f64 {{
+                let a = 0.1f32
+                let n = {n}
+                let z = match n {{ 1 => a, _ => 0.1 }}
+                z + 0.2f32
+            }}
+        "#);
+        assert_eq!(as_float(&run(&src)), F32_SUM_478, "wrong width for n = {}", n);
+    }
+}
+
+#[test]
+fn an_all_f64_join_is_untouched_by_type_direction_478() {
+    // #209 must survive: with no f32 anywhere in the join, the literal stays
+    // f64 and keeps every digit.
+    let v = run(r#"
+        fn main() -> f64 {
+            let a = 0.5
+            let z = if a > 1.0 { a } else { 0.1 }
+            z
+        }
+    "#);
+    // 0.1 quantized through f32 is 0.10000000149011612 — a narrowed join
+    // would not compare equal to the f64 literal.
+    assert_eq!(as_float(&v), 0.1f64, "an f64 join was narrowed: {:?}", v);
+}
+
+#[test]
+fn type_direction_stops_at_the_branch_value_478() {
+    // The hint is armed for one value position. A `let` STATEMENT inside the
+    // f32-hinted branch, and anything after the join, keep the f64 default.
+    let v = run(r#"
+        fn main() -> f64 {
+            let a = 0.1f32
+            let z = if a > 0.0f32 { let w = 0.1  w * 0.0 + a } else { 0.1 }
+            let d = 0.1
+            d
+        }
+    "#);
+    assert_eq!(as_float(&v), 0.1f64, "the hint leaked past the branch: {:?}", v);
+}
+
+// ─── Arena sizing flags (#400, MEMORY.md §1.1) ───────────────────────────────
+
+/// Run `src` with the given arena budgets installed, as `--vault=` / `--forge=`
+/// would. Returns the runtime error message, or `Ok` with the program's value.
+fn run_with_limits(
+    src: &str,
+    limits: crate::arena::ArenaLimits,
+) -> Result<Value, String> {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut interp = Interpreter::new();
+    interp.set_arena_limits(limits);
+    interp.run(&program, None).map_err(|e| e.msg)
+}
+
+fn forge_budget(bytes: u64) -> crate::arena::ArenaLimits {
+    crate::arena::ArenaLimits { vault: None, forge: Some(bytes) }
+}
+
+fn vault_budget(bytes: u64) -> crate::arena::ArenaLimits {
+    crate::arena::ArenaLimits { vault: Some(bytes), forge: None }
+}
+
+#[test]
+fn allocation_within_the_forge_budget_runs() {
+    // 64 f64 elements = 512 bytes, comfortably inside 4 KiB.
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let t = forge.zeros[f32, [8, 8]]
+            1
+        }
+    "#, forge_budget(4096)).expect("should fit the budget");
+    assert_eq!(as_int(&v), 1);
+}
+
+#[test]
+fn allocation_past_the_forge_budget_is_a_runtime_error() {
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let t = forge.zeros[f32, [1024, 1024]]
+            1
+        }
+    "#, forge_budget(4096)).expect_err("should exhaust the budget");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+    assert!(e.contains("--forge"), "{}", e);
+}
+
+#[test]
+fn the_forge_budget_accumulates_across_allocations() {
+    // Two 512-byte tensors fit in 2 KiB; the third does not.
+    let ok = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [8, 8]]
+            let b = forge.ones[f32, [8, 8]]
+            1
+        }
+    "#, forge_budget(1024));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [8, 8]]
+            let b = forge.ones[f32, [8, 8]]
+            let c = forge.zeros[f32, [8, 8]]
+            1
+        }
+    "#, forge_budget(1024)).expect_err("third allocation should not fit");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_forge_block_does_not_rewind_the_budget_on_exit() {
+    // #400: the meter is monotonic. `forge { … }` used to rewind `forge_used`
+    // to the block's entry watermark, on the theory that §3's bump-pointer
+    // reset gives the bytes back — but the interpreter has no bump pointer and
+    // reclaims nothing, so the rewind was a lie that let a program hold every
+    // "reset" tensor at once. Ten 512-byte tensors against a 1 KiB budget must
+    // therefore run out, exactly as they do unwrapped.
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let !n = 0
+            for i in 0..10 {
+                forge {
+                    let tmp = forge.zeros[f32, [8, 8]]
+                    n = n + 1
+                }
+            }
+            n
+        }
+    "#, forge_budget(1024)).expect_err("a forge block must not hand budget back");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+
+    // …and a budget that covers all ten still runs them, so the block itself
+    // is not charged anything extra.
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let !n = 0
+            for i in 0..10 {
+                forge {
+                    let tmp = forge.zeros[f32, [8, 8]]
+                    n = n + 1
+                }
+            }
+            n
+        }
+    "#, forge_budget(10 * 512)).expect("ten 512-byte tensors fit a 5 KiB budget");
+    assert_eq!(as_int(&v), 10);
+}
+
+#[test]
+fn a_forge_block_is_not_a_way_around_the_forge_budget() {
+    // The repro that closed the bypass: a recursive fn that keeps every tensor
+    // it allocates live across the recursive call. Forty 2 MiB tensors is
+    // 80 MiB of simultaneously-live memory; `--forge=4M` must refuse it
+    // whether or not each allocation is wrapped in `forge { … }`. Before the
+    // fix the wrapped form ran to completion and printed 40.
+    const HOLD_40: &str = r#"
+        fn hold(n: i64) -> i64 {
+            if n <= 0 { return 0 }
+            let !t = %s
+            let rest = hold(n - 1)
+            t[0, 0] = 1.0
+            rest + 1
+        }
+        fn main() -> i64 { hold(40) }
+    "#;
+    let wrapped = HOLD_40.replace("%s", "forge { forge.zeros[f64, [512, 512]] }");
+    let bare = HOLD_40.replace("%s", "forge.zeros[f64, [512, 512]]");
+
+    let e = run_with_limits(&wrapped, forge_budget(4 << 20))
+        .expect_err("`forge { … }` bypassed the budget");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+
+    let e = run_with_limits(&bare, forge_budget(4 << 20))
+        .expect_err("the unwrapped form should also be refused");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+
+    // The value of a `forge { … }` block still escapes the block and is still
+    // usable — the fix is to the meter, not to the semantics.
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let !t = forge { forge.zeros[f64, [4, 4]] }
+            t[1, 1] = 7.0
+            if t[1, 1] == 7.0 { 1 } else { 0 }
+        }
+    "#, forge_budget(4 << 20)).expect("a forge block's value escapes");
+    assert_eq!(as_int(&v), 1, "the block's tensor was not usable after the block");
+}
+
+#[test]
+fn the_vault_budget_is_separate_from_the_forge_one() {
+    // A tight vault budget does not constrain forge allocations…
+    let ok = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [64, 64]]
+            1
+        }
+    "#, vault_budget(512));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    // …but it does constrain vault ones.
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = vault.zeros[f32, [64, 64]]
+            1
+        }
+    "#, vault_budget(512)).expect_err("should exhaust the vault budget");
+    assert!(e.contains("vault arena exhausted"), "{}", e);
+    assert!(e.contains("--vault"), "{}", e);
+}
+
+#[test]
+fn the_vault_has_no_reset_so_a_loop_exhausts_it() {
+    // The mirror of the forge-block test: Vault lives for the process, so
+    // repeated allocation genuinely runs out (MEMORY.md §1).
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let !n = 0
+            for i in 0..10 {
+                let tmp = vault.zeros[f32, [8, 8]]
+                n = n + 1
+            }
+            n
+        }
+    "#, vault_budget(1024)).expect_err("vault should not rewind");
+    assert!(e.contains("vault arena exhausted"), "{}", e);
+}
+
+#[test]
+fn no_flag_means_no_budget() {
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [256, 256]]
+            let b = vault.zeros[f32, [256, 256]]
+            1
+        }
+    "#, crate::arena::ArenaLimits::default()).expect("unbounded by default");
+    assert_eq!(as_int(&v), 1);
+}
+
+#[test]
+fn a_kv_allocation_is_stream_not_forge() {
+    // `forge.kv` lands in the Stream arena (MEMORY.md §9), which the sizing
+    // flags do not reach — its bound is its own `capacity`.
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let !c = forge.kv[f32, [~]](capacity = 4096)
+            c <- [1.0f32]
+            1
+        }
+    "#, forge_budget(64)).expect("kv must not charge the forge budget");
+    assert_eq!(as_int(&v), 1);
+}
+
+// ─── #540: fixed-width integer arithmetic wraps at the declared width ────────
+//
+// SPEC §3.1. The interpreter used to hold an `i32` as an i64 and narrow only at
+// an explicit `as i32`, so `let c: i32 = a + b` stored 2^31 where the JIT's
+// `cl::I32` wrapped to -2^31. These pin the interpreter half; the cross-backend
+// half is `tests/i32_wrap_540.rs` + `tests/spec_probes/p57_i32_arith_wraps.dmc`.
+
+/// The issue's repro. Before #540 this returned 2147483648.
+#[test]
+fn i32_add_overflow_wraps_to_min() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = 2147483647
+            let b: i32 = 1
+            let c: i32 = a + b
+            c as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// The other direction: under the bottom, back to MAX.
+#[test]
+fn i32_sub_at_the_negative_boundary_wraps_to_max() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = -2147483648
+            let b: i32 = 1
+            (a - b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 2147483647);
+}
+
+/// 10^10 mod 2^32. Multiply wraps like add and subtract.
+#[test]
+fn i32_mul_overflow_wraps() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = 100000
+            (a * a) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 1410065408);
+}
+
+/// Negating i32::MIN is i32::MIN — the one fixed point of two's complement.
+#[test]
+fn i32_negate_min_is_min() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = -2147483648
+            let z: i32 = 0
+            (z - a) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// The width survives the binding, so a comparison sees the WRAPPED value.
+/// This is the case a narrow-at-the-annotation-only fix would have missed.
+#[test]
+fn i32_comparison_sees_the_wrapped_value() {
+    let v = run(r#"
+        fn main() -> bool {
+            let a: i32 = 2147483647
+            let b: i32 = 1
+            (a + b) < 0
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "got {:?}", v);
+}
+
+/// An untyped integer literal adopts the i32 operand's width (§3.1), the same
+/// rule the JIT applies in `adopt_int_literal_kind`.
+#[test]
+fn i32_meeting_an_untyped_literal_still_wraps() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = 2147483647
+            (a + 1) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// A parameter and a declared return are width origins too, not just a `let`.
+#[test]
+fn i32_width_originates_at_a_parameter_and_a_return() {
+    let v = run(r#"
+        fn bump(x: i32) -> i32 { x + 1 }
+        fn main() -> i64 {
+            let a: i32 = 2147483647
+            bump(a) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// #545: an integer literal's SUFFIX is a width origin. §3.1: "an explicit type
+/// suffix on an integer literal types the literal concretely", so
+/// `2147483647i32` is an `i32` and the add after it wraps. #540 backed this out
+/// because `jit.rs`'s `lower_literal` dropped the suffix and honoring it here
+/// alone would have been a fresh divergence; #545 fixed both backends together,
+/// and `tests/narrow_int_wrap_544.rs` pins that they agree.
+#[test]
+fn an_integer_suffix_is_a_width_origin() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a = 2147483647i32
+            (a + 1i32) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// The suffix originates a width at EVERY fixed-width kind, not just `i32` —
+/// and an unsuffixed literal meeting one adopts it (§3.1's untyped-literal
+/// rule), which is the `IW::join` half of the same fix.
+#[test]
+fn an_integer_suffix_originates_every_width() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a = 32767i16
+            (a + 1i16) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -32768);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a = 127i8
+            (a + 1) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -128);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a = 0u8
+            (a - 1u8) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 255);
+}
+
+/// The explicit cast is UNCHANGED by #540 — it narrowed before and narrows the
+/// same way now, on both backends. This is the case that already agreed.
+#[test]
+fn explicit_as_i32_cast_is_unchanged() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 5000000000
+            (a as i32) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 705032704);
+}
+
+/// …and the cast's RESULT is an i32, so what follows it wraps too.
+#[test]
+fn the_result_of_an_as_i32_cast_is_an_i32() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 2147483647
+            let b: i32 = 1
+            ((a as i32) + b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// i64 is unaffected: the same expression one width up does not wrap, and i64
+/// overflow still wraps at 64 bits (#300).
+#[test]
+fn i64_arithmetic_keeps_its_own_width() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 2147483647
+            a + 1
+        }
+    "#);
+    assert_eq!(as_int(&v), 2147483648);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 9223372036854775807
+            a + 1
+        }
+    "#);
+    assert_eq!(as_int(&v), i64::MIN);
+}
+
+/// `~` complements the operand's width, not always 64 bits: `~0i32` is -1 at
+/// both widths, but the value stays an i32 and the next op wraps at 32.
+#[test]
+fn bitwise_not_and_ops_keep_the_i32_width() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let z: i32 = 0
+            let max: i32 = 2147483647
+            (~z - max) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+/// `<<` is bounded by the SHIFTED VALUE's width — an i32 shift tops out at 31,
+/// and the result wraps at 32. The JIT's `shift_range_check` (#541) sizes its
+/// guard the same way, and its message names the same range.
+#[test]
+fn i32_shift_is_bounded_by_32_bits_and_wraps() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = 1
+            let k: i32 = 31
+            (a << k) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+    let e = run_err(r#"
+        fn main() -> i64 {
+            let a: i32 = 1
+            let k: i32 = 32
+            (a << k) as i64
+        }
+    "#);
+    assert!(e.contains("expected 0..=31"), "got {:?}", e);
+}
+
+/// `MIN / -1` overflows at every width and is the one division with no wrapped
+/// value; the diagnostic names the width that actually overflowed.
+#[test]
+fn i32_min_divided_by_minus_one_reports_the_i32_range() {
+    let e = run_err(r#"
+        fn main() -> i64 {
+            let a: i32 = -2147483648
+            let b: i32 = -1
+            (a / b) as i64
+        }
+    "#);
+    assert!(e.contains("exceeds the i32 range"), "got {:?}", e);
+    let e = run_err(r#"
+        fn main() -> i64 {
+            let a: i64 = -9223372036854775807 - 1
+            let b: i64 = -1
+            a / b
+        }
+    "#);
+    assert!(e.contains("exceeds the i64 range"), "got {:?}", e);
+}
+
+/// Div-by-zero stays total (#208) at every width.
+#[test]
+fn i32_division_by_zero_is_still_zero() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = 2147483647
+            let z: i32 = 0
+            ((a / z) + (a % z)) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// A map is `str → any` and the JIT backs it with a raw i64 store, so an
+/// integer loses its declared width by going through one. Keeping the width
+/// here would make `map_get(m, k) + 1` wrap under `dmc run` and not under
+/// `dmc jit` — a divergence introduced by the fix for a divergence.
+#[test]
+fn a_map_round_trip_drops_the_i32_width() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i32 = 2147483647
+            let m = map_new()
+            map_set(m, "k", a)
+            map_get(m, "k") + 1
+        }
+    "#);
+    assert_eq!(as_int(&v), 2147483648);
+}
+
+/// The width DOES survive the typed containers — a tuple, an enum payload and
+/// a model field are all declared `i32` on both backends.
+#[test]
+fn the_width_survives_typed_containers() {
+    let v = run(r#"
+        enum Opt { Some(i32), None }
+        fn pair(a: i32, b: i32) -> (i32, i32) { (a, b) }
+        fn main() -> i64 {
+            let a: i32 = 2147483647
+            let one: i32 = 1
+            let o = Opt.Some(a)
+            let x = match o { Some(n) => n + one, None => one }
+            let (p, q) = pair(a, one)
+            ((x + q) - (p + q)) as i64
+        }
+    "#);
+    // x and (p + q) are both the wrapped MIN; MIN + 1 - MIN is 1.
+    assert_eq!(as_int(&v), 1);
+}
+
+/// #544: the other fixed-width kinds wrap at their own width too. #540 did
+/// `i32` alone because it was the only narrow `ScalarKind` the JIT had; #544
+/// gave the JIT masked i64-backed kinds for the rest, so both backends now wrap
+/// at 8/16/32 bits (`tests/narrow_int_wrap_544.rs` pins the agreement).
+#[test]
+fn the_other_narrow_widths_wrap_at_their_own_width() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i16 = 32767
+            let b: i16 = 1
+            (a + b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -32768);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i8 = 127
+            let b: i8 = 1
+            (a + b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -128);
+}
+
+/// Unsigned wrap is UNSIGNED: `0u32 - 1u32` is 4294967295, held zero-extended
+/// in the i64-backed value, not the -1 a signed 32-bit wrap would give.
+#[test]
+fn unsigned_widths_wrap_unsigned() {
+    let cases = [
+        ("u8", 255i64), ("u16", 65535), ("u32", 4294967295),
+    ];
+    for (ty, want) in cases {
+        let src = format!(r#"
+            fn main() -> i64 {{
+                let a: {ty} = 0
+                let b: {ty} = 1
+                (a - b) as i64
+            }}
+        "#);
+        assert_eq!(as_int(&run(&src)), want, "0 - 1 at {}", ty);
+    }
+    // …and the zero-extended value is what every later operation sees: the
+    // comparison, the division and the shift are all unsigned because the
+    // operand is a non-negative i64.
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: u32 = 0
+            let b: u32 = 1
+            let m = a - b
+            let two: u32 = 2
+            (m / two) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 2147483647);
+    let v = run(r#"
+        fn main() -> bool {
+            let a: u32 = 0
+            let b: u32 = 1
+            (a - b) > b
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "got {:?}", v);
+}
+
+/// `u64` is the one width an i64-backed value cannot fully hold, so it stays
+/// 64-bit two's-complement: the WRAP is bit-identical to `i64`'s (which is all
+/// §3.1 asks), but a value above 2^63 renders as its signed pattern. Pinned so
+/// the limitation is a decision on record, not a surprise.
+#[test]
+fn u64_wraps_at_64_bits_as_a_twos_complement_pattern() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: u64 = 0
+            let b: u64 = 1
+            (a - b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -1);
+}
+
+/// The narrow widths carry into `/`, `%`, `<<`, `~` and unary `-` — every op
+/// #540 taught to respect a width, now at eight of them.
+#[test]
+fn narrow_widths_carry_through_every_width_sensitive_op() {
+    // `<<` is bounded by the SHIFTED VALUE's width: an i8 shift tops out at 7.
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i8 = 1
+            let k: i8 = 7
+            (a << k) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -128);
+    let e = run_err(r#"
+        fn main() -> i64 {
+            let a: i8 = 1
+            let k: i8 = 8
+            (a << k) as i64
+        }
+    "#);
+    assert!(e.contains("expected 0..=7"), "got {:?}", e);
+    // `MIN / -1` overflows at every width, and names the one that overflowed.
+    let e = run_err(r#"
+        fn main() -> i64 {
+            let a: i16 = -32768
+            let b: i16 = -1
+            (a / b) as i64
+        }
+    "#);
+    assert!(e.contains("exceeds the i16 range"), "got {:?}", e);
+    // `~` complements the operand's width: `~0u8` is 255, not -1.
+    let v = run(r#"
+        fn main() -> i64 {
+            let z: u8 = 0
+            (~z) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 255);
+    // Negating MIN is MIN, the fixed point of two's complement, at i8 too.
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i8 = -128
+            let z: i8 = 0
+            (z - a) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -128);
+}
+
+/// An `as` cast to a narrow type is a width origin as well as a narrowing, so
+/// what follows the cast wraps — the §3.1 rule #540 established for `i32`.
+#[test]
+fn the_result_of_a_narrow_as_cast_carries_its_width() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 100000
+            let one: i16 = 1
+            ((a as i16) + one) as i64
+        }
+    "#);
+    // 100000 as i16 == -31072; +1 stays inside the width.
+    assert_eq!(as_int(&v), -31071);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 255
+            let one: u8 = 1
+            ((a as u8) + one) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// The packed `int4`/`int8` kinds of §3.1 are signed 4-/8-bit types and wrap
+/// at those widths, on the annotation and on the `as` cast alike.
+#[test]
+fn the_packed_int4_and_int8_kinds_wrap_at_their_widths() {
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: int8 = 127
+            let b: int8 = 1
+            (a + b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -128);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: int4 = 7
+            let b: int4 = 1
+            (a + b) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -8);
+    let v = run(r#"
+        fn main() -> i64 {
+            let a: i64 = 9
+            (a as int4) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -7);
+}
+
+/// A width originates at a parameter and a declared return at every kind, not
+/// just at a `let` — the same five origins §3.1 names for a float width.
+#[test]
+fn narrow_widths_originate_at_parameters_and_returns() {
+    let v = run(r#"
+        fn bump(x: u8) -> u8 { x + 1 }
+        fn main() -> i64 {
+            let a: u8 = 255
+            bump(a) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+    let v = run(r#"
+        fn wrapped() -> i8 { 127 + 1 }
+        fn main() -> i64 { wrapped() as i64 }
+    "#);
+    assert_eq!(as_int(&v), -128);
+}
+
+// ── Issue #517: dynamic slice-start OOB is a runtime panic, not a clamp ──────
+//
+// `resolve_index_values` used to normalize a `Range`'s `start`/`end`
+// independently, so a runtime (non-literal) start whose window fell outside
+// the axis silently clamped to a shrunken or empty slice instead of erring
+// (SPEC §4.3: "dynamic OOB is a runtime panic"). `dmc jit` already panics for
+// this shape (`t[i..i+1, ..]`, #511/#515) via `__dmc_slice_oob_trap`; these
+// pin the interpreter matching it, verbatim message included. The STATIC
+// path (both bounds literal, e.g. `t[0..100]`) is untouched — see
+// `jit_slice_bounds_clamp_parity` in jit.rs, which still passes unchanged.
+
+#[test]
+fn dynamic_slice_start_negative_is_a_runtime_panic() {
+    // The issue's exact repro: size-4 axis, i = -1, extent 1. Before #517
+    // this produced an EMPTY slice (sum 0, exit 0, matching neither the
+    // spec nor the JIT). `-1` is a well-formed negative index on its own
+    // (it would resolve to the last row), but the independent-bound clamp
+    // can't preserve that once `end = i+1` normalizes on its own — so, like
+    // the JIT, this is dynamic OOB rather than a "best guess" resolution.
+    let msg = run_err(r#"
+        fn main() -> nil {
+            let !t = forge.zeros[f32, [4, 3]]
+            let !i = -1
+            let row = t[i..i+1, ..]
+            print(sum(row))
+            nil
+        }
+    "#);
+    assert_eq!(msg, "slice start -1 with extent 1 out of bounds for axis of size 4");
+}
+
+#[test]
+fn dynamic_slice_start_past_the_end_is_a_runtime_panic() {
+    // Positive but past the axis: i = 4 on a size-4 axis. Matches
+    // `both_backends_trap_on_out_of_range_runtime_start` (tests/runtime_slice.rs) —
+    // same message, same axis, same extent.
+    let msg = run_err(r#"
+        fn main() -> nil {
+            let !t = forge.zeros[f32, [4, 3]]
+            let !i = 4
+            print(sum(t[i..i+1, ..]))
+            nil
+        }
+    "#);
+    assert_eq!(msg, "slice start 4 with extent 1 out of bounds for axis of size 4");
+}
+
+#[test]
+fn dynamic_slice_start_in_range_still_works() {
+    // A legal in-range dynamic start must keep working exactly as before —
+    // #517 only adds a bounds check, it must not disturb the valid window.
+    // Row i sums to 40i + 6 for i in 0..5 (the table is `10i + j`); the
+    // issue's own repro value (430) pins the sum end to end.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !table = forge.zeros[f32, [8, 4]]
+            for i in 0..8 {
+                for j in 0..4 { table[i, j] = (i as f32) * 10.0 + (j as f32) }
+            }
+            let !acc = 0.0
+            for i in 0..5 {
+                let row = table[i..i+1, ..]
+                acc = acc + sum(row)
+            }
+            acc as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 430);
+}
+
+#[test]
+fn static_slice_bounds_still_clamp_unchanged() {
+    // #291.4's clamp path (BOTH bounds literal) must be untouched by #517:
+    // `t[0..100]` on a size-5 axis still clamps to the full axis rather than
+    // panicking, matching `dmc jit`'s static `IndexCat::Range` path.
+    let v = run(r#"
+        fn main() -> f32 {
+            let !t = forge.zeros[f32, [5]]
+            t[2] = 1.0
+            t[4] = 2.0
+            sum(t[0..100])
+        }
+    "#);
+    assert!((as_float(&v) - 3.0).abs() < 1e-6, "expected clamp to full axis (sum 3.0), got {:?}", v);
 }

@@ -1,0 +1,47 @@
+# Probe 57 — SPEC §3.1 (#540): arithmetic on a fixed-width integer type wraps
+# at that width. `i32` is the width both backends model, so every line here has
+# one answer. Before the rule the interpreter held an `i32` as an i64 and
+# narrowed only at an explicit `as i32`, so `dmc run` printed 2147483648 for the
+# first line while `dmc jit` printed -2147483648.
+#
+# Cross-backend: `../i32_wrap_540.rs` runs this same file under `dmc run` AND
+# `dmc jit` and requires byte-identical output.
+fn main() -> nil {
+    let max:  i32 = 2147483647
+    let min:  i32 = -2147483648
+    let one:  i32 = 1
+    let zero: i32 = 0
+    let big:  i32 = 100000
+
+    print((max + one) as i64)       # -2147483648 — over the top, back to MIN
+    print((min - one) as i64)       # 2147483647  — under the bottom, back to MAX
+    print((big * big) as i64)       # 1410065408  — 10^10 taken mod 2^32
+    print((zero - min) as i64)      # -2147483648 — negating MIN is MIN
+    print((max + one) < zero)       # true — the WRAPPED value is what compares
+
+    # `& | ^ ~` stay inside the width, but the result is still an i32, so the
+    # next arithmetic op wraps: `~zero` is -1, and -1 - MAX is MIN.
+    print((~zero - max) as i64)     # -2147483648
+
+    # An untyped literal adopts the i32 operand's width (§3.1), so this is i32
+    # arithmetic with no annotation on the literal side.
+    print((max + 1) as i64)         # -2147483648
+
+    # `/` and `<<` run at the width too: 1 << 31 is MIN, not 2^31. Division by
+    # zero stays total at 0 rather than trapping.
+    print((one << 31) as i64)       # -2147483648
+    print((max / 2) as i64)         # 1073741823
+    print((max / zero) as i64)      # 0
+
+    # The explicit cast is untouched by the rule: it narrowed before #540 and
+    # narrows identically now, on both backends.
+    let wide: i64 = 5000000000
+    print((wide as i32) as i64)     # 705032704
+    print(((wide as i32) + one) as i64)   # 705032705 — and it is an i32 after
+
+    # A wider type keeps its own width: the same expression one width up does
+    # not wrap, because 2^31 fits an i64.
+    let wmax: i64 = 2147483647
+    print(wmax + 1)                 # 2147483648
+    nil
+}

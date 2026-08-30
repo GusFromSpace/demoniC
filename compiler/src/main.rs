@@ -8,20 +8,30 @@
 
 mod lexer;
 mod ast;
+// #485: `--json` structured diagnostics, schema 1.
+mod diag;
 mod parser;
 mod desugar;
 mod shape;
 mod types;
 mod check;
 mod interp;
+mod ports;
 mod fmt;
 mod resolver;
 mod jit;
 mod selftest;
 mod assimilate;
+// #400: arena sizing flags (`--vault=` / `--forge=`), shared by both backends.
+mod arena;
+// #463: `demoni.json` reader — advisory lint dials only, never semantics.
+mod manifest;
 // #326 GPU/Metal backend — compiled only on macOS with `--features gpu`.
 #[cfg(all(target_os = "macos", feature = "gpu"))]
 mod gpu;
+#[cfg(test)]
+#[path = "arena_tests.rs"]
+mod arena_tests;
 #[cfg(test)]
 #[path = "lexer_tests.rs"]
 mod lexer_tests;
@@ -37,6 +47,12 @@ mod interp_tests;
 #[cfg(test)]
 #[path = "fmt_tests.rs"]
 mod fmt_tests;
+#[cfg(test)]
+#[path = "diag_tests.rs"]
+mod diag_tests;
+#[cfg(test)]
+#[path = "manifest_tests.rs"]
+mod manifest_tests;
 
 use std::path::{Path, PathBuf};
 use lexer::{Lexer, TokenKind};
@@ -64,6 +80,112 @@ fn print_usage() {
     eprintln!("  dmc --profile <file.dmc>          run with op-count profiling (emits summary to stderr)");
     eprintln!("  dmc --profile run <file.dmc>      run mode with profiling");
     eprintln!("  dmc --demon <file.dmc>            demon mode: release the safe-mode lints (raw, no guardrails)");
+    eprintln!("  dmc run <file.dmc> --vault=16G --forge=2G");
+    eprintln!("                                    arena byte budgets (MEMORY.md §1.1); B/K/M/G/T suffixes,");
+    eprintln!("                                    exhausting one is a runtime error. `--vault` is `dmc run` only.");
+    eprintln!("  dmc --check --json <file.dmc>     diagnostics as JSON Lines on stderr (schema 1)");
+    eprintln!("  dmc jit --json <file.dmc>         same, including machine-coded JIT-ineligibility refusals");
+    eprintln!("  dmc test --json <file-or-dir>     same, streaming one `test` object per test (with `--jit`, the parity verdict rides along)");
+}
+
+/// A checker diagnostic in `--json` form. The `code` is the kebab-case tag the
+/// message leads with where the docs define one (`port-forbidden`, …); a
+/// message with no tag simply has no `code`.
+fn check_diag(
+    e: &check::TypeError,
+    file: &Path,
+    severity: diag::Severity,
+) -> diag::Diagnostic {
+    let mut d = diag::Diagnostic::new(diag::Kind::Check, severity, e.msg.clone())
+        .file(file)
+        .at(e.span.line, e.span.col)
+        .bytes(e.span.start, e.span.end)
+        .hint(e.hint.as_deref());
+    if let Some(tag) = diag::tag_of(&e.msg) {
+        d = d.code(tag);
+    }
+    // A shape error carries the two shapes as data (#485): `expected`/`actual`
+    // arrays of dims, so a consumer diffs them instead of re-parsing `message`.
+    if let Some((exp, act)) = &e.shapes {
+        d = d.shapes(&exp.dims, &act.dims);
+    }
+    d
+}
+
+/// A `JitError` in `--json` form. A refusal (`JitErrorKind::Unsupported`) is
+/// `jit-ineligible` and always carries its class code (#485); a defect is
+/// `jit-error` and carries none — that distinction is #480's, and this is the
+/// encoding of it that does not go through English.
+fn jit_diag(e: &jit::JitError, file: &Path) -> diag::Diagnostic {
+    let kind = match e.kind {
+        jit::JitErrorKind::Unsupported => diag::Kind::JitIneligible,
+        jit::JitErrorKind::Error => diag::Kind::JitError,
+    };
+    let mut d = diag::Diagnostic::new(kind, diag::Severity::Error, e.msg.clone()).file(file);
+    // `line: 0` is the JIT's "no source location" sentinel (module-level
+    // failures, `no fn main`). Omit the location rather than claim line 0.
+    if e.line != 0 {
+        d = d.at(e.line, e.col);
+    }
+    if let Some(r) = e.refusal {
+        d = d.code(r.code());
+    }
+    d
+}
+
+/// A module-resolution failure in `--json` form. The located halves are the
+/// same `lex` / `parse` diagnostics `dmc jit` reports; the rest (I/O, a bad
+/// import path, a cycle) has no span and stays `unstructured`.
+fn resolve_diag(e: &resolver::ResolveError) -> diag::Diagnostic {
+    match e {
+        resolver::ResolveError::Lex { file, msg, line, col } => {
+            diag::Diagnostic::new(diag::Kind::Lex, diag::Severity::Error, msg.clone())
+                .file(file)
+                .at(*line, *col)
+        }
+        resolver::ResolveError::Parse { file, msg, line, col } => {
+            diag::Diagnostic::new(diag::Kind::Parse, diag::Severity::Error, msg.clone())
+                .file(file)
+                .at(*line, *col)
+        }
+        resolver::ResolveError::Other(s) => diag::Diagnostic::unstructured(s.clone()),
+    }
+}
+
+/// Report a diagnostic whose category schema 1 does not model yet — resolver
+/// prose, a JIT runtime trap — and exit 1. Without `--json` this is the
+/// unchanged human line.
+fn fail_unstructured(em: &mut Option<diag::Emitter>, msg: impl std::fmt::Display) -> ! {
+    match em.take() {
+        Some(mut e) => {
+            e.emit(&diag::Diagnostic::unstructured(msg.to_string()));
+            std::process::exit(e.finish(1));
+        }
+        None => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Report a command-line usage error and exit 1.
+fn fail_cli(em: &mut Option<diag::Emitter>, code: &str, msg: impl std::fmt::Display) -> ! {
+    match em.take() {
+        Some(mut e) => {
+            let d = diag::Diagnostic::new(
+                diag::Kind::Cli,
+                diag::Severity::Error,
+                msg.to_string(),
+            )
+            .code(code);
+            e.emit(&d);
+            std::process::exit(e.finish(1));
+        }
+        None => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn print_profile(p: &interp::OpProfile) {
@@ -267,16 +389,44 @@ fn collect_dmc_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> 
     Err(format!("test path does not exist: {:?}", path))
 }
 
-fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
+fn run_tests(
+    path: &Path,
+    profile_mode: bool,
+    jit_test: bool,
+    arena_limits: arena::ArenaLimits,
+    mut em: Option<diag::Emitter>,
+) -> i32 {
+    // A fatal before any test ran: one diagnostic, then the envelope. Without
+    // `--json`, the unchanged human line.
+    fn fatal(em: Option<diag::Emitter>, msg: String) -> i32 {
+        match em {
+            Some(mut e) => {
+                e.emit(&diag::Diagnostic::unstructured(msg));
+                e.finish(1)
+            }
+            None => {
+                eprintln!("{}", msg);
+                1
+            }
+        }
+    }
+    // A per-file failure (`FAIL <file>: …`) — not a *test* result, so it has no
+    // `test` object; under `--json` the prose is carried as `unstructured`, and
+    // it still counts into the summary's `failed`, exactly as the human tally.
+    fn fail_line(em: &mut Option<diag::Emitter>, msg: String) {
+        match em {
+            Some(e) => e.emit(&diag::Diagnostic::unstructured(msg)),
+            None => eprintln!("{}", msg),
+        }
+    }
+
     let mut files = Vec::new();
     if let Err(e) = collect_dmc_files(path, &mut files) {
-        eprintln!("{}", e);
-        return 1;
+        return fatal(em, e);
     }
     files.sort();
     if files.is_empty() {
-        eprintln!("no .dmc files found under {:?}", path);
-        return 1;
+        return fatal(em, format!("no .dmc files found under {:?}", path));
     }
 
     let mut total = 0usize;
@@ -285,19 +435,30 @@ fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
     // a file the JIT can't compile is skipped (outside its subset), not failed.
     let mut jit_ran = 0usize;
     let mut jit_skipped = 0usize;
+    // #400: a `--forge` budget must mean the same thing here as under
+    // `dmc run` — the whole budget, per test. The interpreter gets that for
+    // free (a fresh `Interpreter`, hence a fresh meter, is built below for
+    // every test); the JIT's arena is a thread-local that outlives the whole
+    // suite, so it is explicitly reset before each JIT run. And exhaustion
+    // must be reportable: the arena's default is to exit(1) from the
+    // allocation callback, which would kill the harness mid-run with no FAIL
+    // line, no summary, and every later file unrun.
+    if jit_test {
+        jit::set_forge_exhaustion_recoverable(true);
+    }
     for file in files {
         let canonical_file = match file.canonicalize() {
             Ok(p) => p,
             Err(e) => {
                 failed += 1;
-                eprintln!("FAIL {}: canonicalization failed: {}", file.display(), e);
+                fail_line(&mut em, format!("FAIL {}: canonicalization failed: {}", file.display(), e));
                 continue;
             }
         };
         let mut resolver = resolver::Resolver::new();
         if let Err(e) = resolver.resolve_all(&canonical_file) {
             failed += 1;
-            eprintln!("FAIL {}: resolution failed: {}", file.display(), e);
+            fail_line(&mut em, format!("FAIL {}: resolution failed: {}", file.display(), e));
             continue;
         }
 
@@ -305,7 +466,7 @@ fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
             Some(prog) => prog.clone(),
             None => {
                 failed += 1;
-                eprintln!("FAIL {}: program not found in resolved files", file.display());
+                fail_line(&mut em, format!("FAIL {}: program not found in resolved files", file.display()));
                 continue;
             }
         };
@@ -323,9 +484,20 @@ fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
             checker.check_program(prog, Some(p));
             if !checker.errors.is_empty() {
                 failed += 1;
-                eprintln!("FAIL {}: type check failed in dependency {:?}", file.display(), p);
-                for err in &checker.errors {
-                    eprintln!("{}", err);
+                fail_line(&mut em, format!("FAIL {}: type check failed in dependency {:?}", file.display(), p));
+                match &mut em {
+                    // The checker errors themselves are `check` diagnostics with
+                    // spans — the same encoding `dmc --check` gives them.
+                    Some(e) => {
+                        for err in &checker.errors {
+                            e.emit(&check_diag(err, p, diag::Severity::Error));
+                        }
+                    }
+                    None => {
+                        for err in &checker.errors {
+                            eprintln!("{}", err);
+                        }
+                    }
                 }
                 check_failed = true;
                 break;
@@ -344,16 +516,34 @@ fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
         for name in tests {
             total += 1;
             let label = format!("{}::{}", file.display(), name);
+            // Under `--json`, one `test` object per test — the interpreter
+            // verdict and (with `--jit`) the parity verdict on the same line,
+            // emitted after both halves have run. `mk_test` binds the identity
+            // once so every exit path below reports the same name and file.
+            let mk_test = |pass: bool, message: Option<String>| diag::TestResult {
+                name: name.clone(),
+                file: canonical_file.display().to_string(),
+                pass,
+                message,
+                jit: None,
+                jit_message: None,
+            };
             let fn_decl = program.items.iter().find_map(|item| find_fn_decl(item, &name));
             if let Some(f) = fn_decl {
                 if !f.params.is_empty() {
                     failed += 1;
-                    eprintln!("FAIL {}: test function must take zero args", label);
+                    match &mut em {
+                        Some(e) => e.emit_test(&mk_test(
+                            false, Some("test function must take zero args".to_string()),
+                        )),
+                        None => eprintln!("FAIL {}: test function must take zero args", label),
+                    }
                     continue;
                 }
             }
 
             let mut interp = Interpreter::new();
+            interp.set_arena_limits(arena_limits);
             if profile_mode { interp.enable_profile(); }
 
             let mut interp_failed = false;
@@ -361,7 +551,11 @@ fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
                 let prog = resolver.files.get(p).unwrap();
                 if let Err(e) = interp.load_program(prog, Some(p)) {
                     failed += 1;
-                    eprintln!("FAIL {}: interpreter load failed in dependency {:?}: {}", file.display(), p, e);
+                    let msg = format!("interpreter load failed in dependency {:?}: {}", p, e);
+                    match &mut em {
+                        Some(emj) => emj.emit_test(&mk_test(false, Some(msg))),
+                        None => eprintln!("FAIL {}: {}", file.display(), msg),
+                    }
                     interp_failed = true;
                     break;
                 }
@@ -373,79 +567,149 @@ fn run_tests(path: &Path, profile_mode: bool, jit_test: bool) -> i32 {
             }
 
             let result = interp.call_named_fn(&name, Vec::new());
-            match result {
+            let (pass, message): (bool, Option<String>) = match result {
                 Ok(interp::Value::Bool(false)) => {
                     failed += 1;
-                    eprintln!("FAIL {}: returned false", label);
+                    if em.is_none() { eprintln!("FAIL {}: returned false", label); }
+                    (false, Some("returned false".to_string()))
                 }
                 Ok(interp::Value::Bool(true)) | Ok(interp::Value::Nil) => {
-                    println!("ok   {}", label);
-                    if profile_mode {
-                        if let Some(p) = &interp.profile { print_profile(p); }
+                    if em.is_none() {
+                        println!("ok   {}", label);
+                        if profile_mode {
+                            if let Some(p) = &interp.profile { print_profile(p); }
+                        }
                     }
+                    (true, None)
                 }
                 Ok(v) => {
                     failed += 1;
-                    eprintln!(
-                        "FAIL {}: returned {:?}; tests must return bool or nil",
-                        label, v,
-                    );
+                    let msg = format!("returned {:?}; tests must return bool or nil", v);
+                    if em.is_none() { eprintln!("FAIL {}: {}", label, msg); }
+                    (false, Some(msg))
                 }
                 Err(e) => {
                     failed += 1;
-                    eprintln!("FAIL {}: {}", label, e);
+                    let msg = e.to_string();
+                    if em.is_none() { eprintln!("FAIL {}: {}", label, msg); }
+                    (false, Some(msg))
                 }
-            }
+            };
 
             // `--jit`: run the same test under the JIT for parity. A compile
             // error means the program is outside the JIT's subset → skip (the
             // JIT can't run it). A test that compiles but returns false or errors
             // is a real interp/JIT divergence → fail.
+            let mut jit_verdict: Option<diag::JitVerdict> = None;
+            let mut jit_message: Option<String> = None;
             if jit_test {
+                // Fresh arena per test, taken before anything JIT-side exists,
+                // so no pointer handed out by this test's compile or run can
+                // outlive the reset.
+                jit::reset_forge_arena();
                 match jit::Jit::new() {
-                    Err(e) => { failed += 1; eprintln!("FAIL {} [jit]: jit init: {}", label, e.msg); }
+                    Err(e) => {
+                        failed += 1;
+                        jit_verdict = Some(diag::JitVerdict::Fail);
+                        jit_message = Some(format!("jit init: {}", e.msg));
+                        if em.is_none() { eprintln!("FAIL {} [jit]: jit init: {}", label, e.msg); }
+                    }
                     Ok(mut j) => match j.compile_program(&program) {
-                        Err(_) => { jit_skipped += 1; }
+                        Err(_) => {
+                            jit_skipped += 1;
+                            jit_verdict = Some(diag::JitVerdict::Skip);
+                        }
                         Ok(()) => {
                             jit_ran += 1;
-                            match j.run_test_fn(&name) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    failed += 1;
-                                    eprintln!("FAIL {} [jit]: returned false (diverges from interp)", label);
-                                }
-                                Err(e) => {
-                                    failed += 1;
-                                    eprintln!("FAIL {} [jit]: {}", label, e.msg);
+                            let outcome = j.run_test_fn(&name);
+                            // An exhausted budget outranks whatever the test
+                            // went on to return: under the recoverable policy
+                            // the over-budget allocation was still handed out,
+                            // so a test that blew `--forge` can perfectly well
+                            // return true.
+                            if let Some(diag) = jit::take_forge_exhaustion() {
+                                failed += 1;
+                                if em.is_none() { eprintln!("FAIL {} [jit]: {}", label, diag); }
+                                jit_verdict = Some(diag::JitVerdict::Fail);
+                                jit_message = Some(diag);
+                            } else {
+                                match outcome {
+                                    Ok(true) => {
+                                        jit_verdict = Some(diag::JitVerdict::Pass);
+                                    }
+                                    Ok(false) => {
+                                        failed += 1;
+                                        jit_verdict = Some(diag::JitVerdict::Fail);
+                                        jit_message =
+                                            Some("returned false (diverges from interp)".to_string());
+                                        if em.is_none() {
+                                            eprintln!("FAIL {} [jit]: returned false (diverges from interp)", label);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        failed += 1;
+                                        jit_verdict = Some(diag::JitVerdict::Fail);
+                                        jit_message = Some(e.msg.clone());
+                                        if em.is_none() { eprintln!("FAIL {} [jit]: {}", label, e.msg); }
+                                    }
                                 }
                             }
                         }
                     },
                 }
             }
+
+            if let Some(e) = &mut em {
+                let mut t = mk_test(pass, message);
+                t.jit = jit_verdict;
+                t.jit_message = jit_message;
+                e.emit_test(&t);
+            }
         }
     }
 
+    // The summary. Under `--json` the tallies ride in the terminal object —
+    // the same numbers the human lines print, including the exit-code quirks
+    // (`0 tests` exits 0 even after file-level failures), because the exit
+    // code must not depend on the flag.
     if total == 0 {
-        println!("0 tests");
-        return 0;
+        return match em {
+            Some(mut e) => {
+                e.set_test_tally(0, failed);
+                if jit_test { e.set_jit_parity(jit_ran, jit_skipped); }
+                e.finish(0)
+            }
+            None => {
+                println!("0 tests");
+                0
+            }
+        };
     }
-    let jit_note = if jit_test {
-        format!(" | jit parity: {} ran, {} skipped (outside JIT subset)", jit_ran, jit_skipped)
-    } else {
-        String::new()
-    };
-    if failed == 0 {
-        println!("test result: ok. {} passed; 0 failed{}", total, jit_note);
-        0
-    } else {
-        eprintln!(
-            "test result: FAILED. {} passed; {} failed{}",
-            total.saturating_sub(failed),
-            failed,
-            jit_note,
-        );
-        1
+    let exit = if failed == 0 { 0 } else { 1 };
+    match em {
+        Some(mut e) => {
+            e.set_test_tally(total.saturating_sub(failed), failed);
+            if jit_test { e.set_jit_parity(jit_ran, jit_skipped); }
+            e.finish(exit)
+        }
+        None => {
+            let jit_note = if jit_test {
+                format!(" | jit parity: {} ran, {} skipped (outside JIT subset)", jit_ran, jit_skipped)
+            } else {
+                String::new()
+            };
+            if failed == 0 {
+                println!("test result: ok. {} passed; 0 failed{}", total, jit_note);
+            } else {
+                eprintln!(
+                    "test result: FAILED. {} passed; {} failed{}",
+                    total.saturating_sub(failed),
+                    failed,
+                    jit_note,
+                );
+            }
+            exit
+        }
     }
 }
 
@@ -484,30 +748,98 @@ fn real_main() {
     let mut demon_mode = false;
     let mut jit_test = false;
     let mut gpu_mode = false;
-    let args: Vec<String> = raw_args.into_iter().enumerate()
-        .filter_map(|(i, a)| {
-            if i > 0 && a == "--profile" { profile_mode = true; None }
-            else if i > 0 && a == "--demon" { demon_mode = true; None }
-            else if i > 0 && a == "--jit" { jit_test = true; None }
-            else if i > 0 && a == "--gpu" { gpu_mode = true; None }
-            // #400: `--vault=`/`--forge=` are documented arena-sizing flags, but
-            // sizing is unimplemented and they were silently forwarded into the
-            // program's argv (swallowed AND inert). Reject them loudly rather than
-            // leak a `dmc` flag into the program. (Arenas currently size
-            // dynamically; drop the flag.)
-            else if i > 0 && (a == "--vault" || a == "--forge"
-                              || a.starts_with("--vault=") || a.starts_with("--forge=")) {
-                eprintln!("error: `{}` — arena sizing flags are specified but not yet \
-                           implemented; remove it (arenas size dynamically today)", a);
-                std::process::exit(1);
+    // #485: `--json` re-encodes the diagnostics as JSON Lines on stderr. It
+    // changes nothing else — not the set of diagnostics, not the exit code.
+    let mut json_mode = false;
+    // #400: `--vault=<size>` / `--forge=<size>` size the arenas (`MEMORY.md
+    // §1.1`). Both spellings are accepted — `--forge=2G` and `--forge 2G`.
+    let mut arena_limits = arena::ArenaLimits::default();
+    let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
+    args.push(raw_args[0].clone());
+    let mut i = 1;
+    while i < raw_args.len() {
+        let a = raw_args[i].as_str();
+        if a == "--profile" { profile_mode = true; }
+        else if a == "--demon" { demon_mode = true; }
+        else if a == "--jit" { jit_test = true; }
+        else if a == "--gpu" { gpu_mode = true; }
+        else if a == "--json" { json_mode = true; }
+        else if let Some(which) = arena::flag_arena(a) {
+            let value = match a.split_once('=') {
+                Some((_, v)) => v.to_string(),
+                None => match raw_args.get(i + 1) {
+                    Some(v) => { i += 1; v.clone() }
+                    None => {
+                        eprintln!("error: `{}` needs a size, e.g. `{}=2G`", a, which.flag());
+                        std::process::exit(1);
+                    }
+                },
+            };
+            match arena::parse_size(&value) {
+                Ok(bytes) => arena_limits.set(which, bytes),
+                Err(e) => {
+                    eprintln!("error: {}: {}", which.flag(), e);
+                    std::process::exit(1);
+                }
             }
-            else { Some(a) }
-        })
-        .collect();
+        }
+        else { args.push(raw_args[i].clone()); }
+        i += 1;
+    }
 
     if args.len() < 2 {
         print_usage();
         std::process::exit(1);
+    }
+
+    // #400: `--forge` is a real ceiling on the JIT's Forge arena, installed on
+    // this thread before any compiled code runs. `--vault` is not: the JIT
+    // lowers `vault.*` and `forge.*` constructors into that same single arena
+    // (there is no separate Vault region yet), so honoring the flag would mean
+    // metering an arena that does not exist. Refuse it instead of accepting it
+    // and quietly doing nothing.
+    if arena_limits.vault.is_some() && (jit_test || args[1] == "jit") {
+        eprintln!(
+            "error: `--vault` is not honored under the JIT — it lowers `vault.*` and \
+             `forge.*` into one Forge arena, so there is no Vault to size. Use the \
+             interpreter (`dmc run`, or `dmc test` without `--jit`) for a Vault \
+             budget, or drop the flag — `--forge` works here."
+        );
+        std::process::exit(1);
+    }
+    jit::set_forge_limit(arena_limits.forge);
+
+    // #485 wires `--json` to the three consumer-ready commands: check errors
+    // (`dmc --check`), JIT-ineligibility refusals (`dmc jit`), and per-test
+    // results (`dmc test`). Runtime errors are a later slice with a reserved
+    // kind; accepting `--json` elsewhere and emitting nothing structured would
+    // be worse than refusing, because a consumer cannot tell the two apart.
+    // The subcommand as spelled, for the summary's `command` field. A bare
+    // file argument is the implicit full pipeline, not a command name — say so
+    // rather than reporting the path as if it were one.
+    let command = match args[1].as_str() {
+        c if c.starts_with("--") => c.to_string(),
+        c @ ("run" | "jit" | "test" | "selftest" | "assimilate" | "fmt") => c.to_string(),
+        _ => "pipeline".to_string(),
+    };
+    let mut emitter = if json_mode {
+        // Arm the out-of-band path too: the JIT's arena-exhaustion abort
+        // exits from inside compiled code and never returns here.
+        diag::arm_out_of_band(&command);
+        Some(diag::Emitter::new(&command))
+    } else {
+        None
+    };
+    if json_mode && command != "--check" && command != "jit" && command != "test" {
+        fail_cli(
+            &mut emitter,
+            "json-unsupported-command",
+            format!(
+                "`--json` is wired for `dmc --check`, `dmc jit`, and `dmc test` \
+                 in schema {}; `{}` still reports in the human format",
+                diag::SCHEMA, command,
+            ),
+        );
     }
 
     let (mode, path) = match args[1].as_str() {
@@ -520,7 +852,7 @@ fn real_main() {
             ("parse", PathBuf::from(&args[2]))
         }
         "--check" => {
-            if args.len() < 3 { eprintln!("missing file"); std::process::exit(1); }
+            if args.len() < 3 { fail_cli(&mut emitter, "missing-input", "missing file"); }
             ("check", PathBuf::from(&args[2]))
         }
         "run" => {
@@ -528,12 +860,16 @@ fn real_main() {
             ("run", PathBuf::from(&args[2]))
         }
         "jit" => {
-            if args.len() < 3 { eprintln!("missing file"); std::process::exit(1); }
+            if args.len() < 3 { fail_cli(&mut emitter, "missing-input", "missing file"); }
             ("jit", PathBuf::from(&args[2]))
         }
         "test" => {
-            if args.len() < 3 { eprintln!("missing file or directory"); std::process::exit(1); }
-            let code = run_tests(Path::new(&args[2]), profile_mode, jit_test);
+            if args.len() < 3 {
+                fail_cli(&mut emitter, "missing-input", "missing file or directory");
+            }
+            let code = run_tests(
+                Path::new(&args[2]), profile_mode, jit_test, arena_limits, emitter.take(),
+            );
             std::process::exit(code);
         }
         "selftest" => {
@@ -561,25 +897,42 @@ fn real_main() {
 
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading {:?}: {}", path, e);
-            std::process::exit(1);
-        }
+        Err(e) => fail_cli(
+            &mut emitter,
+            "input-unreadable",
+            format_args!("error reading {:?}: {}", path, e),
+        ),
     };
 
     let path = match path.canonicalize() {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("error resolving path {:?}: {}", path, e);
-            std::process::exit(1);
-        }
+        Err(e) => fail_cli(
+            &mut emitter,
+            "input-unresolvable",
+            format_args!("error resolving path {:?}: {}", path, e),
+        ),
     };
 
     let tokens = match Lexer::new(&src).tokenize() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("lex error in {:?}: {}", path, e);
-            std::process::exit(1);
+            match emitter.take() {
+                Some(mut em) => {
+                    let d = diag::Diagnostic::new(
+                        diag::Kind::Lex,
+                        diag::Severity::Error,
+                        e.msg.clone(),
+                    )
+                    .file(&path)
+                    .at(e.line, e.col);
+                    em.emit(&d);
+                    std::process::exit(em.finish(1));
+                }
+                None => {
+                    eprintln!("lex error in {:?}: {}", path, e);
+                    std::process::exit(1);
+                }
+            }
         }
     };
 
@@ -608,8 +961,13 @@ fn real_main() {
         "check" => {
             let mut resolver = resolver::Resolver::new();
             if let Err(e) = resolver.resolve_all(&path) {
-                eprintln!("{}", e);
-                std::process::exit(1);
+                match emitter.take() {
+                    Some(mut em) => {
+                        em.emit(&resolve_diag(&e));
+                        std::process::exit(em.finish(1));
+                    }
+                    None => { eprintln!("{}", e); std::process::exit(1); }
+                }
             }
             let mut checked_modules = std::collections::HashMap::new();
             let mut total_errors = 0;
@@ -621,19 +979,36 @@ fn real_main() {
                 checker.demon = demon_mode;
                 checker.checked_modules = checked_modules.clone();
                 checker.check_program(prog, Some(p));
-                if !checker.errors.is_empty() {
-                    for err in &checker.errors {
-                        eprintln!("{}", err);
+                total_errors += checker.errors.len();
+                match &mut emitter {
+                    Some(em) => {
+                        for err in &checker.errors {
+                            em.emit(&check_diag(err, p, diag::Severity::Error));
+                        }
+                        for w in &checker.warnings {
+                            em.emit(&check_diag(w, p, diag::Severity::Warning));
+                        }
                     }
-                    total_errors += checker.errors.len();
+                    None => {
+                        for err in &checker.errors {
+                            eprintln!("{}", err);
+                        }
+                        print_warnings(&checker.warnings);
+                    }
                 }
-                print_warnings(&checker.warnings);
                 let mod_env = check::ModuleEnv {
                     env: checker.env.clone(),
                     aliases: checker.aliases.clone(),
                     public_items: ast::collect_public_items(prog),
                 };
                 checked_modules.insert(p.clone(), mod_env);
+            }
+            if let Some(mut em) = emitter.take() {
+                // The `✅ Check OK — N top-level items` line and the
+                // `N type error(s)` tally are the same two facts the summary
+                // object carries; they are not repeated in prose.
+                em.set_items(items_count);
+                std::process::exit(em.finish(if total_errors == 0 { 0 } else { 1 }));
             }
             if total_errors == 0 {
                 println!("✅ Check OK — {} top-level items, no type errors", items_count);
@@ -675,6 +1050,7 @@ fn real_main() {
                 std::process::exit(1);
             }
             let mut interp = Interpreter::new();
+            interp.set_arena_limits(arena_limits);
             if profile_mode { interp.enable_profile(); }
             interp.set_argv(args[3..].to_vec());
             for p in &resolver.sorted_paths {
@@ -722,7 +1098,20 @@ fn real_main() {
             let mut parser = Parser::new(tokens);
             let program = match parser.parse_program() {
                 Ok(p) => p,
-                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                Err(e) => match emitter.take() {
+                    Some(mut em) => {
+                        let d = diag::Diagnostic::new(
+                            diag::Kind::Parse,
+                            diag::Severity::Error,
+                            e.msg.clone(),
+                        )
+                        .file(&path)
+                        .at(e.line, e.col);
+                        em.emit(&d);
+                        std::process::exit(em.finish(1));
+                    }
+                    None => { eprintln!("{}", e); std::process::exit(1); }
+                },
             };
             // #478 step 1: `dmc jit` type-checks, like `dmc run` already did.
             // It used to lower raw AST and rely on the JIT's own per-function
@@ -737,16 +1126,35 @@ fn real_main() {
             checker.demon = demon_mode;
             checker.check_program(&program, Some(&path));
             if !checker.errors.is_empty() {
+                if let Some(mut em) = emitter.take() {
+                    for err in &checker.errors {
+                        em.emit(&check_diag(err, &path, diag::Severity::Error));
+                    }
+                    std::process::exit(em.finish(1));
+                }
                 for err in &checker.errors {
                     eprintln!("{}", err);
                 }
                 eprintln!("\n⚠ {} type error(s) — refusing to run", checker.errors.len());
                 std::process::exit(1);
             }
-            print_warnings(&checker.warnings);
+            match &mut emitter {
+                Some(em) => {
+                    for w in &checker.warnings {
+                        em.emit(&check_diag(w, &path, diag::Severity::Warning));
+                    }
+                }
+                None => print_warnings(&checker.warnings),
+            }
             let mut jit = match Jit::new() {
                 Ok(j) => j,
-                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                Err(e) => match emitter.take() {
+                    Some(mut em) => {
+                        em.emit(&jit_diag(&e, &path));
+                        std::process::exit(em.finish(1));
+                    }
+                    None => { eprintln!("{}", e); std::process::exit(1); }
+                },
             };
             if gpu_mode {
                 // #326: honored only on a macOS `--features gpu` build; otherwise
@@ -754,9 +1162,27 @@ fn real_main() {
                 #[cfg(all(target_os = "macos", feature = "gpu"))]
                 jit.set_gpu(true);
                 #[cfg(not(all(target_os = "macos", feature = "gpu")))]
-                eprintln!("warning: --gpu ignored (build with `--features gpu` on macOS to enable)");
+                {
+                    const GPU_IGNORED: &str =
+                        "--gpu ignored (build with `--features gpu` on macOS to enable)";
+                    match &mut emitter {
+                        Some(em) => em.emit(&diag::Diagnostic::new(
+                            diag::Kind::Cli,
+                            diag::Severity::Warning,
+                            GPU_IGNORED,
+                        ).code("gpu-unavailable")),
+                        None => eprintln!("warning: {}", GPU_IGNORED),
+                    }
+                }
             }
             if let Err(e) = jit.compile_program(&program) {
+                // The payload #485 exists for: an agent iterating a program
+                // toward JIT eligibility reads `code` and `line`/`col`, not an
+                // English sentence.
+                if let Some(mut em) = emitter.take() {
+                    em.emit(&jit_diag(&e, &path));
+                    std::process::exit(em.finish(1));
+                }
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
@@ -764,8 +1190,9 @@ fn real_main() {
                 Ok(rc) => {
                     // #271: print REPL feedback by main's *declared return type*,
                     // not by `rc != 0` — the old guard swallowed a real `0`/`false`
-                    // return (run_main also returns 0 for a nil main). Float mains
-                    // already print inside run_main; nil prints nothing.
+                    // return (run_main also returns 0 for a nil main). Float and
+                    // str mains already print inside run_main (only it can read a
+                    // forge string); nil prints nothing.
                     let ret = program.items.iter()
                         .find_map(|it| find_fn_decl(it, "main"))
                         .and_then(|f| f.ret_type.as_ref());
@@ -773,14 +1200,19 @@ fn real_main() {
                         None => {} // unannotated main = nil
                         Some(ast::Type::Scalar(ast::ScalarType::Nil, _))
                         | Some(ast::Type::Scalar(ast::ScalarType::F32, _))
-                        | Some(ast::Type::Scalar(ast::ScalarType::F64, _)) => {}
+                        | Some(ast::Type::Scalar(ast::ScalarType::F64, _))
+                        | Some(ast::Type::Scalar(ast::ScalarType::Str, _)) => {}
                         Some(ast::Type::Scalar(ast::ScalarType::Bool, _)) => {
                             println!("=> {}", rc != 0);
                         }
                         Some(_) => println!("=> {}", rc),
                     }
                 }
-                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                // A trap inside compiled code is a *runtime* diagnostic — a
+                // later slice's category. Schema 1 reserves `runtime` and
+                // carries the prose through as `unstructured` so the stream
+                // stays parseable and nothing is lost.
+                Err(e) => fail_unstructured(&mut emitter, e),
             }
         }
         "pipeline" => {
@@ -819,6 +1251,7 @@ fn real_main() {
             }
             println!("✅ Check OK — no type errors");
             let mut interp = Interpreter::new();
+            interp.set_arena_limits(arena_limits);
             if profile_mode { interp.enable_profile(); }
             for p in &resolver.sorted_paths {
                 let prog = resolver.files.get(p).unwrap();
@@ -853,6 +1286,13 @@ fn real_main() {
             }
         }
         _ => unreachable!(),
+    }
+
+    // Every `--json` run ends with exactly one summary object. The failing
+    // paths above emit theirs on the way out; this is the one for a run that
+    // reached the end without exiting.
+    if let Some(em) = emitter.take() {
+        std::process::exit(em.finish(0));
     }
 }
 

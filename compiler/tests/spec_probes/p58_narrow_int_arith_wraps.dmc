@@ -1,0 +1,72 @@
+# Probe 58 — SPEC §3.1 (#544, #545): the rule probe 57 pins for `i32` holds at
+# EVERY fixed-width integer kind, and an integer literal's type suffix is one of
+# the places a width originates.
+#
+# Before #544 the interpreter held `i8/i16/u8/u16/u32/int4/int8` as plain i64s
+# (so none of them wrapped) and the JIT refused them outright — a declared
+# narrow width was a comment, not semantics. Before #545 the JIT dropped a
+# suffixed literal's type, so `2147483647i32 + 1i32` did not wrap on either
+# backend.
+#
+# Cross-backend: `../narrow_int_wrap_544.rs` runs this same file under `dmc run`
+# AND `dmc jit` and requires byte-identical output.
+fn main() -> nil {
+    # Signed widths: over the top is back to MIN, under the bottom is back to MAX.
+    let i8max:  i8  = 127
+    let i8min:  i8  = -128
+    let i8one:  i8  = 1
+    print((i8max + i8one) as i64)       # -128
+    print((i8min - i8one) as i64)       # 127
+
+    let i16max: i16 = 32767
+    let i16one: i16 = 1
+    let i16big: i16 = 300
+    print((i16max + i16one) as i64)     # -32768
+    print((i16big * i16big) as i64)     # 24464 — 90000 taken mod 2^16
+
+    # Unsigned wrap is UNSIGNED: the value is held zero-extended, so 0 - 1 is
+    # the width's MAX and everything downstream of it stays unsigned.
+    let u8z:   u8  = 0
+    let u8one: u8  = 1
+    print((u8z - u8one) as i64)         # 255
+    print((~u8z) as i64)                # 255 — `~` complements the WIDTH
+
+    let u32z:   u32 = 0
+    let u32one: u32 = 1
+    let u32two: u32 = 2
+    print((u32z - u32one) as i64)             # 4294967295
+    print(((u32z - u32one) / u32two) as i64)  # 2147483647 — unsigned divide
+    print(((u32z - u32one) >> u32two) as i64) # 1073741823 — unsigned shift
+    print((u32z - u32one) > u32one)           # true — unsigned compare
+
+    # `u64` is the one width an i64-backed value cannot fully hold, so it
+    # carries the 64-bit two's-complement PATTERN. The wrap is bit-identical to
+    # i64's; what is not modelled is unsigned rendering above 2^63.
+    let u64z:   u64 = 0
+    let u64one: u64 = 1
+    print((u64z - u64one) as i64)       # -1
+
+    # `<<` is bounded by the SHIFTED VALUE's width — an i8 shift tops out at 7 —
+    # and the result wraps at that width.
+    print((i8one << 7) as i64)          # -128
+
+    # An `as` cast to a narrow type is a width origin as well as a narrowing.
+    let wide: i64 = 100000
+    print((wide as i16) as i64)         # -31072
+    print(((wide as i16) + i16one) as i64)   # -31071 — and it is an i16 after
+
+    # #545: the SUFFIX types the literal concretely, so the add wraps.
+    let sa = 2147483647i32
+    print((sa + 1i32) as i64)           # -2147483648
+    let sb = 127i8
+    print((sb + 1) as i64)              # -128 — an untyped literal adopts it
+
+    # The packed signed 4-/8-bit kinds wrap at their own widths too.
+    let p8:  int8 = 127
+    let p8o: int8 = 1
+    print((p8 + p8o) as i64)            # -128
+    let p4:  int4 = 7
+    let p4o: int4 = 1
+    print((p4 + p4o) as i64)            # -8
+    nil
+}

@@ -148,12 +148,23 @@ tokenizes to hundreds or thousands of tokens and is hostile to every
 language-model consumer of the source. It also defeats the "fits on one
 screen" readability contract.
 
-The normative limit is **256 elements** per tensor literal. Literals larger
-than this are accepted in the current release but produce a warning; a
-future release will make them a hard error. Use `forge.zeros`, `forge.ones`,
-`forge.uninit`, or `vault.load` for bulk data — these are single tokens each,
-and their shapes are expressed as static type arguments that are cheap to
-tokenize.
+The normative limit is **256 elements** per tensor literal. A literal larger
+than this is a **compile-time error** at check time, and the diagnostic names
+the replacement spelling. Use `forge.zeros`, `forge.ones`, `forge.uninit`, or
+`vault.load` for bulk data — these are single tokens each, and their shapes
+are expressed as static type arguments that are cheap to tokenize.
+
+The bound counts leaves through the literal's full inferred shape, so a nested
+literal counts all of its scalars: `[[…150…], […150…]]` is 300 elements, not 2.
+Exactly 256 is legal; the bound is "more than 256". Like the cross-arena write
+of `MEMORY.md §3.1` this is a spec violation rather than a safe-mode lint, so
+`--demon` does not release it.
+
+> **Deprecation note.** Through 0.0.6 an oversized literal was a warning and
+> this section promised that "a future release will make them a hard error".
+> That release is this one — the promise is collected, the warning is gone,
+> and the error above is what a program past the bound gets. This was the only
+> deprecation this document had outstanding.
 
 ---
 

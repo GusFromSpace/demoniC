@@ -540,6 +540,61 @@ fn gradcheck_scalar_math() -> bool {
     ok
 }
 
+# ── 8. Captured `mut` bindings (AUTODIFF.md §2.1) ─────────────────────
+# A module-level `let !` read in the differentiated body is an input like a `!`
+# parameter: its adjoint comes back in `Grads` under the binding's own name.
+# The finite differences here perturb the *captured binding itself* — the
+# numeric oracle never touches the tape.
+let !cap_b = [0.25f32, 0.5f32, -0.75f32]     # captured tensor
+let !cap_s = 2.0f32                          # captured scalar
+
+@grad fn captured_loss[D](!w: Tensor[f32, [D]], x: Tensor[f32, [D]]) -> f32 {
+    let y = w .* x .+ cap_b
+    sum(y .* y .* y) * cap_s
+}
+fn captured_fwd() -> f32 {
+    let w = [1.0f32, 2.0f32, 3.0f32]
+    let x = [0.5f32, -1.0f32, 2.0f32]
+    captured_loss(w, x)
+}
+fn gradcheck_captured_tensor() -> bool {
+    let w = [1.0f32, 2.0f32, 3.0f32]
+    let x = [0.5f32, -1.0f32, 2.0f32]
+    let (loss, g) = captured_loss.fwd_bwd(w, x)
+    let h = 0.015625f32                      # exact in f32 (2^-6)
+    let !ok = true
+    for i in 0..3 {
+        let base = cap_b[i]
+        cap_b[i] = base + h
+        let lp = captured_fwd()
+        cap_b[i] = base - h
+        let lm = captured_fwd()
+        cap_b[i] = base
+        let numeric = (lp - lm) / (2.0f32 * h)
+        if absf(numeric - g.cap_b[i]) > 0.01f32 { ok = false }
+    }
+    # the `!` param's gradient must still be right alongside the capture's:
+    # dL/dw = 3y²·x·s = [1.6875, -13.5, 330.75]
+    if absf(g.w[0] - 1.6875f32) > 0.001f32 { ok = false }
+    if absf(g.w[1] + 13.5f32) > 0.001f32 { ok = false }
+    if absf(g.w[2] - 330.75f32) > 0.01f32 { ok = false }
+    ok
+}
+fn gradcheck_captured_scalar() -> bool {
+    let w = [1.0f32, 2.0f32, 3.0f32]
+    let x = [0.5f32, -1.0f32, 2.0f32]
+    let (loss, g) = captured_loss.fwd_bwd(w, x)
+    let h = 0.015625f32
+    let base = cap_s
+    cap_s = base + h
+    let lp = captured_fwd()
+    cap_s = base - h
+    let lm = captured_fwd()
+    cap_s = base
+    let numeric = (lp - lm) / (2.0f32 * h)
+    absf(numeric - g.cap_s) <= 0.01f32
+}
+
 fn main() -> nil {
     print("gradcheck (analytic @grad vs central finite differences):")
     print("  l2             : " + (gradcheck_l2() as str))
@@ -557,7 +612,118 @@ fn main() -> nil {
     print("  tier_b (reshape/sum_along/mean_along) : " + (gradcheck_tier_b() as str))
     print("  tier_c (variance/max/min)             : " + (gradcheck_tier_c() as str))
     print("  bias_broadcast : " + (gradcheck_bias_broadcast() as str))
+    print("  scalar_math (sqrt/exp/log/sin/cos/tan) : " + (gradcheck_scalar_math() as str))
+    print("  scalar `!` params (SDF norm)          : " + (gradcheck_scalar_param() as str))
+    print("  indexed reads w[i]                    : " + (gradcheck_indexed_read() as str))
+    print("  comparison-masked select              : " + (gradcheck_masked_select() as str))
+    print("  min_along / max_along / soft-min      : " + (gradcheck_axis_reduce() as str))
+    print("  captured mut (tensor / scalar)        : " + (gradcheck_captured_tensor() as str)
+                                                       + " / " + (gradcheck_captured_scalar() as str))
     nil
+}
+
+# ── 8. Scalar `!` parameters — the SDF written in components ───────────
+# `@grad fn f(!a: f32)` used to be refused outright: only tensor parameters
+# became tape inputs, so a scalar gradient parameter had nothing to hang on.
+# At (1, 2, 2) the radius is 3 and the gradient is the unit vector.
+@grad fn sdf_norm(!x: f32, !y: f32, !z: f32) -> f32 { sqrt(x*x + y*y + z*z) }
+fn sdf_norm_fwd(x: f32, y: f32, z: f32) -> f32 { let (l, g) = sdf_norm.fwd_bwd(x, y, z)  l }
+fn gradcheck_scalar_param() -> bool {
+    let x = 1.0f32
+    let y = 2.0f32
+    let z = 2.0f32
+    let (loss, g) = sdf_norm.fwd_bwd(x, y, z)
+    let h = 0.001f32
+    let !ok = true
+    if absf((sdf_norm_fwd(x + h, y, z) - sdf_norm_fwd(x - h, y, z)) / (2.0f32 * h) - g.x) > 0.02f32 { ok = false }
+    if absf((sdf_norm_fwd(x, y + h, z) - sdf_norm_fwd(x, y - h, z)) / (2.0f32 * h) - g.y) > 0.02f32 { ok = false }
+    if absf((sdf_norm_fwd(x, y, z + h) - sdf_norm_fwd(x, y, z - h)) / (2.0f32 * h) - g.z) > 0.02f32 { ok = false }
+    if absf(g.x - 0.3333333f32) > 0.001f32 { ok = false }
+    if absf(g.y - 0.6666667f32) > 0.001f32 { ok = false }
+    ok
+}
+
+# ── 9. Indexed reads — the same norm over tensor components ────────────
+# `w[0]*w[0] + w[1]*w[1]` exited the graph; the gradient of an element read
+# now scatters back to that slot, so component-wise vector math traces.
+@grad fn sdf_idx(!w: Tensor[f32, [3]]) -> f32 { sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]) }
+fn sdf_idx_fwd(w: Tensor[f32, [3]]) -> f32 { let (l, g) = sdf_idx.fwd_bwd(w)  l }
+fn gradcheck_indexed_read() -> bool {
+    let w = [3.0f32, -4.0f32, 1.0f32]
+    let (loss, g) = sdf_idx.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..3 {
+        let !wp = w  wp[i] = w[i] + h
+        let !wm = w  wm[i] = w[i] - h
+        if absf((sdf_idx_fwd(wp) - sdf_idx_fwd(wm)) / (2.0f32 * h) - g.w[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 10. Comparison-masked select — hard nearest-of-two ─────────────────
+# `.<` inside @grad was a hard "no VJP rule yet". The mask is stop-gradient,
+# so the cotangent reaches whichever operand the mask selected. Every point
+# sits ≥ 0.5 from its kink, so the ±h difference never crosses one.
+@grad fn nearest(!d0: Tensor[f32, [4]], d1: Tensor[f32, [4]]) -> f32 {
+    let m = d0 .< d1
+    sum(m .* d0 .+ (d0 .>= d1) .* d1)
+}
+fn nearest_fwd(d0: Tensor[f32, [4]], d1: Tensor[f32, [4]]) -> f32 {
+    let (l, g) = nearest.fwd_bwd(d0, d1)  l
+}
+fn gradcheck_masked_select() -> bool {
+    let d0 = [1.0f32, 5.0f32, 3.0f32, 2.5f32]
+    let d1 = [2.0f32, 1.0f32, 9.0f32, 4.0f32]
+    let (loss, g) = nearest.fwd_bwd(d0, d1)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..4 {
+        let !dp = d0  dp[i] = d0[i] + h
+        let !dm = d0  dm[i] = d0[i] - h
+        if absf((nearest_fwd(dp, d1) - nearest_fwd(dm, d1)) / (2.0f32 * h) - g.d0[i]) > 0.02f32 { ok = false }
+    }
+    ok
+}
+
+# ── 11. Axis reductions: min_along / max_along, and the soft-min ───────
+# The hard per-axis extremes route each lane's cotangent to that lane's
+# extreme element. Entries are distinct, so no lane ties and the argmin is
+# stable under ±h. `softmax(x, axis)` (already differentiable) is the
+# row-wise softmax, and the soft-min is built from it.
+@grad fn minrow(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 { sum(min_along(w, 1) .* t) }
+fn minrow_fwd(w: Tensor[f32, [2, 3]], t: Tensor[f32, [2]]) -> f32 {
+    let (l, g) = minrow.fwd_bwd(w, t)  l
+}
+@grad fn maxcol(!w: Tensor[f32, [2, 3]], t: Tensor[f32, [3]]) -> f32 { sum(max_along(w, 0) .* t) }
+fn maxcol_fwd(w: Tensor[f32, [2, 3]], t: Tensor[f32, [3]]) -> f32 {
+    let (l, g) = maxcol.fwd_bwd(w, t)  l
+}
+@grad fn softmin_row(!w: Tensor[f32, [2, 3]]) -> f32 {
+    sum(sum_along(softmax(0.0f32 .- w, 1) .* w, 1))
+}
+fn softmin_row_fwd(w: Tensor[f32, [2, 3]]) -> f32 {
+    let (l, g) = softmin_row.fwd_bwd(w)  l
+}
+fn gradcheck_axis_reduce() -> bool {
+    let w  = [[1.0f32, 5.0f32, 3.0f32], [4.0f32, 2.0f32, 6.0f32]]
+    let t2 = [2.0f32, 3.0f32]
+    let t3 = [2.0f32, 3.0f32, 0.5f32]
+    let (l1, g1) = minrow.fwd_bwd(w, t2)
+    let (l2, g2) = maxcol.fwd_bwd(w, t3)
+    let (l3, g3) = softmin_row.fwd_bwd(w)
+    let h = 0.001f32
+    let !ok = true
+    for i in 0..2 {
+        for j in 0..3 {
+            let !wp = w  wp[i, j] = w[i, j] + h
+            let !wm = w  wm[i, j] = w[i, j] - h
+            if absf((minrow_fwd(wp, t2) - minrow_fwd(wm, t2)) / (2.0f32 * h) - g1.w[i, j]) > 0.02f32 { ok = false }
+            if absf((maxcol_fwd(wp, t3) - maxcol_fwd(wm, t3)) / (2.0f32 * h) - g2.w[i, j]) > 0.02f32 { ok = false }
+            if absf((softmin_row_fwd(wp) - softmin_row_fwd(wm)) / (2.0f32 * h) - g3.w[i, j]) > 0.05f32 { ok = false }
+        }
+    }
+    ok
 }
 
 # ── ground-truth gates ────────────────────────────────────────────────────────
@@ -581,6 +747,32 @@ fn test_gradcheck_tier_c() -> bool { gradcheck_tier_c() }
 fn test_gradcheck_bias_broadcast() -> bool { gradcheck_bias_broadcast() }
 fn test_gradcheck_tail_branch() -> bool { gradcheck_tail_branch() }
 fn test_gradcheck_scalar_math() -> bool { gradcheck_scalar_math() }
+fn test_gradcheck_scalar_param() -> bool { gradcheck_scalar_param() }
+fn test_gradcheck_indexed_read() -> bool { gradcheck_indexed_read() }
+fn test_gradcheck_masked_select() -> bool { gradcheck_masked_select() }
+fn test_gradcheck_axis_reduce() -> bool { gradcheck_axis_reduce() }
+fn test_gradcheck_captured_tensor() -> bool { gradcheck_captured_tensor() }
+fn test_gradcheck_captured_scalar() -> bool { gradcheck_captured_scalar() }
+
+# Meta-test, mirroring the l2 one below: the captured-binding gradcheck must
+# have teeth. Comparing the numeric slope against a deliberately wrong (zero)
+# adjoint — which is exactly what `Grads` used to hand back for a capture:
+# nothing at all — has to register a mismatch at every element.
+fn test_gradcheck_captured_detects_wrong_gradient() -> bool {
+    let h = 0.015625f32
+    let !detected = true
+    for i in 0..3 {
+        let base = cap_b[i]
+        cap_b[i] = base + h
+        let lp = captured_fwd()
+        cap_b[i] = base - h
+        let lm = captured_fwd()
+        cap_b[i] = base
+        let numeric = (lp - lm) / (2.0f32 * h)
+        if absf(numeric) <= 0.01f32 { detected = false }   # vs wrong grad = 0
+    }
+    detected
+}
 
 # Meta-test: the check must have teeth — comparing the numeric gradient against a
 # deliberately wrong (zero) analytic gradient must register a mismatch, so a

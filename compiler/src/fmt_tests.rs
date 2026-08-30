@@ -176,6 +176,70 @@ fn main() -> i64 { 5 |> inc |> double }
         parse_program(&formatted).expect("re-parse of formatted output failed");
     }
 
+    /// #501. The formatter's job on the pipe is to collapse the surviving
+    /// spellings (`\|>` and the bare `|>`) onto the canonical one — `\|>`, per
+    /// TOKENIZER §2–§3. It was emitting the bare form, i.e. normalizing away
+    /// from canon. The third spelling, `>>`, is gone entirely (ruling S1a).
+    #[test]
+    fn fmt_normalizes_every_pipe_spelling_to_canonical() {
+        for src in [
+            r#"fn inc(x: i64) -> i64 { x + 1 }
+fn main() -> i64 { 5 \|> inc }"#,
+            r#"fn inc(x: i64) -> i64 { x + 1 }
+fn main() -> i64 { 5 |> inc }"#,
+        ] {
+            let prog = parse_program(src).expect("parse failed");
+            let formatted = pretty_print_program(&prog);
+            assert!(formatted.contains(r"\|>"),
+                    "expected canonical `\\|>` in output, got: {}", formatted);
+            parse_program(&formatted).expect("re-parse of formatted output failed");
+        }
+    }
+
+    /// #501. `\>` / `\<` are canonical (TOKENIZER §3 lists `relu(x)` as the
+    /// *alternate*); the formatter was rewriting the operator into the call,
+    /// inverting the rule against all 30 canonical uses in the corpus.
+    #[test]
+    fn fmt_keeps_activation_operators_canonical() {
+        let src = r#"
+fn main() -> f64 {
+    let a = [1.0, -2.0]
+    let b = \> a
+    let c = \< a
+    b[0] + c[0]
+}
+        "#;
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains(r"\>"), "expected `\\>` preserved, got: {}", formatted);
+        assert!(formatted.contains(r"\<"), "expected `\\<` preserved, got: {}", formatted);
+        assert!(!formatted.contains("relu("), "formatter must not emit the alternate spelling: {}", formatted);
+        assert!(!formatted.contains("gelu("), "formatter must not emit the alternate spelling: {}", formatted);
+        parse_program(&formatted).expect("re-parse of formatted output failed");
+    }
+
+    /// #501. XOR is `^` (OPERATORS §8a). The formatter emitted `^^`, which is
+    /// not a demoniC operator — `dmc fmt` output did not lex. No round-trip
+    /// test covered `^`, which is how it survived.
+    #[test]
+    fn fmt_roundtrip_bitwise_operators() {
+        let src = r#"
+fn main() -> i64 {
+    let a = 6
+    let b = 3
+    let x = a ^ b
+    let y = a & b
+    let z = a | b
+    let w = a << b
+    x + y + z + w
+}
+        "#;
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(!formatted.contains("^^"), "`^^` is not a demoniC operator: {}", formatted);
+        parse_program(&formatted).expect("re-parse of formatted output failed");
+    }
+
     #[test]
     fn fmt_roundtrip_lambda() {
         let src = r#"
@@ -279,6 +343,154 @@ fn dot[N](a: Tensor[f32, [N]], b: Tensor[f32, [N]]) -> f32 {
         let reparsed = parse_program(&formatted)
             .expect("re-parse of formatted string-literal output failed");
         // And the round-trip must be lossless: fmt(parse(fmt)) == fmt.
+        assert_eq!(pretty_print_program(&reparsed), formatted);
+    }
+
+    // ── #501 S16: the reserved `BinOp` variants ──────────────────────────
+    //
+    // No parser path constructs `Pow` or `RShift`, so these tests build the
+    // AST nodes directly. Before the fix, `fmt` spelled `Pow` as `^` (which
+    // parses as `BitXor`) and `RShift` as `>>` (which parsed as `BinOp::Pipe`
+    // until S1a freed the token): re-parseable, and a different operator.
+    //
+    // `BitShr` left this set in #530: `>>` is the right shift now, the parser
+    // constructs `BitShr` from it, and `>>` is its true spelling — covered by
+    // `fmt_rshift_round_trips` below rather than by a marker.
+
+    use crate::ast::BinOp;
+    use crate::fmt::{binop_str, RESERVED_POW, RESERVED_RSHIFT};
+
+    const RESERVED: [(BinOp, &str); 2] = [
+        (BinOp::Pow, RESERVED_POW),
+        (BinOp::RShift, RESERVED_RSHIFT),
+    ];
+
+    /// The markers must not lex, let alone re-parse as another operator.
+    /// This is the release-build half of the guarantee, and it holds in
+    /// either build.
+    #[test]
+    fn fmt_reserved_binop_markers_do_not_relex() {
+        for (op, marker) in RESERVED {
+            let src = format!("fn main() -> i64 {{ 1 {} 2 }}", marker);
+            assert!(Lexer::new(&src).tokenize().is_err(),
+                    "marker for BinOp::{:?} lexed: {}", op, marker);
+        }
+        // The old spellings were not inert: `^` still parses, as `BitXor`.
+        assert!(matches!(try_parse_binop("1 ^ 2"), Some(BinOp::BitXor)));
+        // `>>` is the other half, and #530 settled which node it denotes:
+        // `BitShr`, never the pipe-era `RShift`. That is exactly why `RShift`
+        // may not be printed as `>>` — it would round-trip into a shift.
+        assert!(matches!(try_parse_binop("1 >> 2"), Some(BinOp::BitShr)));
+    }
+
+    /// #530: `>>` is the right shift's real spelling, so it must survive a
+    /// format/re-parse round trip as the same node — the property the reserved
+    /// markers exist to deny `RShift`.
+    #[test]
+    fn fmt_rshift_round_trips() {
+        assert_eq!(binop_str(&BinOp::BitShr), ">>");
+        let src = "fn main() -> i64 { 256 >> 2 }";
+        let formatted = pretty_print_program(&parse_program(src).expect("parse failed"));
+        assert!(formatted.contains("256 >> 2"), "formatted: {}", formatted);
+        assert!(matches!(try_parse_binop("1 >> 2"), Some(BinOp::BitShr)));
+    }
+
+    /// `None` when `expr` does not lex or parse as a binop — a reserved
+    /// spelling is a lex error, not a parse of some other operator.
+    fn try_parse_binop(expr: &str) -> Option<BinOp> {
+        let src = format!("fn main() -> i64 {{ {} }}", expr);
+        let tokens = Lexer::new(&src).tokenize().ok()?;
+        let prog = Parser::new(tokens).parse_program().ok()?;
+        match &prog.items[0] {
+            crate::ast::Item::Fn(f) => match &**f.body.tail_expr.as_ref()? {
+                crate::ast::Expr::BinOp { op, .. } => Some(op.clone()),
+                _ => None,
+            },
+            other => panic!("expected fn item, got: {:?}", other),
+        }
+    }
+
+    /// The debug-build half: surfacing a reserved variant trips the assert
+    /// in `fmt::reserved_binop` instead of quietly emitting wrong code.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "reserved BinOp::Pow reached the formatter")]
+    fn fmt_reserved_pow_trips_debug_assert() { let _ = binop_str(&BinOp::Pow); }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "reserved BinOp::RShift reached the formatter")]
+    fn fmt_reserved_rshift_trips_debug_assert() { let _ = binop_str(&BinOp::RShift); }
+
+    /// With the assert compiled out, `fmt` still renders the marker rather
+    /// than a re-parseable operator.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn fmt_reserved_binops_render_as_markers() {
+        for (op, marker) in RESERVED {
+            assert_eq!(binop_str(&op), marker, "BinOp::{:?}", op);
+        }
+    }
+
+    #[test]
+    fn fmt_prints_dynamic_dim_as_query_501() {
+        // A dynamic dim in a *type* prints `?`. It used to print `_`, which the
+        // parser now rejects — the printer would have emitted unparseable code.
+        let src = "fn rows(x: Tensor[f32, [?, ?]]) -> i64 { 1 }";
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains("[?, ?]"), "dynamic dim prints `?`, got: {formatted}");
+        parse_program(&formatted).expect("re-parse of formatted output failed");
+    }
+
+    #[test]
+    fn fmt_prints_shape_pattern_wildcard_as_underscore_501() {
+        // In *pattern* position the same node is the wildcard pattern and keeps
+        // its `_` spelling — the shape pattern at `examples/slice.dmc:20` comes
+        // back out of `dmc fmt` unchanged. (That file is not round-trip clean
+        // overall: it is one of 15 in tree that `fmt` mangles at `..` slicing,
+        // a pre-existing bug unrelated to shapes.)
+        let src = r#"
+fn t[S](x: Tensor[f32, [2, S, 768]]) -> nil {
+    match x.shape {
+        [_, S, 768] => print("ok"),
+        _           => panic("drift"),
+    }
+    nil
+}
+        "#;
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains("[_, S, 768]"), "pattern wildcard prints `_`, got: {formatted}");
+        parse_program(&formatted).expect("re-parse of formatted output failed");
+    }
+
+    #[test]
+    fn fmt_roundtrip_colon_slices_501() {
+        // GRAMMAR_SWEEP N1: the printer emitted `..` for `IndexElem::Slice`,
+        // so `a[0:100:2]` came back out as `a[0..100::2]` — a range in the
+        // start bound, i.e. the invalid mixed form the parser now rejects.
+        // Both slicing families are permanent surface (OPERATORS §9), so the
+        // formatter must preserve which one the author wrote.
+        let src = "fn main() -> nil {\n\
+                   let s1 = a[0:100:2]\n\
+                   let s2 = a[:]\n\
+                   let s3 = a[:50]\n\
+                   let s4 = a[10:]\n\
+                   let s5 = a[0::2]\n\
+                   let r1 = a[0..100]\n\
+                   let r2 = a[0..=99]\n\
+                   let r3 = a[.., 3]\n\
+                   nil\n}";
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        for spelling in ["a[0:100:2]", "a[:]", "a[:50]", "a[10:]", "a[0::2]",
+                         "a[0..100]", "a[0..=99]", "a[.., 3]"] {
+            assert!(formatted.contains(spelling),
+                "fmt must preserve `{spelling}`, got:\n{formatted}");
+        }
+        let reparsed = parse_program(&formatted)
+            .expect("re-parse of formatted slice output failed");
         assert_eq!(pretty_print_program(&reparsed), formatted);
     }
 }

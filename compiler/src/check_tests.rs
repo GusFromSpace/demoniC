@@ -15,6 +15,16 @@ fn check(src: &str) -> Vec<String> {
 
 fn passes(src: &str) -> bool { check(src).is_empty() }
 
+/// Whole `TypeError`s, for the tests that assert on a diagnostic's hint rather
+/// than only its message.
+fn check_full(src: &str) -> Vec<super::check::TypeError> {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.check_program(&program, None);
+    checker.errors.clone()
+}
+
 /// Lint diagnostics (non-fatal warnings), as message strings.
 fn warnings(src: &str) -> Vec<String> {
     let tokens = Lexer::new(src).tokenize().expect("lex failed");
@@ -257,27 +267,55 @@ fn symbolic_ctor_shapes_do_not_false_positive() {
 }
 
 #[test]
-fn oversized_tensor_literal_warns() {
-    // #403 (SPEC §4.2): tensor literals are for small constants — past 256
-    // total elements the checker warns (spec reserves the right to error).
+fn oversized_tensor_literal_is_error() {
+    // #403/#501 (SPEC §4.2, TOKENIZER §8a): tensor literals are for small
+    // constants. Past 256 total elements this was a lint that TOKENIZER §8a
+    // promised to promote; #501 collects the promise — it is a hard error now.
     let elems = std::iter::repeat("1.0").take(300).collect::<Vec<_>>().join(", ");
     let src = format!("fn main() -> f32 {{ let t = [{elems}]  t[0] }}");
-    let warns = warnings(&src);
-    assert!(warns.iter().any(|w| w.contains("300 elements")),
-            "expected oversized-literal warning, got {:?}", warns);
+    let errs = check(&src);
+    assert!(errs.iter().any(|e| e.contains("300 elements") && e.contains("limit is 256")),
+            "expected oversized-literal error, got {:?}", errs);
+    // It must no longer be a lint — the diagnostic moved, it did not double up.
+    assert!(!warnings(&src).iter().any(|w| w.contains("300 elements")),
+            "oversized literal must not also warn");
+
+    // The diagnostic names the replacement spellings.
+    let hints: Vec<String> = check_full(&src).iter()
+        .filter(|e| e.msg.contains("limit is 256"))
+        .filter_map(|e| e.hint.clone())
+        .collect();
+    assert!(hints.iter().any(|h| h.contains("forge.zeros") && h.contains("vault.load")),
+            "error must name the replacement spelling, got {:?}", hints);
 
     // Nested literals count leaves through the full inferred shape: 2 × 150.
     let row = std::iter::repeat("1").take(150).collect::<Vec<_>>().join(", ");
     let src = format!("fn main() -> i64 {{ let t = [[{row}], [{row}]]  t[0, 0] }}");
-    let warns = warnings(&src);
-    assert!(warns.iter().any(|w| w.contains("300 elements")),
-            "expected nested-literal warning, got {:?}", warns);
+    let errs = check(&src);
+    assert!(errs.iter().any(|e| e.contains("300 elements")),
+            "expected nested-literal error, got {:?}", errs);
 
-    // Exactly 256 stays quiet — the bound is "more than 256".
+    // Exactly 256 stays legal — the bound is "more than 256".
     let elems = std::iter::repeat("1.0").take(256).collect::<Vec<_>>().join(", ");
     let src = format!("fn main() -> f32 {{ let t = [{elems}]  t[0] }}");
-    let warns = warnings(&src);
-    assert!(warns.is_empty(), "256-element literal must not warn, got {:?}", warns);
+    assert!(passes(&src), "256-element literal must stay legal, got {:?}", check(&src));
+}
+
+#[test]
+fn oversized_tensor_literal_survives_demon_mode() {
+    // #501: the 256-element bound is a spec violation, not a safe-mode lint,
+    // so `--demon` does not release it — same rule as the §3.1 cross-arena
+    // write. A lint would vanish here; an error must not.
+    let elems = std::iter::repeat("1.0").take(300).collect::<Vec<_>>().join(", ");
+    let src = format!("fn main() -> f32 {{ let t = [{elems}]  t[0] }}");
+    let tokens = Lexer::new(&src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.demon = true;
+    checker.check_program(&program, None);
+    assert!(checker.errors.iter().any(|e| e.msg.contains("limit is 256")),
+            "demon mode must not suppress the oversized-literal error, got {:?}",
+            checker.errors.iter().map(|e| e.msg.clone()).collect::<Vec<_>>());
 }
 
 #[test]
@@ -463,6 +501,176 @@ fn uninit_write_then_read_passes() {
     "#));
 }
 
+// ── Issue #476: the §2 check reaches one level into model fields ─────────────
+//
+// A model array held in a model FIELD was invisible to the definite-assignment
+// check: the same uninitialized read was a clean `--check` error through a
+// local and, through a field, an `opaque` value at runtime whose error named
+// neither the field, nor the array, nor initialization. These pin the issue's
+// four-spelling table.
+
+const CELLS: &str = r#"
+model Cell { !n: i64 }
+model Holder { !cells: [Cell; 3] }
+"#;
+
+#[test]
+fn uninit_model_array_field_read_is_check_error_476() {
+    // Spelling 2 — the one that hurt: reads naturally, passed `--check`, and
+    // produced opaque elements. A model-array field binds BY VALUE, so the
+    // fill through `cs` never reaches `h.cells`.
+    let errs = check(&format!(r#"{CELLS}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            let !cs = h.cells
+            for i in 0..3 {{ cs[i] = Cell {{ n: 0 }} }}
+            let a = h.cells[0]
+            a.n
+        }}
+    "#));
+    assert!(errs.iter().any(|e| e.contains("uninitialized") && e.contains("`h.cells`")),
+            "fill-through-a-copy must fail at --check like the local spelling, got {:?}", errs);
+
+    // The bare field read, with nothing written at all.
+    let errs = check(&format!(r#"{CELLS}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            let c = h.cells[0]
+            c.n
+        }}
+    "#));
+    assert!(errs.iter().any(|e| e.contains("uninitialized") && e.contains("`h.cells`")),
+            "expected uninit field-read error, got {:?}", errs);
+}
+
+#[test]
+fn uninit_model_array_field_write_then_read_passes_476() {
+    // Spelling 3 — `h.cells[i] = Cell { .. }` writes THROUGH the field, so it
+    // is the write that initializes it. It used to fail at runtime with a
+    // message about tensors and lists; it now works, which makes it the
+    // natural fill-in-place idiom and the thing the read error points at.
+    assert!(passes(&format!(r#"{CELLS}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            vault {{ for i in 0..3 {{ h.cells[i] = Cell {{ n: 0 }} }} }}
+            let a = h.cells[0]
+            a.n
+        }}
+    "#)));
+
+    // Spelling 4 — the idiom that always worked: build as a local, fill it,
+    // store it at construction. The field is never marked, because the value
+    // it is built from is not a fresh `uninit`.
+    assert!(passes(&format!(r#"{CELLS}
+        fn make() -> Holder {{
+            let !cs = vault.uninit[Cell, [3]]
+            vault {{ for i in 0..3 {{ cs[i] = Cell {{ n: 0 }} }} }}
+            Holder {{ cells: cs }}
+        }}
+        fn main() -> i64 {{
+            let !h = make()
+            let a = h.cells[0]
+            a.n
+        }}
+    "#)));
+}
+
+#[test]
+fn uninit_model_array_field_reads_report_once_476() {
+    // One bug, one report — same discipline as the binding-level check.
+    let errs = check(&format!(r#"{CELLS}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            let a = h.cells[0]
+            let b = h.cells[1]
+            a.n + b.n
+        }}
+    "#));
+    let n = errs.iter().filter(|e| e.contains("uninitialized")).count();
+    assert_eq!(n, 1, "expected exactly one uninit report, got {:?}", errs);
+}
+
+#[test]
+fn uninit_model_array_field_self_rhs_still_reports_476() {
+    // Re-armed for the RHS: the write target is not a read, but the value it
+    // reads out of the same uninitialized field is.
+    let errs = check(&format!(r#"{CELLS}
+        fn main() -> nil {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            vault {{ h.cells[0] = h.cells[1] }}
+            nil
+        }}
+    "#));
+    assert!(errs.iter().any(|e| e.contains("uninitialized") && e.contains("`h.cells`")),
+            "expected self-RHS uninit field-read error, got {:?}", errs);
+}
+
+#[test]
+fn uninit_model_array_field_check_does_not_over_report_476() {
+    // The check errs toward silence. A model instance aliases through its
+    // `Rc`, so anything handed the binding may have filled the field — a
+    // method call on it, or passing it to a function.
+    assert!(passes(&format!(r#"{CELLS}
+        fn fill(!h: Holder) -> nil {{
+            vault {{ for i in 0..3 {{ h.cells[i] = Cell {{ n: 1 }} }} }}
+            nil
+        }}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            fill(h)
+            let a = h.cells[0]
+            a.n
+        }}
+    "#)));
+
+    // A tensor field is NOT tracked: it binds as a live alias, so filling
+    // through `let !v = h.buf` really works and flagging it would be a false
+    // report. This is the deliberate boundary of the one-level reach.
+    assert!(passes(r#"
+        model Buf { !buf: Tensor[f32, [4]] }
+        fn main() -> f32 {
+            let !h = Buf { buf: vault.uninit[f32, [4]] }
+            let !v = h.buf
+            vault { for i in 0..4 { v[i] = 1.0 } }
+            sum(h.buf)
+        }
+    "#));
+
+    // Rebinding the root drops the marks with it.
+    assert!(passes(&format!(r#"{CELLS}
+        fn make() -> Holder {{
+            let !cs = vault.uninit[Cell, [3]]
+            vault {{ for i in 0..3 {{ cs[i] = Cell {{ n: 2 }} }} }}
+            Holder {{ cells: cs }}
+        }}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: vault.uninit[Cell, [3]] }}
+            h = make()
+            let a = h.cells[0]
+            a.n
+        }}
+    "#)));
+}
+
+#[test]
+fn model_array_field_bracket_literal_points_at_uninit_476() {
+    // Spelling 1 — the natural spelling is still rejected, but the diagnostic
+    // no longer sends the author off to fix the literal's element type. No
+    // bracket literal of any element type builds a model array.
+    let errs = check_full(&format!(r#"{CELLS}
+        fn main() -> i64 {{
+            let !h = Holder {{ cells: [Cell {{ n: 0 }}, Cell {{ n: 0 }}, Cell {{ n: 0 }}] }}
+            let a = h.cells[0]
+            a.n
+        }}
+    "#));
+    let e = errs.iter().find(|e| e.msg.contains("mismatched type for field `cells`"))
+        .expect(&format!("expected the field mismatch, got {:?}", errs));
+    let hint = e.hint.as_deref().unwrap_or("");
+    assert!(hint.contains("uninit"),
+            "the diagnostic must point at `uninit`, not the literal's element type; hint: {hint:?}");
+}
+
 #[test]
 fn stream_append_inside_loop_over_same_kv_is_check_error() {
     // #403 (MEMORY §9.1): `<-` to the binding a `for` loop iterates is the
@@ -594,19 +802,159 @@ fn match_bare_variant_of_same_enum_does_not_warn() {
             "a same-enum variant pattern must not warn, got: {:?}", ws);
 }
 
+// ── #350 (S9): the bare-variant catch-all lint ─────────────────────────────
+//
+// Ruling S9 on the #501 sweep keeps bare variants in the grammar and pays for
+// them with a lint instead: in an enum-typed match, a bare ident that is NOT a
+// variant of that enum binds irrefutably (SPEC §4.5), so it swallows the
+// remaining variants and defeats exhaustiveness. Every such arm warns; arms
+// that DO resolve to a variant stay silent, because the corpus spells them
+// both ways on purpose.
+
+/// Lint diagnostics as whole `TypeError`s, for the tests that assert on a
+/// hint rather than only the message.
+fn warnings_full(src: &str) -> Vec<super::check::TypeError> {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.check_program(&program, None);
+    checker.warnings.clone()
+}
+
+/// The lint's own diagnostics, isolated from the other safe-mode families.
+fn bare_variant_lints(src: &str) -> Vec<super::check::TypeError> {
+    warnings_full(src).into_iter()
+        .filter(|w| w.msg.contains("binds the scrutinee"))
+        .collect()
+}
+
+const TRAFFIC: &str = r#"
+    enum Light { Red, Yellow, Green }
+"#;
+
 #[test]
-fn match_enum_fresh_catchall_does_not_shadow_warn() {
-    // A genuine fresh catch-all (`other`, not a variant of any enum) on an enum
-    // scrutinee must not trip the #350 shadow lint.
-    let ws = warnings(r#"
-        enum Color { Red, Green, Blue }
-        fn classify(c: Color) -> i64 {
-            match c { Red => 1, other => 0 }
-        }
-        fn main() -> i64 { classify(Color.Blue) }
+fn match_enum_typod_variant_warns() {
+    // The case the lint exists for: `Gren` is nobody's variant, so it binds
+    // everything, shadows `Yellow` below it, and silences the missing-`Green`
+    // exhaustiveness error. Warn, and name the variant it misspells.
+    let src = format!(r#"{TRAFFIC}
+        fn duration(l: Light) -> i64 {{
+            match l {{ Light.Red => 30, Gren => 25, Yellow => 5 }}
+        }}
+        fn main() -> i64 {{ duration(Light.Red) }}
     "#);
-    assert!(!ws.iter().any(|w| w.contains("variant of enum")),
-            "a fresh catch-all on an enum must not warn, got: {:?}", ws);
+    let ws = bare_variant_lints(&src);
+    assert_eq!(ws.len(), 1, "expected exactly one lint, got: {:?}", ws);
+    assert!(ws[0].msg.contains("`Gren`") && ws[0].msg.contains("enum `Light` has no variant"),
+            "unexpected message: {}", ws[0].msg);
+    assert!(ws[0].hint.as_deref().is_some_and(|h| h.contains("`Light.Green`")),
+            "expected the misspelled variant named in the hint, got: {:?}", ws[0].hint);
+}
+
+#[test]
+fn match_enum_lowercase_variant_warns() {
+    // A case slip is the same footgun: `green` is not `Green`.
+    let src = format!(r#"{TRAFFIC}
+        fn f(l: Light) -> i64 {{ match l {{ Light.Red => 1, green => 2 }} }}
+        fn main() -> i64 {{ f(Light.Red) }}
+    "#);
+    let ws = bare_variant_lints(&src);
+    assert_eq!(ws.len(), 1, "expected exactly one lint, got: {:?}", ws);
+    assert!(ws[0].hint.as_deref().is_some_and(|h| h.contains("`Light.Green`")),
+            "expected `Light.Green` suggested, got: {:?}", ws[0].hint);
+}
+
+#[test]
+fn match_enum_bare_catchall_warns_suggesting_underscore() {
+    // A name that resembles no variant is a genuine catch-all bind — still
+    // warned, but pointed at `_`, the spelling that says so out loud.
+    let src = format!(r#"{TRAFFIC}
+        fn f(l: Light) -> i64 {{ match l {{ Light.Red => 1, other => 0 }} }}
+        fn main() -> i64 {{ f(Light.Red) }}
+    "#);
+    let ws = bare_variant_lints(&src);
+    assert_eq!(ws.len(), 1, "expected exactly one lint, got: {:?}", ws);
+    let hint = ws[0].hint.clone().unwrap_or_default();
+    assert!(hint.contains("`_`") && hint.contains("Red, Yellow, Green"),
+            "expected the `_` suggestion and the variant list, got: {hint}");
+    // No misspelling was plausible, so nothing is proposed as the intended
+    // variant.
+    assert!(!hint.contains("did you mean"), "unexpected typo suggestion: {hint}");
+}
+
+#[test]
+fn match_bare_variants_stay_silent() {
+    // Resolved bare variants, qualified arms, and an explicit `_` are all
+    // correct spellings — the lint must not fire on any of them. These are the
+    // shapes `examples/enum_traffic.dmc` and `examples/enum_shape.dmc` use.
+    let src = format!(r#"{TRAFFIC}
+        enum Shape {{ Circle(i64), Rect(i64, i64), Empty }}
+        fn duration(l: Light) -> i64 {{
+            match l {{ Light.Red => 30, Green => 25, Yellow => 5 }}
+        }}
+        fn can_go(l: Light) -> bool {{
+            match l {{ Light.Green => true, _ => false }}
+        }}
+        fn area(s: Shape) -> i64 {{
+            match s {{ Circle(r) => 3 * r * r, Shape.Rect(w, h) => w * h, Empty => 0 }}
+        }}
+        fn main() -> i64 {{ duration(Light.Red) + area(Shape.Empty) }}
+    "#);
+    let ws = bare_variant_lints(&src);
+    assert!(ws.is_empty(), "correct enum-match spellings must stay silent, got: {:?}", ws);
+}
+
+#[test]
+fn match_bare_ident_on_non_enum_scrutinee_does_not_warn() {
+    // The lint is scoped to enum scrutinees: on an `i64` a bare ident is the
+    // only way to bind the value, and #269 already covers the shadowing case.
+    let ws = bare_variant_lints(r#"
+        fn f(k: i64) -> i64 { match k { 0 => 10, 1 => 20, other => other * 2 } }
+        fn main() -> i64 { f(5) }
+    "#);
+    assert!(ws.is_empty(), "a non-enum scrutinee must not warn, got: {:?}", ws);
+}
+
+#[test]
+fn match_bare_variant_lint_is_released_by_demon() {
+    // Safe-mode family member: `--demon` drops it on the floor (#196).
+    let src = format!(r#"{TRAFFIC}
+        fn duration(l: Light) -> i64 {{
+            match l {{ Light.Red => 30, Gren => 25, Yellow => 5 }}
+        }}
+        fn main() -> i64 {{ duration(Light.Red) }}
+    "#);
+    assert!(warnings(&src).iter().any(|w| w.contains("binds the scrutinee")),
+            "safe mode should warn");
+    assert!(!warnings_demon(&src).iter().any(|w| w.contains("binds the scrutinee")),
+            "demon mode should release the lint, got: {:?}", warnings_demon(&src));
+}
+
+#[test]
+fn match_bare_variant_lint_does_not_error() {
+    // A lint, never an error: the program still type-checks, because the arm's
+    // meaning (SPEC §4.5) is unchanged.
+    let src = format!(r#"{TRAFFIC}
+        fn duration(l: Light) -> i64 {{
+            match l {{ Light.Red => 30, Gren => 25, Yellow => 5 }}
+        }}
+        fn main() -> i64 {{ duration(Light.Red) }}
+    "#);
+    assert!(passes(&src), "the lint must not fail --check, got: {:?}", check(&src));
+}
+
+#[test]
+fn match_guarded_bare_ident_on_enum_does_not_warn() {
+    // A guard states the intent — the arm is deliberately a conditional bind,
+    // not a mistyped variant.
+    let src = format!(r#"{TRAFFIC}
+        fn f(l: Light) -> i64 {{
+            match l {{ Light.Red => 1, x if (x as i64) > 1 => 2, _ => 0 }}
+        }}
+        fn main() -> i64 {{ f(Light.Red) }}
+    "#);
+    let ws = bare_variant_lints(&src);
+    assert!(ws.is_empty(), "a guarded arm must not warn, got: {:?}", ws);
 }
 
 // ── #369: unimplemented-directive lint ─────────────────────────────────────
@@ -614,13 +962,18 @@ fn match_enum_fresh_catchall_does_not_shadow_warn() {
 #[test]
 fn unimplemented_directive_warns() {
     // #369: `@recompute` / `@comptime` / `@inplace` are parsed but have no
-    // effect — warn so they aren't silent no-ops.
-    for d in ["recompute(budget=2)", "comptime", "inplace"] {
+    // effect — warn so they aren't silent no-ops. Each is written on a target
+    // DIRECTIVES.md §1 allows it on: `@inplace` on an assignment statement,
+    // the other two on a fn.
+    for d in ["recompute(budget=2)", "comptime"] {
         let src = format!("@{d}\nfn f() -> i64 {{ 1 }}\nfn main() -> i64 {{ f() }}");
         let ws = warnings(&src);
         assert!(ws.iter().any(|w| w.contains("is not implemented") && w.contains("no effect")),
                 "expected an unimplemented-directive warning for @{d}, got: {:?}", ws);
     }
+    let ws = warnings("fn main() -> i64 {\n let !a = 1\n @inplace a += 1\n a\n}");
+    assert!(ws.iter().any(|w| w.contains("is not implemented") && w.contains("no effect")),
+            "expected an unimplemented-directive warning for @inplace, got: {:?}", ws);
 }
 
 #[test]
@@ -1185,15 +1538,148 @@ fn demon_mode_suppresses_lint_family() {
     assert!(demon.is_empty(), "demon mode should suppress all lints, got: {:?}", demon);
 }
 
+// --- file-size lint (#463) --------------------------------------------------
+
+/// A trivial program padded with leading comment lines to exactly `n` source
+/// lines, no trailing newline.
+fn src_of_lines(n: usize) -> String {
+    let mut s = String::new();
+    for _ in 0..n.saturating_sub(1) { s.push_str("# pad\n"); }
+    s.push_str("fn main() -> i64 { 0 }");
+    s
+}
+
+/// Warnings with the file-size dial pinned (as if the nearest demoni.json
+/// set `lints.max_file_lines` to `dial`), demon mode selectable. Full
+/// `TypeError`s so tests can assert on the span, not just the message.
+fn warnings_with_dial(src: &str, dial: Option<usize>, demon: bool) -> Vec<super::check::TypeError> {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.max_file_lines = dial;
+    checker.demon = demon;
+    checker.check_program(&program, None);
+    checker.warnings.clone()
+}
+
+fn file_size_warns(src: &str, dial: Option<usize>) -> bool {
+    warnings_with_dial(src, dial, false)
+        .iter().any(|w| w.msg.contains("lints.max_file_lines"))
+}
+
+const DIAL: usize = 120;
+
+#[test]
+fn file_size_lint_fires_over_dial() {
+    let src = src_of_lines(DIAL + 1);
+    assert!(file_size_warns(&src, Some(DIAL)),
+            "a {}-line file should trip a {}-line dial", DIAL + 1, DIAL);
+}
+
+#[test]
+fn file_size_lint_silent_at_dial() {
+    // Exactly at the dial: quiet. And with a trailing newline (EOF sits
+    // at column 1 of the phantom next line): still quiet — the parser must
+    // not count that line.
+    let src = src_of_lines(DIAL);
+    assert!(!file_size_warns(&src, Some(DIAL)),
+            "a file at exactly the dial must not warn");
+    let with_nl = format!("{}\n", src);
+    assert!(!file_size_warns(&with_nl, Some(DIAL)),
+            "a trailing newline must not push a dial-sized file over");
+}
+
+#[test]
+fn file_size_lint_off_unless_configured() {
+    // No manifest dial → the lint does not exist. The compiler does not
+    // pick a number (#463 refinement: per-project dial, opt-in).
+    let src = src_of_lines(5000);
+    assert!(!file_size_warns(&src, None),
+            "with no dial configured the file-size lint must never fire");
+}
+
+#[test]
+fn file_size_lint_suppressed_in_demon_mode() {
+    let src = src_of_lines(DIAL + 1);
+    assert!(file_size_warns(&src, Some(DIAL)), "safe mode should warn");
+    assert!(!warnings_with_dial(&src, Some(DIAL), true)
+                .iter().any(|w| w.msg.contains("lints.max_file_lines")),
+            "demon mode should release the file-size lint");
+}
+
+#[test]
+fn file_size_lint_anchors_at_end_of_file() {
+    // The excess is at the end of the file, so the diagnostic points there —
+    // not at line 1.
+    let n = DIAL + 30;
+    let src = src_of_lines(n);
+    let all = warnings_with_dial(&src, Some(DIAL), false);
+    let w = all.iter().find(|w| w.msg.contains("lints.max_file_lines"))
+        .expect("file-size warning expected");
+    assert_eq!((w.span.line, w.span.col), (n, 1),
+               "diagnostic must anchor at the last line, got {}:{}", w.span.line, w.span.col);
+}
+
+#[test]
+fn file_size_dial_resolved_from_nearest_manifest() {
+    // End to end through `check_program(path)`: the dial comes out of the
+    // nearest demoni.json above the source file, and only from there.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::write(root.join("demoni.json"),
+                   r#"{ "lints": { "max_file_lines": 60 } }"#).expect("write manifest");
+    let src_path = root.join("big.dmc");
+    let src = src_of_lines(61);
+    std::fs::write(&src_path, &src).expect("write source");
+
+    let tokens = Lexer::new(&src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut checker = Checker::new();
+    checker.check_program(&program, Some(&src_path));
+    assert!(checker.warnings.iter().any(|w| w.msg.contains("lints.max_file_lines")),
+            "a 61-line file under a 60-line manifest dial should warn, got {:?}",
+            checker.warnings);
+}
+
 #[test]
 fn pipe_into_value_is_rejected() {
-    // #188: `x >> 2` (meant as bitwise shift) pipes into a non-callable value.
-    // Previously type-checked, then failed at runtime; now a check error.
+    // A pipe whose RHS is a concrete value is not callable. It used to
+    // type-check and then fail at runtime; it is a check error (#188).
     let errs = check(r#"
-        fn test_op() -> bool { let x = 256  (x >> 2) >= 0 }
+        fn test_op() -> bool { let x = 256  (x \|> 2) >= 0 }
     "#);
     assert!(errs.iter().any(|e| e.contains("not callable")),
             "expected non-callable pipe error, got: {:?}", errs);
+}
+
+#[test]
+fn shift_intent_now_type_checks_as_a_shift() {
+    // #188 verbatim: `x >> 2` written meaning a bitwise shift. It type-checked
+    // as a pipe and died at runtime; S1a (#501) made it a lex error; #530 gives
+    // it the meaning it was always written for. The issue's own repro passes.
+    assert!(passes(r#"
+        fn test_op() -> bool {
+            let x = 256
+            (x >> 2) >= 0
+        }
+    "#));
+}
+
+#[test]
+fn right_shift_types_exactly_like_left_shift() {
+    // `>>` joins the bitwise arm (`BitAnd | BitOr | BitXor | BitShl | BitShr`),
+    // so its typing is `<<`'s typing — including the arm's known looseness on
+    // floats, which the interpreter catches at runtime for both. Pinning the
+    // two together is the invariant; changing the arm must move both.
+    for op in ["<<", ">>"] {
+        let ok = format!("fn main() -> nil {{\n    let x = 256 {} 2\n    nil\n}}", op);
+        assert!(passes(&ok), "`{}` on two ints must check", op);
+
+        let bad = format!("fn main() -> nil {{\n    let x = true {} \"s\"\n    nil\n}}", op);
+        let errs = check(&bad);
+        assert!(errs.iter().any(|e| e.contains("bitwise operator requires integer operands")),
+                "`{}` on non-numeric operands must error, got: {:?}", op, errs);
+    }
 }
 
 #[test]
@@ -1616,6 +2102,189 @@ fn lit_range_overflow_295() {
         "200 - 100 (=100) must not be flagged — it is not a syntactic literal");
     // i64 target fits any i64 literal; quantization int kinds are not checked.
     assert!(!has_range_err("fn m() -> nil { let x: i64 = 9000000000  nil }"), "i64 literal fits i64");
+}
+
+#[test]
+fn lit_range_overflow_operand_538() {
+    // #538: SPEC §3.1 lists "other operand at its use site" as a context an
+    // untyped literal adopts — #295's range check must reach that context
+    // too, not just the annotation/return/param positions above.
+    fn has_range_err(src: &str) -> bool {
+        check(src).iter().any(|m| m.contains("out of range"))
+    }
+
+    // Operand on the right of a narrow-typed operand.
+    assert!(has_range_err(
+        "fn m() -> nil { let a: i32 = 256  let b: i32 = a + 5000000000  nil }"
+    ), "a + 5000000000 (a: i32) should overflow");
+    // Same, operand order reversed — the literal is checked either side.
+    assert!(has_range_err(
+        "fn m() -> nil { let a: i32 = 256  let b: i32 = 5000000000 + a  nil }"
+    ), "5000000000 + a (a: i32) should overflow");
+    // A parameter's declared type is a context too.
+    assert!(has_range_err("fn f(x: i32) -> i32 { x + 5000000000 }"),
+        "x + 5000000000 (x: i32 param) should overflow");
+
+    // ── In-range operand literals must NOT be flagged ───────────────────────
+    assert!(!has_range_err(
+        "fn m() -> nil { let a: i32 = 256  let b: i32 = a + 5000  nil }"
+    ), "a + 5000 (a: i32) fits");
+    assert!(!has_range_err("fn f(x: i32) -> i32 { x + 5000 }"),
+        "x + 5000 (x: i32 param) fits");
+}
+
+#[test]
+fn suffix_conflicts_in_operand_position_539() {
+    // #539: SPEC §3.1 says an explicit type suffix "conflicts with a
+    // different annotation or parameter type as a normal type error" — that
+    // must reach the operand position too, not just the binding position
+    // (#445).
+    fn disagrees(src: &str) -> bool {
+        check(src).iter().any(|m| m.contains("disagree"))
+    }
+
+    // A suffix naming a *different* width than the other operand conflicts,
+    // the same way `let y: i64 = 2i32` already does.
+    assert!(disagrees(
+        "fn m() -> nil { let a: i32 = 256  let b: i32 = a + 2i64  nil }"
+    ), "a + 2i64 (a: i32) should conflict");
+    // Two plain locals of different declared widths must stay a type error —
+    // this is not a literal at all, but the same #284 strict-typing rule
+    // reaching operand position closes this gap too.
+    assert!(disagrees(
+        "fn m() -> nil { let a: i32 = 5  let b: i64 = 10  let c: i32 = a + b  nil }"
+    ), "a + b (a: i32, b: i64) should conflict");
+
+    // A suffix naming the *same* width as the other operand must keep
+    // working — the suffix is not a generic implicit cast, it is the most
+    // explicit statement of intent a literal can carry, and here it agrees.
+    assert!(passes(
+        "fn m() -> nil { let a: i32 = 256  let b: i32 = a + 2i32  nil }"
+    ), "a + 2i32 (a: i32) should still check clean");
+    // Existing #445 binding-position conflict is untouched by this change.
+    assert!(!passes("fn m() -> nil { let x = 2i32  let y: i64 = x  nil }"),
+        "let y: i64 = x (x bound i32 via suffix) should still conflict");
+}
+
+#[test]
+fn lit_and_suffix_operand_checks_reach_comparisons_and_bitwise_538_539() {
+    // #538/#539: `check_binop`'s literal-range and suffix-conflict checks
+    // were originally wired into the arithmetic arm only — comparisons and
+    // bitwise/shift ops have their own arms in `check_binop` and silently
+    // skipped both rules, so `a < 5000000000` or `a & 2i64` (a: i32) checked
+    // clean while the JIT's single `lower_binop` guard (which covers every
+    // scalar binop uniformly) already refused them. Both rules are now
+    // shared via `adopt_and_check_operand_types`, called from all three
+    // arms alike.
+    fn has_range_err(src: &str) -> bool {
+        check(src).iter().any(|m| m.contains("out of range"))
+    }
+    fn disagrees(src: &str) -> bool {
+        check(src).iter().any(|m| m.contains("disagree"))
+    }
+
+    // ── Comparisons ──────────────────────────────────────────────────────
+    assert!(has_range_err("fn m() -> nil { let a: i32 = 5  let _ = a < 5000000000  nil }"),
+        "a < 5000000000 (a: i32) should overflow");
+    assert!(disagrees("fn m() -> nil { let a: i32 = 5  let _ = a < 2i64  nil }"),
+        "a < 2i64 (a: i32) should conflict");
+    assert!(disagrees("fn m() -> nil { let a: i32 = 5  let b: i64 = 10  let _ = a < b  nil }"),
+        "a < b (a: i32, b: i64) should conflict");
+    assert!(disagrees("fn m() -> nil { let a: i32 = 5  let b: i64 = 10  let _ = a == b  nil }"),
+        "a == b (a: i32, b: i64) should conflict");
+    // A comparison's result is bool regardless — the check is a pure side
+    // effect and must not change what the expression itself types as.
+    assert!(passes("fn m() -> bool { let a: i32 = 5  a < 2i32 }"),
+        "a < 2i32 (a: i32) should still check clean and type as bool");
+    // Non-numeric comparisons never touch the numeric-only check.
+    assert!(passes(r#"fn m() -> bool { "x" == "y" }"#), "str == str is untouched");
+
+    // ── Bitwise / shift ──────────────────────────────────────────────────
+    assert!(has_range_err("fn m() -> nil { let a: i32 = 5  let b: i32 = a & 5000000000  nil }"),
+        "a & 5000000000 (a: i32) should overflow");
+    assert!(disagrees("fn m() -> nil { let a: i32 = 5  let b: i32 = a << 2i64  nil }"),
+        "a << 2i64 (a: i32) should conflict");
+    assert!(disagrees("fn m() -> nil { let a: i32 = 5  let b: i64 = 10  let c: i32 = a & b  nil }"),
+        "a & b (a: i32, b: i64) should conflict");
+    // A matching suffix and an in-range literal still check clean.
+    assert!(passes("fn m() -> nil { let a: i32 = 5  let b: i32 = a & 2i32  nil }"),
+        "a & 2i32 (a: i32) should still check clean");
+    assert!(passes("fn m() -> nil { let a: i32 = 5  let b: i32 = a & 500  nil }"),
+        "a & 500 (a: i32) fits");
+}
+
+#[test]
+fn operand_checks_reach_through_as_cast_547() {
+    // #547: `check_expr`'s `Cast` arm used to resolve the cast's target type
+    // and stop — it never recursed into the operand at all, so nothing
+    // check_expr would otherwise catch on that operand (including
+    // check_binop's #295/#538/#539 range/suffix/mixed-width checks above)
+    // ran on it. `dmc --check` reported clean on `(a + b) as i64` (a: i32,
+    // b: i64) while both `dmc run` (silently wraps) and `dmc jit` (refuses)
+    // disagreed with it — the same three-way split #538/#539 closed
+    // everywhere else, still open in the one position (`as i64`) that real
+    // code — especially anything printing a narrow int — actually writes.
+    // Fixed by making the `Cast` arm check its operand like any other
+    // position, at any nesting depth, while leaving the cast itself (and
+    // its own legality) untouched.
+    fn has_range_err(src: &str) -> bool {
+        check(src).iter().any(|m| m.contains("out of range"))
+    }
+    fn disagrees(src: &str) -> bool {
+        check(src).iter().any(|m| m.contains("disagree"))
+    }
+
+    // ── Mixed integral width, through a cast ────────────────────────────
+    assert!(disagrees(
+        "fn m() -> i64 { let a: i32 = 1  let b: i64 = 2  let c: i64 = (a + b) as i64  c }"
+    ), "(a + b) as i64 (a: i32, b: i64) should still conflict under a cast");
+    assert!(disagrees(
+        "fn m() -> i64 { let a: i32 = 1  let b: i64 = 2  let c: i64 = (b + a) as i64  c }"
+    ), "(b + a) as i64 — operand order reversed — should still conflict");
+
+    // ── Suffix conflict, through a cast ──────────────────────────────────
+    assert!(disagrees(
+        "fn m() -> i64 { let a: i32 = 1  let c: i64 = (a & 2i64) as i64  c }"
+    ), "(a & 2i64) as i64 (a: i32) should still conflict");
+    assert!(disagrees(
+        "fn m() -> i64 { let a: i32 = 1  let c: i64 = (2i64 & a) as i64  c }"
+    ), "(2i64 & a) as i64 — operand order reversed — should still conflict");
+
+    // ── Literal range, through a cast ────────────────────────────────────
+    assert!(has_range_err(
+        "fn m() -> i64 { let a: i32 = 1  let c: i64 = (a + 5000000000) as i64  c }"
+    ), "(a + 5000000000) as i64 (a: i32) should still overflow");
+    assert!(has_range_err(
+        "fn m() -> i64 { let a: i32 = 1  let c: i64 = (5000000000 + a) as i64  c }"
+    ), "(5000000000 + a) as i64 — operand order reversed — should still overflow");
+
+    // ── Nested casts: the check must reach through more than one `as` ───
+    assert!(disagrees(
+        "fn m() -> i64 { let a: i32 = 1  let b: i64 = 2  let c: i64 = ((a + b) as i64) as i64  c }"
+    ), "((a + b) as i64) as i64 should still conflict at any nesting depth");
+
+    // ── Cast inside a call argument — the idiomatic "print a narrow int"
+    // shape that let this hole survive #543's own gate run.
+    assert!(disagrees(
+        "fn m() -> nil { let a: i32 = 1  let b: i64 = 2  print((a + b) as i64) }"
+    ), "print((a + b) as i64) should conflict — this is the shape #547 was filed over");
+
+    // ── Must stay clean: the cast itself is not the problem ─────────────
+    // A plain concrete-to-concrete cast is legal SPEC §3.1 and must not be
+    // touched by this fix.
+    assert!(passes(
+        "fn m() -> i64 { let a: i32 = 1  a as i64 }"
+    ), "a as i64 (a: i32) is a plain, legal, concrete-to-concrete cast");
+    // The correct way to write the mixed-width intent: cast the narrow
+    // operand up *before* combining it, rather than the whole expression
+    // after. This must keep checking clean. (Newline-separated, not
+    // double-space-separated: a numeric literal statement immediately
+    // followed by a same-line `(` parses as a call on the literal — an
+    // unrelated parser gotcha the diagnostic itself warns about — so the
+    // tail expression needs its own line here.)
+    assert!(passes(
+        "fn m() -> i64 {\n let a: i32 = 1\n let b: i64 = 2\n (a as i64) + b\n}"
+    ), "(a as i64) + b — widen before combining — must stay clean");
 }
 
 #[test]
@@ -2579,29 +3248,311 @@ fn fwd_bwd_bwd_wrong_arity_errors_392() {
 }
 
 #[test]
-fn captured_mut_in_grad_fn_errors_398() {
+fn captured_mut_in_grad_fn_is_accepted_398() {
+    // #398 implemented: a captured `mut` binding read directly in the body is a
+    // differentiable input (AUTODIFF.md §2), so the program that used to be
+    // rejected now checks clean — the interpreter returns `g.gg` for real
+    // (`interp_tests::grad_captured_mut_tensor_*`).
     let errs = check(r#"
         let !gg = forge.zeros[f32,[3]]
         @grad fn loss(!w: Tensor[f32,[3]]) -> f32 { sum(w .* gg) }
         fn main() -> nil { nil }
     "#);
-    assert!(errs.iter().any(|e| e.contains("not differentiable") && e.contains("gg")),
-            "expected captured-mut error, got {:?}", errs);
+    assert!(errs.is_empty(), "captured-mut @grad fn must check clean, got {:?}", errs);
     // A @grad fn using only its ! params must stay clean.
     let ok = check(r#"
         @grad fn loss(!w: Tensor[f32,[3]], x: Tensor[f32,[3]]) -> f32 { sum(w .* x) }
         fn main() -> nil { nil }
     "#);
-    assert!(!ok.iter().any(|e| e.contains("not differentiable")),
-            "param-only @grad fn must not error: {:?}", ok);
+    assert!(ok.is_empty(), "param-only @grad fn must not error: {:?}", ok);
+}
+
+#[test]
+fn captured_mut_only_grad_fn_is_differentiable_398() {
+    // AUTODIFF.md §2's sentence, now literal: "no mut bindings **and** no mut
+    // parameters" is the error. A captured mut with no `!` param is enough to
+    // differentiate, so it must NOT trip the nothing-to-differentiate rule…
+    let ok = check(r#"
+        let !gain = 2.0f32
+        @grad fn loss(x: Tensor[f32,[3]]) -> f32 { sum(x .* x) * gain }
+        fn main() -> nil { nil }
+    "#);
+    assert!(ok.is_empty(), "capture-only @grad fn must check clean, got {:?}", ok);
+
+    // …while neither a `!` param nor a captured mut still errors, with the
+    // full message naming both sources.
+    let errs = check(r#"
+        let gain = 2.0f32
+        @grad fn loss(x: Tensor[f32,[3]]) -> f32 { sum(x .* x) * gain }
+        fn main() -> nil { nil }
+    "#);
+    assert_eq!(
+        errs,
+        vec!["`@grad fn` with no `!` (mut) parameter and no captured `mut` binding \
+              has nothing to differentiate (see the spec on `@grad`)".to_string()],
+        "expected exactly the nothing-to-differentiate error",
+    );
+
+    // An *immutable* module binding is not a capture for gradient purposes
+    // (§2: "captured immut binding — no"), so it cannot rescue the fn above:
+    // that is what the second case just proved. A non-differentiable captured
+    // mut can't either.
+    let ints = check(r#"
+        let !steps = 0
+        @grad fn loss(x: Tensor[f32,[3]]) -> f32 { sum(x .* x) * (steps as f32) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(ints.iter().any(|e| e.contains("nothing to differentiate")),
+            "an integer capture must not count as differentiable, got {:?}", ints);
+}
+
+#[test]
+fn captured_mut_read_in_callee_errors_398() {
+    // The tape traces only the differentiated body; a plain fn call runs
+    // concretely and contributes no nodes. So a capture read in the body AND in
+    // a called fn would come back with half its gradient — silently. Rejected,
+    // naming the callee. (Truth here: dL/db = 2w; the traced half alone is w.)
+    let errs = check(r#"
+        let !b = forge.zeros[f32,[2]]
+        fn helper(x: Tensor[f32,[2]]) -> f32 { sum(x .* b) }
+        @grad fn loss(!w: Tensor[f32,[2]]) -> f32 { sum(w .* b) + helper(w) }
+        fn main() -> nil { nil }
+    "#);
+    assert_eq!(
+        errs,
+        vec!["captured mutable binding `b` is also read inside fn `helper`, which this \
+              `@grad fn` calls — the tape does not trace calls, so `b`'s gradient would \
+              silently omit that path".to_string()],
+        "expected exactly the callee-read error",
+    );
+
+    // Transitively: the body calls `outer`, which calls `inner`, which reads it.
+    let deep = check(r#"
+        let !b = forge.zeros[f32,[2]]
+        fn inner(x: Tensor[f32,[2]]) -> f32 { sum(x .* b) }
+        fn outer(x: Tensor[f32,[2]]) -> f32 { inner(x) }
+        @grad fn loss(!w: Tensor[f32,[2]]) -> f32 { sum(w .* b) + outer(w) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(deep.iter().any(|e| e.contains("is also read inside fn `inner`")),
+            "expected the transitive callee to be named, got {:?}", deep);
+}
+
+#[test]
+fn captured_mut_callee_scan_tolerates_shadows_and_recursion_398() {
+    // Near-miss 1: the callee's own *parameter* is named `b` — it shadows the
+    // module binding, so the callee is not a reader and the capture is fine.
+    let param_shadow = check(r#"
+        let !b = forge.zeros[f32,[2]]
+        fn helper(b: Tensor[f32,[2]]) -> f32 { sum(b .* b) }
+        @grad fn loss(!w: Tensor[f32,[2]]) -> f32 { sum(w .* b) + helper(w) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(param_shadow.is_empty(),
+            "a callee param shadowing the capture must not error: {:?}", param_shadow);
+
+    // Near-miss 2: the callee has a local `let b` of its own.
+    let local_shadow = check(r#"
+        let !b = forge.zeros[f32,[2]]
+        fn helper(x: Tensor[f32,[2]]) -> f32 { let b = 2.0f32  sum(x) * b }
+        @grad fn loss(!w: Tensor[f32,[2]]) -> f32 { sum(w .* b) + helper(w) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(local_shadow.is_empty(),
+            "a callee local shadowing the capture must not error: {:?}", local_shadow);
+
+    // Near-miss 3: the callee never mentions the capture at all.
+    let unrelated = check(r#"
+        let !b = forge.zeros[f32,[2]]
+        fn helper(x: Tensor[f32,[2]]) -> f32 { sum(x .* x) }
+        @grad fn loss(!w: Tensor[f32,[2]]) -> f32 { sum(w .* b) + helper(w) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(unrelated.is_empty(),
+            "an unrelated callee must not error: {:?}", unrelated);
+
+    // A recursive call graph must terminate (and still find the reader).
+    let recursive = check(r#"
+        let !b = forge.zeros[f32,[2]]
+        fn ping(x: Tensor[f32,[2]], n: i64) -> f32 {
+            if n <= 0 { sum(x .* b) } else { pong(x, n - 1) }
+        }
+        fn pong(x: Tensor[f32,[2]], n: i64) -> f32 { ping(x, n - 1) }
+        @grad fn loss(!w: Tensor[f32,[2]]) -> f32 { sum(w .* b) + ping(w, 2) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(recursive.iter().any(|e| e.contains("is also read inside fn `ping`")),
+            "mutual recursion must terminate and report the reader, got {:?}", recursive);
+}
+
+#[test]
+fn captured_mut_read_in_a_model_method_errors_398() {
+    // The rule that catches a plain callee was escaped by a METHOD call.
+    // `h.contrib()` parses as Call(Field(h, "contrib")), so the callee's name is
+    // a `PostfixOp::Field` and never an `Expr::Ident` — the identifier scan that
+    // discovers plain callees could not see it, and the program compiled clean
+    // while returning half of dL/dcap ([1,1,1] where the truth is [2,2,2]).
+    let errs = check(r#"
+        let !cap = forge.zeros[f32,[3]]
+        model H {
+            k: f32,
+            fn contrib(self) -> f32 { sum(cap) }
+        }
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let h = H { k: 1.0f32 }
+            sum(w .* cap) + h.contrib()
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("is also read inside fn `H.contrib`")),
+            "a method reading the capture must be named like any other callee, got {:?}", errs);
+
+    // A method that does NOT read the capture is not a reader.
+    let clean = check(r#"
+        let !cap = forge.zeros[f32,[3]]
+        model H {
+            k: f32,
+            fn contrib(self) -> f32 { self.k }
+        }
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let h = H { k: 1.0f32 }
+            sum(w .* cap) + h.contrib()
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(clean.is_empty(),
+            "an unrelated method must not error: {:?}", clean);
+
+    // A method whose own parameter shadows the capture is not a reader either.
+    let shadowed = check(r#"
+        let !cap = forge.zeros[f32,[3]]
+        model H {
+            k: f32,
+            fn contrib(self, cap: Tensor[f32,[3]]) -> f32 { sum(cap) }
+        }
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let h = H { k: 1.0f32 }
+            sum(w .* cap) + h.contrib(w)
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(shadowed.is_empty(),
+            "a method param shadowing the capture must not error: {:?}", shadowed);
+}
+
+#[test]
+fn captured_mut_method_call_graph_is_transitive_and_terminates_398() {
+    // A method calling a plain fn that reads the capture, and a method calling
+    // another method — both must be followed, and a cycle must not hang.
+    let via_fn = check(r#"
+        let !cap = forge.zeros[f32,[3]]
+        fn reads() -> f32 { sum(cap) }
+        model H {
+            k: f32,
+            fn contrib(self) -> f32 { reads() }
+        }
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let h = H { k: 1.0f32 }
+            sum(w .* cap) + h.contrib()
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(via_fn.iter().any(|e| e.contains("is also read inside fn `reads`")),
+            "method → fn → capture must be followed, got {:?}", via_fn);
+
+    let cyclic = check(r#"
+        let !cap = forge.zeros[f32,[3]]
+        model H {
+            k: f32,
+            fn a(self) -> f32 { self.b() }
+            fn b(self) -> f32 { self.a() + sum(cap) }
+        }
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let h = H { k: 1.0f32 }
+            sum(w .* cap) + h.a()
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(cyclic.iter().any(|e| e.contains("is also read inside fn `H.b`")),
+            "a cyclic method graph must terminate and report the reader, got {:?}", cyclic);
+}
+
+#[test]
+fn captured_mut_body_local_let_shadows_the_module_binding_398() {
+    // Direction (a): a body-local `let cap` shadows the module `!cap`, so the
+    // body reads no capture at all. The old scan asked only "is this name a
+    // module mutable?" and produced a phantom `g.cap` for a binding the body
+    // never touched.
+    let shadowed = check(r#"
+        let !cap = forge.zeros[f32,[3]]
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let cap = [1.0f32, 1.0f32, 1.0f32]
+            sum(w .* cap)
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(shadowed.is_empty(),
+            "a body-local shadowing the capture must check clean: {:?}", shadowed);
+
+    // Direction (b): the module's `counter` is an `i64`, which is not
+    // differentiable — but this body never reads it. Its own float local of the
+    // same name was being type-checked against the MODULE binding and rejected,
+    // so a correct program did not compile.
+    let local_of_a_nondiff_name = check(r#"
+        let !counter = 0
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 {
+            let counter = 2.0f32
+            sum(w .* w) * counter
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(local_of_a_nondiff_name.is_empty(),
+            "a body-local must not inherit the module binding's type: {:?}",
+            local_of_a_nondiff_name);
+
+    // The rule still fires when the body genuinely READS the non-differentiable
+    // module binding — shadowing narrows the rule, it does not disable it.
+    let genuinely_reads = check(r#"
+        let !counter = 0
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 { sum(w .* w) * (counter as f32) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(genuinely_reads.iter().any(|e| e.contains("non-differentiable type")),
+            "a real read of the i64 capture must still error, got {:?}", genuinely_reads);
+}
+
+#[test]
+fn captured_mut_non_float_errors_398() {
+    // Only float scalars / float tensors carry gradients. A captured integer
+    // mutable would otherwise land in `Grads` as a meaningless field (or, worse,
+    // be silently skipped), so it stays a compile-time error — full message.
+    let errs = check(r#"
+        let !steps = 0
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 { sum(w .* w) * (steps as f32) }
+        fn main() -> nil { nil }
+    "#);
+    assert_eq!(
+        errs,
+        vec!["captured mutable binding `steps` has non-differentiable type `I64` \
+              inside a `@grad fn`".to_string()],
+        "expected exactly the non-differentiable-type error",
+    );
+
+    // The float counterpart of the same program is clean.
+    let ok = check(r#"
+        let !gain = 0.5f32
+        @grad fn loss(!w: Tensor[f32,[3]]) -> f32 { sum(w .* w) * gain }
+        fn main() -> nil { nil }
+    "#);
+    assert!(ok.is_empty(), "a float capture must check clean, got {:?}", ok);
 }
 
 #[test]
 fn captured_mut_hidden_in_closure_errors_398() {
-    // A captured mutable referenced inside a closure LITERAL used to slip past
-    // the #398 check (collect_body_idents skipped FnLit bodies), silently
-    // yielding an opaque `grads.<name>` at runtime. The scan now recurses into
-    // closure bodies, so the capture is caught.
+    // A captured mutable referenced inside a closure LITERAL is still rejected
+    // after #398 shipped: the tape never enters a closure body, so this one
+    // capture genuinely has no adjoint and an empty/zero `g.bias` would be a
+    // silent wrong answer. Assert the whole message, not a fragment.
     let errs = check(r#"
         let !bias = forge.zeros[f32,[1]]
         @grad fn loss(!w: Tensor[f32,[1]], x: Tensor[f32,[1]]) -> f32 {
@@ -2611,8 +3562,43 @@ fn captured_mut_hidden_in_closure_errors_398() {
         }
         fn main() -> nil { nil }
     "#);
-    assert!(errs.iter().any(|e| e.contains("not differentiable") && e.contains("bias")),
-            "expected captured-mut-in-closure error, got {:?}", errs);
+    assert_eq!(
+        errs,
+        vec!["captured mutable binding `bias` is not differentiable inside a closure — \
+              the gradient tape does not enter closure bodies, so its gradient would be \
+              silently absent".to_string()],
+        "expected exactly the captured-mut-in-closure error",
+    );
+
+    // Reading the same binding directly *as well* does not launder the closure
+    // read: the direct read is traced, the closure read is not, and a gradient
+    // missing that term is exactly the silent wrongness this rejects.
+    let both = check(r#"
+        let !bias = forge.zeros[f32,[1]]
+        @grad fn loss(!w: Tensor[f32,[1]], x: Tensor[f32,[1]]) -> f32 {
+            let _hook = fn() -> f32 { sum(bias) }
+            let y = sum(w .* x .+ bias)
+            y * y
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(both.iter().any(|e| e.contains("not differentiable inside a closure")
+                              && e.contains("bias")),
+            "a capture read in a closure must error even when also read directly: {:?}", both);
+
+    // Nesting the closure one level deeper must not hide it either.
+    let nested = check(r#"
+        let !bias = forge.zeros[f32,[1]]
+        @grad fn loss(!w: Tensor[f32,[1]], x: Tensor[f32,[1]]) -> f32 {
+            let _outer = fn() -> fn() -> f32 { fn() -> f32 { sum(bias) } }
+            let y = sum(w .* x)
+            y * y
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(nested.iter().any(|e| e.contains("not differentiable inside a closure")
+                                && e.contains("bias")),
+            "a capture nested two closures deep must still error: {:?}", nested);
 
     // The closure's OWN params are not captures — a closure that touches no
     // module-level mutable must stay clean.
@@ -2625,6 +3611,19 @@ fn captured_mut_hidden_in_closure_errors_398() {
     "#);
     assert!(!ok.iter().any(|e| e.contains("not differentiable")),
             "closure with no captured mutable must not error: {:?}", ok);
+
+    // A closure param that shadows a module-level mutable of the same name is
+    // not a capture either.
+    let shadow = check(r#"
+        let !bias = 1.0f32
+        @grad fn loss(!w: Tensor[f32,[1]], x: Tensor[f32,[1]]) -> f32 {
+            let sq = fn(bias: f32) -> f32 { bias * bias }
+            sq(sum(w .* x))
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(!shadow.iter().any(|e| e.contains("not differentiable")),
+            "a closure param shadowing a mutable is not a capture: {:?}", shadow);
 }
 
 #[test]
@@ -2965,6 +3964,34 @@ fn port_call_outside_grad_fn_is_allowed() {
     assert!(!errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
 }
 
+// SPEC.md §4.11 / PORTS.md §3.2: the copy-mode primitives are *not* port
+// calls. They are pure value transforms — a tensor to text and back, with no
+// runtime on the other end — so the effect-boundary ban does not reach them.
+// Pinned because the ban is a name list in `check.rs`: without this, adding a
+// `port_`-prefixed primitive to that list, or forgetting to keep these off it,
+// would silently move the boundary the spec draws.
+#[test]
+fn the_copy_mode_primitives_are_not_port_calls() {
+    for site in [
+        r#"@grad fn loss(!w: Tensor[f32, [4]]) -> f32 {
+               let s = port_tensor_encode(w)
+               let (b, e) = port_tensor_decode(s, forge.zeros[f32, [4]])
+               sum(w .* w)
+           }"#,
+        r#"fn f() -> i64 {
+               let !g = forge.zeros[i64, [2]]
+               @deterministic {
+                   let s = port_tensor_encode(g)
+                   let (b, e) = port_tensor_decode(s, forge.zeros[i64, [2]])
+               }
+               0
+           }"#,
+    ] {
+        let errs = check(site);
+        assert!(!errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
+    }
+}
+
 // The restriction reaches into a closure checked within the `@grad fn` body:
 // a port call there is still inside the tape.
 #[test]
@@ -2976,4 +4003,1652 @@ fn port_call_in_closure_within_grad_fn_is_forbidden() {
         }
     "#);
     assert!(errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
+}
+
+// ── #474: model shape args survive into the type, in all three positions ────
+//
+// A model literal used to type bare — `Box[2, 2] { … }` was just `Box`, the
+// two numbers standing right there thrown away — so a parameterized model
+// type had nothing to unify against anywhere: not a field, not a parameter.
+// And a shape bracket between a method name and its call hid the method from
+// the checker entirely, which is how a defined, `--check`-clean method could
+// do nothing at all. Every message below is asserted whole: a substring match
+// would not notice a diagnostic that stopped naming the field, the model, or
+// the shapes.
+
+/// The one error `src` must produce, or a panic naming what came instead.
+fn one_error(src: &str) -> String {
+    let errs = check(src);
+    assert_eq!(errs.len(), 1, "expected exactly one type error, got: {:?}", errs);
+    errs.into_iter().next().unwrap()
+}
+
+#[test]
+fn model_field_of_parameterized_model_type_474() {
+    // The issue comment's repro. `Inner[4, 5]` is exactly what `H, W` bind to
+    // from `Outer[2, 3, 4, 5]`, and the literal now carries it.
+    let errs = check(r#"
+        model Inner[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        model Outer[R, C, H, W] {
+            !grid: Tensor[u32, [R, C]]
+            !surf: Inner[H, W]
+        }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[2, 3, 4, 5] {
+                    grid: vault.zeros[u32, [2, 3]],
+                    surf: Inner[4, 5] { px: vault.zeros[u32, [4, 5]], n: 0 }
+                }
+                nil
+            }
+        }
+    "#);
+    assert!(errs.is_empty(), "expected the field literal to unify, got: {:?}", errs);
+}
+
+#[test]
+fn model_field_shape_args_are_enforced_474() {
+    // Accepting the literal is only half the fix: the shapes it carries have
+    // to be *checked* against the ones the field expects. `Inner[9, 5]` where
+    // `H` is 4 is a different type, and the diagnostic still names the field.
+    let msg = one_error(r#"
+        model Inner[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        model Outer[R, C, H, W] {
+            !grid: Tensor[u32, [R, C]]
+            !surf: Inner[H, W]
+        }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[2, 3, 4, 5] {
+                    grid: vault.zeros[u32, [2, 3]],
+                    surf: Inner[9, 5] { px: vault.zeros[u32, [9, 5]], n: 0 }
+                }
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "mismatched type for field `surf` of model `Outer`: \
+                     expected `Inner[4, 5]`, got `Inner[9, 5]`");
+}
+
+#[test]
+fn a_bare_model_literal_that_pins_its_shape_satisfies_the_field_474() {
+    // The issue's title spelling: "a bare `Inner { … }` literal". It has no
+    // bracket, but it is not silent — `px` is a 4x5 tensor, which pins `H` and
+    // `W` as plainly as `Inner[4, 5]` would. Unify and let it in.
+    let errs = check(r#"
+        model Inner[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        model Outer[H, W] { !surf: Inner[H, W] }
+        fn mk() -> Tensor[u32, [4, 5]] { vault { vault.zeros[u32, [4, 5]] } }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[4, 5] { surf: Inner { px: mk(), n: 0 } }
+                nil
+            }
+        }
+    "#);
+    assert!(errs.is_empty(), "expected a bare literal that pins 4x5 to unify, got: {:?}", errs);
+}
+
+#[test]
+fn a_bare_literal_whose_fields_disagree_is_rejected_474() {
+    // The same bare spelling, a 7x7 buffer, a 4x5 field. Accepting a literal
+    // because it *declared* nothing would make the empty argument list a
+    // wildcard — the one reading that lets a wrong shape through in silence.
+    // It unifies to `Inner[7, 7]` and is refused, naming the field.
+    let msg = one_error(r#"
+        model Inner[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        model Outer[H, W] { !surf: Inner[H, W] }
+        fn mk() -> Tensor[u32, [7, 7]] { vault { vault.zeros[u32, [7, 7]] } }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[4, 5] { surf: Inner { px: mk(), n: 0 } }
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "mismatched type for field `surf` of model `Outer`: \
+                     expected `Inner[4, 5]`, got `Inner[7, 7]`");
+}
+
+#[test]
+fn a_bare_literal_that_pins_nothing_is_rejected_474() {
+    // #474's field position, the silent case. `vault.zeros[…]` types as
+    // `Unknown` in constructor position (a pre-existing tensor-typing gap), so
+    // this literal pins neither `H` nor `W` — it makes no claim at all. The
+    // slot says `Inner[4, 5]` and nothing later will re-check it, so an
+    // unprovable literal is refused here rather than accepted on the strength
+    // of its name. The diagnostic names the field and says how to fix it.
+    let msg = one_error(r#"
+        model Inner[H, W] {
+            !px: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        model Outer[H, W] { !surf: Inner[H, W] }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[4, 5] { surf: Inner { px: vault.zeros[u32, [7, 7]], n: 0 } }
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "field `surf` of model `Outer` expects `Inner[4, 5]`, and the \
+                     literal given does not say what shape it is");
+}
+
+#[test]
+fn a_different_model_is_still_the_wrong_field_474() {
+    // Carrying shape args is not a licence for any model to satisfy any
+    // parameterized model field.
+    let msg = one_error(r#"
+        model Inner[H, W] { !px: Tensor[u32, [H, W]] }
+        model Crate { !n: i64 }
+        model Outer[H, W] { !surf: Inner[H, W] }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[4, 5] { surf: Crate { n: 1 } }
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "mismatched type for field `surf` of model `Outer`: \
+                     expected `Inner[4, 5]`, got `Crate`");
+}
+// ── #474 parameter position, and the two holes next door that stay open ─────
+
+#[test]
+fn parameterized_model_param_accepts_a_bare_model_arg_474() {
+    // A model literal types bare (`Box`), so `!b: Box[H, W]` used to reject
+    // every call that did not spell the shapes out. The dims are on the
+    // instance and the interpreter's harvest binds them, so the call stands.
+    let errs = check(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+        }
+        fn area[H, W](!b: Box[H, W]) -> i64 { H * W }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]], n: 0 }
+                area(b)
+            }
+        }
+    "#);
+    assert!(errs.is_empty(), "expected the call to check clean, got: {:?}", errs);
+}
+
+#[test]
+fn a_model_of_the_wrong_shape_is_rejected_at_the_call_474() {
+    // The binding runs both ways: a concretely-shaped model parameter now has
+    // something to compare against, so the wrong instance is caught here
+    // rather than deep inside the callee.
+    let msg = one_error(r#"
+        model Box[H, W] { !cells: Tensor[u32, [H, W]] }
+        fn concrete(!b: Box[2, 2]) -> i64 { 1 }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 3] { cells: vault.zeros[u32, [2, 3]] }
+                concrete(b)
+            }
+        }
+    "#);
+    assert_eq!(msg, "arg 0: expected Box[2, 2], got Box[2, 3]");
+}
+
+#[test]
+fn a_model_and_a_tensor_that_disagree_are_caught_at_check_474() {
+    // The promotion the shape lane predicted: once the model argument binds
+    // `H = 2` at check time, the tensor argument that wants `H = 3` no longer
+    // has to wait for the interpreter. It only reaches this far when the
+    // tensor's own type is known — a `vault.zeros` binding deliberately types
+    // as `Unknown` (#248), and that pair is still the interpreter's to catch.
+    let msg = one_error(r#"
+        model Box[H, W] { !cells: Tensor[u32, [H, W]] }
+        fn wide[H, W](!b: Box[H, W], src: Tensor[u32, [H, W]]) -> i64 { H }
+        fn drive(src: Tensor[u32, [3, 2]]) -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                wide(b, src)
+            }
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert_eq!(msg, "arg 1: expected Tensor[U32, [2, 2]], got Tensor[U32, [3, 2]]");
+}
+
+#[test]
+fn bracketed_method_call_checks_its_arity_474() {
+    // The headline hole seen from the checker's side. `b.generic![2, 2](src)`
+    // parses as Call(Index(Field(b, "generic!"), [2, 2]), [src]), so the
+    // method-call resolution never saw a method and the whole call typed as
+    // `Unknown`: any number of arguments, of any type, and a result that
+    // unified with anything.
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [2, 2]]
+                b.generic![2, 2](s, s, s)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "wrong number of args: expected 1, got 3");
+}
+
+#[test]
+fn bracketed_method_call_checks_its_argument_types_474() {
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                b.generic![2, 2]("hello")
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "arg 0: expected Tensor[U32, [2, 2]], got Str");
+}
+
+#[test]
+fn bracketed_method_call_has_the_methods_return_type_474() {
+    // `-> i64` reaching a `bool` binding. Under `Unknown` this passed.
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [2, 2]]
+                let ok: bool = b.generic![2, 2](s)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "let binding has type Bool but value has type I64");
+}
+
+#[test]
+fn a_method_bracket_naming_a_shape_param_that_is_not_there_474() {
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [2, 2]]
+                b.generic![SX = 2](s)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "`SX` is not a shape parameter of `Box.generic!` (declared: SH, SW)");
+}
+
+#[test]
+fn a_method_bracket_with_more_args_than_shape_params_474() {
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [2, 2]]
+                b.generic![2, 2, 2](s)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "`Box.generic!` declares 2 shape parameter(s), got more bracket args");
+}
+
+#[test]
+fn a_method_bracket_binding_one_shape_param_twice_474() {
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let !s = vault.zeros[u32, [2, 2]]
+                b.generic![SH = 2, SH = 2](s)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "shape parameter `SH` of `Box.generic!` bound twice");
+}
+
+#[test]
+fn ghost_method_behind_a_bracket_and_a_field_receiver_is_a_check_error_474() {
+    // #441's gate, on the bracketed spelling and through a receiver that is
+    // not a bare identifier — the form the old Ident-only lookup missed.
+    let msg = one_error(r#"
+        model Inner[H, W] { !px: Tensor[u32, [H, W]] }
+        model Holder { !surf: Inner[2, 2] }
+        fn main() -> nil {
+            vault {
+                let !i = Inner[2, 2] { px: vault.zeros[u32, [2, 2]] }
+                let !h = Holder { surf: i }
+                h.surf.nope![2, 2](1)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "no method `nope!` on model `Inner`");
+}
+
+#[test]
+fn a_bracket_on_a_model_field_is_still_indexing_474() {
+    // The method typing must not swallow `b.cells[0, 1]`: a field of that
+    // name being indexed stays on the indexing path, and a real out-of-range
+    // index there is still caught.
+    let errs = check(r#"
+        model Box[H, W] { !cells: Tensor[u32, [H, W]] }
+        fn main() -> u32 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                b.cells[0, 1]
+            }
+        }
+    "#);
+    assert!(errs.is_empty(), "expected field indexing to stay clean, got: {:?}", errs);
+}
+
+#[test]
+fn an_error_inside_a_method_bracket_is_reported_once_474() {
+    // Both spellings of the bracket, each reported exactly once (`one_error`
+    // asserts the count): the positional one is typed by the index path
+    // before the call typing sees it, the named one is not typed anywhere
+    // else. Getting this wrong is invisible except as a doubled diagnostic.
+    let src = r#"
+        model Box[H, W] {
+            !n: i64
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> i64 { SH }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { n: 0 }
+                let !s = vault.zeros[u32, [4, 5]]
+                b.generic![PLACEHOLDER](s)
+                nil
+            }
+        }
+    "#;
+    assert_eq!(one_error(&src.replace("PLACEHOLDER", "nope, 5")),
+               "undefined identifier `nope`");
+    assert_eq!(one_error(&src.replace("PLACEHOLDER", "SH = nope, SW = 5")),
+               "undefined identifier `nope`");
+}
+
+#[test]
+fn a_method_bracket_without_a_call_is_an_error_474() {
+    // The ghost's last spelling. `b.generic![2, 2]` with no arguments after it
+    // typed as `Unknown`, passed `--check`, and evaluated to an opaque that
+    // did nothing — a statement shaped exactly like the call the author meant.
+    // A shape bracket is part of calling a method; on its own it is not a
+    // value, and saying so is the same principle that killed the ghost.
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> nil {
+                self.n = self.n + 1
+            }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]], n: 0 }
+                b.generic![2, 2]
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "`Box.generic!` is a method, and a shape bracket on it is \
+                     part of calling it — `generic![…]` on its own is not a value");
+}
+
+#[test]
+fn a_method_bracket_bound_to_a_name_is_the_same_error_474() {
+    // Not only in statement position: there is no value to bind either.
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH](self, n: i64) -> i64 { SH + n }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                let f = b.generic![2]
+                nil
+            }
+        }
+    "#);
+    assert!(msg.contains("is not a value"), "got: {msg}");
+}
+
+#[test]
+fn a_non_integer_shape_argument_is_a_check_error_474() {
+    // The arity, the parameter names and the bind-twice rule all report at
+    // `--check`; this one waited for the interpreter for no reason. A shape
+    // argument is a dim, and `"x"` is not one.
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> nil {
+                self.n = self.n + 1
+            }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]], n: 0 }
+                let !s = vault.zeros[u32, [2, 2]]
+                b.generic!["x", 2](s)
+                nil
+            }
+        }
+    "#);
+    assert_eq!(msg, "shape argument `SH` of `Box.generic!` must be an integer, got Str");
+}
+
+#[test]
+fn a_named_non_integer_shape_argument_is_caught_too_474() {
+    // The named spelling reaches the bracket by a different route; it is held
+    // to the same rule.
+    let msg = one_error(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            fn generic![SH](self, n: i64) -> i64 { SH + n }
+        }
+        fn main() -> i64 {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]] }
+                b.generic![SH = true](1)
+            }
+        }
+    "#);
+    assert_eq!(msg, "shape argument `SH` of `Box.generic!` must be an integer, got Bool");
+}
+
+#[test]
+fn a_shape_generic_method_still_checks_clean_474() {
+    // The whole repro, end to end: it must type-check as well as run.
+    let errs = check(r#"
+        model Box[H, W] {
+            !cells: Tensor[u32, [H, W]]
+            !n: i64
+            fn plain!(self, v: u32) -> nil { self.n = self.n + 100 }
+            fn generic![SH, SW](self, src: Tensor[u32, [SH, SW]]) -> nil {
+                self.n = self.n + 1
+                let !c = self.cells
+                c[0, 0] = src[0, 0]
+            }
+        }
+        fn main() -> nil {
+            vault {
+                let !b = Box[2, 2] { cells: vault.zeros[u32, [2, 2]], n: 0 }
+                let !s = vault.zeros[u32, [2, 2]]
+                b.plain!(1u32)
+                b.generic![2, 2](s)
+                nil
+            }
+        }
+    "#);
+    assert!(errs.is_empty(), "expected #474's repro to check clean, got: {:?}", errs);
+}
+
+#[test]
+fn a_different_model_is_still_the_wrong_argument_474() {
+    // The allowance is for the *same* model written bare — not a licence for
+    // any model to satisfy any parameterized model parameter.
+    let errs = check(r#"
+        model Box[H, W] { !cells: Tensor[u32, [H, W]] }
+        model Crate { !n: i64 }
+        fn area[H, W](!b: Box[H, W]) -> i64 { H * W }
+        fn main() -> i64 {
+            let !c = Crate { n: 1 }
+            area(c)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("arg 0")), "expected an arg-0 error, got: {:?}", errs);
+}
+
+#[test]
+fn model_array_shape_param_still_checks_clean_459() {
+    // #459 was never a check-time rejection — it checked clean and failed at
+    // the call. The fix is inference, so it must still check clean.
+    let errs = check(r#"
+        model Node { kind: i64 }
+        fn build[N](!ns: [Node; N], n: i64) -> i64 {
+            ns[0] = Node { kind: 7 }
+            ns[0].kind
+        }
+        fn main() -> i64 {
+            let !arena = forge.uninit[Node, [8]]
+            build(arena, 8)
+        }
+    "#);
+    assert!(errs.is_empty(), "expected a clean check, got: {:?}", errs);
+}
+
+#[test]
+fn model_field_of_parameterized_model_type_no_longer_rejects_474() {
+    // This was the scope boundary while only #474's parameter position was
+    // fixed: the field position had the same root — a literal types bare —
+    // and was left alone, so a correctly-shaped `Inner[4, 5]` in an
+    // `Inner[H, W]` field was rejected. The field position is fixed now (a
+    // literal keeps the args it was written with), so the same program that
+    // used to have to fail has to pass. The rejections that *should* survive
+    // are pinned next door: a literal whose args contradict the field
+    // (`model_field_shape_args_are_enforced_474`), one whose fields
+    // contradict them (`a_bare_literal_whose_fields_disagree_is_rejected_474`),
+    // and a different model entirely (`a_different_model_is_still_the_wrong_field_474`).
+    let errs = check(r#"
+        model Inner[H, W] { !px: Tensor[u32, [H, W]] }
+        model Outer[R, C, H, W] {
+            !grid: Tensor[u32, [R, C]]
+            !surf: Inner[H, W]
+        }
+        fn main() -> nil {
+            vault {
+                let !o = Outer[2, 3, 4, 5] {
+                    grid: vault.zeros[u32, [2, 3]],
+                    surf: Inner[4, 5] { px: vault.zeros[u32, [4, 5]] }
+                }
+                nil
+            }
+        }
+    "#);
+    assert!(errs.is_empty(),
+            "expected the field literal to unify now that field position is fixed, got: {:?}", errs);
+}
+
+// `@fuse` is the second §5 gate: no fusion crosses a port call, so a port
+// call inside the block contradicts the single-kernel promise.
+#[test]
+fn port_call_inside_fuse_block_is_forbidden() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @fuse {
+                let (p, e) = port_open("python")
+                1.0f32
+            }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("port-forbidden") && e.contains("@fuse")),
+        "got: {:?}", errs);
+}
+
+// A `@fuse` block that is its enclosing block's trailing value takes a
+// different path through `check_block` (its body is walked in the outer
+// scope). The gate has to hold there too.
+#[test]
+fn port_call_in_trailing_fuse_block_is_forbidden() {
+    let errs = check(r#"
+        fn f() -> f32 {
+            @fuse {
+                let (p, e) = port_open("python")
+                1.0f32
+            }
+        }
+        fn main() -> nil { print(f())  nil }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("port-forbidden") && e.contains("@fuse")),
+        "got: {:?}", errs);
+}
+
+// `@deterministic` is the third: bit-exactness needs a port manifest naming
+// the runtime, version, env, files and args (PORTS.md §5), and no port has
+// one — so every core op inside the block is rejected today.
+#[test]
+fn port_call_inside_deterministic_block_is_forbidden() {
+    let errs = check(r#"
+        fn main() -> nil {
+            @deterministic {
+                let (p, e) = port_open("python")
+                let (out, e2) = port_call(p, "len", "[[1,2,3]]")
+                let (_, e3) = port_close(p)
+                print(out)
+            }
+            nil
+        }
+    "#);
+    let hits = errs.iter().filter(|e| e.contains("port-forbidden")).count();
+    assert_eq!(hits, 3, "every core op must be rejected, got: {:?}", errs);
+    assert!(errs.iter().any(|e| e.contains("@deterministic")), "got: {:?}", errs);
+}
+
+// Closures again: a port call written inside a closure in a `@fuse` block is
+// still lexically inside the block.
+#[test]
+fn port_call_in_closure_within_fuse_block_is_forbidden() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @fuse {
+                let f = fn() -> nil { let (p, e) = port_open("python")  nil }
+                1.0f32
+            }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
+}
+
+// The gate is lexical, like every other directive scope (DIRECTIVES.md §4):
+// the same calls beside the block are fine.
+#[test]
+fn port_call_beside_a_fuse_block_is_allowed() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let t = [1.0f32, 2.0f32]
+            let y = @fuse { t .+ t }
+            let (p, e) = port_open("python")
+            let (_, e3) = port_close(p)
+            print(y[0])
+            nil
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("port-forbidden")), "got: {:?}", errs);
+}
+
+// ── DIRECTIVES.md §3: illegal stacks ───────────────────────────────────────
+
+// `@cast(t1) @cast(t2)`: the inner dtype wins, so the outer one is dead code
+// dressed as intent. The diagnostic names both.
+#[test]
+fn stacked_cast_directives_are_rejected() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @cast(f32) @cast(bf16) { 1.0f32 }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("@cast(bf16)") && e.contains("@cast(f32)")),
+        "got: {:?}", errs);
+}
+
+// Written with braces instead of stacked, it is the same program.
+#[test]
+fn directly_nested_cast_blocks_are_rejected() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @cast(f32) { @cast(bf16) { 1.0f32 } }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack") && e.contains("@cast")),
+        "got: {:?}", errs);
+}
+
+// One cast per scope is the whole point — a lone `@cast` stays quiet,
+// including when the block it wraps carries an unrelated directive.
+#[test]
+fn a_single_cast_scope_is_legal() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let t = [1.0f32, 2.0f32]
+            let x = @cast(bf16) { 1.0f32 }
+            let y = @cast(bf16) { @fuse { t .* t } }
+            print(x); print(y[0])
+            nil
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("illegal directive stack")), "got: {:?}", errs);
+}
+
+// `@fuse @fuse` — fusion is idempotent, so the second one says nothing.
+#[test]
+fn stacked_fuse_directives_are_rejected() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @fuse @fuse { 1.0f32 }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack") && e.contains("@fuse")),
+        "got: {:?}", errs);
+}
+
+// The canonical legal stack (DIRECTIVES.md §3) must keep checking — the
+// rejections are targeted, not a ban on stacking.
+#[test]
+fn the_canonical_directive_stack_stays_legal() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let t = [1.0f32, 2.0f32]
+            let x = @deterministic @cast(bf16) @fuse { t .+ t }
+            print(x[0])
+            nil
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("illegal directive stack")), "got: {:?}", errs);
+}
+
+// `@grad @grad` is the second-order autodiff form (SPEC.md §6.2), explicitly
+// legal — the duplicate-directive rejections must not reach it.
+#[test]
+fn stacked_grad_directives_stay_legal() {
+    let errs = check(r#"
+        @grad @grad fn loss(!w: Tensor[f32, [4]]) -> f32 { sum(w .* w) }
+        fn main() -> nil { nil }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("illegal directive stack")), "got: {:?}", errs);
+}
+
+// `@inplace` guards a write that would copy-on-write (MEMORY.md §4.3), so an
+// assignment statement is the only thing it can attach to.
+#[test]
+fn inplace_on_an_assignment_is_legal() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let !a = 1
+            @inplace a += 1
+            print(a)
+            nil
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("illegal directive stack")), "got: {:?}", errs);
+}
+
+#[test]
+fn inplace_on_a_non_assignment_is_rejected() {
+    // fn declaration, `let` binding, block, bare expression — none of them
+    // hold a write for `@inplace` to guard.
+    let cases = [
+        ("@inplace\nfn f() -> i64 { 1 }\nfn main() -> nil {\n print(f())\n nil\n}",
+         "`fn` declaration"),
+        ("fn main() -> nil {\n @inplace let b = 2\n print(b)\n nil\n}", "`let` binding"),
+        ("fn main() -> nil {\n @inplace {\n print(1)\n }\n nil\n}", "a block"),
+        ("fn main() -> nil {\n let !a = 1\n @inplace a\n print(a)\n nil\n}",
+         "bare expression"),
+    ];
+    for (src, what) in cases {
+        let errs = check(src);
+        assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+                && e.contains("@inplace") && e.contains(what)),
+            "expected an `@inplace` attachment error naming {what}, got: {:?}", errs);
+    }
+}
+
+// A directive level between two casts does not launder the stack: written
+// flat, `@cast(f32) @fuse @cast(bf16)` is rejected, so the long-hand brace
+// spelling of the same stack has to be rejected too (DIRECTIVES.md §3).
+#[test]
+fn cast_blocks_separated_by_another_directive_are_rejected() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @cast(f32) { @fuse { @cast(bf16) { 1.0f32 } } }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("@cast(bf16)") && e.contains("@cast(f32)")),
+        "got: {:?}", errs);
+}
+
+// The flat spelling of that same stack, for the pair — both must reject.
+#[test]
+fn casts_separated_by_another_directive_reject_flat_too() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @cast(f32) @fuse @cast(bf16) { 1.0f32 }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("@cast(bf16)") && e.contains("@cast(f32)")),
+        "got: {:?}", errs);
+}
+
+// Two `@fuse` with a cast between them is the same story.
+#[test]
+fn fuse_blocks_separated_by_a_cast_are_rejected() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @fuse { @cast(bf16) { @fuse { 1.0f32 } } }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack") && e.contains("@fuse")),
+        "got: {:?}", errs);
+}
+
+// A block that holds more than the lone nested directive construct is a real
+// block, not a stack written long-hand — the descent has to stop there.
+#[test]
+fn a_cast_around_a_real_block_is_not_a_stack() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @cast(f32) {
+                print(1)
+                @cast(bf16) { 1.0f32 }
+            }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("illegal directive stack")), "got: {:?}", errs);
+}
+
+// ── SPEC.md §7.7: the fuse-infeasible analysis (#503) ──────────────────────
+//
+// `@fuse` promises one kernel and no materialized intermediates. The set the
+// JIT's fused kernel actually collapses is a single elementwise chain over
+// shape-equal f32 tensors with float-scalar broadcasts; everything else is
+// refused at check time as `fuse-infeasible`, naming the offending op.
+
+fn fuse_infeasible(errs: &[String]) -> Vec<&String> {
+    errs.iter().filter(|e| e.contains("fuse-infeasible")).collect()
+}
+
+// The positive case: an elementwise chain with a scalar broadcast, ReLU, and
+// parentheses is exactly the fused kernel's shape — it stays silent.
+#[test]
+fn fusable_elementwise_chain_is_accepted() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
+            let b = [10.0f32, 20.0f32, 30.0f32, 40.0f32]
+            let s = 2.0f32
+            let c = @fuse { \>((a .+ b) .* s .+ 1.0f32) }
+            print(c[0])
+            nil
+        }
+    "#);
+    assert!(fuse_infeasible(&errs).is_empty(), "got: {:?}", errs);
+}
+
+// The same ops without `@fuse` make no promise, so nothing fires — the
+// analysis gates the directive, not the ops.
+#[test]
+fn programs_without_fuse_are_untouched() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [[1.0f32, 2.0f32], [3.0f32, 4.0f32]]
+            let t = a @ a
+            let s = softmax([1.0f32, 2.0f32], -1)
+            print(t[0, 0]); print(s[0])
+            nil
+        }
+    "#);
+    assert!(fuse_infeasible(&errs).is_empty(), "got: {:?}", errs);
+}
+
+// `@` contracts an axis — that is a reduction, not a lane-wise op. The
+// diagnostic names it.
+#[test]
+fn matmul_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [[1.0f32, 2.0f32], [3.0f32, 4.0f32]]
+            let c = @fuse { a @ a }
+            print(c[0, 0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("`@` is not elementwise")),
+        "got: {:?}", errs);
+}
+
+// A call is an opaque boundary — the kernel cannot see through it. The
+// diagnostic names the callee.
+#[test]
+fn call_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            let c = @fuse { softmax(a, -1) }
+            print(c[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("`softmax`")),
+        "got: {:?}", errs);
+}
+
+// A `let` inside the block materializes its binding — the exact intermediate
+// the directive promises away. Hoist it above the block.
+#[test]
+fn let_statement_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            let c = @fuse {
+                let t = a .* a
+                t .+ a
+            }
+            print(c[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("`let` statement")),
+        "got: {:?}", errs);
+}
+
+// A scalar-valued block has no lanes to write.
+#[test]
+fn scalar_body_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let x = @fuse { 1.0f32 }
+            print(x)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("scalar")),
+        "got: {:?}", errs);
+}
+
+// A KV cache carries a streaming `~` extent; its read is not a static-shape
+// lane. The leaf is named with its type.
+#[test]
+fn kv_leaf_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn step[B, H, D](q: Tensor[f32, [B, H, 1, D]], k: KV[f32, [B, H, ~, D]])
+            -> Tensor[f32, [B, H, 1, D]] {
+            @fuse { q .* k }
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("`k`")),
+        "got: {:?}", errs);
+}
+
+// `'` reorders lanes; the single pass reads every operand at one offset.
+#[test]
+fn transpose_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [[1.0f32, 2.0f32], [3.0f32, 4.0f32]]
+            let c = @fuse { a .* a' }
+            print(c[0, 0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("transpose")),
+        "got: {:?}", errs);
+}
+
+// The non-f32 leaf class: the fused kernel computes in f32 lanes.
+#[test]
+fn int_tensor_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1, 2, 3]
+            let c = @fuse { a .+ a }
+            print(c[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("f32")),
+        "got: {:?}", errs);
+}
+
+// Tensor-tensor broadcast: the interpreter's `.*` broadcasts [2, 1] against
+// [2, 3], but the fused kernel reads every leaf at one lane offset — the
+// JIT's `fuse_infer_ty` refuses unequal shapes, so the checker does too.
+// Only float scalars broadcast inside `@fuse`.
+#[test]
+fn tensor_tensor_broadcast_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [[1.0f32, 2.0f32, 3.0f32], [4.0f32, 5.0f32, 6.0f32]]
+            let b = [[10.0f32], [20.0f32]]
+            let c = @fuse { a .* b }
+            print(c[0, 0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible")
+            && e.contains("[2, 3]") && e.contains("[2, 1]")),
+        "got: {:?}", errs);
+}
+
+// Rank broadcast is the same refusal: [2] has no lane to pair with [2, 2].
+#[test]
+fn rank_broadcast_inside_fuse_is_infeasible() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [[1.0f32, 2.0f32], [3.0f32, 4.0f32]]
+            let v = [10.0f32, 20.0f32]
+            let c = @fuse { a .+ v }
+            print(c[0, 0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible")
+            && e.contains("[2, 2]") && e.contains("[2]")),
+        "got: {:?}", errs);
+}
+
+// `@fuse` on a `fn` declaration: the catalog's attachment is block / expr,
+// and both backends ignore the declaration form — an unaudited promise, so
+// it is refused like `@inplace`'s attachment rule is.
+#[test]
+fn fuse_on_a_fn_declaration_is_rejected() {
+    let errs = check(r#"
+        @fuse fn f(a: Tensor[f32, [2]]) -> Tensor[f32, [2]] { a .+ a }
+        fn main() -> nil { nil }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("`@fuse`") && e.contains("`fn` declaration")),
+        "got: {:?}", errs);
+}
+
+// Symbolic shapes that are not *provably* equal: the JIT's fused kernel
+// refuses unequal shapes at monomorphization, so `[N, 4]` against `[M, 4]`
+// across fn params — Equiv::Unknown, some monomorphization can differ — is
+// refused here, at check time, naming both shapes. Without this the checker
+// stays silent and the backends split on the same program.
+#[test]
+fn unprovable_symbolic_shapes_inside_fuse_are_infeasible() {
+    let errs = check(r#"
+        fn f[N, M](a: Tensor[f32, [N, 4]], b: Tensor[f32, [M, 4]]) -> f32 {
+            let t = @fuse { a .+ b }
+            sum(t)
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible")
+            && e.contains("[N, 4]") && e.contains("[M, 4]")),
+        "got: {:?}", errs);
+}
+
+// `@fuse` attached to a statement (`@fuse let x = …`) is an attachment
+// error, whatever the body: the catalog's attachment is block / expr, and
+// the JIT refuses every statement-attached directive before any fuse
+// analysis runs — admitting the form (even with a feasible body) would
+// split the backends on a program the expression spelling handles. The
+// attachment refusal fires alone; the body analysis never runs on it.
+#[test]
+fn fuse_on_a_let_statement_is_an_attachment_error() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            @fuse let x = softmax(a, -1)
+            print(x[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("`@fuse`") && e.contains("`let` statement")),
+        "got: {:?}", errs);
+    assert!(fuse_infeasible(&errs).is_empty(),
+        "the attachment refusal fires alone — the body analysis must not \
+         also run on a refused form; got: {:?}", errs);
+}
+
+// A feasible body changes nothing: the divergence is the attachment itself
+// (`dmc jit` refuses every statement directive; `dmc run` would execute),
+// so the checker refuses the spelling and the hint names the expression
+// form that both backends handle.
+#[test]
+fn fuse_on_a_feasible_let_statement_is_an_attachment_error() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            @fuse let x = a .+ a
+            print(x[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("`@fuse`") && e.contains("`let` statement")),
+        "got: {:?}", errs);
+}
+
+// Any other statement kind is the same refusal, naming the attachment.
+#[test]
+fn fuse_on_a_control_flow_statement_is_an_attachment_error() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            @fuse for i in 0..2 {
+                print(a[i])
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("illegal directive stack")
+            && e.contains("`@fuse`") && e.contains("`for` statement")),
+        "got: {:?}", errs);
+}
+
+// The supported spelling: the same fused unit as an expression checks clean.
+#[test]
+fn fuse_expression_form_of_a_let_is_accepted() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            let x = @fuse { a .+ a }
+            print(x[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().all(|e| !e.contains("illegal directive stack")
+            && !e.contains("fuse-infeasible")),
+        "got: {:?}", errs);
+}
+
+// Unsuffixed float tensor literals are the language's ordinary form; they
+// type as f32 tensors (both backends build f32 lanes from float leaves) and
+// must fuse — refusing them was a false diagnostic against a program the
+// JIT's fused kernel lowers happily.
+#[test]
+fn unsuffixed_float_literal_tensors_fuse() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let a = [1.0, 2.0]
+            let c = @fuse { \>(a .+ a .* 0.5) }
+            print(c[0])
+            nil
+        }
+    "#);
+    assert!(fuse_infeasible(&errs).is_empty(), "got: {:?}", errs);
+}
+
+// Symbolic shapes: `[B, D]` against `[B, D]` is provably equal, so the walk
+// stays silent — provable equality is the bar, and same-name symbols meet it.
+#[test]
+fn equal_symbolic_shapes_inside_fuse_are_accepted() {
+    let errs = check(r#"
+        fn affine[B, D](x: Tensor[f32, [B, D]], g: Tensor[f32, [B, D]])
+            -> Tensor[f32, [B, D]] {
+            @fuse { x .* g }
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(fuse_infeasible(&errs).is_empty(), "got: {:?}", errs);
+}
+
+// The statement diagnostic anchors at the offending statement, not at the
+// enclosing `@fuse` block.
+#[test]
+fn statement_diagnostic_anchors_at_the_statement() {
+    let errs = check_full(r#"
+        fn main() -> nil {
+            let a = [1.0f32, 2.0f32]
+            let c = @fuse {
+                let t = a .* a
+                t .+ a
+            }
+            print(c[0])
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.msg.contains("fuse-infeasible") && e.span.line == 5),
+        "expected the diagnostic on line 5 (the `let t`), got: {:?}",
+        errs.iter().map(|e| (e.span.line, e.msg.clone())).collect::<Vec<_>>());
+}
+
+// The trailing-block path through `check_block` bypasses `check_stmt`; the
+// gate has to hold there the same way port-forbidden's does.
+#[test]
+fn trailing_fuse_block_is_checked_too() {
+    let errs = check(r#"
+        fn f() -> Tensor[f32, [2, 2]] {
+            let a = [[1.0f32, 2.0f32], [3.0f32, 4.0f32]]
+            @fuse { a @ a }
+        }
+        fn main() -> nil { nil }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("fuse-infeasible") && e.contains("`@` is not elementwise")),
+        "got: {:?}", errs);
+}
+
+// ── DIRECTIVES.md §3: `@shard`/`@tp` attachment, expression form ───────────
+//
+// The catalog advertises `@shard` on an expression as well as on a `let`, so
+// the expression form has to be checked identically — every way the `let`
+// form is a hard error, the brace form is the same hard error.
+
+#[test]
+fn shard_block_requires_a_tensor_like_value() {
+    let errs = check(r#"
+        let mesh = Mesh[dp=8, tp=4]
+        fn main() -> nil {
+            let s: f32 = 1.0
+            let y = @shard(axis=0, mesh=mesh.dp) { s }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@shard") && e.contains("tensor-like")),
+        "expected a `@shard` non-tensor error on the block form, got: {:?}", errs);
+}
+
+#[test]
+fn shard_block_requires_the_mesh_divisor_in_the_shape() {
+    let errs = check(r#"
+        let mesh = Mesh[dp=8, tp=4]
+        fn main[B, D](x: Tensor[f32, [B, D]]) -> nil {
+            let y = @shard(axis=0, mesh=mesh.dp) { x }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@shard") && e.contains("divisor `dp`")),
+        "expected a `@shard` divisor error on the block form, got: {:?}", errs);
+}
+
+#[test]
+fn shard_block_requires_the_mesh_argument() {
+    let errs = check(r#"
+        fn main[B, D](x: Tensor[f32, [B, D]]) -> nil {
+            let y = @shard(axis=99) { x }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@shard") && e.contains("mesh=mesh.axis")),
+        "expected a `@shard` missing-mesh error on the block form, got: {:?}", errs);
+}
+
+#[test]
+fn shard_block_axis_must_be_in_bounds() {
+    let errs = check(r#"
+        let mesh = Mesh[dp=8, tp=4]
+        fn main[B, D](x: Tensor[f32, [B/dp, D]]) -> nil {
+            let y = @shard(axis=99, mesh=mesh.dp) { x }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@shard") && e.contains("axis 99 out of bounds")),
+        "expected a `@shard` axis-bounds error on the block form, got: {:?}", errs);
+}
+
+#[test]
+fn tp_block_requires_a_tensor_like_value() {
+    let errs = check(r#"
+        fn main() -> nil {
+            let s: f32 = 1.0
+            let y = @tp(axis=-1) { s }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@tp") && e.contains("tensor-like")),
+        "expected a `@tp` non-tensor error on the block form, got: {:?}", errs);
+}
+
+#[test]
+fn tp_block_requires_the_tp_divisor_in_the_shape() {
+    let errs = check(r#"
+        fn main[D](w: Tensor[f32, [D, 4*D]]) -> nil {
+            let y = @tp(axis=-1) { w }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@tp") && e.contains("divisor `tp`")),
+        "expected a `@tp` divisor error on the block form, got: {:?}", errs);
+}
+
+#[test]
+fn tp_block_axis_must_be_in_bounds() {
+    let errs = check(r#"
+        fn main[D](w: Tensor[f32, [D, 4*D/tp]]) -> nil {
+            let y = @tp(axis=99) { w }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@tp") && e.contains("axis 99 out of bounds")),
+        "expected a `@tp` axis-bounds error on the block form, got: {:?}", errs);
+}
+
+// A well-formed sharded value in the expression form stays quiet — the check
+// is the `let` form's check, not a ban on the brace spelling.
+#[test]
+fn a_well_formed_shard_block_is_legal() {
+    let errs = check(r#"
+        let mesh = Mesh[dp=8, tp=4]
+        fn main[B, D](x: Tensor[f32, [B/dp, D]]) -> nil {
+            let y = @shard(axis=0, mesh=mesh.dp) { x }
+            print(y)
+            nil
+        }
+    "#);
+    assert!(!errs.iter().any(|e| e.contains("@shard")),
+        "expected a well-formed `@shard` block to pass, got: {:?}", errs);
+}
+
+// The statement form of the block reaches the same check — a `@shard { … }`
+// standing as a statement is not a way around the rule either.
+#[test]
+fn shard_block_as_a_statement_is_checked() {
+    let errs = check(r#"
+        let mesh = Mesh[dp=8, tp=4]
+        fn main() -> nil {
+            let s: f32 = 1.0
+            @shard(axis=0, mesh=mesh.dp) { print(s) }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@shard") && e.contains("tensor-like")),
+        "expected a `@shard` non-tensor error on the statement form, got: {:?}", errs);
+}
+
+// The third way in: a directive block standing as a function body's trailing
+// value takes its own path through `check_block`, so it needs its own guard.
+
+#[test]
+fn shard_block_as_a_trailing_value_is_checked() {
+    let errs = check(r#"
+        let mesh = Mesh[dp=8, tp=4]
+        fn main() -> f32 {
+            let s: f32 = 1.0
+            @shard(axis=0, mesh=mesh.dp) { s }
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("@shard") && e.contains("tensor-like")),
+        "expected a `@shard` non-tensor error on the trailing-block form, got: {:?}", errs);
+}
+
+#[test]
+fn a_port_handle_in_a_model_field_is_rejected() {
+    // SPEC §3.11: a handle "cannot appear inside tensor element types, model
+    // fields, or Vault constants". Nothing enforced the model-field half, so
+    // `dmc run` accepted the program and `dmc jit` failed it with `cannot
+    // convert `Port` to `Port`` — the field's type had resolved to a *model*
+    // named `Port`, so both sides rendered alike and neither was the handle
+    // type. One answer now, from the checker, so both backends give it.
+    let errs = check("model Holder { h: Port[python] }\nfn main() -> i64 { 0 }\n");
+    assert!(errs.iter().any(|e| e.contains("model field `Holder.h` is a port handle")),
+        "{:?}", errs);
+    // A handle in a parameter or return position stays legal — the same §3.11
+    // sentence says so explicitly.
+    assert!(passes("fn ask(q: Port[python]) -> Port[python] { q }\nfn main() -> i64 { 0 }\n"));
+}
+
+#[test]
+fn a_query_dim_still_accepts_differing_shapes_501() {
+    // The `[?, ?]` escape hatch (SPEC §3.2) is what survives the removal of
+    // `_`-as-dim (#501, ruling S3): one parameter, two argument shapes, no
+    // shape error.
+    assert!(passes(r#"
+        fn total(x: Tensor[f32, [?, ?]]) -> f32 { sum(x) }
+        fn main() -> i64 {
+            let a = total([[1.0f32, 2.0f32], [3.0f32, 4.0f32]])
+            let b = total([[1.0f32, 2.0f32, 3.0f32]])
+            (a + b) as i64
+        }
+    "#));
+}
+
+#[test]
+fn a_shape_diagnostic_spells_a_dynamic_dim_query_501() {
+    // The checker is the third renderer of a dynamic dim, after `fmt` and the
+    // JIT's refusal. It spelled one `_`, so a shape error described the user's
+    // `[?, 4]` back to them as `[_, 4]` — a type the parser rejects since #501.
+    let errs = check(
+        "fn need(x: Tensor[f32, [?, 4]]) -> Tensor[f32, [2, 8]] { x }\n\
+         fn main() -> i64 { 0 }\n",
+    );
+    assert_eq!(errs.len(), 1, "expected one shape error, got {errs:?}");
+    assert!(errs[0].contains("[?, 4]"), "dynamic dim renders `?`, got: {}", errs[0]);
+    assert!(!errs[0].contains('_'), "no dim may render as `_`, got: {}", errs[0]);
+}
+
+// ── #550: `as` cast legality ────────────────────────────────────────────────
+//
+// The `Cast` arm resolved its target type and returned it on faith, so a cast
+// between types with no conversion type-checked clean and the interpreter
+// handed the *unconverted* value back — a `-> i64` function returning a `str`,
+// with the checker's blessing. `dmc jit` already refused every one of these;
+// the diagnostics below reuse its wording so the two backends do not describe
+// the same bad program differently.
+
+/// The headline repro. `str` has no numeric reading, so there is no conversion
+/// to name — SPEC §3.1 licenses `as` between *scalars* and to `str`, never out
+/// of one.
+#[test]
+fn a_str_cannot_be_cast_to_a_number_550() {
+    for (src, want) in [
+        ("fn main() -> i64 { let s: str = \"abc\"  s as i64 }",
+         "cannot convert `str` to `i64`"),
+        ("fn main() -> f64 { let s: str = \"1.5\"  s as f64 }",
+         "cannot convert `str` to `f64`"),
+        ("fn main() -> bool { let s: str = \"x\"  s as bool }",
+         "cannot convert `str` to `bool`"),
+    ] {
+        let errs = check(src);
+        assert_eq!(errs.len(), 1, "expected exactly one error for {src:?}, got {errs:?}");
+        assert_eq!(errs[0], want, "message must match the JIT's, got: {}", errs[0]);
+    }
+}
+
+/// The other kinds with no conversion: `nil`, a tuple, and a tensor retyped as
+/// a whole other tensor — which the JIT spells with exactly these words.
+#[test]
+fn the_kinds_with_no_conversion_are_refused_550() {
+    for (src, want) in [
+        ("fn main() -> i64 { let n = nil  n as i64 }",
+         "cannot convert `nil` to `i64`"),
+        ("fn main() -> i64 { let p: (i64, i64) = (1, 2)  p as i64 }",
+         "cannot convert `(i64, i64)` to `i64`"),
+        ("fn main() -> str { let t: Tensor[f32, [2]] = forge.zeros[f32, [2]]  t as str }",
+         "cannot convert `Tensor[f32, [2]]` to `str`"),
+        ("fn main() -> i64 { let t: Tensor[f32, [2]] = forge.zeros[f32, [2]]  \
+                             let u = t as Tensor[i64, [2]]  u[0] }",
+         "cannot convert `Tensor[f32, [2]]` to `Tensor[i64, [2]]`"),
+    ] {
+        let errs = check(src);
+        assert!(errs.iter().any(|e| e == want),
+            "expected {want:?} for {src:?}, got {errs:?}");
+    }
+}
+
+/// (1) scalar ↔ scalar, the family SPEC §3.1 exists to describe — including
+/// `bool as i64` (`1` on both backends) and the #540 narrowing wrap.
+#[test]
+fn the_scalar_conversions_stay_legal_550() {
+    assert!(passes("fn main() -> i64 { let b: bool = true  b as i64 }"),
+        "`bool as i64` is a real conversion and must not be refused");
+    assert!(passes("fn main() -> i64 { let a: i32 = 1  a as i64 }"),
+        "widening i32 -> i64");
+    assert!(passes("fn main() -> i32 { let a: i64 = 5000000000  a as i32 }"),
+        "the #540 narrowing wrap");
+    assert!(passes("fn main() -> i8 { let a: i64 = 300  a as i8 }"),
+        "narrowing to a sub-word integer");
+    assert!(passes("fn main() -> i64 { let x: f64 = 1.5  x as i64 }"),
+        "float -> int truncation (OPERATORS.md §7)");
+    assert!(passes("fn main() -> f32 { let x: f64 = 1.5  x as f32 }"),
+        "f64 -> f32 narrowing");
+    assert!(passes("fn main() -> bool { let n: i64 = 2  n as bool }"),
+        "int -> bool (0 is false, anything else true)");
+    assert!(passes("fn main() -> f32 { 5 as f32 }"),
+        "an untyped int literal casts into the float family");
+}
+
+/// (2) `x as str` — SPEC §3.1, "Integer-to-string conversion: `n as str`".
+#[test]
+fn casting_to_str_stays_legal_550() {
+    assert!(passes("fn main() -> str { let n: i64 = 42  n as str }"));
+    assert!(passes("fn main() -> str { let x: f64 = 0.5  x as str }"));
+    assert!(passes("fn main() -> str { let b: bool = true  b as str }"));
+    assert!(passes("fn main() -> str { let s: str = \"abc\"  s as str }"),
+        "the identity cast is always legal");
+}
+
+/// (3) the elementwise tensor cast. It is legal — `dmc run` maps every element,
+/// and `dmc jit` declines it as *unsupported*, not illegal — but it produces a
+/// TENSOR of the target element type, which is what typing it as the bare
+/// scalar got wrong: `fn main() -> i64 { … t as i64 }` used to check clean and
+/// then return a `Tensor`.
+#[test]
+fn the_elementwise_tensor_cast_is_legal_and_yields_a_tensor_550() {
+    assert!(passes(
+        "fn main() -> Tensor[i64, [2]] { \
+           let t: Tensor[f32, [2]] = forge.zeros[f32, [2]]  t as i64 }"),
+        "a tensor cast to a numeric scalar is an elementwise cast");
+    assert!(passes(
+        "fn main() -> Tensor[f32, [4, 3]] { \
+           let t: Tensor[f64, [4, 3]] = forge.zeros[f64, [4, 3]]  t as f32 }"),
+        "…at any rank, narrowing inside the float family");
+    // Typed as the scalar, this was the second half of the soundness hole.
+    let errs = check(
+        "fn main() -> i64 { let t: Tensor[f32, [2]] = forge.zeros[f32, [2]]  t as i64 }");
+    assert!(errs.iter().any(|e| e.contains("returns `I64`") && e.contains("Tensor[I64, [2]]")),
+        "an elementwise cast must not type as a scalar, got {errs:?}");
+    // …and the same through a bare `let` off a constructor, which reports
+    // `Unknown` on purpose (#248) — the shape side-table still knows it is a
+    // tensor. This spelling is the second repro in #550.
+    let errs = check("fn main() -> i64 { let t = forge.zeros[f32, [2]]  t as i64 }");
+    assert!(errs.iter().any(|e| e.contains("returns `I64`") && e.contains("Tensor[I64, [2]]")),
+        "the constructor-bound form must be caught too, got {errs:?}");
+}
+
+/// (4) enum ↔ ordinal — SPEC §3.1: "An enum value is its variant's `i64`
+/// ordinal … `Token.Eq as i64 == 1`", and the explicit way back the JIT lowers.
+#[test]
+fn the_enum_ordinal_casts_stay_legal_550() {
+    assert!(passes("enum Light { Red, Amber, Green }\n\
+                    fn main() -> i64 { Light.Amber as i64 }"));
+    assert!(passes("enum Light { Red, Amber, Green }\n\
+                    fn main() -> i64 { let n: i64 = 1  let l = n as Light  l as i64 }"));
+}
+
+/// (5) the types the checker deliberately does not model must not be refused:
+/// `any` (⊥), a shape parameter in value position, a dynamic map read.
+#[test]
+fn casts_involving_unmodelled_types_are_not_refused_550() {
+    assert!(passes("fn s[D]() -> f32 { D as f32 }\nfn main() -> f32 { s[4]() }"),
+        "a shape param is a SymDim, not a value the checker types");
+    assert!(passes("fn f(x: any) -> i64 { x as i64 }\nfn main() -> i64 { f(1) }"),
+        "`any` is the dynamic escape hatch — it converts to anything");
+    assert!(passes("fn main() -> i64 { let m = map_new()  map_set(m, \"k\", 1)  \
+                    map_get(m, \"k\") as i64 }"),
+        "a dynamically-typed map read still casts");
+}
+
+/// #549 fixed the recursion into a cast's operand and left the cast alone.
+/// Both halves must now fire, and the operand's own diagnostics must not be
+/// swallowed by the new one.
+#[test]
+fn the_operand_checks_and_the_cast_check_coexist_549_550() {
+    assert!(!passes("fn m() -> i64 { (nonexistent_var + 1) as i64 }"),
+        "#549's operand recursion must still report the undefined identifier");
+    assert!(passes("fn m() -> i64 { let a: i32 = 1  a as i64 }"),
+        "a legal cast over a clean operand stays clean");
+}
+
+// ── #533: a `trit` tensor has no copy-mode wire dtype ───────────────────────
+//
+// PORTS.md §3.2: "`trit` has no wire dtype. A packed ternary weight is a
+// demoniC storage format, not a portable element type." Both backends enforce
+// that at run time; the set of encodable element types is a property of the
+// argument's *type*, so it is a compile-time error (AGENTS.md §2.5). The
+// wording is the backends' own, pinned on their side by #512's
+// `jit_a_trit_tensor_is_refused_the_way_the_interpreter_refuses_it`.
+
+const TRIT_ENCODE_REFUSAL: &str =
+    "port_tensor_encode: a `trit` tensor has no copy-mode wire dtype (PORTS.md §3.2)";
+const TRIT_DECODE_REFUSAL: &str =
+    "port_tensor_decode: a `trit` tensor has no copy-mode wire dtype (PORTS.md §3.2)";
+
+/// Every spelling that reaches the primitive with a `trit` tensor: the bare
+/// `let` off the constructor (the repro in #533, which types as `Unknown`
+/// because `forge.trit` carries no element-type argument), an annotated
+/// binding, a parameter, and the constructor written inline.
+#[test]
+fn port_tensor_encode_refuses_a_trit_tensor_533() {
+    for src in [
+        "fn main() -> str { let !t = forge.trit[2, 2]  port_tensor_encode(t) }",
+        "fn main() -> str { let !t: Tensor[trit, [2, 2]] = forge.trit[2, 2]  \
+                            port_tensor_encode(t) }",
+        "fn enc(t: Tensor[trit, [2, 2]]) -> str { port_tensor_encode(t) }\n\
+         fn main() -> str { let !t = forge.trit[2, 2]  enc(t) }",
+        "fn main() -> str { port_tensor_encode(forge.trit[2, 2]) }",
+    ] {
+        let errs = check(src);
+        assert!(errs.iter().any(|e| e == TRIT_ENCODE_REFUSAL),
+            "expected the backends' refusal for {src:?}, got {errs:?}");
+    }
+}
+
+/// `port_tensor_decode(s, like)` reads `like`'s dtype, so a `trit` declared
+/// payload buffer is the same refusal — PORTS.md §3.2's second primitive.
+#[test]
+fn port_tensor_decode_refuses_a_trit_like_tensor_533() {
+    for src in [
+        "fn main() -> i64 { let !t = forge.trit[2, 2]  \
+                            let (v, e) = port_tensor_decode(\"{}\", t)  0 }",
+        "fn dec(t: Tensor[trit, [2, 2]]) -> i64 { \
+           let (v, e) = port_tensor_decode(\"{}\", t)  0 }\n\
+         fn main() -> i64 { let !t = forge.trit[2, 2]  dec(t) }",
+    ] {
+        let errs = check(src);
+        assert!(errs.iter().any(|e| e == TRIT_DECODE_REFUSAL),
+            "expected the backends' refusal for {src:?}, got {errs:?}");
+    }
+}
+
+/// The refusal is about the element type and nothing else: every dtype §3.2's
+/// table does define still encodes, and a `trit` tensor doing the job it exists
+/// for — a POPCNT matmul — is untouched.
+#[test]
+fn the_wire_dtypes_still_encode_and_trit_still_matmuls_533() {
+    for src in [
+        "fn main() -> str { let t = forge.zeros[i64, [2, 3]]  port_tensor_encode(t) }",
+        "fn main() -> str { let t = forge.zeros[f32, [2]]  port_tensor_encode(t) }",
+        "fn main() -> str { let t = forge.zeros[bool, [2]]  port_tensor_encode(t) }",
+        "fn main() -> i64 { let t = forge.zeros[f64, [2]]  \
+                            let (v, e) = port_tensor_decode(\"{}\", t)  0 }",
+        "fn main() -> f32 { let x = forge.ones[f32, [2, 4]]  \
+                            let !w = forge.trit[4, 3]  sum(x @ w) }",
+    ] {
+        assert!(passes(src), "must stay legal: {src:?}, got {:?}", check(src));
+    }
+}
+
+/// A rebind drops the tag in that scope, like every other binding side-table.
+#[test]
+fn a_rebound_trit_binding_stops_being_a_trit_533() {
+    assert!(passes(
+        "fn main() -> str { let !t = forge.trit[2, 2]  \
+                            let t = forge.zeros[f32, [2]]  port_tensor_encode(t) }"),
+        "the name now holds an f32 tensor: {:?}",
+        check("fn main() -> str { let !t = forge.trit[2, 2]  \
+                                  let t = forge.zeros[f32, [2]]  port_tensor_encode(t) }"));
 }

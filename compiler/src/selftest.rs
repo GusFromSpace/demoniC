@@ -44,7 +44,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::check::Checker;
-use crate::interp::{Interpreter, Value};
+use crate::interp::{Interpreter, Value, IW};
 use crate::jit::{Jit, ScalarRet};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
@@ -420,7 +420,7 @@ fn floats_agree(a: f64, b: f64) -> bool {
 
 fn agree(v: &Value, r: &ScalarRet) -> bool {
     match (v, r) {
-        (Value::Int(a), ScalarRet::I64(b)) => a == b,
+        (Value::Int(a, _), ScalarRet::I64(b)) => a == b,
         (Value::Bool(a), ScalarRet::Bool(b)) => a == b,
         (Value::Nil, ScalarRet::Nil) => true,
         (Value::Float(a, _), ScalarRet::F32(b)) => floats_agree(*a, *b as f64),
@@ -640,7 +640,7 @@ fn verdict_index(v: Verdict) -> usize {
 /// guards against.
 fn meta_test() -> bool {
     let mut ok = true;
-    if agree(&Value::Int(1), &ScalarRet::I64(2)) {
+    if agree(&Value::Int(1, IW::I64), &ScalarRet::I64(2)) {
         eprintln!("selftest: meta-test: error: differ failed to flag i64 1 vs 2");
         ok = false;
     }
@@ -658,7 +658,7 @@ fn meta_test() -> bool {
         eprintln!("selftest: meta-test: error: differ failed to accept NaN vs NaN");
         ok = false;
     }
-    if !agree(&Value::Int(5), &ScalarRet::I64(5)) {
+    if !agree(&Value::Int(5, IW::I64), &ScalarRet::I64(5)) {
         eprintln!("selftest: meta-test: error: differ failed to accept i64 5 vs 5");
         ok = false;
     }

@@ -436,3 +436,4 @@ while x < 10 { x = x + 1 }   # OK
 ```
 
 `let mut x` also works but `let !` is idiomatic demoniC. The compiler now suggests `let !` first in the error message.
+The two are **not** synonyms at a model-field binding: `let !x = m.field` on a tensor field takes a live alias, `let mut x = m.field` binds the value — see the spec's Mutability section.

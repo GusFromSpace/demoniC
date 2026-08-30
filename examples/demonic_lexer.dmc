@@ -591,6 +591,10 @@ fn lex(src: str) -> (list, str) {
         if b == 62 {  # >
             i = i + 1
             if i < n && src[i] == 61 { i = i + 1; toks = list_push(toks, tok("ge", ">=", tok_lo, i, cur_line, cur_col)); continue }
+            # `>>` is the arithmetic right shift. It spelled the pipe until the
+            # pre-0.1.0 redundancy sweep freed the token, and was a hard lex
+            # error in between; the reference takes it greedily, so we do too —
+            # two `gt` tokens would diverge on every shift in the corpus.
             if i < n && src[i] == 62 { i = i + 1; toks = list_push(toks, tok("rshift", ">>", tok_lo, i, cur_line, cur_col)); continue }
             toks = list_push(toks, tok("gt", ">", tok_lo, i, cur_line, cur_col)); continue
         }
@@ -668,9 +672,12 @@ fn lex(src: str) -> (list, str) {
             if i < n && src[i] == 42 {
                 i = i + 1
                 if i < n && src[i] == 42 {
+                    # `.**` was a second spelling of `.^`, removed in the
+                    # pre-0.1.0 redundancy sweep; the reference hard-errors
+                    # after consuming all three bytes, so we do too.
                     i = i + 1
-                    toks = list_push(toks, tok("dotstarstar", ".**", tok_lo, i, cur_line, cur_col))
-                    continue
+                    let (el, ec) = advance_pos(src, lc_pos, i, cur_line, cur_col)
+                    return (toks, lex_error("`.**` is not an operator; elementwise power is `.^`", el, ec))
                 }
                 toks = list_push(toks, tok("dotstar", ".*", tok_lo, i, cur_line, cur_col)); continue
             }
@@ -1030,6 +1037,26 @@ fn test_err_byte_lit_too_long() -> bool {
 fn test_err_lone_backslash() -> bool {
     lex_err_of("a \\ b") ==
         "lex error at 1:4: unexpected `\\` — expected `\\>`, `\\<`, or `\\|>`"
+}
+
+fn test_rshift_is_one_token() -> bool {
+    # `>>` is the right shift, and greedy: one `rshift`, never two `gt`. The
+    # mirror contract cuts both ways — what the reference accepts, we accept,
+    # with the same kind. The neighbouring `>` spellings must survive intact.
+    let toks = lex_ok("a >> b")
+    list_len(toks) == 4 &&
+        tok_kind(list_get(toks, 1)) == "rshift" &&
+        tok_raw(list_get(toks, 1)) == ">>" &&
+        tok_kind(list_get(lex_ok("a > b"), 1)) == "gt" &&
+        tok_kind(list_get(lex_ok("a >= b"), 1)) == "ge"
+}
+
+fn test_err_dotstarstar_rejected() -> bool {
+    # `.**` was removed in the redundancy sweep. Tokenizing it as
+    # `.*` `*` would silently accept what the reference rejects, breaking
+    # the mirror contract — it must be the same hard error, same position.
+    lex_err_of("a .** b") ==
+        "lex error at 1:6: `.**` is not an operator; elementwise power is `.^`"
 }
 
 fn test_err_unknown_character() -> bool {

@@ -46,17 +46,80 @@ The arenas are sized at program startup:
 dmc run model.dmc --vault=16G --forge=2G
 ```
 
-*(Specified, not yet implemented: `dmc` rejects the sizing flags with a
-diagnostic saying so; arenas size dynamically today.)*
+Both spellings work — `--forge=2G` and `--forge 2G`. A size is an integer
+with an optional binary unit suffix (`B`, `K`, `M`, `G`, `T`, or the
+spelled-out `KiB`/`MiB`/…, case-insensitive). No floats: write `1536M`,
+not `1.5G`. Zero, a non-numeric value, an unknown suffix, and a count that
+overflows a 64-bit byte total are all rejected on the command line, before
+the program starts.
 
-Specified defaults, once sizing lands:
+Exhausting a sized arena is a **runtime error at the allocation site** —
+never an OOM-kill, never a silent grow:
+
+```
+runtime error at 12:9: forge arena exhausted: this allocation needs 2 MiB,
+but only 1 KiB of the 1 KiB --forge budget is free
+```
+
+Omit a flag and that arena is unbounded. What each backend meters:
+
+- **`dmc run`** meters both arenas. The interpreter has no bump pointer, so
+  the budget is byte accounting over the explicit `vault.*` and `forge.*`
+  constructors, charged at the interpreter's f64 per element. Both meters
+  are **monotonic**: the interpreter reclaims nothing, so nothing gives
+  budget back — a `forge { … }` block does *not* rewind the Forge meter on
+  exit (§3), because its tensors stay alive and its value escapes as the
+  block's result. Implicit intermediates (`let C = A @ B`) and the Stream
+  arena (`forge.kv` / `stream.kv`, bounded by its own `capacity` — §9) are
+  not charged.
+- **`dmc jit`** honors `--forge` against the real bump allocator: the
+  budget caps the bytes the arena may commit, and an allocation that does
+  not fit reports the same message with the same numbers, minus the source
+  location — the JIT's allocator is a runtime callback and has no span to
+  point at:
+
+  ```
+  runtime error: forge arena exhausted: this allocation needs 1 MiB, but
+  only 1 KiB of the 1 KiB --forge budget is free
+  ```
+
+  `forge.restore(mark)` rewinds the bump cursor so the memory is reused,
+  but it does **not** return committed bytes to the budget — matching the
+  interpreter's monotonic meter.
+
+  `--vault` is **rejected**
+  under `dmc jit` rather than ignored — the JIT lowers `vault.*` and
+  `forge.*` into that one Forge arena, so there is no Vault region to size.
+  Use `dmc run` when you want a Vault budget.
+
+The two backends are **not** interchangeable for a given budget. The
+interpreter stores tensor elements as f64 and the JIT as f32, and the JIT
+materializes intermediates the interpreter does not, so the same program
+can fit under `dmc run --forge=N` and exhaust under `dmc jit --forge=N`,
+or the reverse. Size each backend against its own measurements.
+
+Under `dmc test --jit`, every test gets the whole budget: the interpreter
+is rebuilt per test and the JIT's arena is reset alongside it. A test that
+exhausts the budget is reported as that test's `FAIL` and the run
+continues — the allocation is still served, so the budget acts as a
+detector there rather than the hard ceiling it is under `dmc run` and
+`dmc jit`.
+
+Specified defaults, once sizing is a reservation rather than a budget:
 
 - Vault: half of physical RAM, rounded down to nearest huge-page boundary.
 - Forge: 2 GiB.
 
+*(Not yet applied: an omitted flag means unbounded today, not the default
+above.)*
+
 Both arenas reserve virtual address space up front (`mmap(MAP_NORESERVE)`
 on Linux, `VirtualAlloc(MEM_RESERVE)` on Windows) and commit pages lazily
 on first touch. This means a 16 GiB Vault costs nothing until you fill it.
+*(Specified reservation model. Today the interpreter allocates per tensor
+and the JIT commits chunked bump slabs on demand; neither reserves the
+whole range up front, so `--vault` and `--forge` are budgets rather than
+reservations.)*
 
 ### 1.2 Alignment
 
@@ -102,6 +165,34 @@ or whole assignment, a `<-` append, or passing the binding to a `!`
 parameter — initializes it; per-element coverage is not tracked.
 Passing it to a plain parameter or a builtin counts as a read.
 
+The check reaches one level into a model's fields. A **model-array**
+field built straight from `uninit` is tracked under its dotted path, so
+`h.cells` obeys exactly the rules above. Fill it in place, through the field:
+
+```
+model Cell   { !n: i64 }
+model Holder { !cells: [Cell; 3] }
+
+let !h = Holder { cells: vault.uninit[Cell, [3]] }
+vault { for i in 0..3 { h.cells[i] = Cell { n: 0 } } }   # this is the write
+```
+
+Copying the field out first — `let !cs = h.cells` — does **not** work: a
+model-array field binds by *value*, so the fill lands in the copy and the
+field itself stays uninitialized. Reading the field to make that copy is the
+error. Building the array as a local and storing it at construction
+(`Holder { cells: cs }`) is equally correct, and never marks the field.
+
+Two deliberate boundaries. **Tensor** fields are not tracked: they bind as a
+live alias, so filling through `let !v = h.buf` really does reach the field
+and flagging it would be a false report. And the reach is one level and coarse
+in the same direction as the binding-level check — handing the model to
+anything that could fill it (a method call on it, passing it as an argument)
+drops the mark rather than risk a false error.
+
+A bracket literal never builds a model array: `[Cell { n: 0 }, …]` is a tensor
+literal, and is rejected at the field's declared type.
+
 ---
 
 ## 3. Arena selection rules
@@ -129,6 +220,13 @@ forge {
     ...                                     # `tmp` is alive here
 }                                           # Forge resets to entry state
 ```
+
+The reset is a bump-pointer rewind, not a refund: an arena that is *sized*
+(§1.1) does not get those bytes back when the block ends. On `dmc run`
+there is no bump pointer at all — the block is a scope, its allocations are
+ordinary heap tensors, and its value escapes as the block's result — so the
+`--forge` meter simply keeps climbing. `forge { … }` is therefore never a
+way to fit more into a budget than the program actually holds live.
 
 Want a tensor in Vault? Put it in a `vault {}` block or call
 `vault.alloc` explicitly. This is intentional — implicit promotion would
@@ -212,7 +310,10 @@ let !x = forge.uninit[f32, [N]]
 The `@inplace` directive is *specified* to turn aliasing into a
 diagnostic. Not yet implemented: today it parses and the checker warns
 that it has no effect, like the other unimplemented directives in
-`docs/DIRECTIVES.md §1` (Catalog).
+`docs/DIRECTIVES.md §1` (Catalog). What *is* enforced is where it may be
+written — `@inplace` on anything but an assignment statement is an
+illegal stack (`docs/DIRECTIVES.md §3` (Stacking)), because nothing else
+here holds a write to guard.
 
 ---
 

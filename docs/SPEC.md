@@ -247,7 +247,8 @@ slicing never copies.
 ```
 let !w = forge.zeros[f32, [768, 768]]   # mut binding, mut data
 let  w = forge.zeros[f32, [768, 768]]   # immut binding, immut data
-let mut x = ...                          # long form, identical to !x
+let mut x = ...                          # long form of `let !x`, except at a
+                                         # model field — see below
 ```
 
 Binding a mutable copy of an existing value (`let !y = x`) copies by value:
@@ -258,6 +259,13 @@ a **tensor** field binds a live alias — every write through the binding
 (element write, whole-binding assignment, compound assignment, stream
 append) reaches the field; every other field kind (scalars above all) binds
 its current **value**, a snapshot per the copy rule above.
+
+**`!` and `mut` are not interchangeable.** Both spellings make the binding
+and its data mutable, and everywhere else in the language they mean the same
+thing. They part company at exactly one construct — the field binding above.
+`let !x = m.field` takes the alias; `let mut x = m.field` binds the field's
+current **value** for every field kind, tensor included. Take the long form
+when the point is to snapshot a tensor field.
 
 ### 3.5 Functions
 
@@ -395,6 +403,33 @@ A `model` is a struct with:
   instances of model `M`, shape-parameterized forms included
   (`blocks: [Block[D, H]; L]`). Allocated with `forge.uninit[M, [N]]`,
   indexed `blocks[i]`, iterated with `for`. `N` is comptime.
+- **Shape parameters, in every position they can be written.** A model's own
+  shape parameters are in scope throughout its methods and bind from the
+  instance: `Box[2, 3]` gives `H = 2`, `W = 3`. A method may declare shape
+  parameters of its own — `fn blit![SH, SW](self, src: Tensor[u32, [SH, SW]])`
+  — bound by an explicit bracket between the method name and the call
+  (`b.blit![4, 5](src)`, positional or named `b.blit![SH=4, SW=5](src)`) or
+  inferred from the arguments (`b.blit!(src)`); a method shape parameter that
+  reuses one of the model's names shadows it for that call. A
+  shape-parameterized model type is legal as a field type
+  (`!surface: Surface[H, W]`) and as a parameter type (`!b: Box[H, W]`): a
+  model literal carries the shape arguments it was written with, so
+  `Surface[4, 5] { … }` unifies with a field expecting `Surface[H, W]` under
+  `H = 4, W = 5`, and an argument's own shape arguments bind the parameter's
+  shape names. A literal written *without* a bracket (`Surface { … }`) is not
+  silent: its shape arguments are recovered from the fields it was given, so
+  `Surface { px: <a 4x5 tensor> }` unifies as `Surface[4, 5]` and a 7x7 one
+  does not. An empty argument list is never a wildcard — a bare literal whose
+  fields pin *nothing* is rejected in a field slot, naming the field.
+
+  Three caveats, all pre-existing: **reading** such a field yields the declared
+  type *unsubstituted* (`o.surf` types as `Inner[H, W]`, not `Inner[4, 5]`), so
+  it satisfies a generic consumer but not a concrete expectation — as a tensor
+  field already does; **assignment** to a model field is not shape-checked at
+  all (`o.surf = Inner[9, 9] { … }` on an `Outer[2, 2]` is accepted); and a
+  lowercase shape argument (`Box[h, w]`) checks but can only be
+  supplied explicitly at the call, since inference binds uppercase-initial
+  names only, for models and tensors alike.
 - **No inheritance, no traits, no methods other than those declared in the
   model body.** (Exception: UFCS, §4.11.)
 
@@ -434,13 +469,26 @@ port_call(p: Port[L], name: str, payload: str) -> (str, Err)
 port_close(p: Port[L]) -> (nil, Err)
 ```
 
-The interpreter implements the `python` process port: `name` is a dotted
+The `python` process port is implemented: `name` is a dotted
 import path (`math.sqrt`, `json.dumps`) or a bare builtin name, the
 JSON-decoded `payload` is the call's argument vector — a JSON array of
 positional arguments, or an `{args, kwargs}` object — and the result is
-re-encoded to canonical JSON. Other runtimes report a `port-open` error. The
-JIT does not lower port calls. Semantics, the value boundary, and the error
-tags are specified in `docs/PORTS.md`.
+re-encoded to canonical JSON. Other runtimes report a `port-open` error. Both
+backends lower port calls and drive one shared port registry, so the wire
+protocol and the error tags are the same code under `dmc run` and `dmc jit`.
+
+A handle stays opaque in both. It compares only against `nil` — `p == nil` is
+how a failed `port_open` is detected — never against another handle or a `str`,
+and a `str` is not a handle: handle text is ordinary text, so accepting one
+would let a program forge a handle it never opened. It renders, for display
+only, as `<opaque port#<id>:<lang>>`. `Port[L]` is writable in a parameter or
+return position, so a handle may be passed and returned — and `L` is checked
+there: binding a handle to a `Port[L]` position compares `L` against the
+runtime the handle was opened for, and a mismatch is a located runtime error
+in both backends. A handle may *not* appear in a model field, a tensor element
+type, or a Vault constant; the checker rejects the model-field case, so both
+backends refuse the same program at the same span. Semantics, the value
+boundary, and the error tags are specified in `PORTS.md`.
 
 ## 4. Expressions
 
@@ -459,7 +507,10 @@ context-adoption rules of §3.1.
 ```
 
 Tensor literals are for small constants (test vectors, small
-initializations). For bulk data use the arena constructors:
+initializations). A tensor literal with more than 256 elements is a
+**compile-time error** — the count is of leaves through the full inferred
+shape, and the diagnostic names the replacement spelling (`TOKENIZER.md
+§8a`). For bulk data use the arena constructors:
 
 ```
 forge.zeros[f32, [768, 768]]    # zero-initialised, in forge arena
@@ -609,7 +660,7 @@ A directive may scope an expression:
 ```
 let y = @cast(bf16) { mlp(x) }
 let l = @deterministic { train_step(...) }
-let z = @fuse { softmax(q @ k', -1) @ v }
+let z = @fuse { x .* g .+ b }
 ```
 
 The block is an expression evaluating to its last expression. Directives may
@@ -624,12 +675,22 @@ methods, the `@grad` call-surface methods (`.fwd`, `.grad`, `.fwd_bwd`,
 dispatch as builtins. If `f` is not a known free function or builtin, the
 compiler reports an unknown-function error on the desugared form.
 
+`nil` has no methods, and neither backend answers one with a value. Under
+`dmc run` a nil receiver is a located runtime error — ``cannot call method
+`f` on nil`` — for every `f`; `dmc jit` raises the same error at the same
+span for the methods it lowers (today `.starts_with` on a `str`), and refuses
+the program at compile time, naming the method, for one it does not. They
+differ in when they speak, not in whether. This matters most for the
+`(_, Err)` convention: `e.starts_with("…")` on an `Err` that is `nil` because
+nothing went wrong must say so, not answer "no".
+
 ## 5. Statements
 
 ```
 let pat = expr                       # binding (immut)
 let !pat = expr                      # binding (mut)
-let mut pat = expr                   # binding (mut, long form)
+let mut pat = expr                   # binding (mut, long form; §3.4 — not
+                                     # a synonym at a model-field binding)
 
 expr = expr                          # assignment (LHS must be mut)
 expr += expr                         # compound assignment

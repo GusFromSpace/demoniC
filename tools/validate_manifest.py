@@ -16,6 +16,9 @@ SCHEMA = "demoni.package.v0"
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+# PACKAGES.md §4: recognized per-project lint dials. The set is closed so a
+# misspelled dial fails `make check` instead of silently doing nothing.
+LINT_DIALS = {"max_file_lines"}
 
 ERRORS: list[str] = []
 
@@ -100,6 +103,19 @@ def validate_manifest(path: Path) -> None:
                 continue
             check_dmc_path(rel, root, f"modules.{alias}", module_path)
 
+    lints = data.get("lints")
+    if lints is not None:
+        if not isinstance(lints, dict):
+            err(rel, "manifest-field", "`lints` must be an object")
+        else:
+            for dial, value in lints.items():
+                if dial not in LINT_DIALS:
+                    err(rel, "manifest-lint", f"unknown lint dial: {dial!r}")
+                elif dial == "max_file_lines" and (
+                    not isinstance(value, int) or isinstance(value, bool) or value < 1
+                ):
+                    err(rel, "manifest-lint", "`lints.max_file_lines` must be a positive integer")
+
     exports = data.get("exports", [])
     if not isinstance(exports, list) or not all(isinstance(x, str) for x in exports):
         err(rel, "manifest-field", "`exports` must be a list of strings")
@@ -111,7 +127,15 @@ def validate_manifest(path: Path) -> None:
 
 def main() -> int:
     manifests = sorted(ROOT.glob("**/demoni.json"))
-    manifests = [p for p in manifests if ".git" not in p.parts]
+    # `publish/` is the GENERATED public tree (tools/build_public_tree.py). Its
+    # manifest names `examples/*.dmc` paths that resolve in the published repo,
+    # which ships those files; this repo mirrors only the docs into `publish/`,
+    # so every path in it reads as missing here. Validating it against the
+    # private tree is the wrong question, and it failed `make check` (and so
+    # `make ci`) unconditionally. The authored manifest at the repo root is
+    # still checked, and it is the one the generated copy is derived from.
+    skip = {".git", "publish"}
+    manifests = [p for p in manifests if not skip & set(p.parts)]
     if not manifests:
         return 0
     for path in manifests:

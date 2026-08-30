@@ -1,0 +1,245 @@
+# generic_shape_values.dmc — a shape parameter used as a VALUE, and tensor-
+# valued control-flow joins inside generic code.
+#
+# Two gate holes meet here.
+#
+# The first is the shape parameter's second life. `[N]` is a type-level thing
+# in `Tensor[f32, [N]]`, but the same `N` is also an ordinary integer inside
+# the body: a `forge` extent, a loop bound, a `while` predicate, an `N as f32`
+# divisor. The corpus reaches the type-level use constantly and the value-level
+# use barely — `while` bounds in the corpus are module constants, not shape
+# parameters, and only four files allocate with a parameterized extent at all.
+# Interpreter and JIT get that integer by different routes (a binding looked up
+# at call time vs. a constant folded in per instantiation), so a generic that
+# both allocates `[N]` and divides by `N as f32` is a place they could part
+# company with nothing to notice.
+#
+# The second is the shape of the join. `jit_probes.py` carries a large `if_*`
+# family, but every probe in it joins an `i64`; `grad_control_flow.dmc` is the
+# only corpus file whose branches yield TENSORS, and it is `@grad` throughout.
+# A tensor-valued join is a different lowering — the phi carries a buffer, not
+# a number — and outside `@grad` nothing exercised it.
+#
+# Every generic below is called at more than one shape, N = 1 included, so an
+# instantiation that got folded once and reused shows up as a wrong number
+# rather than as a shape error.
+#
+# Run:
+#   dmc test examples/generic_shape_values.dmc
+#   dmc test --jit examples/generic_shape_values.dmc
+
+# ─── The shape parameter as a value ──────────────────────────────────────────
+
+# `N` is three things in one body: the extent of a local allocation, a `for`
+# bound, and a float divisor. All three must agree about the instantiation.
+fn mean_the_long_way[N](x: Tensor[f32, [N]]) -> f32 {
+    let !acc = forge.zeros[f32, [N]]
+    for i in 0..N { acc[i] = x[i] / (N as f32) }
+    sum(acc)
+}
+
+# The same total, accumulated in a `while` whose predicate is the parameter.
+fn sum_while[N](x: Tensor[f32, [N]]) -> f32 {
+    let !i = 0
+    let !acc = 0.0f32
+    while i < N {
+        acc = acc + x[i]
+        i = i + 1
+    }
+    acc
+}
+
+# No argument mentions `N`, so it cannot be inferred — the caller states it,
+# and the returned tensor's extent comes from that statement alone.
+fn even_ramp[N]() -> Tensor[f32, [N]] {
+    let !t = forge.zeros[f32, [N]]
+    for i in 0..N { t[i] = (i * 2) as f32 }
+    t
+}
+
+# Two parameters, one scaling the other: the row count sizes the local, the
+# column count is arithmetic.
+fn first_column_scaled[R, C](m: Tensor[f32, [R, C]]) -> f32 {
+    let !t = forge.zeros[f32, [R]]
+    for i in 0..R { t[i] = (C as f32) * m[i, 0] }
+    sum(t)
+}
+
+# ─── Tensor-valued joins in generic code ─────────────────────────────────────
+
+# Both arms are tensors of `[N]`, so the join carries a buffer.
+fn branch[N](x: Tensor[f32, [N]], double: bool) -> f32 {
+    let y = if double { x .* 2.0 } else { x .+ 1.0 }
+    sum(y)
+}
+
+# Same at a `match` join, and the default arm hands back the parameter itself
+# rather than a freshly computed tensor — the one arm that yields a buffer the
+# callee did not allocate.
+fn dispatch[N](x: Tensor[f32, [N]], k: i64) -> f32 {
+    let y = match k { 0 => x .* 2.0, 1 => x .+ 1.0, _ => x }
+    sum(y)
+}
+
+# ─── Generic calling generic ─────────────────────────────────────────────────
+
+fn sq_sum[N](x: Tensor[f32, [N]]) -> f32 { sum(x .* x) }
+
+# `N` has to survive one more hop, once on the parameter and once on a
+# temporary the caller built.
+fn sq_sum_pair[N](x: Tensor[f32, [N]]) -> f32 { sq_sum(x) + sq_sum(x .+ 1.0) }
+
+# An elementwise comparison mask is a tensor of 1.0/0.0, so summing it counts.
+fn count_above[N](x: Tensor[f32, [N]], t: f32) -> f32 { sum(x .> t) }
+
+# ─── Fixtures ────────────────────────────────────────────────────────────────
+
+fn quad() -> Tensor[f32, [4]] {
+    let !x = forge.zeros[f32, [4]]
+    x[0] = -1.0
+    x[1] = 2.0
+    x[2] = 3.0
+    x[3] = 4.0
+    x
+}
+
+fn octet() -> Tensor[f32, [8]] {
+    let !x = forge.zeros[f32, [8]]
+    for i in 0..8 { x[i] = (i + 1) as f32 }
+    x
+}
+
+fn single() -> Tensor[f32, [1]] {
+    let !x = forge.zeros[f32, [1]]
+    x[0] = 7.0
+    x
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+# `diff_backends.py` skips any file whose `dmc run` exits non-zero, so a
+# test-only file never reaches it. Printing every shape here adds the
+# byte-for-byte half of the parity gate on top of the numeric `dmc test --jit`
+# comparison below.
+fn main() -> i64 {
+    let q = quad()
+    let o = octet()
+    let s = single()
+    print_i64((mean_the_long_way(q) * 10.0) as i64)
+    print_i64((mean_the_long_way(o) * 10.0) as i64)
+    print_i64((mean_the_long_way(s) * 10.0) as i64)
+    print_i64(sum_while(q) as i64)
+    print_i64(sum_while(o) as i64)
+    print_i64(sum_while(s) as i64)
+    print_i64(sum(even_ramp[5]()) as i64)
+    print_i64(sum(even_ramp[3]()) as i64)
+    print_i64(sum(even_ramp[1]()) as i64)
+    print_i64(branch(q, true) as i64)
+    print_i64(branch(q, false) as i64)
+    print_i64(dispatch(q, 0) as i64)
+    print_i64(dispatch(q, 1) as i64)
+    print_i64(dispatch(q, 9) as i64)
+    print_i64(sq_sum_pair(q) as i64)
+    print_i64(sq_sum_pair(o) as i64)
+    print_i64(count_above(q, 2.0) as i64)
+    0
+}
+
+# ─── Tests ───────────────────────────────────────────────────────────────────
+
+# mean of [-1,2,3,4] is 2.0; mean of 1..8 is 4.5. The divisor is `N as f32`,
+# so the two instantiations must divide by 4 and by 8 respectively.
+fn test_shape_param_is_the_divisor() -> bool {
+    abs(mean_the_long_way(quad()) - 2.0) < 1e-4
+        && abs(mean_the_long_way(octet()) - 4.5) < 1e-4
+}
+
+# N = 1 is the degenerate instantiation: the local is one element wide and the
+# divisor is 1.0, so the answer is the element itself.
+fn test_shape_param_divisor_at_one() -> bool {
+    abs(mean_the_long_way(single()) - 7.0) < 1e-4
+}
+
+# The same totals reached through a `while` whose predicate is the parameter:
+# sum([-1,2,3,4]) = 8, sum(1..8) = 36, sum([7]) = 7.
+fn test_shape_param_bounds_a_while() -> bool {
+    abs(sum_while(quad()) - 8.0) < 1e-4
+        && abs(sum_while(octet()) - 36.0) < 1e-4
+        && abs(sum_while(single()) - 7.0) < 1e-4
+}
+
+# `even_ramp[5]()` is [0,2,4,6,8] → 20; `even_ramp[3]()` is [0,2,4] → 6.
+# Nothing in the call site's types could supply `N`, so a backend that lost the
+# explicit argument has no fallback that happens to be right.
+fn test_explicit_shape_argument_sizes_the_result() -> bool {
+    let a = even_ramp[5]()
+    let b = even_ramp[3]()
+    abs(sum(a) - 20.0) < 1e-4 && abs(sum(b) - 6.0) < 1e-4
+}
+
+# One element, so the ramp is just [0.0] and the sum is 0 — a length a
+# constant-folded `N` from the [5] instantiation would get wrong.
+fn test_explicit_shape_argument_at_one() -> bool {
+    let c = even_ramp[1]()
+    abs(sum(c)) < 1e-4
+}
+
+# R sizes the local, C is the multiplier: on a [2,4] grid with first column
+# [1,2] the total is 4*1 + 4*2 = 12. On a [3,2] grid with first column [1,2,3]
+# it is 2*6 = 12 as well — the same answer from different parameters, so this
+# pair pins that BOTH are read, not that one happens to work.
+fn test_two_shape_params_are_read_independently() -> bool {
+    let !m = forge.zeros[f32, [2, 4]]
+    m[0, 0] = 1.0
+    m[1, 0] = 2.0
+    let !n = forge.zeros[f32, [3, 2]]
+    n[0, 0] = 1.0
+    n[1, 0] = 2.0
+    n[2, 0] = 3.0
+    abs(first_column_scaled(m) - 12.0) < 1e-4
+        && abs(first_column_scaled(n) - 12.0) < 1e-4
+}
+
+# Tensor-valued `if`: sum(2x) = 16 on the then side, sum(x+1) = 12 on the else
+# side. Both arms allocate, and the join has to pick the right buffer.
+fn test_tensor_valued_if_join() -> bool {
+    let x = quad()
+    abs(branch(x, true) - 16.0) < 1e-4 && abs(branch(x, false) - 12.0) < 1e-4
+}
+
+# The same join at N = 1: 2*7 = 14 and 7+1 = 8.
+fn test_tensor_valued_if_join_at_one() -> bool {
+    let s = single()
+    abs(branch(s, true) - 14.0) < 1e-4 && abs(branch(s, false) - 8.0) < 1e-4
+}
+
+# Tensor-valued `match`, all three arms. The default arm returns `x` itself,
+# whose sum is 8 — a buffer the callee did not allocate reaching the join.
+fn test_tensor_valued_match_join() -> bool {
+    let x = quad()
+    abs(dispatch(x, 0) - 16.0) < 1e-4
+        && abs(dispatch(x, 1) - 12.0) < 1e-4
+        && abs(dispatch(x, 9) - 8.0) < 1e-4
+}
+
+# sum(x*x) = 1+4+9+16 = 30; x+1 is [0,3,4,5] and sums its squares to 50.
+# The inner generic is instantiated twice from one call: once on the parameter,
+# once on a temporary.
+fn test_generic_calls_generic() -> bool {
+    let x = quad()
+    abs(sq_sum_pair(x) - 80.0) < 1e-4
+}
+
+# The same nesting at a second shape: sum(i^2) for 1..8 is 204, and for 2..9 it
+# is 284.
+fn test_generic_calls_generic_second_shape() -> bool {
+    let x = octet()
+    abs(sq_sum_pair(x) - 488.0) < 1e-4
+}
+
+# `.>` yields a 1.0/0.0 mask, so summing it counts the elements above the
+# threshold: 3 and 4 clear 2.0, and nothing clears 10.0.
+fn test_mask_counts_inside_a_generic() -> bool {
+    let x = quad()
+    abs(count_above(x, 2.0) - 2.0) < 1e-4 && abs(count_above(x, 10.0)) < 1e-4
+}

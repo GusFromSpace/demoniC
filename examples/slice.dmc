@@ -12,8 +12,12 @@ fn demo[B, S](x: Tensor[f32, [B, S, 768]]) -> nil {
     # Drop the leading batch axis on a single sample → View[f32, [S, 768]]
     let one = x[0, .., ..]
 
-    # Reverse the sequence axis with negative stride → View, no copy
-    let reversed = x[.., -1..0:-1, ..]
+    # Reverse the sequence axis with negative stride → View, no copy.
+    # The step lives in the colon form only (OPERATORS §9): a `..` range
+    # cannot carry one, so this is `::-1`, not `-1..0:-1`. Leading `::`
+    # (start AND stop both omitted) is the full-axis form, so this no
+    # longer needs to spell the axis length out as `S - 1::-1`.
+    let reversed = x[.., ::-1, ..]
 
     # Inspecting shape — all stack reads, no heap, no allocator.
     match (first_chan.shape, half_batch.shape, reversed.shape) {
@@ -99,6 +103,20 @@ fn test_single_batch_drop() -> bool {
     let one = x[0, .., ..]
     # sum over j in 0..2, k in 0..4 of (j*4 + k) = 6 + 22 = 28
     abs(sum(one) - 28.0) < 0.0001
+}
+
+# test_reverse_axis: the negative-stride form in `demo` above, pinned numerically.
+# x[i] = i*10 on a [4] tensor; x[3::-1] walks the axis backwards from the last
+# element, so the view is [30, 20, 10, 0]. This is the colon form on purpose —
+# a `..` range carries no step, and `x[-1..0:-1]` is a parse error, not a slice.
+fn test_reverse_axis() -> bool {
+    let !x = forge.zeros[f32, [4]]
+    for i in 0..4 {
+        x[i] = (i * 10) as f32
+    }
+    let rev = x[3::-1]
+    abs(rev[0] - 30.0) < 0.0001 && abs(rev[1] - 20.0) < 0.0001
+        && abs(rev[2] - 10.0) < 0.0001 && abs(rev[3] - 0.0) < 0.0001
 }
 
 # test_stride2_batch_odd: x[1::2, .., ..] on a [4, 2, 3] tensor selects batch items 1 and 3.

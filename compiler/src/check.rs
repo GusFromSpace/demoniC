@@ -17,7 +17,7 @@ use std::{collections::{HashMap, HashSet}, fmt, path::{Path, PathBuf}};
 
 use crate::ast::*;
 use crate::lexer::Span;
-use crate::shape::{Shape, ShapeError, SymDim};
+use crate::shape::{Equiv, Shape, ShapeError, SymDim};
 use crate::types::{Env, FnSig, ModelInfo, TyType};
 
 // ─── Diagnostic ──────────────────────────────────────────────────────────────
@@ -27,6 +27,10 @@ pub struct TypeError {
     pub msg: String,
     pub span: Span,
     pub hint: Option<String>,
+    /// For a shape error: the (expected, actual) shapes as data (#485), set
+    /// where a mismatch compares two tensor-like types whose shapes disagree.
+    /// The human rendering never reads this — `--json` is its only consumer.
+    pub shapes: Option<(Shape, Shape)>,
 }
 
 impl fmt::Display for TypeError {
@@ -34,6 +38,58 @@ impl fmt::Display for TypeError {
         write!(f, "type error at {}:{}: {}", self.span.line, self.span.col, self.msg)?;
         if let Some(h) = &self.hint { write!(f, "\n  hint: {}", h)?; }
         Ok(())
+    }
+}
+
+/// PORTS.md §5: the enclosing construct that makes a port call illegal.
+/// A port call is an effect boundary; each of these promises something the
+/// boundary breaks, so `port_open`/`port_call`/`port_close` are rejected in
+/// their lexical extent (closures included) with a `port-forbidden` tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortBan {
+    /// `@grad fn` — the tape cannot record the call (#497).
+    GradFn,
+    /// `@fuse` block — no fusion crosses a port call.
+    Fuse,
+    /// `@deterministic` block — only a port with a determinism manifest may
+    /// be called, and no port carries one yet.
+    Deterministic,
+}
+
+impl PortBan {
+    /// The construct as it appears in source, for the diagnostic.
+    fn what(self) -> &'static str {
+        match self {
+            PortBan::GradFn => "`@grad fn`",
+            PortBan::Fuse => "`@fuse` block",
+            PortBan::Deterministic => "`@deterministic` block",
+        }
+    }
+
+    /// Why this construct cannot contain the call.
+    fn because(self) -> &'static str {
+        match self {
+            PortBan::GradFn =>
+                "a port call is an effect boundary the gradient cannot cross",
+            PortBan::Fuse =>
+                "no fusion crosses a port call, so the block cannot be one kernel",
+            PortBan::Deterministic =>
+                "only a port with a determinism manifest may be called there, \
+                 and no port carries one yet",
+        }
+    }
+}
+
+/// PORTS.md §5: does this directive stack forbid port calls in what it wraps?
+/// `@fuse` and `@deterministic` do; `@grad` is decided at the `fn` (it is a
+/// `fn` directive, not a block one).
+fn port_ban_of(directives: &[Directive]) -> Option<PortBan> {
+    if directives.iter().any(|d| d.name == "fuse") {
+        Some(PortBan::Fuse)
+    } else if directives.iter().any(|d| d.name == "deterministic") {
+        Some(PortBan::Deterministic)
+    } else {
+        None
     }
 }
 
@@ -62,6 +118,22 @@ pub struct Checker {
     /// to fall through to generic field access and silently produce garbage
     /// at runtime.
     grad_fn_counts: HashMap<String, usize>,
+    /// #398: per-fn identifier sets (reads, closure reads, bound names) from
+    /// `collect_body_idents`, recorded for every registered fn. The
+    /// captured-mut rule follows calls out of a `@grad fn` body through this
+    /// map: the tape does not trace a call, so a capture read inside a callee
+    /// would leave the returned gradient silently short of that path.
+    fn_body_refs: HashMap<String, BodyRefs>,
+    /// #398: the same scan for **model methods**, keyed by method name —
+    /// several models may define a method of the same name, so each entry
+    /// carries every `(model, refs)` that answers to it. A method call in a
+    /// `@grad fn` body names only the method (`h.contrib()`), and by the time
+    /// the captured-mut rule runs the body's locals have left the env, so the
+    /// receiver's model usually cannot be pinned down. The walk therefore
+    /// enters every candidate: over-reporting a capture that is genuinely read
+    /// by *some* `contrib` is a diagnostic the author can act on, where
+    /// missing it is a wrong gradient nobody sees.
+    method_body_refs: HashMap<String, Vec<(String, BodyRefs)>>,
     /// #403 (MEMORY §2): per-fn param mutability (`!` markers), by position.
     /// Lets call sites treat an uninit binding passed to a `!` param as the
     /// fill that initializes it, and one passed to a plain param as a read.
@@ -69,15 +141,34 @@ pub struct Checker {
     /// #442 (MEMORY §3.1): the lexically enclosing arena blocks, innermost
     /// last. Empty = the default Forge context (MEMORY §3 rule 3).
     arena_stack: Vec<ArenaKind>,
-    /// PORTS.md §5: set while checking a `@grad fn` body (closures included).
-    /// A port call inside the tape is an effect the gradient cannot cross, so
-    /// `port_open`/`port_call`/`port_close` are rejected here (`port-forbidden`).
-    in_grad_fn: bool,
+    /// #474: every model name declared in this program, hoisted ahead of
+    /// signature registration. `resolve_type` needs to know a name is a model
+    /// before `env.models` has it — `Outer`'s `!surf: Inner[H, W]` field is
+    /// resolved while registering `Outer`, which may precede `Inner`.
+    model_names: std::collections::HashSet<String>,
+    /// #474: set while typing the callee of a call, and consumed by the one
+    /// postfix level it applies to. A shape bracket between a method name and
+    /// its arguments (`b.blit![2, 2](src)`) is legal only there; the same
+    /// bracket standing on its own is a reference to a method, which is not a
+    /// value this language has.
+    typing_callee: bool,
+    /// PORTS.md §5: the innermost construct forbidding port calls, if any —
+    /// a `@grad fn` body (#497), a `@fuse` block, or a `@deterministic` block,
+    /// closures they enclose included. `port_open`/`port_call`/`port_close`
+    /// are rejected here with a `port-forbidden` diagnostic. Outermost wins:
+    /// the diagnostic names the construct the call first escaped.
+    port_ban: Option<PortBan>,
     pub checked_modules: HashMap<PathBuf, ModuleEnv>,
     /// Demon mode: the Control Art Restriction released. When set, the
     /// safe-mode lint family (`warn()`) is suppressed entirely — raw, full
     /// speed, no guardrails (issue #196). Hard type errors still fire.
     pub demon: bool,
+    /// #463: the file-size lint dial — `lints.max_file_lines` from the
+    /// nearest `demoni.json` (PACKAGES.md §4). `None` means unconfigured,
+    /// and unconfigured means the lint does not fire: the threshold is a
+    /// per-project dial, not a number the compiler picks. Resolved from the
+    /// source path in `check_program` unless a caller (tests) set it first.
+    pub max_file_lines: Option<usize>,
 }
 
 impl Checker {
@@ -90,12 +181,24 @@ impl Checker {
             warnings: Vec::new(),
             current_fn_ret: None,
             grad_fn_counts: HashMap::new(),
+            fn_body_refs: HashMap::new(),
+            method_body_refs: HashMap::new(),
             fn_mut_params: HashMap::new(),
             arena_stack: Vec::new(),
-            in_grad_fn: false,
+            model_names: std::collections::HashSet::new(),
+            typing_callee: false,
+            port_ban: None,
             checked_modules: HashMap::new(),
             demon: false,
+            max_file_lines: None,
         }
+    }
+
+    /// #474: is `name` a model type? Local declarations are hoisted into
+    /// `model_names` before any signature is resolved; imported ones are
+    /// already in `env.models` by then (`process_imports` runs first).
+    fn is_model_name(&self, name: &str) -> bool {
+        self.model_names.contains(name) || self.env.models.contains_key(name)
     }
 
     pub fn check_program(&mut self, program: &Program, path: Option<&Path>) {
@@ -104,6 +207,41 @@ impl Checker {
         self.pass2_check_types(program);
         self.pass3_arena_coherence(program);
         self.lint_writeback(program);
+        // #463: resolve the file-size dial from the nearest demoni.json,
+        // unless a caller pinned it already (tests, future CLI overrides).
+        if self.max_file_lines.is_none() {
+            if let Some(p) = path {
+                self.max_file_lines = crate::manifest::max_file_lines_for(p);
+            }
+        }
+        self.lint_file_size(program);
+    }
+
+    /// #463: safe-mode file-size lint. Warns — never errors — when a source
+    /// file exceeds the per-project dial `lints.max_file_lines` from the
+    /// nearest `demoni.json` (PACKAGES.md §4). Off unless configured: the
+    /// threshold is a dial each codebase sets for itself, not a number the
+    /// compiler picks. A lint, not a parser cap: a hard limit real programs
+    /// could hit would make the two implementations disagree and break the
+    /// differential gate (`docs/design/AST_CONTRACT.md` §4.3). Released by
+    /// `--demon` like the rest of the family, via `warn()`.
+    fn lint_file_size(&mut self, program: &Program) {
+        let Some(max) = self.max_file_lines else { return };
+        let lines = program.source_lines;
+        if lines <= max { return; }
+        // Anchor the diagnostic at the end of the file — the excess is there,
+        // not at line 1.
+        let span = Span {
+            start: program.span.end,
+            end: program.span.end,
+            line: lines,
+            col: 1,
+        };
+        self.warn(
+            format!("file is {lines} lines, over the {max}-line limit set by demoni.json (lints.max_file_lines)"),
+            span,
+            Some("split the file — a source a model reads whole is a source it edits correctly (SPEC axiom 5)".to_string()),
+        );
     }
 
     /// Lint pass: flag the "dead write-back" pattern — a mutable binding
@@ -283,6 +421,10 @@ impl Checker {
             // #336: register enums in this first pass1 loop so a later
             // model field or fn signature can resolve an enum-typed annotation.
             Item::Enum(e) => self.register_enum(e),
+            // #474: the *name* only, and this early, so that resolving any
+            // annotation — including a field of a model declared further up —
+            // knows to read `Inner[H, W]`'s args as dims.
+            Item::Model(m) => { self.model_names.insert(m.name.clone()); }
             Item::Directive { inner, .. } => self.collect_alias_item(inner),
             Item::Pub(inner) => self.collect_alias_item(inner),
             _ => {}
@@ -340,6 +482,12 @@ impl Checker {
             f.name.clone(),
             f.params.iter().map(|p| p.mutating).collect(),
         );
+        // #398: the identifiers each fn body reads/binds, so the captured-mut
+        // rule can follow calls out of a `@grad fn` body. Only the name sets are
+        // kept, not the AST.
+        let mut refs = collect_body_idents(&f.body);
+        for p in &f.params { refs.bound.insert(p.name.clone()); }
+        self.fn_body_refs.insert(f.name.clone(), refs);
     }
 
     fn register_extern_fn(&mut self, e: &ExternFnDecl) {
@@ -387,6 +535,19 @@ impl Checker {
                     let ret = f.ret_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(TyType::Unit);
                     self.env.pop_shape_scope();
                     methods.insert(f.name.clone(), FnSig { shape_params: m_shape, params, ret });
+                    // #398: keep the method body's identifier sets alongside the
+                    // plain fns', so the captured-mut call-graph walk can follow
+                    // `h.contrib()` into `contrib`'s body. Registered here, in
+                    // the registration pass, so the walk does not depend on
+                    // whether the model is declared above or below the
+                    // `@grad fn` that calls into it.
+                    let mut mrefs = collect_body_idents(&f.body);
+                    for p in &f.params { mrefs.bound.insert(p.name.clone()); }
+                    mrefs.bound.insert("self".to_string());
+                    self.method_body_refs
+                        .entry(f.name.clone())
+                        .or_default()
+                        .push((m.name.clone(), mrefs));
                 }
             }
         }
@@ -475,20 +636,311 @@ impl Checker {
         }
     }
 
+    /// DIRECTIVES.md §3 "illegal stacks": a stack the spec rejects outright.
+    /// `stack` is the directive list written on one construct, outermost
+    /// first; `nested` is every directive on the chain of lone directive
+    /// constructs it wraps, so `@cast(f32) { @cast(bf16) { x } }` reads as the
+    /// same stack as `@cast(f32) @cast(bf16) { x }` and is rejected the same
+    /// way — and so does `@cast(f32) { @fuse { @cast(bf16) { x } } }`, where
+    /// the two casts are separated by an intervening directive level.
+    ///
+    /// Two of the six §3 entries are enforced here (`@cast @cast`,
+    /// `@fuse @fuse`); `@inplace`'s attachment rule is
+    /// `check_inplace_target`, `@shard`'s is `check_sharding_directives`, and
+    /// the remaining two (`fuse-infeasible`, `comptime-non-static`) are
+    /// properties of directives that do not execute yet.
+    fn check_illegal_stack(&mut self, stack: &[Directive], nested: &[&Directive]) {
+        for name in ["cast", "fuse"] {
+            let mut hits = stack.iter().chain(nested.iter().copied()).filter(|d| d.name == name);
+            let (Some(outer), Some(inner)) = (hits.next(), hits.next()) else { continue };
+            let (msg, hint) = if name == "cast" {
+                (format!(
+                    "illegal directive stack: {} inside {} — the inner dtype \
+                     wins, so the outer cast is dead (DIRECTIVES.md §3)",
+                    render_directive(inner), render_directive(outer),
+                ), format!("drop {}; a cast scope has one dtype", render_directive(outer)))
+            } else {
+                (format!(
+                    "illegal directive stack: {} inside {} — fusion is \
+                     idempotent, so the second is redundant (DIRECTIVES.md §3)",
+                    render_directive(inner), render_directive(outer),
+                ), "drop one `@fuse`; one fused unit is one kernel".to_string())
+            };
+            self.error_with_hint(msg, inner.span.clone(), Some(hint));
+        }
+    }
+
+    /// SPEC.md §7.7 / DIRECTIVES.md §3: the fuse-infeasible analysis. `@fuse`
+    /// promises the block lowers as one kernel with no materialized
+    /// intermediates. The set the JIT's fused kernel actually collapses today
+    /// is small — a single elementwise chain (`.+ .- .* ./ .^ .** .< .> .<=
+    /// .>=`, `\>` ReLU) over f32 tensor operands sharing one shape, with
+    /// float-scalar broadcasts (tensors do not broadcast against each
+    /// other) — and the contract is about not lying: a body containing
+    /// anything outside that set is refused here, at the same compile stage
+    /// as the §3 stacking rejections, naming the offending op. Port calls in
+    /// the block are the other half, already gated as `port-forbidden`
+    /// (PORTS.md §5). The JIT's lowering keeps its own per-op refusals as a
+    /// backstop; this check is what makes both backends refuse the same
+    /// program at the same stage (SPEC.md §7.6).
+    fn check_fuse_feasible(&mut self, directives: &[Directive], body: &Block, span: &Span) {
+        if !directives.iter().any(|d| d.name == "fuse") {
+            return;
+        }
+        // A statement inside the block materializes its result — the single
+        // pass the directive promises cannot carry it. The fused unit is one
+        // expression; intermediates are hoisted above the block.
+        if let Some(stmt) = body.stmts.first() {
+            self.error(
+                format!("fuse-infeasible: a `{}` statement inside `@fuse` materializes \
+                         an intermediate — the block collapses a single elementwise \
+                         expression (SPEC.md §7.7)", stmt_kind(stmt)),
+                stmt_span(stmt).clone(),
+            );
+            return;
+        }
+        let Some(tail) = body.tail_expr.as_deref() else {
+            self.error(
+                "fuse-infeasible: the `@fuse` block is empty — there is nothing \
+                 to collapse (SPEC.md §7.7)".to_string(),
+                span.clone(),
+            );
+            return;
+        };
+        self.check_fuse_unit(tail);
+    }
+
+    /// The fused unit is one expression; run the walk over it and refuse a
+    /// scalar yield. Shared by the three block paths (`@fuse { … }` as
+    /// statement, expression, and trailing block). The statement attachment
+    /// (`@fuse let x = …`) never gets here — it is an attachment error in
+    /// `check_directive_stmt`, since the JIT refuses every statement-attached
+    /// directive and the catalog's attachment is block / expr only.
+    fn check_fuse_unit(&mut self, e: &Expr) {
+        match self.fuse_expr(e) {
+            Err((msg, espan)) => self.error(msg, espan),
+            // A scalar-valued unit has no lanes: the fused kernel is a loop
+            // that writes a tensor, and there is no loop to emit here.
+            Ok(FuseLane::Scalar) => self.error(
+                "fuse-infeasible: the fused expression yields a scalar — a fused \
+                 kernel writes a tensor, one lane per element (SPEC.md §7.7)".to_string(),
+                e.span_of(),
+            ),
+            Ok(FuseLane::Tensor(_)) => {}
+        }
+    }
+
+    /// The fusable-expression walk for `check_fuse_feasible`. `Ok(Tensor)` —
+    /// the subtree yields a tensor lane, carrying its shape when the checker
+    /// knows it (`None` for an unresolved name — the normal checker reports
+    /// that; this walk stays quiet). `Ok(Scalar)` — a float-scalar broadcast.
+    /// `Err` carries the first offender found, as (message, span). Mirrors the
+    /// JIT's `fuse_infer_ty`/`fuse_emit_elem` support exactly: what this walk
+    /// admits, that kernel lowers.
+    fn fuse_expr(&self, e: &Expr) -> Result<FuseLane, (String, Span)> {
+        match e {
+            // A one-element tuple is parenthesization; look through it.
+            Expr::Tuple(elems, _) if elems.len() == 1 => self.fuse_expr(&elems[0]),
+            Expr::BinOp { op, lhs, rhs, span } => match op {
+                BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
+                | BinOp::DotPow
+                | BinOp::DotLt | BinOp::DotGt | BinOp::DotLe | BinOp::DotGe => {
+                    let l = self.fuse_expr(lhs)?;
+                    let r = self.fuse_expr(rhs)?;
+                    match (l, r) {
+                        (FuseLane::Scalar, FuseLane::Scalar) => Err((format!(
+                            "fuse-infeasible: `{}` has no tensor operand here — a fused \
+                             lane reads at least one tensor (SPEC.md §7.7)",
+                            crate::fmt::binop_str(op)), span.clone())),
+                        // Two tensor operands pair elements one-to-one: the
+                        // fused kernel reads every leaf at one lane offset, so
+                        // tensor-tensor broadcast has no single pass to ride —
+                        // the JIT's kernel refuses unequal shapes, and so does
+                        // this walk.
+                        (FuseLane::Tensor(Some(a)), FuseLane::Tensor(Some(b))) => {
+                            if !fuse_shapes_agree(&a, &b) {
+                                return Err((format!(
+                                    "fuse-infeasible: `{}` reads tensors of shapes {} \
+                                     and {} — fused lanes pair elements one-to-one, and \
+                                     only float scalars broadcast (SPEC.md §7.7)",
+                                    crate::fmt::binop_str(op), a, b), span.clone()));
+                            }
+                            Ok(FuseLane::Tensor(Some(a)))
+                        }
+                        (FuseLane::Tensor(a), FuseLane::Tensor(b)) =>
+                            Ok(FuseLane::Tensor(a.or(b))),
+                        (FuseLane::Tensor(s), FuseLane::Scalar)
+                        | (FuseLane::Scalar, FuseLane::Tensor(s)) =>
+                            Ok(FuseLane::Tensor(s)),
+                    }
+                }
+                _ => Err((format!(
+                    "fuse-infeasible: `{}` is not elementwise — only `.+ .- .* ./ .^ \
+                     .** .< .> .<= .>=` and `\\>` collapse into one kernel (SPEC.md §7.7)",
+                    crate::fmt::binop_str(op)), span.clone())),
+            },
+            Expr::UnOp { op: UnOp::ReLU, operand, span } => {
+                match self.fuse_expr(operand)? {
+                    FuseLane::Tensor(s) => Ok(FuseLane::Tensor(s)),
+                    FuseLane::Scalar =>
+                        Err(("fuse-infeasible: `\\>` (ReLU) needs a tensor operand inside \
+                              `@fuse` (SPEC.md §7.7)".to_string(), span.clone())),
+                }
+            }
+            Expr::UnOp { op, span, .. } => {
+                let tok = match op {
+                    UnOp::Neg => "-", UnOp::Not => "!", UnOp::Deref => "*",
+                    UnOp::GeLU => "\\<", UnOp::BitNot => "~", UnOp::ReLU => unreachable!(),
+                };
+                Err((format!(
+                    "fuse-infeasible: unary `{}` is outside the fusable set — `\\>` \
+                     (ReLU) is its only unary op (SPEC.md §7.7)", tok), span.clone()))
+            }
+            Expr::Ident(name, span) => {
+                // An unresolved or unknown-typed name is the normal checker's
+                // report to make; stay quiet rather than cascade.
+                let Some(ty) = self.env.lookup(name) else {
+                    return Ok(FuseLane::Tensor(None));
+                };
+                match ty {
+                    TyType::Unknown => Ok(FuseLane::Tensor(None)),
+                    TyType::Tensor(elem, shape) | TyType::View(elem, shape) => {
+                        if !matches!(elem.as_ref(),
+                                     TyType::Scalar(ScalarType::F32) | TyType::FloatLit(_)) {
+                            return Err((format!(
+                                "fuse-infeasible: `{}` is a {} — the fused kernel \
+                                 computes in f32 (SPEC.md §7.7)", name, ty), span.clone()));
+                        }
+                        if shape.dims.iter().any(|d| matches!(d, SymDim::Streaming)) {
+                            return Err((format!(
+                                "fuse-infeasible: `{}` carries a streaming `~` extent — \
+                                 a fused lane needs a static shape (SPEC.md §7.7)",
+                                name), span.clone()));
+                        }
+                        Ok(FuseLane::Tensor(Some(shape.clone())))
+                    }
+                    t if t.is_float() => Ok(FuseLane::Scalar),
+                    _ => Err((format!(
+                        "fuse-infeasible: `{}` is a {} — only f32 tensors and float \
+                         scalars fuse (SPEC.md §7.7)", name, ty), span.clone())),
+                }
+            }
+            Expr::Literal(Literal::Float(..), _) => Ok(FuseLane::Scalar),
+            Expr::Literal(_, span) => Err((
+                "fuse-infeasible: only float literals broadcast into a fused kernel \
+                 (SPEC.md §7.7)".to_string(), span.clone())),
+            Expr::Postfix { expr, op: PostfixOp::Call(_), span } => {
+                let callee = match expr.as_ref() {
+                    Expr::Ident(n, _) => format!("`{}`", n),
+                    Expr::Postfix { op: PostfixOp::Field(f), .. } => format!("`{}`", f),
+                    _ => "a function".to_string(),
+                };
+                Err((format!(
+                    "fuse-infeasible: a call to {} does not collapse — calls are \
+                     outside the elementwise set (SPEC.md §7.7)", callee), span.clone()))
+            }
+            Expr::Postfix { op: PostfixOp::Transpose, span, .. } => Err((
+                "fuse-infeasible: `'` (transpose) is not elementwise — it reorders \
+                 lanes (SPEC.md §7.7)".to_string(), span.clone())),
+            Expr::Postfix { op: PostfixOp::Index(_), span, .. } => Err((
+                "fuse-infeasible: indexing does not collapse into a fused lane \
+                 (SPEC.md §7.7)".to_string(), span.clone())),
+            Expr::Cast { span, .. } => Err((
+                "fuse-infeasible: an `as` cast is outside the fusable set — cast \
+                 above the block (SPEC.md §7.7)".to_string(), span.clone())),
+            Expr::TensorLit(_, span) => Err((
+                "fuse-infeasible: a tensor literal does not fuse — bind it to a `let` \
+                 above the block (SPEC.md §7.7)".to_string(), span.clone())),
+            Expr::DirectiveBlock { directives, span, .. } => {
+                let name = directives.first()
+                    .map(|d| format!("`@{}`", d.name))
+                    .unwrap_or_else(|| "directive".to_string());
+                Err((format!(
+                    "fuse-infeasible: a {} block inside `@fuse` does not collapse — \
+                     wrap `@fuse` in it, not the other way (SPEC.md §7.7)", name),
+                    span.clone()))
+            }
+            Expr::If(_) | Expr::Match(_) => Err((
+                "fuse-infeasible: control flow inside `@fuse` breaks the single-pass \
+                 contract (SPEC.md §7.7)".to_string(), e.span_of())),
+            other => Err((
+                "fuse-infeasible: this expression is outside the fusable set — only \
+                 elementwise ops over f32 tensor operands collapse (SPEC.md §7.7)"
+                    .to_string(), other.span_of())),
+        }
+    }
+
+    /// DIRECTIVES.md §3: `@inplace` attaches to an assignment statement and
+    /// nothing else — the write that could copy-on-write is the whole point
+    /// (`MEMORY.md §4.3`). Anywhere else it has no write to guard.
+    fn check_inplace_target(&mut self, directives: &[Directive], what: &str) {
+        for d in directives.iter().filter(|d| d.name == "inplace") {
+            self.error_with_hint(
+                format!("illegal directive stack: `@inplace` attaches to an assignment \
+                         statement, not to {} — there is no write here that could \
+                         copy-on-write (DIRECTIVES.md §3, MEMORY.md §4.3)", what),
+                d.span.clone(),
+                Some("move `@inplace` onto the assignment itself, e.g. `@inplace x += bias`"
+                    .to_string()),
+            );
+        }
+    }
+
+    /// Run `body` under the port-call ban this directive stack imposes
+    /// (PORTS.md §5). Outermost wins: a `@fuse` block inside a `@grad fn`
+    /// keeps the `@grad fn` diagnostic — that is the restriction the
+    /// programmer has to satisfy first, and both forbid the same call.
+    fn with_port_ban<R>(
+        &mut self,
+        directives: &[Directive],
+        body: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let outer = self.port_ban;
+        if outer.is_none() {
+            self.port_ban = port_ban_of(directives);
+        }
+        let r = body(self);
+        self.port_ban = outer;
+        r
+    }
+
     fn check_directive_item(&mut self, directives: &[Directive], inner: &Item, is_public: bool) {
         self.lint_unimplemented_directives(directives);
+        if !matches!(inner, Item::Pub(_)) {
+            self.check_illegal_stack(directives, &[]);
+        }
         match inner {
             Item::Let(l) => {
-                let ty = self.check_let(l);
+                self.check_inplace_target(directives, "a `let` binding");
+                let ty = self.with_port_ban(directives, |c| c.check_let(l));
                 self.check_sharding_directives(directives, &ty, l.span.clone());
             }
             Item::Pub(inner_inner) => self.check_directive_item(directives, inner_inner, true),
-            _ => self.check_item_vis(inner, is_public),
+            // The parser only builds `Item::Directive` around a `let` (or a
+            // `pub let`); this arm is defensive.
+            _ => {
+                self.check_inplace_target(directives, "a top-level item");
+                self.with_port_ban(directives, |c| c.check_item_vis(inner, is_public));
+            }
         }
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
         self.lint_unimplemented_directives(&f.directives);
+        self.check_illegal_stack(&f.directives, &[]);
+        self.check_inplace_target(&f.directives, "a `fn` declaration");
+        // DIRECTIVES.md §1: `@fuse` attaches to a block or expression. On a
+        // `fn` declaration both backends ignore it — an unaudited promise,
+        // the class #503 exists to close.
+        for d in f.directives.iter().filter(|d| d.name == "fuse") {
+            self.error_with_hint(
+                "illegal directive stack: `@fuse` attaches to a block or \
+                 expression, not to a `fn` declaration — both backends ignore \
+                 it here (DIRECTIVES.md §1)".to_string(),
+                d.span.clone(),
+                Some("wrap the body's fused expression instead: `@fuse { … }`".to_string()),
+            );
+        }
         self.check_grad_fn_differentiable(f);
         self.check_pp_directive(f);
         self.env.push_scope();
@@ -527,35 +979,85 @@ impl Checker {
         let outer_fn_ret = self.current_fn_ret.replace(declared_ret.clone());
         // PORTS.md §5: port calls are an effect boundary a gradient cannot
         // cross. Track the `@grad fn` body (and any closures it checks) so the
-        // call site can reject them.
-        let outer_in_grad = self.in_grad_fn;
-        self.in_grad_fn = f.directives.iter().any(|d| d.name == "grad");
+        // call site can reject them. `@fuse`/`@deterministic` on the `fn` ban
+        // them for the same reason the block form does.
+        let outer_ban = self.port_ban;
+        self.port_ban = if f.directives.iter().any(|d| d.name == "grad") {
+            Some(PortBan::GradFn)
+        } else {
+            port_ban_of(&f.directives)
+        };
         let body_ty = self.check_block(&f.body);
-        self.in_grad_fn = outer_in_grad;
+        self.port_ban = outer_ban;
         self.current_fn_ret = outer_fn_ret;
-        // #398: a captured mutable binding (a module-level `let !`) referenced in
-        // a `@grad fn` is NOT differentiable — only the fn's `!` params enter the
-        // gradient tape, so its gradient silently comes back absent (a downstream
-        // `grads.<name>` reads as an opaque nil). Flag it at compile time. This
-        // runs after `check_block`, so body-local bindings are already popped from
-        // the env: a mutable binding here that is neither a param nor a local can
-        // only be a captured module-level `let !`.
+        // #398: a captured mutable binding (a module-level `let !`) read in a
+        // `@grad fn` is a differentiable input — the interpreter records it as a
+        // tape input and returns its adjoint in `Grads` under the binding's own
+        // name (AUTODIFF.md §2). Two shapes stay compile-time errors, because the
+        // tape genuinely cannot produce a gradient for them and an absent (or
+        // zero) field would be a silent wrong answer:
+        //   * a capture read only from inside a closure literal — closure bodies
+        //     are not traced;
+        //   * a capture whose type carries no gradient (ints, bools, strings, …).
+        // This runs after `check_block`, so body-local bindings are already popped
+        // from the env: a mutable binding here that is neither a param nor a local
+        // can only be a captured module-level `let !` / `let mut`.
         if self.grad_fn_counts.get(&f.name).copied().unwrap_or(0) >= 1 {
             let params: std::collections::HashSet<&str> =
                 f.params.iter().map(|p| p.name.as_str()).collect();
-            let mut refs = std::collections::HashSet::new();
-            collect_body_idents(&f.body, &mut refs);
-            let mut captured: Vec<&String> = refs.iter()
-                .filter(|n| !params.contains(n.as_str()) && self.env.is_mutable_binding(n))
+            let refs = collect_body_idents(&f.body);
+            // A name the body BINDS itself (`let cap = …`, a `for` pattern) is
+            // a local, not a capture: the module binding of that name is
+            // shadowed and never read. Filtering by `reads_free` fixes the rule
+            // in both directions — no phantom `g.cap` for a shadowed binding,
+            // and no rejection of a local `let counter = 2.0f32` merely because
+            // the module's unread `counter` happens to be an `i64`.
+            let mut captured: Vec<&String> = refs.direct.iter().chain(refs.in_closure.iter())
+                .filter(|n| !params.contains(n.as_str())
+                            && refs.reads_free(n)
+                            && self.env.is_mutable_binding(n))
                 .collect();
             captured.sort();
+            captured.dedup();
             for name in captured {
-                self.error_with_hint(
-                    format!("captured mutable binding `{}` is not differentiable inside a \
-                             `@grad fn` — its gradient is silently absent", name),
-                    f.body.span.clone(),
-                    Some(format!("pass `{}` as a `!` parameter so it enters the gradient tape", name)),
-                );
+                if refs.in_closure.contains(name) {
+                    self.error_with_hint(
+                        format!("captured mutable binding `{}` is not differentiable inside a \
+                                 closure — the gradient tape does not enter closure bodies, so \
+                                 its gradient would be silently absent", name),
+                        f.body.span.clone(),
+                        Some(format!("read `{}` directly in the differentiated body (a direct \
+                                      capture does get a gradient), or pass it as a `!` parameter",
+                                     name)),
+                    );
+                    continue;
+                }
+                let ty = self.env.lookup(name).cloned().unwrap_or(TyType::Unknown);
+                if !capture_type_is_differentiable(&ty) {
+                    self.error_with_hint(
+                        format!("captured mutable binding `{}` has non-differentiable type `{}` \
+                                 inside a `@grad fn`", name, ty),
+                        f.body.span.clone(),
+                        Some("only float scalars and float tensors carry gradients; a captured \
+                              integer, bool, or string binding never enters the tape".to_string()),
+                    );
+                    continue;
+                }
+                // The tape does not trace a call, so a capture the body reads
+                // *and* a called fn reads would come back with a gradient that
+                // silently omits the callee's path. Name the callee.
+                if let Some(callee) = self.capture_read_in_callee(&f.name, &refs, name) {
+                    self.error_with_hint(
+                        format!("captured mutable binding `{}` is also read inside fn `{}`, \
+                                 which this `@grad fn` calls — the tape does not trace calls, \
+                                 so `{}`'s gradient would silently omit that path",
+                                name, callee, name),
+                        f.body.span.clone(),
+                        Some(format!("read `{}` only in the differentiated body (inline what \
+                                      `{}` does with it), or stop reading it here so the \
+                                      gradient is not half-computed", name, callee)),
+                    );
+                }
             }
         }
         // If the body ends with `return X` and has no tail expression, the
@@ -591,10 +1093,12 @@ impl Checker {
                           .to_string()),
                 );
             } else {
-                self.error_with_hint(
+                self.error_mismatch(
                     format!("fn `{}` returns `{}` but body produces `{}`", f.name, declared_ret, effective_body_ty),
                     f.body.span.clone(),
                     Some(format!("declared return type at line {}", f.span.line)),
+                    &declared_ret,
+                    &effective_body_ty,
                 );
             }
         }
@@ -608,24 +1112,120 @@ impl Checker {
         self.env.pop_scope();
     }
 
+    /// #398: does any user fn reachable from this `@grad fn` body read the
+    /// captured mutable `name` freely? Returns the first such fn.
+    ///
+    /// The tape records only what the differentiated body itself evaluates; a
+    /// plain fn call is executed concretely and contributes no nodes. So when
+    /// the body reads a capture *and* a callee reads the same capture, the
+    /// adjoint we return covers only the body's half — a silently partial
+    /// gradient. Names are resolved through `fn_body_refs`, and a callee that
+    /// binds the name itself (its own param or `let`) is not a reader of the
+    /// module binding.
+    fn capture_read_in_callee(
+        &self,
+        grad_fn: &str,
+        body: &BodyRefs,
+        name: &str,
+    ) -> Option<String> {
+        // A callee is either a plain fn (keyed by its name in `fn_body_refs`)
+        // or one model's method (keyed by `model` + `method` in
+        // `method_body_refs`). Both are walked; both can read a capture.
+        #[derive(PartialEq, Eq, Hash, Clone)]
+        enum Callee {
+            Fn(String),
+            /// (model, method) — reported as `Model.method`.
+            Method(String, String),
+        }
+        impl Callee {
+            fn label(&self) -> String {
+                match self {
+                    Callee::Fn(n) => n.clone(),
+                    Callee::Method(m, f) => format!("{}.{}", m, f),
+                }
+            }
+        }
+        let mut seen: std::collections::HashSet<Callee> = std::collections::HashSet::new();
+        seen.insert(Callee::Fn(grad_fn.to_string()));
+        let mut queue: Vec<Callee> = Vec::new();
+        // `enqueue` expands one body's outgoing edges: identifiers that name a
+        // registered fn (conservative — a bare fn reference passed as a value
+        // counts too), plus every model method matching a `recv.m()` call.
+        let enqueue = |refs: &BodyRefs, queue: &mut Vec<Callee>| {
+            for n in refs.direct.iter().chain(refs.in_closure.iter()) {
+                if self.fn_body_refs.contains_key(n) {
+                    queue.push(Callee::Fn(n.clone()));
+                }
+            }
+            for m in &refs.method_calls {
+                let Some(cands) = self.method_body_refs.get(m) else { continue };
+                for (model, _) in cands {
+                    queue.push(Callee::Method(model.clone(), m.clone()));
+                }
+            }
+        };
+        enqueue(body, &mut queue);
+        let mut found: Option<String> = None;
+        while let Some(callee) = queue.pop() {
+            if !seen.insert(callee.clone()) {
+                continue;
+            }
+            let refs = match &callee {
+                Callee::Fn(n) => self.fn_body_refs.get(n),
+                Callee::Method(model, m) => self.method_body_refs.get(m)
+                    .and_then(|cands| cands.iter()
+                        .find(|(owner, _)| owner == model)
+                        .map(|(_, r)| r)),
+            };
+            let Some(refs) = refs else { continue };
+            if refs.reads_free(name) {
+                // Report the alphabetically first reader, so the diagnostic is
+                // stable no matter how the traversal ordered the graph.
+                let label = callee.label();
+                if found.as_deref().map_or(true, |f| label.as_str() < f) {
+                    found = Some(label);
+                }
+            }
+            enqueue(refs, &mut queue);
+        }
+        found
+    }
+
     /// AUTODIFF.md §2: a `@grad fn` that captures **no** mut bindings and has
     /// **no** mut (`!`) parameters is a compile-time error — there is nothing
-    /// for the backward to produce. The JIT already enforces this in
+    /// for the backward to produce. The JIT enforces the parameter half in
     /// `declare_grad_fn` (jit.rs); mirror it here so `--check` and the
-    /// tree-walking `run` reject it too, not just `--jit`. Captured mut bindings
-    /// are specified-but-not-yet-implemented (#398) and top-level/method fns
-    /// have no captures, so the mut-parameter set is the only source of
-    /// differentiable inputs today — matching the JIT's own condition.
+    /// tree-walking `run` reject it too, not just `--jit`. Since #398 a
+    /// directly-read captured mut binding *is* a differentiable input in the
+    /// interpreter, so it satisfies this rule on its own — which is what the
+    /// spec sentence has always said. (The JIT can't reach that case: a
+    /// module-level non-const `let` is already unsupported at lowering, so
+    /// such a program runs on the interpreter.)
     fn check_grad_fn_differentiable(&mut self, f: &FnDecl) {
         let is_grad = f.directives.iter().any(|d| d.name == "grad");
         if !is_grad {
             return;
         }
-        let has_mut_param = f.params.iter().any(|p| p.mutating);
-        if !has_mut_param {
+        if f.params.iter().any(|p| p.mutating) {
+            return;
+        }
+        let params: std::collections::HashSet<&str> =
+            f.params.iter().map(|p| p.name.as_str()).collect();
+        let refs = collect_body_idents(&f.body);
+        let has_captured_mut = refs.direct.iter().any(|n| {
+            // Same shadowing rule as the capture scan itself (#398): a body-local
+            // `let cap` is not a capture, so it cannot be the differentiable
+            // input that saves an otherwise input-less `@grad fn`.
+            !params.contains(n.as_str())
+                && refs.reads_free(n)
+                && self.env.is_mutable_binding(n)
+                && capture_type_is_differentiable(
+                    self.env.lookup(n).unwrap_or(&TyType::Unknown))
+        });
+        if !has_captured_mut {
             self.error(
-                "`@grad fn` with no `!` (mut) parameter has nothing to differentiate \
-                 (see the spec on `@grad`)",
+                "`@grad fn` with no `!` (mut) parameter and no captured `mut` binding \
+                 has nothing to differentiate (see the spec on `@grad`)",
                 f.span.clone(),
             );
         }
@@ -674,6 +1274,8 @@ impl Checker {
 
     fn check_model(&mut self, m: &ModelDecl) {
         self.lint_unimplemented_directives(&m.directives);
+        self.check_illegal_stack(&m.directives, &[]);
+        self.check_inplace_target(&m.directives, "a `model` declaration");
         self.env.push_shape_scope();
         for sp in &m.shape_params {
             self.env.bind_shape_param(&sp.name, None);
@@ -681,6 +1283,28 @@ impl Checker {
         let model_shape_names: std::collections::HashSet<String> =
             m.shape_params.iter().map(|sp| sp.name.clone()).collect();
         for member in &m.members {
+            // SPEC §3.11: a port handle "cannot appear inside tensor element
+            // types, model fields, or Vault constants". Nothing enforced the
+            // model-field half, and the two backends disagreed about what a
+            // program that did it even meant: `dmc run` accepted it, while
+            // `dmc jit` reported `cannot convert \`Port\` to \`Port\`` — a
+            // message that reads like a compiler bug and half was: the field's
+            // declared type had resolved to a *model* named `Port`, so the two
+            // sides rendered the same and neither was what the author wrote.
+            // Rejecting it here means the same answer under both backends,
+            // named at the field, which is what SPEC already promised.
+            if let ModelMember::Field { name, ty, span, .. } = member {
+                if crate::ports::is_port_type(ty) {
+                    self.error_with_hint(
+                        format!("model field `{}.{}` is a port handle — a handle cannot \
+                                 appear in a model field (SPEC §3.11)", m.name, name),
+                        span.clone(),
+                        Some("a handle does not outlive its run and owns no demoniC \
+                              memory; pass it as a parameter instead (`Port[L]` is \
+                              writable in parameter and return positions)".to_string()),
+                    );
+                }
+            }
             if let ModelMember::Method(f) = member {
                 // Detect shape vars used in method signature that are not declared on the
                 // model or the method itself. Emit a targeted diagnostic before body checking
@@ -776,9 +1400,12 @@ impl Checker {
         let declared = l.ty.as_ref().map(|t| self.resolve_type(t));
         let final_ty = if let Some(d) = declared {
             if !d.compatible_with(&value_ty) {
-                self.error(
+                self.error_mismatch(
                     format!("let binding has type {} but value has type {}", d, value_ty),
                     l.span.clone(),
+                    None,
+                    &d,
+                    &value_ty,
                 );
             }
             // #295: catch `let x: i8 = 300` — a literal that doesn't fit its
@@ -810,6 +1437,13 @@ impl Checker {
                 None
             };
             self.env.set_ctor_shape(name.clone(), ctor_shape);
+            // #533 (PORTS.md §3.2): remember a `forge.trit[K, N]` RHS. The
+            // constructor has no element-type argument, so nothing else on this
+            // path records that the binding holds a packed ternary tensor — and
+            // whether a tensor has a copy-mode wire dtype is a static property
+            // of its element type. Cleared on a rebind to anything else.
+            let is_trit = l.ty.is_none() && is_trit_ctor(&l.value);
+            self.env.set_trit_origin(name.clone(), is_trit);
         }
         // #403 (MEMORY §2): a fresh `forge.uninit`/`vault.uninit` allocation is
         // undefined until written — mark simple-ident bindings for the
@@ -821,6 +1455,24 @@ impl Checker {
                 self.env.mark_uninit(name.clone());
             } else {
                 self.env.unmark_uninit_here(name);
+            }
+            // #476 (MEMORY §2): reach one level into the model being built.
+            // `Holder { cells: vault.uninit[Cell, [3]] }` leaves the field just
+            // as undefined as the local spelling, but the array is a field, not
+            // a binding, so the check above never saw it — the read sailed
+            // through `--check` and surfaced at runtime as a complaint about
+            // `opaque`. Any earlier marks under this name are stale.
+            self.env.clear_uninit_fields_under(name);
+            if let Expr::StructLit { name: model, fields, .. } = &l.value {
+                for (fname, fexpr) in fields {
+                    // Model-array fields only — see `is_uninit_field`.
+                    let is_model_array = self.env.models.get(model)
+                        .and_then(|m| m.fields.get(fname))
+                        .is_some_and(|t| matches!(t, TyType::Array(..)));
+                    if is_model_array && is_uninit_ctor(fexpr) {
+                        self.env.mark_uninit(format!("{name}.{fname}"));
+                    }
+                }
             }
             // #442 (MEMORY §3.1): tag bindings whose value lives in the Vault,
             // so mutating them outside a `vault { … }` block can error.
@@ -843,14 +1495,47 @@ impl Checker {
 
     fn check_directive_stmt(&mut self, directives: &[Directive], inner: &Stmt) {
         self.lint_unimplemented_directives(directives);
+        self.check_illegal_stack(directives, &[]);
+        // DIRECTIVES.md §3: `@inplace` attaches to an assignment statement and
+        // nothing else — that is the only construct whose write could CoW.
+        match inner {
+            Stmt::Expr { assign: Some(_), .. } => {}
+            Stmt::Let(_) => self.check_inplace_target(directives, "a `let` binding"),
+            Stmt::Expr { .. } => self.check_inplace_target(directives, "a bare expression"),
+            other => {
+                let what = format!("a `{}` statement", stmt_kind(other));
+                self.check_inplace_target(directives, &what);
+            }
+        }
+        // DIRECTIVES.md §1: `@fuse` attaches to a block or expression — a
+        // statement is neither. The JIT refuses every statement-attached
+        // directive before any fuse analysis runs, so admitting the form here
+        // (even with a feasible body) would split the backends on a program
+        // the expression spelling handles. Same refusal as the `fn` form.
+        for d in directives.iter().filter(|d| d.name == "fuse") {
+            self.error_with_hint(
+                format!("illegal directive stack: `@fuse` attaches to a block or \
+                         expression, not to a `{}` statement (DIRECTIVES.md §1)",
+                        stmt_kind(inner)),
+                d.span.clone(),
+                Some("write the fused unit as an expression: `let x = @fuse { … }`"
+                    .to_string()),
+            );
+        }
         if let Stmt::Let(l) = inner {
-            let ty = self.check_let(l);
+            let ty = self.with_port_ban(directives, |c| c.check_let(l));
             self.check_sharding_directives(directives, &ty, l.span.clone());
         } else {
-            self.check_stmt(inner);
+            self.with_port_ban(directives, |c| c.check_stmt(inner));
         }
     }
 
+    /// DIRECTIVES.md §3: `@shard`/`@tp` name a mesh axis the sharded value's
+    /// type has to be able to accept. `ty` is the type the directive attaches
+    /// to — the bound type for the `let` form, the body's type for the
+    /// expression/block form. Both forms run this, so `@shard(axis=0,
+    /// mesh=mesh.dp) { s }` on an `f32` is the same hard error as the `let`
+    /// spelling of it.
     fn check_sharding_directives(&mut self, directives: &[Directive], ty: &TyType, span: Span) {
         for directive in directives {
             match directive.name.as_str() {
@@ -886,7 +1571,7 @@ impl Checker {
         span: Span,
     ) {
         let Some((_elem, shape)) = ty.as_tensor_like() else {
-            self.error(format!("{} requires tensor-like let binding; got `{}`", directive, ty), span);
+            self.error(format!("{} requires a tensor-like value; got `{}`", directive, ty), span);
             return;
         };
         let Some(axis) = normalize_axis(raw_axis, shape.rank()) else {
@@ -1003,14 +1688,25 @@ impl Checker {
             self.check_expr(tail)
         } else if deferred_last {
             match &block.stmts[n - 1] {
-                Stmt::DirectiveBlock { body, .. } => {
-                    // Walk the body's stmts in the outer scope so lets are visible.
-                    for s in &body.stmts {
-                        self.check_stmt(s);
-                    }
-                    if let Some(t) = &body.tail_expr {
-                        self.check_expr(t)
-                    } else { TyType::Unit }
+                Stmt::DirectiveBlock { directives, body, span: db_span } => {
+                    // This path bypasses `check_stmt`, so the directive checks
+                    // that arm runs have to happen here too — a trailing
+                    // `@fuse { … }` is still a `@fuse` block.
+                    self.lint_unimplemented_directives(directives);
+                    self.check_illegal_stack(directives, &nested_directive_stack(body));
+                    self.check_inplace_target(directives, "a block");
+                    self.check_fuse_feasible(directives, body, db_span);
+                    let ty = self.with_port_ban(directives, |c| {
+                        // Walk the body's stmts in the outer scope so lets are visible.
+                        for s in &body.stmts {
+                            c.check_stmt(s);
+                        }
+                        if let Some(t) = &body.tail_expr {
+                            c.check_expr(t)
+                        } else { TyType::Unit }
+                    });
+                    self.check_sharding_directives(directives, &ty, db_span.clone());
+                    ty
                 }
                 Stmt::Expr { lhs, .. } => self.check_expr(lhs),
                 Stmt::Stage { body, .. } => self.check_stage_expr(body),
@@ -1074,10 +1770,29 @@ impl Checker {
                     _ => None,
                 };
                 if let Some(r) = &uninit_write { self.env.clear_uninit(r); }
+                // #476: the same suppression one level in. `h.cells[i] = Cell { .. }`
+                // is the write that initializes the field, not a read of it —
+                // and a whole-`=` rebind of the root drops every mark under it.
+                let uninit_field_write: Option<(String, String)> = match assign {
+                    Some((AssignOp::Eq | AssignOp::ColonEq | AssignOp::StreamArrow, _)) =>
+                        lhs_field_path(lhs)
+                            .filter(|(r, f)| self.env.is_uninit_field(r, f)),
+                    _ => None,
+                };
+                if let Some((r, f)) = &uninit_field_write { self.env.clear_uninit_field(r, f); }
+                if matches!(assign, Some((AssignOp::Eq | AssignOp::ColonEq, _))) {
+                    if let Expr::Ident(n, _) = lhs { self.env.clear_uninit_fields_under(n); }
+                }
                 let lhs_ty = self.check_expr(lhs);
                 if let Some((op, rhs)) = assign {
                     if let Some(r) = &uninit_write { self.env.mark_uninit(r.clone()); }
+                    // #476: re-arm for the RHS so `h.cells[0] = h.cells[1]`
+                    // still reports the undefined read it performs.
+                    if let Some((r, f)) = &uninit_field_write {
+                        self.env.mark_uninit(format!("{r}.{f}"));
+                    }
                     let rhs_ty = self.check_expr(rhs);
+                    if let Some((r, f)) = &uninit_field_write { self.env.clear_uninit_field(r, f); }
                     if let Some(r) = &uninit_write { self.env.clear_uninit(r); }
                     // Re-assigning a fresh uninit allocation re-arms the flag.
                     if matches!(op, AssignOp::Eq | AssignOp::ColonEq) && is_uninit_ctor(rhs) {
@@ -1326,9 +2041,13 @@ impl Checker {
             Stmt::Directive { directives, inner, .. } => {
                 self.check_directive_stmt(directives, inner);
             }
-            Stmt::DirectiveBlock { directives, body, .. } => {
+            Stmt::DirectiveBlock { directives, body, span } => {
                 self.lint_unimplemented_directives(directives);
-                let _ = self.check_block(body);
+                self.check_illegal_stack(directives, &nested_directive_stack(body));
+                self.check_inplace_target(directives, "a block");
+                self.check_fuse_feasible(directives, body, span);
+                let ty = self.with_port_ban(directives, |c| c.check_block(body));
+                self.check_sharding_directives(directives, &ty, span.clone());
             }
             Stmt::Break(_) | Stmt::Continue(_) => {}
             Stmt::Return { value, span } => {
@@ -1471,33 +2190,56 @@ impl Checker {
                                       `x if x == {} => ...`", name)),
                     );
                 }
-                // #350: a bare-ident catch-all on an *enum* scrutinee whose name
-                // is a variant of a DIFFERENT enum is almost always a mistake —
-                // the author meant a variant pattern, but because it isn't a
-                // variant of THIS enum it silently binds everything (catch-all),
-                // shadowing later arms. Fire only when the name resolves to a
-                // real variant elsewhere (high-confidence), so genuine fresh
-                // catch-all binds stay quiet. (#269 above handles value shadows.)
+                // #350 (S9 ruling on #501): in a match whose scrutinee is
+                // enum-typed, a bare identifier that does NOT name a variant of
+                // that enum is an *irrefutable* catch-all binding (SPEC §4.5) —
+                // it swallows every variant left, shadows the arms below it, and
+                // silences the exhaustiveness check that would otherwise report
+                // the variant the author forgot. A typo'd variant name reads as
+                // working code. Warn on every such arm; the hint says which of
+                // the two intents to write explicitly.
+                //
+                // Bare idents that DO resolve to a variant are genuine variant
+                // patterns and stay silent — the corpus spells arms both ways on
+                // purpose (`examples/enum_traffic.dmc`, `examples/enum_shape.dmc`).
+                // A guarded arm states its own intent, and a name already bound
+                // in scope is #269's case above; both are left to those paths.
                 if arm.guard.is_none()
                     && name != "_"
                     && self.env.lookup(name).is_none()
                     && enum_variants.as_ref().is_some_and(|vs| !vs.contains(name))
                 {
-                    let mut owners: Vec<&String> = self.env.enums.iter()
-                        .filter(|(_, vs)| vs.contains(name))
-                        .map(|(en, _)| en)
-                        .collect();
-                    owners.sort();
-                    if let Some(owner) = owners.first() {
-                        let this = enum_name.clone().unwrap_or_default();
-                        self.warn(
-                            format!("match arm `{}` binds the scrutinee (catch-all), but `{}` is a \
-                                     variant of enum `{}`, not `{}`", name, name, owner, this),
-                            pspan.clone(),
-                            Some(format!("did you mean a variant of `{}`? qualify it as `{}.<Variant>`, \
-                                          or use `_` for a real catch-all", this, this)),
-                        );
-                    }
+                    let this = enum_name.clone().unwrap_or_default();
+                    let variants = enum_variants.clone().unwrap_or_default();
+                    // A variant of some *other* enum is the highest-confidence
+                    // read: name the enum that actually owns it.
+                    let owner = {
+                        let mut owners: Vec<&String> = self.env.enums.iter()
+                            .filter(|(_, vs)| vs.contains(name))
+                            .map(|(en, _)| en)
+                            .collect();
+                        owners.sort();
+                        owners.first().map(|o| (*o).clone())
+                    };
+                    let (msg, hint) = if let Some(owner) = owner {
+                        (format!("match arm `{}` binds the scrutinee (catch-all), but `{}` is a \
+                                  variant of enum `{}`, not `{}`", name, name, owner, this),
+                         format!("did you mean a variant of `{}`? qualify it as `{}.<Variant>`, \
+                                  or use `_` for a real catch-all", this, this))
+                    } else if let Some(near) = closest_variant(name, &variants) {
+                        // Near-miss on this enum's own variants: a typo or a
+                        // case slip, not a binding anyone wanted.
+                        (format!("match arm `{}` binds the scrutinee (catch-all); enum `{}` has no \
+                                  variant `{}`", name, this, name),
+                         format!("did you mean `{}.{}`? a bare non-variant ident is an irrefutable \
+                                  catch-all — write `_` if that is what you meant", this, near))
+                    } else {
+                        (format!("match arm `{}` binds the scrutinee (catch-all); enum `{}` has no \
+                                  variant `{}`", name, this, name),
+                         format!("write `_` for a catch-all, or qualify the variant you meant as \
+                                  `{}.<Variant>` (variants: {})", this, variants.join(", ")))
+                    };
+                    self.warn(msg, pspan.clone(), Some(hint));
                 }
             }
             // #336/#350: validate enum-variant patterns — qualified (`Shape.Circle`)
@@ -1793,12 +2535,27 @@ impl Checker {
                     TyType::Scalar(s) => {
                         TyType::Tensor(Box::new(TyType::Scalar(s)), Shape::new(vec![SymDim::Const(n)]))
                     }
+                    // Unsuffixed float elements (`[1.0, 2.0]` — the ordinary
+                    // spelling): both backends build f32 lanes from float
+                    // leaves (the interpreter tags tensor literals `DType::F32`,
+                    // the JIT's literal lowering picks f32 on any float leaf),
+                    // so the checker says f32 too instead of `Unknown`. The
+                    // scalar f64 default (SPEC §2) is for a *bare* literal
+                    // bound without context, not for tensor data.
+                    TyType::FloatLit(_) => TyType::Tensor(
+                        Box::new(TyType::Scalar(ScalarType::F32)),
+                        Shape::new(vec![SymDim::Const(n)]),
+                    ),
                     _ => TyType::Tensor(Box::new(TyType::Unknown), Shape::new(vec![SymDim::Const(n)])),
                 };
-                // #403 (SPEC §4.2): tensor literals are for small, human-legible
-                // constants; the spec warns past 256 total elements and reserves
-                // the right to make it an error. Leaf count comes from the full
-                // inferred shape, so nested literals count all their scalars.
+                // #403/#501 (SPEC §4.2, TOKENIZER §8a): tensor literals are for
+                // small, human-legible constants. Past 256 total elements this
+                // was a lint that TOKENIZER §8a promised to promote; #501 (the
+                // pre-0.1.0 sweep) collects that promise. Like the §3.1
+                // cross-arena write it is a spec violation rather than a lint,
+                // so it goes through `error_with_hint` and demon mode does not
+                // suppress it. Leaf count comes from the full inferred shape,
+                // so nested literals count all their scalars.
                 if let TyType::Tensor(_, shape) = &ty {
                     let total = shape.dims.iter().try_fold(1i64, |acc, d| match d {
                         SymDim::Const(k) => Some(acc.saturating_mul(*k)),
@@ -1806,12 +2563,13 @@ impl Checker {
                     });
                     if let Some(total) = total {
                         if total > 256 {
-                            self.warn(
-                                format!("tensor literal has {total} elements — literals are for \
-                                         small, human-legible constants (past 256 elements)"),
+                            self.error_with_hint(
+                                format!("tensor literal has {total} elements — the limit is 256 \
+                                         (SPEC §4.2); literals are for small, human-legible constants"),
                                 lit_span.clone(),
-                                Some("for bulk data use `forge.zeros/ones/uninit` and fill, \
-                                      or `vault.load` for constants".to_string()),
+                                Some("write it as `forge.zeros[T, S]`, `forge.ones[T, S]` or \
+                                      `forge.uninit[T, S]` and fill, or `vault.load[T, S](\"file.bin\")` \
+                                      for constant data".to_string()),
                             );
                         }
                     }
@@ -1843,9 +2601,14 @@ impl Checker {
                 self.arena_stack.pop();
                 t
             }
-            DirectiveBlock { directives, body, .. } => {
+            DirectiveBlock { directives, body, span } => {
                 self.lint_unimplemented_directives(directives);
-                self.check_block(body)
+                self.check_illegal_stack(directives, &nested_directive_stack(body));
+                self.check_inplace_target(directives, "a block");
+                self.check_fuse_feasible(directives, body, span);
+                let ty = self.with_port_ban(directives, |c| c.check_block(body));
+                self.check_sharding_directives(directives, &ty, span.clone());
+                ty
             }
             StructLit { name, type_args, fields, span } => {
                 let mut field_tys = Vec::new();
@@ -1854,10 +2617,28 @@ impl Checker {
                 }
                 if let Some(info) = self.env.models.get(name).cloned() {
                     // Build shape-param substitution from constructor type args, e.g. M[3] binds N=3.
-                    let shape_bindings: HashMap<String, SymDim> = info.shape_params.iter()
+                    let mut shape_bindings: HashMap<String, SymDim> = info.shape_params.iter()
                         .zip(type_args.iter())
                         .map(|(param, arg_expr)| (param.clone(), SymDim::from_expr(arg_expr).simplify()))
                         .collect();
+                    // #474: a literal written without a bracket is not silent
+                    // about its shape — its fields say it. Recover the args
+                    // from them, so both the literal's own field check and the
+                    // type it hands back speak in dims rather than in the
+                    // model's unbound parameter names.
+                    let literal_args: Vec<TyType> = if type_args.is_empty() {
+                        let args = self.infer_literal_shape_args(&info, &field_tys);
+                        for (param, arg) in info.shape_params.iter().zip(&args) {
+                            if let TyType::Dim(d) = arg {
+                                shape_bindings.insert(param.clone(), d.clone());
+                            }
+                        }
+                        args
+                    } else {
+                        type_args.iter()
+                            .map(|e| TyType::Dim(SymDim::from_expr(e).simplify()))
+                            .collect()
+                    };
                     for (fname, fty) in &field_tys {
                         if let Some(declared_ty) = info.fields.get(*fname) {
                             let expected_ty = if shape_bindings.is_empty() {
@@ -1865,11 +2646,19 @@ impl Checker {
                             } else {
                                 substitute_shape_args(declared_ty.clone(), &shape_bindings)
                             };
+                            let val = fields.iter()
+                                .find(|(k, _)| k == *fname).map(|(_, v)| v);
                             if !expected_ty.compatible_with(fty) {
-                                self.error(
-                                    format!("mismatched type for field `{}` of model `{}`: expected `{}`, got `{}`", fname, name, expected_ty, fty),
-                                    span.clone(),
-                                );
+                                self.field_type_mismatch(
+                                    fname, name, &expected_ty, fty, val, span.clone());
+                            } else if let Some(hint) =
+                                unproven_model_literal(&expected_ty, fty, val)
+                            {
+                                self.error_with_hint(
+                                    format!("field `{}` of model `{}` expects `{}`, and the \
+                                             literal given does not say what shape it is",
+                                            fname, name, expected_ty),
+                                    span.clone(), Some(hint));
                             }
                         } else {
                             self.error(
@@ -1897,7 +2686,19 @@ impl Checker {
                             span.clone(),
                         );
                     }
-                    TyType::Named { name: name.clone(), args: Vec::new() }
+                    // #474: the literal keeps the shape args it was written
+                    // with. `Inner[4, 5] { … }` used to type as a bare `Inner`,
+                    // throwing away the two numbers standing right there, so it
+                    // could never unify with an `Inner[H, W]` field or
+                    // parameter — the information needed was present at the
+                    // construction site and discarded by the type.
+                    //
+                    // A literal written *without* a bracket still has its
+                    // fields, and they say the same thing: a `!px` holding a
+                    // 4x5 tensor pins `H` and `W` as surely as `Inner[4, 5]`
+                    // does. Unify them, so a bare literal carries a real claim
+                    // instead of an absent one that anything would satisfy.
+                    TyType::Named { name: name.clone(), args: literal_args }
                 } else {
                     self.error(format!("unknown model `{}`", name), span.clone());
                     TyType::Unknown
@@ -1906,9 +2707,86 @@ impl Checker {
             BinOp { op, lhs, rhs, span } => self.check_binop(op.clone(), lhs, rhs, span.clone()),
             UnOp { operand, .. } => self.check_expr(operand),
             Postfix { expr, op, span } => self.check_postfix(expr, op, span.clone()),
-            Cast { ty, .. } => self.resolve_type(ty),
+            // #547: the cast's target type is a new *expectation* on the
+            // outer expression, but it says nothing about the operand
+            // underneath — an `as` cast doesn't change what the two sides of
+            // an inner binop are, only what the result is reinterpreted as.
+            // This arm used to resolve `ty` and stop, never recursing into
+            // `expr` at all, so every check that lives in `check_expr` —
+            // `check_binop`'s #295/#538/#539 operand-position checks among
+            // them — silently never ran on a cast's operand, at any nesting
+            // depth. Recurse for the side effects (errors/lints), same as
+            // any other operand position.
+            //
+            // #550: the cast ITSELF is checked here too. This arm used to
+            // resolve `ty` and return it on faith, so `s as i64` on a `str`
+            // reported `Check OK` and `dmc run` then handed the *str* back out
+            // of a function declared `-> i64` — the value's runtime kind did
+            // not match the static type the checker had assigned it. `#549`
+            // fixed the recursion into the operand and deliberately left the
+            // cast alone; `check_cast` is the missing half.
+            Cast { ty, expr, span } => {
+                let mut from = self.check_expr(expr);
+                // #248/#283's trick, reused: an arena constructor reports
+                // `Unknown` on purpose, and so does a `let` bound to one, but
+                // the side-table still knows the value is a tensor. Without
+                // this the operand looks like ⊥ and no legality question about
+                // it can be answered — which is exactly #550's second repro,
+                // `let t = forge.zeros[f32, [2]]  t as i64`.
+                if matches!(from, TyType::Unknown) {
+                    if let Some(t) = self.ctor_tensor_fallback(expr) { from = t; }
+                }
+                let to = self.resolve_type(ty);
+                self.check_cast(&from, &to, span.clone())
+            }
             Range { .. } => TyType::Unknown,  // ranges have no concrete type yet
         }
+    }
+
+    /// #533: is this argument statically a packed `trit` tensor?
+    ///
+    /// Three spellings reach the port primitives, and all three are decidable
+    /// at check time: an annotated binding or parameter (`Tensor[trit, …]`,
+    /// which lands in `ty`), the constructor written inline
+    /// (`port_tensor_encode(forge.trit[2, 2])`), and a `let` bound to one —
+    /// which types as `Unknown`, because `forge.trit` carries no element-type
+    /// argument, and so needs the side-table.
+    fn is_trit_tensor(&self, e: &Expr, ty: Option<&TyType>) -> bool {
+        if let Some(t) = ty {
+            if let Some((elem, _)) = t.as_tensor_like() {
+                if matches!(elem, TyType::Scalar(ScalarType::Trit)) { return true; }
+            }
+        }
+        if is_trit_ctor(e) { return true; }
+        matches!(e, Expr::Ident(name, _) if self.env.is_trit_binding(name))
+    }
+
+    /// The tensor type an expression carries when its *reported* type is
+    /// `Unknown` — a literal arena constructor, or a simple binding whose RHS
+    /// was one. The element type is only known on the syntactic form; through
+    /// the side-table only the shape survives, which is enough to know the
+    /// value is a tensor and not a scalar.
+    fn ctor_tensor_fallback(&self, e: &Expr) -> Option<TyType> {
+        ctor_tensor_ty(e).or_else(|| match e {
+            Expr::Ident(name, _) => self.env.lookup_ctor_shape(name)
+                .map(|s| TyType::Tensor(Box::new(TyType::Unknown), s.clone())),
+            _ => None,
+        })
+    }
+
+    /// #550: type an `expr as Type`, rejecting a cast the language defines no
+    /// conversion for. Reuses the JIT's wording — `cannot convert `str` to
+    /// `i64`` — because the JIT already refuses exactly these programs and the
+    /// two backends should not describe the same bad program differently.
+    fn check_cast(&mut self, from: &TyType, to: &TyType, span: Span) -> TyType {
+        if !cast_is_legal(from, to) {
+            self.error(
+                format!("cannot convert `{}` to `{}`", render_ty(from), render_ty(to)),
+                span,
+            );
+            return TyType::Unknown;
+        }
+        cast_result_ty(from, to)
     }
 
     fn check_stage_expr(&mut self, expr: &Expr) -> TyType {
@@ -1978,7 +2856,7 @@ impl Checker {
                     }
                 }
             }
-            DotAdd | DotSub | DotMul | DotDiv | DotPow | DotPow2
+            DotAdd | DotSub | DotMul | DotDiv | DotPow
             | DotGt | DotLt | DotGe | DotLe => {
                 // Elementwise: broadcast-merge the shapes; element type from lhs
                 // (comparisons keep the lhs element type — at this layer we don't
@@ -2054,34 +2932,11 @@ impl Checker {
                     }
                 }
                 // Scalar arithmetic (tensor versions use the dotted ops).
+                // #538/#539: literal adoption+range-check and the
+                // integral-mismatch check are shared with comparisons and
+                // bitwise/shift below — see `adopt_and_check_operand_types`.
                 if lt.is_numeric() && rt.is_numeric() {
-                    // A literal operand adopts the other (concrete) operand's
-                    // type; two literals stay an untyped literal (#295). Otherwise
-                    // result = lhs type (pre-alpha: no widening).
-                    match (&lt, &rt) {
-                        // Two untyped literals of the same kind stay that kind.
-                        (TyType::IntLit(_), TyType::IntLit(_)) => lt,
-                        (TyType::FloatLit(_), TyType::FloatLit(_)) => lt,
-                        // Mixed untyped literals: the float kind wins (the int
-                        // literal promotes to float).
-                        (TyType::IntLit(_), TyType::FloatLit(_)) => rt,
-                        (TyType::FloatLit(_), TyType::IntLit(_)) => lt,
-                        // One untyped literal adopts the other (concrete) operand.
-                        (TyType::IntLit(_), _) | (TyType::FloatLit(_), _) => rt,
-                        // #473: two concrete floats of different widths — the
-                        // WIDER one wins. Both backends compute `f32 + f64` in
-                        // f64 (the f32 operand promotes; mixed float arithmetic
-                        // never silently narrows), so typing it as the lhs made
-                        // an expression whose runtime value IS an f64
-                        // unbindable to an `f64` — `let w: f64 = a_f32 + b_f64`
-                        // was rejected. Same-width pairs and integer arithmetic
-                        // keep the lhs rule unchanged.
-                        (TyType::Scalar(a), TyType::Scalar(b))
-                            if is_f32_family(a) && matches!(b, ScalarType::F64) => rt,
-                        (TyType::Scalar(a), TyType::Scalar(b))
-                            if matches!(a, ScalarType::F64) && is_f32_family(b) => lt,
-                        _ => lt,
-                    }
+                    self.adopt_and_check_operand_types(&lt, &rt, lhs, rhs, &span)
                 } else if matches!(lt, TyType::Unknown) || matches!(rt, TyType::Unknown) {
                     TyType::Unknown
                 } else if lt.as_tensor_like().is_some() || rt.as_tensor_like().is_some() {
@@ -2097,20 +2952,36 @@ impl Checker {
                 }
             }
             And | Or => TyType::Scalar(ScalarType::Bool),
-            Eq | NotEq | Lt | Gt | LtEq | GtEq => TyType::Scalar(ScalarType::Bool),
+            Eq | NotEq | Lt | Gt | LtEq | GtEq => {
+                // #538/#539: a comparison's *result* is always `bool` — never
+                // adopted from an operand — but its operands are still an
+                // untyped/suffixed literal's use site (SPEC §3.1) and are
+                // just as subject to #295's range check and #284's
+                // strict-typing rule as an arithmetic operand is. Run the
+                // shared check for its side effects only; a non-numeric
+                // comparison (str == str, enum == enum, bool == bool, …)
+                // skips it exactly as before.
+                if lt.is_numeric() && rt.is_numeric() {
+                    self.adopt_and_check_operand_types(&lt, &rt, lhs, rhs, &span);
+                }
+                TyType::Scalar(ScalarType::Bool)
+            }
             Pipe | RShift => {
-                // `x |> f` / `x >> f` pipe into a callable RHS. The placeholder
-                // form (`x |> _ .+ b`) and bare activation stages (`\|> \>`,
-                // which parse to an ident) are valid non-callable RHS forms.
-                // Catch the footgun where the RHS is a concrete *value* — most
-                // often `x >> 2` meant as a bitwise shift (#188): it would
+                // `x \|> f` pipes into a callable RHS. The placeholder form
+                // (`x |> _ .+ b`) and bare activation stages (`\|> \>`, which
+                // parse to an ident) are valid non-callable RHS forms. Catch
+                // the footgun where the RHS is a concrete *value*: it would
                 // type-check and then fail at runtime with "expected callable".
+                // (#188's `x >> 2` shape no longer reaches here at all: `>>`
+                // is the right shift since #530 and types in the bitwise arm
+                // below. `RShift` is unreachable — the token parses to
+                // `BitShr`, and nothing constructs this variant.)
                 let rhs_is_value = rt.is_numeric() || rt.as_tensor_like().is_some();
                 if rhs_is_value && !expr_contains_underscore(rhs) {
                     self.error_with_hint(
-                        format!("`>>`/`|>` pipe into a callable, but the right side is {rt}, not callable"),
+                        format!("`\\|>` pipes into a callable, but the right side is {rt}, not callable"),
                         span,
-                        Some("`>>` is the pipe operator, not bitwise shift; for an elementwise stage use a `_` placeholder (e.g. `x |> _ .+ y`)".to_string()),
+                        Some("for an elementwise stage use a `_` placeholder (e.g. `x \\|> _ .+ y`)".to_string()),
                     );
                 }
                 TyType::Unknown
@@ -2130,7 +3001,13 @@ impl Checker {
                 if matches!(lt, TyType::Unknown) || matches!(rt, TyType::Unknown) {
                     TyType::Unknown
                 } else if lt.is_numeric() && rt.is_numeric() {
-                    lt
+                    // #538/#539: same shared check as arithmetic and
+                    // comparisons — a literal operand (`a & 5000000000`) is
+                    // range-checked against what it adopts, and a
+                    // differently-typed suffix or declared width (`a & 2i64`)
+                    // disagrees, matching the JIT's single `lower_binop`
+                    // guard across every scalar binop uniformly.
+                    self.adopt_and_check_operand_types(&lt, &rt, lhs, rhs, &span)
                 } else {
                     self.error(
                         format!("bitwise operator requires integer operands; got {} and {}", lt, rt),
@@ -2141,6 +3018,94 @@ impl Checker {
             }
             // StreamArrow is a stmt-level assignment op, not a binary expr op;
             // shouldn't reach here, but cover defensively.
+        }
+    }
+
+    /// #538/#539: the operand-position half of #295's literal range check
+    /// and #445's suffix-conflict rule, shared by every scalar binop that
+    /// reaches this point with two already-numeric operands — arithmetic,
+    /// comparison, and bitwise/shift alike. Mirrors the JIT's single
+    /// `adopt_int_literal_kind` guard in `lower_binop`, which enforces both
+    /// rules uniformly across every scalar binop; before this helper existed
+    /// `check_binop` only enforced them in the arithmetic arm, so `a & 2i64`
+    /// or `a < 5000000000` (a: i32) checked clean and only the JIT refused
+    /// them — the three-way `--check`/`run`/`jit` split #538 and #539 exist
+    /// to close.
+    ///
+    /// Returns the type an untyped/float-promoted operand *adopts* — the
+    /// arithmetic and bitwise/shift callers use this as their own result
+    /// type (matching the pre-#538/#539 behavior when both operands already
+    /// agree). A comparison's result is always `bool`, never this return
+    /// value — its caller calls this purely for the check side effects and
+    /// discards what comes back.
+    ///
+    /// Precondition (checked by every caller before calling this):
+    /// `lt.is_numeric() && rt.is_numeric()`.
+    fn adopt_and_check_operand_types(
+        &mut self,
+        lt: &TyType,
+        rt: &TyType,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: &Span,
+    ) -> TyType {
+        // A literal operand adopts the other (concrete) operand's type;
+        // two literals stay an untyped literal (#295). Otherwise result =
+        // lhs type (pre-alpha: no widening).
+        match (lt, rt) {
+            // Two untyped literals of the same kind stay that kind.
+            (TyType::IntLit(_), TyType::IntLit(_)) => lt.clone(),
+            (TyType::FloatLit(_), TyType::FloatLit(_)) => lt.clone(),
+            // Mixed untyped literals: the float kind wins (the int
+            // literal promotes to float).
+            (TyType::IntLit(_), TyType::FloatLit(_)) => rt.clone(),
+            (TyType::FloatLit(_), TyType::IntLit(_)) => lt.clone(),
+            // #538: an untyped int literal adopts the other (concrete)
+            // operand's type in either operand order — and, like the
+            // annotation/return/param contexts (#295), its magnitude must
+            // fit what it adopts. `check_int_literal_range` no-ops when the
+            // adopted target isn't a range-checked integral scalar (e.g.
+            // the other operand is itself untyped, or float), so this is
+            // safe to call unconditionally here.
+            (TyType::IntLit(_), _) => { self.check_int_literal_range(rt, lhs); rt.clone() }
+            (_, TyType::IntLit(_)) => { self.check_int_literal_range(lt, rhs); lt.clone() }
+            // An untyped float literal adopts the other (concrete) operand;
+            // floats aren't range-checked (#295 is int-only).
+            (TyType::FloatLit(_), _) => rt.clone(),
+            (_, TyType::FloatLit(_)) => lt.clone(),
+            // #473: two concrete floats of different widths — the WIDER one
+            // wins. Both backends compute `f32 + f64` in f64 (the f32
+            // operand promotes; mixed float arithmetic never silently
+            // narrows), so typing it as the lhs made an expression whose
+            // runtime value IS an f64 unbindable to an `f64` — `let w: f64 =
+            // a_f32 + b_f64` was rejected. Same-width pairs and integer
+            // arithmetic keep the lhs rule unchanged.
+            (TyType::Scalar(a), TyType::Scalar(b))
+                if is_f32_family(a) && matches!(b, ScalarType::F64) => rt.clone(),
+            (TyType::Scalar(a), TyType::Scalar(b))
+                if matches!(a, ScalarType::F64) && is_f32_family(b) => lt.clone(),
+            // #539: two concrete *integral* scalars — one may be a
+            // suffix-typed literal, which types exactly as concretely as a
+            // declared variable (SPEC §3.1) — of different kinds never
+            // silently combine. This is the same #284 strict-typing rule
+            // already enforced at the annotation/return/param positions,
+            // reaching the operand position. Deliberately narrower than
+            // `compatible_with`: scoped to the *integral* family only, so
+            // `f64 ** i64` (a float base with an integer exponent — `**`
+            // always computes in f64 regardless of the exponent's declared
+            // width, both backends agree, and it's an established idiom —
+            // see `examples/translations/adamw_step.dmc`) keeps checking
+            // clean; only same-family, different-width integers (or an
+            // integer suffix conflicting with one) are flagged.
+            _ => {
+                if lt.is_integral() && rt.is_integral() && lt != rt {
+                    self.error(
+                        format!("operand types disagree: {} vs {} (no implicit cast)", lt, rt),
+                        span.clone(),
+                    );
+                }
+                lt.clone()
+            }
         }
     }
 
@@ -2212,6 +3177,146 @@ impl Checker {
         })
     }
 
+    /// Type an expression that has already been typed once on this path, and
+    /// drop whatever it reports. Used where a sub-expression's type is needed
+    /// a second time (a bracketed method's receiver): re-checking is cheap and
+    /// idempotent, but re-reporting would duplicate every diagnostic inside it.
+    fn quiet_ty(&mut self, e: &Expr) -> TyType {
+        let (errs, warns) = (self.errors.len(), self.warnings.len());
+        let t = self.check_expr(e);
+        self.errors.truncate(errs);
+        self.warnings.truncate(warns);
+        t
+    }
+
+    /// #474: type `recv.method![shape args]` — the shape bracket standing
+    /// between a model method and its call.
+    ///
+    /// `b.blit![2, 2](src)` parses as `Call(Index(Field(b, "blit!"), [2, 2]),
+    /// [src])`, so the method-call resolution in the `Call` arm never sees a
+    /// method: the callee typed as `Unknown` and the call inherited it. No
+    /// arity check, no argument check, and a result that unified with
+    /// anything — `let ok: bool = b.blit![2, 2](src)` on a `-> i64` method
+    /// passed `--check`. The interpreter dispatches this spelling for real
+    /// (`call_bracketed_method`); the checker has to see the same signature.
+    ///
+    /// The returned `Fn` drops the receiver parameter — the call site does not
+    /// write it — and has every shape argument substituted: the model's own,
+    /// read off the receiver's type, then the method's, read off the bracket.
+    /// The bracket shadows a reused name, which is the only reading that makes
+    /// writing it mean anything, and is what the interpreter does.
+    ///
+    /// `None` leaves the call to the path that owns it: a non-model receiver,
+    /// a *field* of that name being indexed (`b.handlers[i](x)`), or a name
+    /// that is no member at all — the last is #441's undefined method, whose
+    /// error the caller raises.
+    ///
+    /// Called only from the `Call` arm. A bracket that is not called is not a
+    /// working value (see the note there), so it keeps typing as `Unknown`.
+    /// #474: `b.generic![2, 2]` with no call after it.
+    ///
+    /// The bracket is the shape-argument half of a method call, and a method
+    /// call is the only thing it can be part of — there is no value in this
+    /// language that means "the method `generic!` of `b`, with `SH` and `SW`
+    /// fixed". Left alone it typed as `Unknown`, passed `--check`, and at run
+    /// time evaluated to an opaque and did nothing: a statement that looks
+    /// exactly like the call the author meant to write, and silently is not
+    /// one. That is the same ghost the bracketed dispatch was written to kill,
+    /// wearing its last spelling, so it is refused for the same reason.
+    fn reject_uncalled_method_bracket(&mut self, expr: &Expr, op: &PostfixOp, span: &Span) {
+        if !is_shape_bracket(op) { return; }
+        let Expr::Postfix { expr: base, op: PostfixOp::Field(method), .. } = expr else { return };
+        let TyType::Named { name: model, .. } = self.quiet_ty(base) else { return };
+        let Some(info) = self.env.models.get(&model) else { return };
+        // A field of that name being indexed is ordinary indexing, not this.
+        if info.fields.contains_key(method) || !info.methods.contains_key(method) { return; }
+        self.error_with_hint(
+            format!("`{model}.{method}` is a method, and a shape bracket on it is \
+                     part of calling it — `{method}[…]` on its own is not a value"),
+            span.clone(),
+            Some(format!("call it: `{method}[…](args)`")),
+        );
+    }
+
+    fn bracketed_method_ty(&mut self, expr: &Expr, op: &PostfixOp, span: &Span) -> Option<TyType> {
+        let bracket = shape_bracket_pairs(op)?;
+        let Expr::Postfix { expr: base, op: PostfixOp::Field(method), .. } = expr else {
+            return None;
+        };
+        let TyType::Named { name: model, args: model_args } = self.quiet_ty(base) else {
+            return None;
+        };
+        let info = self.env.models.get(&model)?.clone();
+        if info.fields.contains_key(method) { return None; }
+        let sig = info.methods.get(method)?.clone();
+        let owner = format!("{model}.{method}");
+
+        let mut binds: HashMap<String, SymDim> = info.shape_params.iter()
+            .zip(model_args.iter())
+            .filter_map(|(p, a)| match a {
+                TyType::Dim(d) => Some((p.clone(), d.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut pos = 0usize;
+        let mut bound: Vec<String> = Vec::new();
+        for (name, value) in &bracket {
+            let pname = match name {
+                None => match sig.shape_params.get(pos) {
+                    Some(p) => { pos += 1; p.clone() }
+                    None => {
+                        self.error(format!(
+                            "`{}` declares {} shape parameter(s), got more bracket args",
+                            owner, sig.shape_params.len()), span.clone());
+                        return Some(TyType::Unknown);
+                    }
+                },
+                Some(n) => {
+                    if !sig.shape_params.iter().any(|p| p == n) {
+                        self.error(format!(
+                            "`{}` is not a shape parameter of `{}` (declared: {})",
+                            n, owner, sig.shape_params.join(", ")), span.clone());
+                        return Some(TyType::Unknown);
+                    }
+                    (*n).to_string()
+                }
+            };
+            if bound.contains(&pname) {
+                self.error(format!(
+                    "shape parameter `{}` of `{}` bound twice", pname, owner), span.clone());
+                return Some(TyType::Unknown);
+            }
+            // The positional spelling reaches here through the `Index` arm,
+            // which has already typed these; the named one does not, and its
+            // arguments would otherwise never be checked at all.
+            let vty = if matches!(op, PostfixOp::Index(_)) {
+                self.quiet_ty(value)
+            } else {
+                self.check_expr(value)
+            };
+            // A shape argument is a dim. `b.generic!["x", 2](s)` used to reach
+            // the interpreter and die there, while the arity, the names and
+            // the duplicate check all reported at `--check` — the one member
+            // of the family that waited until run time for no reason.
+            if !is_integral_shape_arg(&vty) {
+                self.error(format!(
+                    "shape argument `{}` of `{}` must be an integer, got {}",
+                    pname, owner, vty), span.clone());
+                return Some(TyType::Unknown);
+            }
+            binds.insert(pname.clone(), SymDim::from_expr(value).simplify());
+            bound.push(pname);
+        }
+
+        let drop_self = usize::from(sig.params.first().is_some_and(|(n, _)| n == "self"));
+        Some(TyType::Fn {
+            params: sig.params.iter().skip(drop_self)
+                .map(|(_, t)| substitute_shape_args(t.clone(), &binds))
+                .collect(),
+            ret: Box::new(substitute_shape_args(sig.ret.clone(), &binds)),
+        })
+    }
+
     fn check_postfix(&mut self, expr: &Expr, op: &PostfixOp, span: Span) -> TyType {
         // #336: `Color.Red` — a qualified enum-variant value. Intercept before
         // the base is typed as a value (the enum name is not a binding).
@@ -2222,6 +3327,41 @@ impl Checker {
                 }
                 self.error(format!("enum `{}` has no variant `{}`", base, variant), span);
                 return TyType::Unknown;
+            }
+        }
+        // #476 (MEMORY §2): reading a model-array field that is still straight
+        // out of `uninit`. Reported here, at the read, rather than left to the
+        // runtime — which used to hand back an `Opaque` and fail later at the
+        // first *use*, naming neither the field nor initialization.
+        if let (Expr::Ident(root, _), PostfixOp::Field(fname)) = (expr, op) {
+            if self.env.is_uninit_field(root, fname) {
+                self.env.clear_uninit_field(root, fname); // one bug, one report
+                self.error(
+                    format!(
+                        "read of uninitialized memory: `{root}.{fname}` comes from \
+                         `forge.uninit`/`vault.uninit` and nothing has been written to \
+                         it yet. Filling it through a copy (`let !cs = {root}.{fname}`) \
+                         does not reach the field — write the elements through \
+                         `{root}.{fname}[i]`, or build the array as a local and store \
+                         it at construction"),
+                    span.clone(),
+                );
+            }
+        }
+        // #476: a model instance aliases through its `Rc`, so anything handed
+        // the binding may fill the field. Give up the marks rather than risk a
+        // false report: on a method call through the receiver, and on any bare
+        // identifier passed as an argument.
+        if let PostfixOp::Call(args) = op {
+            if let Expr::Postfix { expr: recv, op: PostfixOp::Field(_), .. } = expr {
+                if let Expr::Ident(r, _) = recv.as_ref() {
+                    self.env.clear_uninit_fields_under(r);
+                }
+            }
+            for a in args {
+                if let CallArg::Positional(Expr::Ident(n, _)) = a {
+                    self.env.clear_uninit_fields_under(n);
+                }
             }
         }
         // #350 Part 2: `Shape.Circle(args)` — payload-variant construction.
@@ -2236,7 +3376,13 @@ impl Checker {
                 }
             }
         }
+        // #474: the marker applies to exactly one postfix level. Take it on
+        // entry so nothing nested inherits it, then re-arm it for this node's
+        // own callee if this node is a call.
+        let is_callee = std::mem::take(&mut self.typing_callee);
+        if matches!(op, PostfixOp::Call(_)) { self.typing_callee = true; }
         let recv = self.check_expr(expr);
+        self.typing_callee = false;
         match op {
             PostfixOp::Transpose => {
                 // Swap last two axes of the receiver's shape.
@@ -2278,6 +3424,7 @@ impl Checker {
                 }
             }
             PostfixOp::Index(elems) => {
+                if !is_callee { self.reject_uncalled_method_bracket(expr, op, &span); }
                 if let Some(ty) = self.tensor_split_type(expr, op) { return ty; }
                 // Type-check each index expr; result shape pruned per scalar indices.
                 for e in elems {
@@ -2350,16 +3497,24 @@ impl Checker {
                     self.env.is_builtin(name)
                 } else { false };
 
-                // PORTS.md §5: no `@grad fn` may call a port. The call is an
-                // effect boundary the tape cannot record, so a gradient through
-                // it would be silently wrong — reject it at compile time.
-                if self.in_grad_fn {
+                // PORTS.md §5: no `@grad fn`, `@fuse` block, or `@deterministic`
+                // block may call a port. The call is an effect boundary — the
+                // tape cannot record it, fusion cannot cross it, and no port yet
+                // carries the manifest determinism needs. Reject at compile time
+                // rather than silently break the enclosing promise.
+                //
+                // The list is exactly the three that reach a runtime.
+                // `port_tensor_encode` / `port_tensor_decode` share the prefix
+                // but not the property: they are pure value transforms with no
+                // runtime on the other end (SPEC.md §4.11), so they stay legal
+                // here. `check_tests::the_copy_mode_primitives_are_not_port_calls`
+                // pins that, because the distinction lives only in this list.
+                if let Some(ban) = self.port_ban {
                     if let Expr::Ident(name, _) = expr {
                         if matches!(name.as_str(), "port_open" | "port_call" | "port_close") {
                             self.error(
-                                format!("port-forbidden: `{}` is illegal inside a `@grad fn` \
-                                         — a port call is an effect boundary the gradient \
-                                         cannot cross (PORTS.md §5)", name),
+                                format!("port-forbidden: `{}` is illegal inside a {} — {} \
+                                         (PORTS.md §5)", name, ban.what(), ban.because()),
                                 span.clone(),
                             );
                         }
@@ -2423,6 +3578,79 @@ impl Checker {
                     CallArg::Named { value, .. } => self.check_expr(value),
                     CallArg::Spread(_) => TyType::Unknown,
                 }).collect();
+
+                // #533 (PORTS.md §3.2): "`trit` has no wire dtype. A packed
+                // ternary weight is a demoniC storage format, not a portable
+                // element type." Both backends refuse it, but only at run time,
+                // so a program that cannot run passed `--check` clean. The set
+                // of encodable element types is a property of the *argument's
+                // type*, never of any value, which makes this a compile-time
+                // error by the same reasoning as AGENTS.md §2.5. Same words as
+                // the two backends — `interp.rs`'s `port_tensor_encode` arm and
+                // the JIT's `port_tensor_wire_ty`, pinned by #512's
+                // `jit_a_trit_tensor_is_refused_the_way_the_interpreter_refuses_it`.
+                if let Expr::Ident(name, _) = expr {
+                    let trit_arg = match name.as_str() {
+                        // `port_tensor_encode(t)`
+                        "port_tensor_encode" => Some(0),
+                        // `port_tensor_decode(s, like)` — `like` declares the
+                        // payload buffer, so its dtype is the one being asked for.
+                        "port_tensor_decode" => Some(1),
+                        _ => None,
+                    };
+                    if let Some(i) = trit_arg {
+                        if let Some(CallArg::Positional(e)) = args.get(i) {
+                            if self.is_trit_tensor(e, arg_tys.get(i)) {
+                                self.error(format!(
+                                    "{}: a `trit` tensor has no copy-mode wire dtype \
+                                     (PORTS.md §3.2)", name),
+                                    span.clone());
+                            }
+                        }
+                    }
+                }
+
+                // #474: `b.blit![2, 2](src)` puts a shape bracket between the
+                // method name and the call, so the Field-shaped resolution
+                // below never sees a method — and #441's check-time "no such
+                // method" gate did not fire on this spelling either, leaving
+                // exactly the hole #441 closed. Both are handled on the peeled
+                // callee: an undefined name is that error, and a defined one
+                // hands the machinery below the method's real signature
+                // instead of the `Unknown` this used to type as. The receiver
+                // is re-typed quietly so nothing is reported twice.
+                //
+                // Deliberately here, at the call, and not in the bracket's own
+                // postfix arm: `let f = b.blit![2, 2]` is not a working value
+                // — a method bound without being called evaluates to an opaque
+                // at run time, for shape-bracketed and plain methods alike —
+                // so handing the bracket a callable type on its own would be
+                // the checker endorsing something that does not run.
+                let mut recv = recv;
+                if let Expr::Postfix { expr: bracketed, op: bop, .. } = expr {
+                    if is_shape_bracket(bop) {
+                        if let Expr::Postfix { expr: base, op: PostfixOp::Field(method), .. } =
+                            bracketed.as_ref()
+                        {
+                            if let TyType::Named { name: model_name, .. } = self.quiet_ty(base) {
+                                let unknown = self.env.models.get(&model_name).is_some_and(|info| {
+                                    !info.methods.contains_key(method)
+                                        && !info.fields.contains_key(method)
+                                });
+                                if unknown {
+                                    self.error(
+                                        format!("no method `{method}` on model `{model_name}`"),
+                                        span.clone(),
+                                    );
+                                    return TyType::Unknown;
+                                }
+                            }
+                        }
+                        if let Some(t) = self.bracketed_method_ty(bracketed, bop, &span) {
+                            recv = t;
+                        }
+                    }
+                }
 
                 let mut is_method = false;
                 if let Expr::Postfix { expr: base, op: PostfixOp::Field(method), .. } = expr {
@@ -2542,6 +3770,22 @@ impl Checker {
                                     span.clone(),
                                     Some("supported string methods: split, lines, trim/strip, upper, lower, replace, contains, starts_with, ends_with, find, index, count, len".to_string()),
                                 );
+                            } else if matches!(base_ty,
+                                TyType::Unit | TyType::Scalar(ScalarType::Nil)) {
+                                // `nil` used to take the same forward-compat
+                                // path as any other method-less receiver, so
+                                // this warning told the author their call would
+                                // "resolve to an opaque value at runtime". It
+                                // no longer does: `nil` has no methods and both
+                                // backends now say so at the call (SPEC §4.10).
+                                // Describing the old behaviour would send the
+                                // reader looking for a value that is never
+                                // produced.
+                                self.warn(
+                                    format!("`.{method}()` on a `nil` receiver — `nil` has no methods; this raises at runtime rather than producing a value"),
+                                    span.clone(),
+                                    Some("guard the receiver before calling: `if e != nil { … }` (the `(_, Err)` convention, SPEC §3.9)".to_string()),
+                                );
                             } else {
                                 // #202: a method call on a method-less, non-string
                                 // type (scalar / tensor / tuple / …). No method
@@ -2578,17 +3822,25 @@ impl Checker {
                         }
                         for (i, (pty, aty)) in params.iter().zip(arg_tys.iter()).enumerate() {
                             let inferred_pty = substitute_shape_args(pty.clone(), &shape_bindings);
-                            if !inferred_pty.compatible_with(aty) {
+                            if !inferred_pty.compatible_with(aty)
+                                && !model_arg_binds_at_runtime(&inferred_pty, aty)
+                            {
                                 let report_idx = if is_method { i as isize - 1 } else { i as isize };
                                 if report_idx >= 0 {
-                                    self.error(
+                                    self.error_mismatch(
                                         format!("arg {}: expected {}, got {}", report_idx, inferred_pty, aty),
                                         span.clone(),
+                                        None,
+                                        &inferred_pty,
+                                        aty,
                                     );
                                 } else {
-                                    self.error(
+                                    self.error_mismatch(
                                         format!("receiver: expected {}, got {}", inferred_pty, aty),
                                         span.clone(),
+                                        None,
+                                        &inferred_pty,
+                                        aty,
                                     );
                                 }
                             }
@@ -2608,6 +3860,7 @@ impl Checker {
                 TyType::Unknown
             }
             PostfixOp::BracketArgs(_) => {
+                if !is_callee { self.reject_uncalled_method_bracket(expr, op, &span); }
                 if let Some(ty) = self.tensor_split_type(expr, op) { return ty; }
                 // Generic instantiation or shape-literal call; conservatively Unknown.
                 TyType::Unknown
@@ -2638,10 +3891,11 @@ impl Checker {
                         for (fname, fty) in &field_tys {
                             if let Some(expected_ty) = info.fields.get(*fname) {
                                 if !expected_ty.compatible_with(fty) {
-                                    self.error(
-                                        format!("mismatched type for field `{}` of model `{}`: expected `{}`, got `{}`", fname, model_name, expected_ty, fty),
-                                        span.clone(),
-                                    );
+                                    let expected_ty = expected_ty.clone();
+                                    let val = fields.iter()
+                                        .find(|(k, _)| k == *fname).map(|(_, v)| v);
+                                    self.field_type_mismatch(
+                                        fname, model_name, &expected_ty, fty, val, span.clone());
                                 }
                             } else {
                                 self.error(
@@ -2788,6 +4042,21 @@ impl Checker {
                 if self.env.enums.contains_key(name) {
                     return TyType::Enum(name.clone());
                 }
+                // #474: a model's arguments are shape arguments — `Box[H, W]`,
+                // `Inner[4, 5]` — so resolve them as dims. Before this the
+                // expression form (`Inner[4, 5]`) was dropped outright and the
+                // identifier form (`Inner[H, W]`) resolved to a *type* named
+                // `H`, which no substitution could ever replace with 4. Both
+                // halves of the field-position unification hole.
+                if self.is_model_name(name) {
+                    let resolved_args: Vec<TyType> = args.iter()
+                        .map(|a| match symdim_from_type_arg(a) {
+                            Some(d) => TyType::Dim(d),
+                            None => TyType::Unknown,
+                        })
+                        .collect();
+                    return TyType::Named { name: name.clone(), args: resolved_args };
+                }
                 // Resolve type args; named types can carry type or expr args
                 let resolved_args: Vec<TyType> = args.iter().filter_map(|a| match a {
                     TypeArg::Type(t) => Some(self.resolve_type(t)),
@@ -2857,11 +4126,95 @@ impl Checker {
     // ── Diagnostics ───────────────────────────────────────────────────────
 
     fn error(&mut self, msg: impl Into<String>, span: Span) {
-        self.errors.push(TypeError { msg: msg.into(), span, hint: None });
+        self.errors.push(TypeError { msg: msg.into(), span, hint: None, shapes: None });
     }
 
     fn error_with_hint(&mut self, msg: impl Into<String>, span: Span, hint: Option<String>) {
-        self.errors.push(TypeError { msg: msg.into(), span, hint });
+        self.errors.push(TypeError { msg: msg.into(), span, hint, shapes: None });
+    }
+
+    /// An expected-vs-actual mismatch. Same diagnostic as `error_with_hint`,
+    /// plus the structured shape pair (#485) when the two types are tensor-like
+    /// and it is the *shapes* that disagree — an element-type mismatch over
+    /// equal shapes carries none, so the payload never points away from the fix.
+    fn error_mismatch(
+        &mut self,
+        msg: impl Into<String>,
+        span: Span,
+        hint: Option<String>,
+        expected: &TyType,
+        actual: &TyType,
+    ) {
+        let shapes = match (expected.as_tensor_like(), actual.as_tensor_like()) {
+            (Some((_, e)), Some((_, a))) if !e.same(a) => Some((e.clone(), a.clone())),
+            _ => None,
+        };
+        self.errors.push(TypeError { msg: msg.into(), span, hint, shapes });
+    }
+
+    /// #474: recover a bare model literal's shape args from the fields it was
+    /// actually given. `Inner { px: <a 4x5 tensor>, n: 0 }` says `H = 4, W = 5`
+    /// just as plainly as `Inner[4, 5] { … }` does — the declared field type
+    /// names the parameters and the actual field type supplies the dims, which
+    /// is the same unification a call site performs on its arguments.
+    ///
+    /// All or nothing: the args are returned only when *every* shape parameter
+    /// is pinned. A literal that pins some and not others has not made a claim
+    /// anyone can check, and half a claim must not read as a whole one. The
+    /// empty result is what the field and argument checks treat as "this
+    /// literal proves nothing", not as "this literal matches anything".
+    fn infer_literal_shape_args(
+        &self,
+        info: &crate::types::ModelInfo,
+        field_tys: &[(&String, TyType)],
+    ) -> Vec<TyType> {
+        if info.shape_params.is_empty() { return Vec::new(); }
+        let mut bindings: HashMap<String, SymDim> = HashMap::new();
+        for (fname, actual) in field_tys {
+            let Some(declared) = info.fields.get(fname.as_str()) else { continue };
+            infer_call_shape_bindings(declared, actual, &mut bindings);
+        }
+        let mut args = Vec::with_capacity(info.shape_params.len());
+        for p in &info.shape_params {
+            match bindings.get(p) {
+                // A dim that resolved to nothing useful is not a binding.
+                Some(SymDim::Unknown) | None => return Vec::new(),
+                Some(d) => args.push(TyType::Dim(d.clone())),
+            }
+        }
+        args
+    }
+
+    /// #476: a model-array field initialized with a bracket literal. The bare
+    /// mismatch ("expected `[Cell; 3]`, got `Tensor[?, [3]]`") sends the author
+    /// off to fix the literal's element type, which is not the problem — a
+    /// bracket literal builds a tensor, and no bracket literal of any element
+    /// type builds a model array. Point at the idiom that does.
+    fn field_type_mismatch(
+        &mut self,
+        fname: &str, model: &str,
+        expected: &TyType, got: &TyType,
+        value: Option<&Expr>, span: Span,
+    ) {
+        let hint = match (expected, got) {
+            (TyType::Array(elem, n), TyType::Tensor(..))
+                if matches!(value, Some(Expr::TensorLit(..))) =>
+            {
+                Some(format!(
+                    "a bracket literal builds a tensor, not a model array. Build \
+                     `[{elem}; {n}]` with `vault.uninit[{elem}, [{n}]]`, fill every \
+                     slot with a whole model literal, then store it: \
+                     `let !cs = vault.uninit[{elem}, [{n}]]  \
+                     vault {{ for i in 0..{n} {{ cs[i] = {elem} {{ .. }} }} }}  \
+                     {model} {{ {fname}: cs }}` (MEMORY §2)"))
+            }
+            _ => None,
+        };
+        self.error_mismatch(
+            format!("mismatched type for field `{}` of model `{}`: expected `{}`, got `{}`",
+                    fname, model, expected, got),
+            span, hint, expected, got,
+        );
     }
 
     /// Emit a non-fatal lint (safe-mode diagnostic). Surfaced by the CLI but does
@@ -2869,8 +4222,43 @@ impl Checker {
     /// is set the lint is dropped on the floor — no collection, no print (#196).
     fn warn(&mut self, msg: impl Into<String>, span: Span, hint: Option<String>) {
         if self.demon { return; }
-        self.warnings.push(TypeError { msg: msg.into(), span, hint });
+        self.warnings.push(TypeError { msg: msg.into(), span, hint, shapes: None });
     }
+}
+
+/// #350: the variant of `variants` that `name` most plausibly misspells, if
+/// any. Case-insensitive edit distance, with a budget of one edit per three
+/// characters (at least one) — tight enough that an ordinary binding name
+/// (`other`, `rest`, `x`) suggests nothing, loose enough to catch `Gren` for
+/// `Green` and the all-lowercase `green`. Ties break toward the earlier
+/// (declaration-order) variant, so the suggestion is stable.
+fn closest_variant<'a>(name: &str, variants: &'a [String]) -> Option<&'a String> {
+    let lower = name.to_lowercase();
+    let mut best: Option<(usize, &String)> = None;
+    for v in variants {
+        let d = edit_distance(&lower, &v.to_lowercase());
+        let better = match best { None => true, Some((bd, _)) => d < bd };
+        if better { best = Some((d, v)); }
+    }
+    let (d, v) = best?;
+    if d <= (name.chars().count() / 3).max(1) { Some(v) } else { None }
+}
+
+/// Levenshtein distance over `char`s, two rolling rows.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(sub);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// A receiver type that definitionally carries no methods — scalars, tensors,
@@ -2887,6 +4275,21 @@ fn lhs_root_ident(e: &Expr) -> Option<&str> {
         Expr::Ident(n, _) => Some(n.as_str()),
         Expr::Postfix { expr, op: PostfixOp::Index(_), .. } => lhs_root_ident(expr),
         Expr::Postfix { expr, op: PostfixOp::Field(_), .. } => lhs_root_ident(expr),
+        _ => None,
+    }
+}
+
+/// #476: the `binding.field` an assignment LHS writes through, peeling any
+/// trailing index chain — `h.cells[i] = ..` and `h.cells = ..` both yield
+/// `("h", "cells")`. Returns `None` for anything deeper or not rooted in a
+/// simple identifier; the #476 check reaches exactly one level.
+fn lhs_field_path(e: &Expr) -> Option<(String, String)> {
+    match e {
+        Expr::Postfix { expr, op: PostfixOp::Index(_), .. } => lhs_field_path(expr),
+        Expr::Postfix { expr, op: PostfixOp::Field(f), .. } => match expr.as_ref() {
+            Expr::Ident(root, _) => Some((root.clone(), f.clone())),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -2914,6 +4317,20 @@ fn is_uninit_ctor(expr: &Expr) -> bool {
     };
     matches!(base, Expr::Postfix { expr: inner, op: PostfixOp::Field(m), .. }
         if m == "uninit" && matches!(inner.as_ref(), Expr::Ident(a, _) if a == "forge" || a == "vault"))
+}
+
+/// #533: is this expression a `forge.trit[K, N]` / `vault.trit[K, N]`
+/// constructor? Unlike `forge.zeros[f32, […]]` it carries no element-type
+/// argument — the dims are bare integers — so `ctor_tensor_ty` cannot read a
+/// `trit` element off it and the binding types as `Unknown`. The port
+/// primitives need the element type, so the constructor is recognised by shape.
+fn is_trit_ctor(expr: &Expr) -> bool {
+    let base = match expr {
+        Expr::Postfix { expr: base, op: PostfixOp::Index(_), .. } => base.as_ref(),
+        _ => return false,
+    };
+    matches!(base, Expr::Postfix { expr: inner, op: PostfixOp::Field(m), .. }
+        if m == "trit" && matches!(inner.as_ref(), Expr::Ident(a, _) if a == "forge" || a == "vault"))
 }
 
 /// #442 (MEMORY §3.1): does this expression produce a value living in the
@@ -2984,6 +4401,139 @@ fn scalar_type_from_ident(e: &Expr) -> Option<ScalarType> {
     })
 }
 
+// ─── `as` cast legality (#550) ───────────────────────────────────────────────
+
+/// Render a type the way the JIT's diagnostics do: scalars in their *source*
+/// spelling (`i64`, not the `I64` that `TyType`'s `Display` derives from the
+/// `ScalarType` variant name). The cast refusal below has to read exactly like
+/// `dmc jit`'s, so it cannot go through `Display`.
+fn render_ty(t: &TyType) -> String {
+    match t {
+        TyType::Scalar(s) => crate::fmt::scalar_type_str(s).to_string(),
+        TyType::Tensor(e, sh) => format!("Tensor[{}, {}]", render_ty(e), sh),
+        TyType::View(e, sh)   => format!("View[{}, {}]", render_ty(e), sh),
+        TyType::KV(e, sh)     => format!("KV[{}, {}]", render_ty(e), sh),
+        TyType::Tuple(ts) => format!(
+            "({})",
+            ts.iter().map(render_ty).collect::<Vec<_>>().join(", "),
+        ),
+        TyType::Array(e, n) => format!("[{}; {}]", render_ty(e), n),
+        TyType::RawPtr(e) => format!("*{}", render_ty(e)),
+        TyType::Unit => "nil".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The scalar kinds an *elementwise tensor cast* is defined for — exactly the
+/// targets `interp::apply_cast`'s tensor arm maps every element through. A
+/// `bool`, `str`, `nil` or `trit` target falls through that arm and hands the
+/// tensor back untouched, which is not a conversion.
+fn scalar_is_elementwise_cast_target(s: &ScalarType) -> bool {
+    use ScalarType::*;
+    matches!(s,
+        I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | Int4 | Int8 |
+        F16 | Bf16 | Tf32 | F32 | F64 | Fp8E4M3 | Fp8E5M2)
+}
+
+/// A scalar type with a numeric (or `bool`) value that `as` can convert.
+/// `str`, `nil` and the never-a-value kinds are excluded: they have no numeric
+/// reading, which is why `str as i64` is the #550 hole and not a conversion.
+fn ty_is_convertible_scalar(t: &TyType) -> bool {
+    match t {
+        TyType::IntLit(_) | TyType::FloatLit(_) => true,
+        TyType::Scalar(s) => matches!(s, ScalarType::Bool) || {
+            use ScalarType::*;
+            matches!(s,
+                I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | Int4 | Int8 |
+                F16 | Bf16 | Tf32 | F32 | F64 | Fp8E4M3 | Fp8E5M2 | Trit)
+        },
+        _ => false,
+    }
+}
+
+/// Types the checker deliberately does not model well enough to rule on a
+/// cast. `Unknown` is ⊥ (and what `any` resolves to), `Dim` is a shape
+/// parameter in value position (`D as f32`), `Named` covers models, `Port[L]`
+/// and unresolved aliases, and the rest are opaque handles that reach `as`
+/// only at boundaries the spec leaves to the backends. Casting one is not
+/// endorsed — it is simply not *refused* on evidence the checker doesn't have.
+fn cast_ty_is_opaque(t: &TyType) -> bool {
+    matches!(t,
+        TyType::Unknown | TyType::Dim(_) | TyType::Named { .. } | TyType::Module { .. } |
+        TyType::Map | TyType::Mesh(_) | TyType::RawPtr(_) | TyType::Fn { .. } |
+        TyType::Array(..))
+}
+
+/// #550: the conversions `as` is licensed to perform.
+///
+/// SPEC §3.1 makes `as` the only way one concrete scalar becomes another —
+/// "All implicit numeric conversions are forbidden. Casts are explicit: `x as
+/// f32`" — and does not license it between arbitrary types. The complete set:
+///
+/// 1. **scalar ↔ scalar** inside the numeric + `bool` families (SPEC §3.1:
+///    "`i64 → i32`, `f64 → f32`, `f64 → i8` all require an `as` cast"),
+///    including the narrowing two's-complement wrap of #540 (`5000000000 as
+///    i32` is `705032704`) and OPERATORS.md §7's float→int truncate/saturate.
+/// 2. **`x as str`** — SPEC §3.1, "Integer-to-string conversion: `n as str`";
+///    both backends render `bool` and float sources through the same path.
+/// 3. **the elementwise tensor cast** — `Tensor[E, S] as N` for a numeric `N`,
+///    which retags or truncates every element (DIRECTIVES.md §4.1 documents
+///    the `@cast(i64) { t }` block analog). The JIT declines to lower it as
+///    *unsupported*, not illegal, and points at `dmc run`.
+/// 4. **enum ↔ ordinal** — SPEC §3.1's enum paragraph: "An enum value is its
+///    variant's `i64` ordinal … `Token.Eq as i64 == 1`", and the explicit
+///    `n as Light` the JIT lowers back the other way.
+/// 5. the **identity** cast, and any cast touching a type the checker does not
+///    model (see `cast_ty_is_opaque`).
+///
+/// Everything else is a type error: `str as i64`, `nil as i64`, a tuple cast
+/// to a scalar, a tensor cast to another tensor type. Each of those is already
+/// refused by `dmc jit` and silently hands the *unconverted* value back under
+/// `dmc run`, which is the soundness hole #550 was filed over.
+fn cast_is_legal(from: &TyType, to: &TyType) -> bool {
+    if from == to { return true; }
+    if cast_ty_is_opaque(from) || cast_ty_is_opaque(to) { return true; }
+    match to {
+        TyType::Scalar(t) => match t {
+            // (2) `x as str`.
+            ScalarType::Str => matches!(from,
+                TyType::Scalar(_) | TyType::IntLit(_) | TyType::FloatLit(_) |
+                TyType::Enum(_) | TyType::Unit),
+            // `x as nil` discards a value that is already `nil`; nothing else
+            // has a `nil` reading.
+            ScalarType::Nil => matches!(from, TyType::Unit),
+            // (1) + (3) + (4).
+            _ => ty_is_convertible_scalar(from)
+                || matches!(from, TyType::Enum(_))
+                || (from.as_tensor_like().is_some() && scalar_is_elementwise_cast_target(t)),
+        },
+        // (4), the reverse direction: an integer ordinal back to its enum.
+        TyType::Enum(_) => from.is_integral(),
+        _ => false,
+    }
+}
+
+/// The type an accepted cast produces.
+///
+/// Almost always the target type — but an **elementwise tensor cast** yields a
+/// *tensor* of the target element type, not a bare scalar. Typing `t as i64`
+/// as `i64` was the other half of the #550 hole: `dmc run` maps every element
+/// and hands back a `Tensor`, so a `-> i64` function could return one with the
+/// checker's blessing.
+fn cast_result_ty(from: &TyType, to: &TyType) -> TyType {
+    if let TyType::Scalar(t) = to {
+        if scalar_is_elementwise_cast_target(t) {
+            match from {
+                TyType::Tensor(_, sh) => return TyType::Tensor(Box::new(to.clone()), sh.clone()),
+                TyType::View(_, sh)   => return TyType::View(Box::new(to.clone()), sh.clone()),
+                TyType::KV(_, sh)     => return TyType::KV(Box::new(to.clone()), sh.clone()),
+                _ => {}
+            }
+        }
+    }
+    to.clone()
+}
+
 fn ty_has_no_methods(t: &TyType) -> bool {
     matches!(t,
         TyType::Scalar(_) | TyType::Tensor(..) | TyType::View(..)
@@ -3046,6 +4596,50 @@ fn is_pipeline_block_placeholder(name: &str) -> bool {
         return false;
     };
     !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Every directive reachable from `body` by descending through blocks that
+/// consist of a lone directive construct and nothing else — the `@fuse` and
+/// `@cast(bf16)` in `{ @fuse { @cast(bf16) { … } } }`. Braces around a lone
+/// directive block are the stacked form written long-hand, so DIRECTIVES.md §3
+/// reads the stack across them; the descent continues through intervening
+/// levels so `@cast(f32) { @fuse { @cast(bf16) { … } } }` is the same stack as
+/// `@cast(f32) @fuse @cast(bf16) { … }` and is rejected the same way. A block
+/// holding anything besides that lone construct is a real block, not a
+/// long-hand stack, and ends the descent.
+fn nested_directive_stack(body: &Block) -> Vec<&Directive> {
+    let mut out = Vec::new();
+    let mut cur = body;
+    loop {
+        let (directives, next) = match (cur.stmts.as_slice(), &cur.tail_expr) {
+            ([], Some(tail)) => match tail.as_ref() {
+                Expr::DirectiveBlock { directives, body, .. } => (directives, body),
+                _ => break,
+            },
+            ([Stmt::DirectiveBlock { directives, body, .. }], None) => (directives, body),
+            _ => break,
+        };
+        out.extend(directives.iter());
+        cur = next;
+    }
+    out
+}
+
+/// The directive as written, for a diagnostic: `` `@cast(bf16)` `` when every
+/// argument is a bare identifier, `` `@cast` `` otherwise. An illegal stack
+/// names both of its directives, and for `@cast @cast` the dtype is the only
+/// thing telling them apart.
+fn render_directive(d: &Directive) -> String {
+    let args: Vec<String> = d.args.iter().filter_map(|a| match a {
+        DArg::Positional(Expr::Ident(n, _)) => Some(n.clone()),
+        DArg::Named { name, value: Expr::Ident(n, _), .. } => Some(format!("{}={}", name, n)),
+        _ => None,
+    }).collect();
+    if args.is_empty() || args.len() != d.args.len() {
+        format!("`@{}`", d.name)
+    } else {
+        format!("`@{}({})`", d.name, args.join(", "))
+    }
 }
 
 fn directive_i64_arg(d: &Directive, name: &str) -> Option<i64> {
@@ -3111,6 +4705,45 @@ fn symdim_mentions_var(dim: &SymDim, name: &str) -> bool {
     }
 }
 
+/// One operand's role in the fusable walk (`Checker::fuse_expr`): a tensor
+/// lane carrying its shape when the checker knows it (`None` — an unresolved
+/// name), or a float-scalar broadcast.
+enum FuseLane {
+    Scalar,
+    Tensor(Option<Shape>),
+}
+
+/// Do two tensor operands of a fused elementwise op agree, lane for lane?
+/// The JIT's `fuse_infer_ty` refuses unequal concrete shapes at
+/// monomorphization, so every dim pair must be *provably* equal here —
+/// `equivalent()` ruling `Equal`, which admits the `?` wildcard. An
+/// `Unknown` pair (`N` against `M` across fn params) is refused: some
+/// monomorphization can differ, and the promise `@fuse` makes is the
+/// kernel's, not the optimist's. This is deliberately stricter than
+/// `Shape::matmul`'s Unknown-tolerant stance — a matmul that mismatches
+/// fails at runtime on both backends, while a fused lane pair that
+/// mismatches would check clean and then split the backends.
+fn fuse_shapes_agree(a: &Shape, b: &Shape) -> bool {
+    a.rank() == b.rank()
+        && a.dims.iter().zip(&b.dims)
+            .all(|(x, y)| matches!(x.equivalent(y), Equiv::Equal))
+}
+
+/// The source span of a statement, for anchoring a diagnostic at the
+/// statement itself rather than at its enclosing block.
+fn stmt_span(stmt: &Stmt) -> &Span {
+    match stmt {
+        Stmt::Let(l) => &l.span,
+        Stmt::If(i) => &i.span,
+        Stmt::Match(m) => &m.span,
+        Stmt::Expr { span, .. } | Stmt::For { span, .. } | Stmt::While { span, .. }
+        | Stmt::Loop { span, .. } | Stmt::Stage { span, .. }
+        | Stmt::Directive { span, .. } | Stmt::DirectiveBlock { span, .. }
+        | Stmt::Return { span, .. } => span,
+        Stmt::Break(span) | Stmt::Continue(span) => span,
+    }
+}
+
 fn stmt_kind(stmt: &Stmt) -> &'static str {
     match stmt {
         Stmt::Let(_) => "let",
@@ -3127,6 +4760,32 @@ fn stmt_kind(stmt: &Stmt) -> &'static str {
         Stmt::Continue(_) => "continue",
         Stmt::Return { .. } => "return",
     }
+}
+
+/// #474: this postfix bracket read as shape arguments — `[2, 2]`, `[SH=2]` —
+/// one `(name?, value)` pair per argument. `None` when the bracket cannot be
+/// shape arguments at all (a slice, `..`, a spread, or an empty bracket), which
+/// keeps it on the indexing path. Mirrors `interp::shape_bracket_args`.
+fn shape_bracket_pairs(op: &PostfixOp) -> Option<Vec<(Option<&str>, &Expr)>> {
+    let pairs: Option<Vec<_>> = match op {
+        PostfixOp::Index(elems) => elems.iter().map(|e| match e {
+            IndexElem::Expr(e) => Some((None, e)),
+            _ => None,
+        }).collect(),
+        PostfixOp::BracketArgs(args) => args.iter().map(|a| match a {
+            CallArg::Positional(e) => Some((None, e)),
+            CallArg::Named { name, value, .. } => Some((Some(name.as_str()), value)),
+            CallArg::Spread(_) => None,
+        }).collect(),
+        _ => None,
+    };
+    pairs.filter(|p| !p.is_empty())
+}
+
+/// #474: does this postfix bracket read as shape arguments rather than as
+/// indexing?
+fn is_shape_bracket(op: &PostfixOp) -> bool {
+    shape_bracket_pairs(op).is_some()
 }
 
 fn symdim_from_type_arg(arg: &TypeArg) -> Option<SymDim> {
@@ -3210,8 +4869,80 @@ fn substitute_shape_args(ty: TyType, args: &HashMap<String, SymDim>) -> TyType {
             args: type_args.into_iter().map(|t| substitute_shape_args(t, args)).collect(),
         },
         TyType::RawPtr(inner) => TyType::RawPtr(Box::new(substitute_shape_args(*inner, args))),
+        // #474: a model's shape argument substitutes like any other dim, which
+        // is the whole point of holding it as one — `Inner[H, W]` under
+        // `H=4, W=5` becomes `Inner[4, 5]` and meets the literal.
+        TyType::Dim(d) => TyType::Dim(substitute_symdim(d, args)),
         TyType::Scalar(_) | TyType::IntLit(_) | TyType::FloatLit(_) | TyType::Enum(_) | TyType::Unit | TyType::Map | TyType::Unknown | TyType::Module { .. } => ty,
     }
+}
+
+/// #474 (parameter position): a model argument is typed bare — a model literal
+/// discards the shape args it was written with — so a parameterized model
+/// parameter (`Box[H, W]`) has nothing here to unify against and the call is
+/// rejected, forcing every call site to spell out `f![2, 2](b, …)`. The dims
+/// are not lost, though: the instance carries them, and the interpreter's
+/// shape-param harvest binds them from the argument itself. So let this pair
+/// through and leave the binding to the call.
+///
+/// Deliberately narrow — a bare model against the *same* model with args, and
+/// nothing else. It is not a general "parameterized and bare are the same
+/// type" rule, and in particular it is not reached from the model-field check,
+/// which is a separate hole.
+/// #474: a model literal that cannot show it fits a parameterized slot.
+///
+/// `compatible_with` lets a `Named` with no args past a `Named` with args —
+/// it has to, because plenty of legitimate values type as a bare model name
+/// and the parameter position leans on it deliberately (see
+/// `model_arg_binds_at_runtime`, where the interpreter's harvest supplies the
+/// dims from the instance at the call). In a *field* slot there is no later
+/// binding step to save it: the field says `Inner[4, 5]` and whatever goes in
+/// is that shape forever after. So a bare literal there was accepted on the
+/// strength of its name alone, and `Inner { px: <a 7x7 buffer> }` sat in a
+/// 4x5 field with `--check` clean — the emptiness read as a wildcard.
+///
+/// It is a unification opportunity instead: a literal whose fields pin its
+/// shape args carries them (`infer_literal_shape_args`) and is compared like
+/// any other. Only one that pins nothing lands here, and it is refused —
+/// nothing about it can be checked, now or later.
+///
+/// Returns the hint for that refusal, or `None` when this pair is not it.
+fn unproven_model_literal(expected: &TyType, got: &TyType, value: Option<&Expr>) -> Option<String> {
+    if !matches!(value, Some(Expr::StructLit { .. })) { return None; }
+    let (TyType::Named { name: e, args: eargs }, TyType::Named { name: g, args: gargs }) =
+        (expected, got) else { return None };
+    // Only a concrete expectation is worth refusing over. An expectation still
+    // written in shape variables has nothing to contradict yet.
+    if e != g || gargs.len() == eargs.len() || eargs.is_empty() { return None; }
+    if !eargs.iter().all(|a| matches!(a, TyType::Dim(SymDim::Const(_)))) { return None; }
+    let dims: Vec<String> = eargs.iter().map(|a| a.to_string()).collect();
+    Some(format!(
+        "write the shape args on the literal — `{}[{}] {{ … }}` — or give it a \
+         field whose own type pins them; a bare `{} {{ … }}` makes no claim the \
+         checker can compare against `{}[{}]`",
+        e, dims.join(", "), e, e, dims.join(", ")))
+}
+
+/// #474: may this type stand as a shape argument? A dim is an integer, so an
+/// int literal or any integral scalar qualifies. `Unknown` qualifies too — an
+/// expression the checker could not type is not evidence of a wrong one, and
+/// refusing it here would reject working programs over a gap elsewhere.
+fn is_integral_shape_arg(ty: &TyType) -> bool {
+    use crate::ast::ScalarType::*;
+    match ty {
+        TyType::IntLit(_) | TyType::Unknown => true,
+        TyType::Scalar(s) => matches!(s,
+            I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | Int4 | Int8),
+        _ => false,
+    }
+}
+
+fn model_arg_binds_at_runtime(param: &TyType, arg: &TyType) -> bool {
+    matches!(
+        (param, arg),
+        (TyType::Named { name: p, args: pargs }, TyType::Named { name: a, args: aargs })
+            if p == a && !pargs.is_empty() && aargs.is_empty()
+    )
 }
 
 fn infer_call_shape_bindings(param: &TyType, arg: &TyType, out: &mut HashMap<String, SymDim>) {
@@ -3242,6 +4973,23 @@ fn infer_call_shape_bindings(param: &TyType, arg: &TyType, out: &mut HashMap<Str
                 infer_call_shape_bindings(p, a, out);
             }
             infer_call_shape_bindings(pr, ar, out);
+        }
+        // #474 (parameter position): a model argument carries the shape args
+        // it was constructed with, so `!b: Box[H, W]` binds H and W from the
+        // instance exactly as a tensor parameter binds them from a shape. The
+        // alternative — every call site spelling `f![2, 3](b, …)` — is what
+        // demoniOS's surface.dmc carries today. An argument written without
+        // its args (an unannotated `let`, a bare literal) simply binds
+        // nothing; the pair still compares, since `compatible_with` reads a
+        // missing argument list as "no claim".
+        (TyType::Named { name: pn, args: pa }, TyType::Named { name: an, args: aa })
+            if pn == an && pa.len() == aa.len() =>
+        {
+            for (p, a) in pa.iter().zip(aa) {
+                if let (TyType::Dim(pd), TyType::Dim(ad)) = (p, a) {
+                    infer_symdim_binding(pd, ad, out);
+                }
+            }
         }
         _ => {}
     }
@@ -3352,106 +5100,200 @@ fn lit_usize(e: &crate::ast::Expr) -> Option<usize> {
     }
 }
 
-/// Collect every identifier *referenced* (read) anywhere in a block — used by
-/// the #398 captured-mutable check. Conservative and read-only; it does not try
-/// to track binding scopes (the caller filters against the type env instead).
-fn collect_body_idents(block: &crate::ast::Block, out: &mut std::collections::HashSet<String>) {
+/// Can a captured `mut` binding of this type carry a gradient (AUTODIFF.md §2,
+/// #398)? Float scalars and float-element tensors do; integers, bools, strings,
+/// enums, models and the rest do not — the tape has no adjoint for them.
+///
+/// `Unknown` (a type the checker could not resolve) is admitted rather than
+/// rejected: the interpreter tapes a capture only when its *runtime value* is a
+/// float scalar or float tensor, so an unresolved binding degrades to "no
+/// gradient field", never to a wrong gradient — and a false error here would
+/// reject working programs.
+fn capture_type_is_differentiable(ty: &TyType) -> bool {
+    match ty {
+        TyType::Unknown => true,
+        TyType::Tensor(elem, _) | TyType::View(elem, _) => elem.is_float(),
+        other => other.is_float(),
+    }
+}
+
+/// The identifiers a `@grad fn` body reads, split by whether the tape can see
+/// the read (#398). Read-only and conservative: it does not track binding
+/// scopes, so the caller filters the names against the type env (checker) or
+/// the module's mutable bindings (interpreter).
+#[derive(Debug, Default)]
+pub(crate) struct BodyRefs {
+    /// Identifiers read *directly* in the differentiated body. These are the
+    /// reads the interpreter's tape records, so a captured mutable among them
+    /// becomes a real tape input with a real adjoint.
+    pub direct: std::collections::HashSet<String>,
+    /// Identifiers read from inside a closure literal in the body. The tape
+    /// does not trace closure bodies, so a captured mutable reached this way
+    /// gets no adjoint and stays a compile-time error.
+    pub in_closure: std::collections::HashSet<String>,
+    /// Names the body *binds* — `let` idents, `for` patterns, closure params.
+    /// A read of one of these is local, not a reference to a module-level
+    /// binding of the same name. Used when scanning a *called* fn for reads of
+    /// a captured mutable, so a callee's own local `b` is not mistaken for the
+    /// module's `!b`.
+    pub bound: std::collections::HashSet<String>,
+    /// Method names invoked on some receiver in this body (`h.contrib()` →
+    /// `contrib`). A plain call is discoverable from `direct` alone, because
+    /// the callee's name *is* an `Expr::Ident`; a method call's name lives in
+    /// a `PostfixOp::Field` and would otherwise be invisible to the call-graph
+    /// walk — which is how a method reading a capture used to slip past the
+    /// captured-mut rule and return a silent half-gradient.
+    pub method_calls: std::collections::HashSet<String>,
+}
+
+impl BodyRefs {
+    /// Does this body read `name` as a free (non-local) identifier, anywhere —
+    /// closure literals included?
+    pub fn reads_free(&self, name: &str) -> bool {
+        !self.bound.contains(name)
+            && (self.direct.contains(name) || self.in_closure.contains(name))
+    }
+}
+
+/// Collect every identifier *referenced* (read) anywhere in a block, keeping
+/// closure-literal reads separate — used by the #398 captured-mutable rule
+/// (`Checker::check_fn`) and by the interpreter's capture set (`call_grad`),
+/// so the diagnostic and the implementation agree on one scan.
+pub(crate) fn collect_body_idents(block: &crate::ast::Block) -> BodyRefs {
     use crate::ast::*;
-    fn walk_e(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    type Set = std::collections::HashSet<String>;
+    fn walk_e(e: &Expr, out: &mut Set, closures: &mut Set, bound: &mut Set, methods: &mut Set) {
         match e {
             Expr::Ident(name, _) => { out.insert(name.clone()); }
-            Expr::BinOp { lhs, rhs, .. } => { walk_e(lhs, out); walk_e(rhs, out); }
-            Expr::UnOp { operand, .. } => walk_e(operand, out),
-            Expr::Cast { expr, .. } => walk_e(expr, out),
-            Expr::Tuple(es, _) | Expr::TensorLit(es, _) => { for e in es { walk_e(e, out); } }
+            Expr::BinOp { lhs, rhs, .. } => { walk_e(lhs, out, closures, bound, methods); walk_e(rhs, out, closures, bound, methods); }
+            Expr::UnOp { operand, .. } => walk_e(operand, out, closures, bound, methods),
+            Expr::Cast { expr, .. } => walk_e(expr, out, closures, bound, methods),
+            Expr::Tuple(es, _) | Expr::TensorLit(es, _) => { for e in es { walk_e(e, out, closures, bound, methods); } }
             Expr::Range { start, end, .. } => {
-                if let Some(s) = start { walk_e(s, out); }
-                if let Some(en) = end { walk_e(en, out); }
+                if let Some(s) = start { walk_e(s, out, closures, bound, methods); }
+                if let Some(en) = end { walk_e(en, out, closures, bound, methods); }
             }
             Expr::Postfix { expr, op, .. } => {
-                walk_e(expr, out);
+                walk_e(expr, out, closures, bound, methods);
+                // `recv.m(...)` parses as Call(Field(recv, "m")): the callee's
+                // name is a `PostfixOp::Field`, never an `Expr::Ident`, so the
+                // plain-call discovery in `direct` cannot see it. Record the
+                // method name so the captured-mut call-graph walk can enter the
+                // method body the same way it enters a called fn's.
+                if matches!(op, PostfixOp::Call(_)) {
+                    if let Expr::Postfix { op: PostfixOp::Field(mname), .. } = &**expr {
+                        methods.insert(mname.clone());
+                    }
+                }
                 match op {
                     PostfixOp::Call(args) | PostfixOp::BracketArgs(args) => {
                         for a in args {
                             match a {
-                                CallArg::Positional(e) | CallArg::Named { value: e, .. } => walk_e(e, out),
+                                CallArg::Positional(e) | CallArg::Named { value: e, .. } => walk_e(e, out, closures, bound, methods),
                                 CallArg::Spread(_) => {}
                             }
                         }
                     }
                     PostfixOp::Index(elems) => {
                         for el in elems {
-                            if let IndexElem::Expr(e) = el { walk_e(e, out); }
+                            if let IndexElem::Expr(e) = el { walk_e(e, out, closures, bound, methods); }
                         }
                     }
-                    PostfixOp::Constructor(fields) => { for (_, e) in fields { walk_e(e, out); } }
+                    PostfixOp::Constructor(fields) => { for (_, e) in fields { walk_e(e, out, closures, bound, methods); } }
                     _ => {}
                 }
             }
             Expr::StructLit { type_args, fields, .. } => {
-                for t in type_args { walk_e(t, out); }
-                for (_, v) in fields { walk_e(v, out); }
+                for t in type_args { walk_e(t, out, closures, bound, methods); }
+                for (_, v) in fields { walk_e(v, out, closures, bound, methods); }
             }
             Expr::If(ie) => {
-                walk_e(&ie.cond, out);
-                walk_block(&ie.then_branch, out);
+                walk_e(&ie.cond, out, closures, bound, methods);
+                walk_block(&ie.then_branch, out, closures, bound, methods);
                 match &ie.else_branch {
-                    Some(ElseBranch::Block(b)) => walk_block(b, out),
-                    Some(ElseBranch::If(i)) => walk_e(&Expr::If(i.clone()), out),
+                    Some(ElseBranch::Block(b)) => walk_block(b, out, closures, bound, methods),
+                    Some(ElseBranch::If(i)) => walk_e(&Expr::If(i.clone()), out, closures, bound, methods),
                     None => {}
                 }
             }
             Expr::Match(m) => {
-                walk_e(&m.scrutinee, out);
+                walk_e(&m.scrutinee, out, closures, bound, methods);
                 for arm in &m.arms {
-                    if let Some(g) = &arm.guard { walk_e(g, out); }
-                    walk_e(&arm.body, out);
+                    pat_names(&arm.pattern, bound);
+                    if let Some(g) = &arm.guard { walk_e(g, out, closures, bound, methods); }
+                    walk_e(&arm.body, out, closures, bound, methods);
                 }
             }
-            Expr::Block(b) => walk_block(b, out),
-            Expr::DirectiveBlock { body, .. } => walk_block(body, out),
+            Expr::Block(b) => walk_block(b, out, closures, bound, methods),
+            Expr::DirectiveBlock { body, .. } => walk_block(body, out, closures, bound, methods),
             // #398: a closure BODY can still capture module-level mutable state
             // (`let !bias` referenced inside `fn() { sum(bias) }`). Recurse so the
-            // captured-mutable check sees those free references, but exclude the
-            // closure's OWN params — they shadow and are not captures. Skipping
-            // the whole FnLit (as before) let a capture hide inside a closure and
-            // slip past the check, silently yielding an opaque `grads.<name>`.
+            // captured-mutable rule sees those free references — but book them as
+            // `in_closure`: the tape never enters a closure body, so a capture
+            // reached only this way is not differentiable. Exclude the closure's
+            // OWN params — they shadow and are not captures. Reads nested inside
+            // a further closure are in-closure too.
             Expr::FnLit(fl) => {
-                let mut inner = std::collections::HashSet::new();
-                walk_block(&fl.body, &mut inner);
+                let mut inner = Set::new();
+                let mut inner_closures = Set::new();
+                // The closure's own bindings stay inside it — they must not
+                // mask an outer read of the same name in `bound`.
+                let mut inner_bound = Set::new();
+                walk_block(&fl.body, &mut inner, &mut inner_closures, &mut inner_bound, methods);
+                inner.extend(inner_closures);
                 for p in &fl.params { inner.remove(&p.name); }
-                out.extend(inner);
+                closures.extend(inner);
             }
             // An arena/vault/stream block feeding the loss can likewise carry a
             // captured reference — recurse into its body too.
-            Expr::ArenaBlock(ab) => walk_block(&ab.body, out),
+            Expr::ArenaBlock(ab) => walk_block(&ab.body, out, closures, bound, methods),
             Expr::Literal(..) | Expr::Nil(_) | Expr::Underscore(_) | Expr::Spread(_) => {}
         }
     }
-    fn walk_block(b: &Block, out: &mut std::collections::HashSet<String>) {
-        for s in &b.stmts { walk_stmt(s, out); }
-        if let Some(t) = &b.tail_expr { walk_e(t, out); }
+    fn walk_block(b: &Block, out: &mut Set, closures: &mut Set, bound: &mut Set, methods: &mut Set) {
+        for s in &b.stmts { walk_stmt(s, out, closures, bound, methods); }
+        if let Some(t) = &b.tail_expr { walk_e(t, out, closures, bound, methods); }
     }
-    fn walk_stmt(s: &Stmt, out: &mut std::collections::HashSet<String>) {
-        match s {
-            Stmt::Let(l) => walk_e(&l.value, out),
-            Stmt::Expr { lhs, assign, .. } => {
-                walk_e(lhs, out);
-                if let Some((_, rhs)) = assign { walk_e(rhs, out); }
+    /// Names a pattern binds (`let (a, b)`, `for i in …`, a match arm's
+    /// payload binders). Recorded so a callee's own local of the same name is
+    /// not read as a reference to a module-level binding.
+    fn pat_names(p: &Pattern, bound: &mut Set) {
+        match p {
+            Pattern::Ident(n, _) if n != "_" => { bound.insert(n.clone()); }
+            Pattern::Tuple(ps, _) => { for sub in ps { pat_names(sub, bound); } }
+            Pattern::Bind(a, b, _) => { pat_names(a, bound); pat_names(b, bound); }
+            Pattern::EnumVariant { bindings, .. } => {
+                for sub in bindings { pat_names(sub, bound); }
             }
-            Stmt::Return { value: Some(e), .. } => walk_e(e, out),
-            Stmt::If(ie) => walk_e(&Expr::If(Box::new(ie.clone())), out),
-            Stmt::Match(m) => walk_e(&Expr::Match(Box::new(m.clone())), out),
-            Stmt::For { iter, body, .. } => { walk_e(iter, out); walk_block(body, out); }
-            Stmt::While { cond, body, .. } => { walk_e(cond, out); walk_block(body, out); }
-            Stmt::Loop { body, .. } => walk_block(body, out),
-            Stmt::Stage { body, .. } => walk_e(body, out),
-            Stmt::Directive { inner, .. } => walk_stmt(inner, out),
-            Stmt::DirectiveBlock { body, .. } => walk_block(body, out),
+            _ => {}
+        }
+    }
+    fn walk_stmt(s: &Stmt, out: &mut Set, closures: &mut Set, bound: &mut Set, methods: &mut Set) {
+        match s {
+            Stmt::Let(l) => { pat_names(&l.pattern, bound); walk_e(&l.value, out, closures, bound, methods) }
+            Stmt::Expr { lhs, assign, .. } => {
+                walk_e(lhs, out, closures, bound, methods);
+                if let Some((_, rhs)) = assign { walk_e(rhs, out, closures, bound, methods); }
+            }
+            Stmt::Return { value: Some(e), .. } => walk_e(e, out, closures, bound, methods),
+            Stmt::If(ie) => walk_e(&Expr::If(Box::new(ie.clone())), out, closures, bound, methods),
+            Stmt::Match(m) => walk_e(&Expr::Match(Box::new(m.clone())), out, closures, bound, methods),
+            Stmt::For { pattern, iter, body, .. } => {
+                pat_names(pattern, bound);
+                walk_e(iter, out, closures, bound, methods);
+                walk_block(body, out, closures, bound, methods);
+            }
+            Stmt::While { cond, body, .. } => { walk_e(cond, out, closures, bound, methods); walk_block(body, out, closures, bound, methods); }
+            Stmt::Loop { body, .. } => walk_block(body, out, closures, bound, methods),
+            Stmt::Stage { body, .. } => walk_e(body, out, closures, bound, methods),
+            Stmt::Directive { inner, .. } => walk_stmt(inner, out, closures, bound, methods),
+            Stmt::DirectiveBlock { body, .. } => walk_block(body, out, closures, bound, methods),
             Stmt::Return { value: None, .. } | Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
-    walk_block(block, out);
+    let mut refs = BodyRefs::default();
+    walk_block(block, &mut refs.direct, &mut refs.in_closure, &mut refs.bound, &mut refs.method_calls);
+    refs
 }
 
 impl Expr {
@@ -3564,6 +5406,7 @@ fn collect_writeback_warnings(body: &Block, out: &mut Vec<TypeError>) {
                     name
                 ),
                 span: let_span.clone(),
+                shapes: None,
                 hint: Some(
                     "to mutate the tensor, assign through the index instead, e.g. `t[i] = ...`".to_string(),
                 ),

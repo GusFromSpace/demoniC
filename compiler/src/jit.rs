@@ -26,7 +26,7 @@
 //! diagnostic pointing at the offending span and a hint to use `dmc run`.
 //! Builtins are emitted as runtime symbols (e.g. print_i64/print_f64/…).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use cranelift::codegen::ir::{AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, UserFuncName};
@@ -65,6 +65,16 @@ pub struct JitError {
     /// a genuine miscompile whose text happened to contain "slice 1" would have
     /// been downgraded to an allowlistable gap.
     pub kind: JitErrorKind,
+    /// Which refusal class this is (#485). `Some` for every
+    /// `JitErrorKind::Unsupported`, `None` for a `JitErrorKind::Error` — a
+    /// defect has no class, that is what makes it a defect.
+    ///
+    /// `kind` says *whether* the JIT can be expected to handle the program;
+    /// this says *what kind of thing* it declined. Roadmap §2 wants the
+    /// JIT-support table generated rather than hand-maintained, and a table
+    /// generated from prose is a table generated from something that changes
+    /// every time a sentence is reworded.
+    pub refusal: Option<Refusal>,
 }
 
 /// Whether a `JitError` is a deliberate refusal or a failure (#480).
@@ -76,6 +86,112 @@ pub enum JitErrorKind {
     /// The JIT deliberately declines to lower this construct; `dmc run` has the
     /// full semantics. Expected, and allowlistable by the differential tools.
     Unsupported,
+}
+
+/// The class of a JIT refusal — a stable machine code for "this kind of thing
+/// is outside the lowered subset" (#485).
+///
+/// The class is the *nature* of the refusal, not its context: an f32-only op
+/// inside `@grad fn` is `F32Only`, not `Grad`, because "widen it to f32" is the
+/// action either way. `Grad` is for constructs the backward pass itself cannot
+/// take, which have no meaning outside a `@grad fn`.
+///
+/// Codes are namespaced `jit-*` so they never collide with the checker's tag
+/// vocabulary (`port-forbidden`, `decode-type`, …). **Codes are append-only:**
+/// a class may be added, and a site may be reclassified to a *finer* class, but
+/// a code that has appeared in a release is not renamed or given a new meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A top-level item form the JIT does not lower.
+    Item,
+    /// A multi-file `use` import. The JIT is single-file (#15 slice 1).
+    Import,
+    /// An `extern` declaration form.
+    Extern,
+    /// A function signature the JIT cannot build (parameter forms).
+    Signature,
+    /// A directive in a position the JIT does not lower.
+    Directive,
+    /// A syntactic construct with no lowering.
+    Construct,
+    /// A binding or match pattern the JIT does not destructure.
+    Pattern,
+    /// A call-argument form (named, spread, non-positional).
+    ArgForm,
+    /// An assignment target or compound-assignment operator.
+    AssignForm,
+    /// A loop form.
+    LoopForm,
+    /// A call through a value rather than a name.
+    IndirectCall,
+    /// A call to a function the JIT has no lowering for.
+    UnknownFn,
+    /// An operator applied to an operand type it is not lowered for.
+    OperandType,
+    /// The arms of an `if`/`match` disagree on type.
+    BranchType,
+    /// The op is lowered for f32 tensors only.
+    F32Only,
+    /// The op needs a statically known shape or rank.
+    DynamicShape,
+    /// The op is lowered over one axis only.
+    Axis,
+    /// A construct the JIT's `@grad` subset cannot differentiate.
+    Grad,
+    /// `@grad @grad` over a builtin with no second-order rule.
+    SecondOrder,
+}
+
+impl Refusal {
+    /// The stable machine code. Part of the `--json` schema; see `diag.rs`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Refusal::Item => "jit-item",
+            Refusal::Import => "jit-import",
+            Refusal::Extern => "jit-extern",
+            Refusal::Signature => "jit-signature",
+            Refusal::Directive => "jit-directive",
+            Refusal::Construct => "jit-construct",
+            Refusal::Pattern => "jit-pattern",
+            Refusal::ArgForm => "jit-arg-form",
+            Refusal::AssignForm => "jit-assign-form",
+            Refusal::LoopForm => "jit-loop-form",
+            Refusal::IndirectCall => "jit-indirect-call",
+            Refusal::UnknownFn => "jit-unknown-fn",
+            Refusal::OperandType => "jit-operand-type",
+            Refusal::BranchType => "jit-branch-type",
+            Refusal::F32Only => "jit-f32-only",
+            Refusal::DynamicShape => "jit-dynamic-shape",
+            Refusal::Axis => "jit-axis",
+            Refusal::Grad => "jit-grad",
+            Refusal::SecondOrder => "jit-second-order",
+        }
+    }
+
+    /// Every class, in code order — the roster the vocabulary tests walk. A
+    /// variant added without a line here fails `every_refusal_class_is_listed`.
+    #[cfg(test)]
+    pub const ALL: &'static [Refusal] = &[
+        Refusal::ArgForm,
+        Refusal::AssignForm,
+        Refusal::Axis,
+        Refusal::BranchType,
+        Refusal::Construct,
+        Refusal::Directive,
+        Refusal::DynamicShape,
+        Refusal::Extern,
+        Refusal::F32Only,
+        Refusal::Grad,
+        Refusal::Import,
+        Refusal::IndirectCall,
+        Refusal::Item,
+        Refusal::LoopForm,
+        Refusal::OperandType,
+        Refusal::Pattern,
+        Refusal::SecondOrder,
+        Refusal::Signature,
+        Refusal::UnknownFn,
+    ];
 }
 
 impl std::fmt::Display for JitError {
@@ -98,26 +214,52 @@ fn err<T>(span: &Span, msg: impl Into<String>) -> Result<T, JitError> {
     Err(JitError {
         msg: msg.into(), line: span.line, col: span.col,
         kind: JitErrorKind::Error,
+        refusal: None,
     })
 }
 
 /// The JIT declines to lower `what`. Always `JitErrorKind::Unsupported`.
-fn unsupported<T>(span: &Span, what: &str) -> Result<T, JitError> {
+///
+/// `class` is required rather than defaulted (#485): a refusal with no class is
+/// a row the generated support table cannot carry, and the compiler is the only
+/// thing that can make "every refusal has one" true by construction.
+fn unsupported<T>(span: &Span, class: Refusal, what: &str) -> Result<T, JitError> {
     Err(JitError {
         msg: format!("{}; use `dmc run` for full semantics", what),
         line: span.line, col: span.col,
         kind: JitErrorKind::Unsupported,
+        refusal: Some(class),
     })
 }
 
 /// `unsupported` for sites whose message is already a full sentence — used to
 /// reclassify refusals that were historically raised through `err` and so were
 /// scored as divergences by the probe battery (#480).
-fn unsupported_msg<T>(span: &Span, msg: impl Into<String>) -> Result<T, JitError> {
+fn unsupported_msg<T>(span: &Span, class: Refusal, msg: impl Into<String>) -> Result<T, JitError> {
     Err(JitError {
         msg: msg.into(), line: span.line, col: span.col,
         kind: JitErrorKind::Unsupported,
+        refusal: Some(class),
     })
+}
+
+/// Render a `define_function` failure with the detail attached.
+///
+/// A malformed-IR rejection arrives as `ModuleError::Compilation(
+/// CodegenError::Verifier(..))`, whose `Display` is the bare string
+/// "Verifier errors" — the per-instruction complaints live one level down and
+/// were being dropped. #422 wall 2 was reported as exactly that bare string,
+/// which is why it stayed undiagnosed: the message named the function and
+/// nothing else. Emitting invalid IR is always a compiler bug, so this is a
+/// diagnostic of last resort, not a user-facing contract — but when it fires
+/// it must say which instruction the verifier rejected.
+fn define_detail(e: &cranelift_module::ModuleError) -> String {
+    if let cranelift_module::ModuleError::Compilation(
+        cranelift::codegen::CodegenError::Verifier(errs)) = e
+    {
+        return format!("Verifier errors: {}", errs);
+    }
+    e.to_string()
 }
 
 // ─── Scalar type bridge ──────────────────────────────────────────────────────
@@ -125,6 +267,22 @@ fn unsupported_msg<T>(span: &Span, msg: impl Into<String>) -> Result<T, JitError
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScalarKind {
     I32, I64, F32, F64, Bool, Nil,
+    /// #544: the remaining fixed-width integer kinds. Unlike `I32` (a real
+    /// `cl::I32`) these are **i64-backed and masked**: the machine value is a
+    /// `cl::I64` holding the wrapped result sign-extended (`I8`/`I16`/`I4`) or
+    /// zero-extended (`U8`/`U16`/`U32`), and every arithmetic op re-applies
+    /// that mask (`mask_to_kind`). That is the cheaper of the two routes #544
+    /// names, and it is exactly what the interpreter's `IW` does, which is what
+    /// keeps the two backends on the same number.
+    ///
+    /// Zero-extension makes the unsigned kinds non-negative i64s, so the signed
+    /// `sdiv`/`srem`/`sshr`/`icmp` the lowering already emits ARE the unsigned
+    /// operations — no unsigned instruction set is needed. `u64` has no variant
+    /// here: it stays `I64` (see `interp::IW`), where the 64-bit wrap is
+    /// bit-identical and the i64 backing has no room for the top half of the
+    /// unsigned range. `int8` shares `I8` and `int4` is `I4` (SPEC §3.1's
+    /// packed signed 8-/4-bit types).
+    I8, I16, I4, U8, U16, U32,
     /// A maybe-nil i64 — the result of `map_get`, which is dynamically typed
     /// (`Unknown`) and returns `nil` on a missing key in the interpreter (#300.4).
     /// Packed into an I128: high bit = present flag, low 64 bits = the value.
@@ -147,23 +305,73 @@ impl ScalarKind {
             ScalarKind::Bool => cl::I8,
             ScalarKind::Nil  => cl::I8,
             ScalarKind::OptI64 => cl::I128,
+            // #544: masked, i64-backed (see the variant docs).
+            ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
+            | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32 => cl::I64,
         }
     }
 
     fn is_int(self) -> bool {
-        matches!(self, ScalarKind::I32 | ScalarKind::I64)
+        matches!(self, ScalarKind::I32 | ScalarKind::I64
+            | ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
+            | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32)
     }
     fn is_float(self) -> bool {
         matches!(self, ScalarKind::F32 | ScalarKind::F64)
     }
     fn is_bool(self) -> bool { matches!(self, ScalarKind::Bool) }
+
+    /// #544: an integer kind whose machine representation is WIDER than its
+    /// arithmetic width, so every op on it has to be re-masked. `I32` is not
+    /// one of these — it is a real `cl::I32` and Cranelift wraps it natively.
+    fn is_masked_int(self) -> bool {
+        matches!(self, ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
+            | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32)
+    }
+    /// Whether an integer kind is signed. Only a signed kind has a `MIN / -1`,
+    /// and only a signed kind sign-extends when masked.
+    fn is_signed_int(self) -> bool {
+        matches!(self, ScalarKind::I32 | ScalarKind::I64
+            | ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4)
+    }
+
+    /// MACHINE width of the value, in bits — what a slot has to hold and what
+    /// `widen_to_i64` and `TensorTy::elem_bytes` ask about. A masked narrow
+    /// kind answers 64: that is the register it lives in.
     fn bits(self) -> u8 {
         match self {
             ScalarKind::I32 | ScalarKind::F32 => 32,
             ScalarKind::I64 | ScalarKind::F64 => 64,
             ScalarKind::Bool | ScalarKind::Nil => 8,
             ScalarKind::OptI64 => 128,
+            ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
+            | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32 => 64,
         }
+    }
+
+    /// ARITHMETIC width of an integer kind, in bits (#544) — the width the
+    /// value wraps at, which is what sizes the `<<` range guard and names the
+    /// range in a `/`-overflow diagnostic. Equal to `bits()` for every kind
+    /// whose machine width IS its arithmetic width.
+    fn int_bits(self) -> u8 {
+        match self {
+            ScalarKind::I8 | ScalarKind::U8 => 8,
+            ScalarKind::I16 | ScalarKind::U16 => 16,
+            ScalarKind::U32 => 32,
+            ScalarKind::I4 => 4,
+            other => other.bits(),
+        }
+    }
+
+    /// The most negative value at this kind's arithmetic width, or `None` for
+    /// an unsigned kind (which has no `MIN / -1` — its operands are
+    /// zero-extended, so `-1` is not a value it can hold).
+    fn int_min(self) -> Option<i64> {
+        if !self.is_signed_int() { return None; }
+        Some(match self {
+            ScalarKind::I64 => i64::MIN,
+            other => -(1i64 << (other.int_bits() - 1)),
+        })
     }
 
     fn name(self) -> &'static str {
@@ -175,7 +383,46 @@ impl ScalarKind {
             ScalarKind::Bool => "bool",
             ScalarKind::Nil => "nil",
             ScalarKind::OptI64 => "i64?",
+            ScalarKind::I8  => "i8",
+            ScalarKind::I16 => "i16",
+            ScalarKind::I4  => "int4",
+            ScalarKind::U8  => "u8",
+            ScalarKind::U16 => "u16",
+            ScalarKind::U32 => "u32",
         }
+    }
+}
+
+/// The `ScalarKind` a fixed-width integer scalar type lowers to (#544). The
+/// mirror of `interp::scalar_int_width` — the two tables must agree or the
+/// backends wrap at different widths. `u64` maps to `I64`: the 64-bit wrap is
+/// bit-identical and neither backend can hold the top half of the u64 range.
+fn narrow_scalar_kind(s: &ScalarType) -> Option<ScalarKind> {
+    Some(match s {
+        ScalarType::I8 | ScalarType::Int8 => ScalarKind::I8,
+        ScalarType::I16 => ScalarKind::I16,
+        ScalarType::Int4 => ScalarKind::I4,
+        ScalarType::U8  => ScalarKind::U8,
+        ScalarType::U16 => ScalarKind::U16,
+        ScalarType::U32 => ScalarKind::U32,
+        ScalarType::U64 => ScalarKind::I64,
+        _ => return None,
+    })
+}
+
+/// Wrap a compile-time constant into an integer kind's width, two's-complement.
+/// The constant-folding twin of `Lowerer::mask_to_kind`, and the mirror of
+/// `interp::IW::wrap` — the number a suffixed literal is born as.
+fn mask_const_to_kind(n: i64, k: ScalarKind) -> i64 {
+    match k {
+        ScalarKind::I32 => n as i32 as i64,
+        ScalarKind::I16 => n as i16 as i64,
+        ScalarKind::I8  => n as i8  as i64,
+        ScalarKind::I4  => ((n & 0xf) ^ 0x8) - 0x8,
+        ScalarKind::U32 => n as u32 as i64,
+        ScalarKind::U16 => n as u16 as i64,
+        ScalarKind::U8  => n as u8  as i64,
+        _ => n,
     }
 }
 
@@ -244,6 +491,11 @@ fn scalar_from_ast(ty: &Type) -> Result<ScalarKind, JitError> {
             ScalarType::F64  => Ok(ScalarKind::F64),
             ScalarType::Bool => Ok(ScalarKind::Bool),
             ScalarType::Nil  => Ok(ScalarKind::Nil),
+            // #544: the remaining fixed-width integers are masked i64-backed
+            // kinds. Before this they were refused outright, so `let a: i16`
+            // and `fn f(ch: u32)` could not be JIT-compiled at all.
+            other if narrow_scalar_kind(other).is_some() =>
+                Ok(narrow_scalar_kind(other).unwrap()),
             other => err(&span, format!(
                 "scalar type `{:?}` not yet supported by the JIT (slice 1)", other,
             )),
@@ -434,6 +686,21 @@ enum TyKind {
     Model(String, Vec<i64>),
     /// i64 pointer to forge-allocated [len: i64, data: u8*]
     Str,
+    /// An open process port's handle (PORTS.md §2). The runtime value is the
+    /// same forge string `crate::ports` mints (`port#<id>:<lang>`; a NULL
+    /// pointer is `nil`, which is what a failed `port_open` hands back) — but
+    /// the *type* is deliberately not `Str`. The interpreter carries a handle
+    /// as `Value::Opaque`, which is not a str there either: it cannot be
+    /// printed as text, concatenated, indexed, or compared to another handle.
+    /// A distinct `TyKind` is what lets the JIT refuse the same things instead
+    /// of quietly treating a handle as an ordinary string.
+    /// A process-port handle, carrying the runtime name `L` from its
+    /// `Port[L]` annotation when it had one. Handles are all one i64
+    /// pointer at run time; `L` is carried so a `Port[lua]` parameter can
+    /// refuse a python handle instead of taking it silently (SPEC §3.11).
+    /// `None` is a bare `Port`, and also what `port_open` yields — its
+    /// runtime name is a value, not a static fact.
+    Port(Option<String>),
     /// i64 raw pointer to Box<HashMap<String, i64>> (process-lifetime allocation)
     Map,
     /// A fixed-size array of KV streaming caches: `[KV[T, [.., ~, ..]]; N]`.
@@ -488,6 +755,8 @@ impl TyKind {
             TyKind::DynTensor(d) => d.render(),
             TyKind::Model(name, _) => name.clone(),
             TyKind::Str => "str".to_string(),
+            TyKind::Port(None) => "Port".to_string(),
+            TyKind::Port(Some(l)) => format!("Port[{}]", l),
             TyKind::Map => "Map".to_string(),
             TyKind::KvArray(kv, n) => format!("[{}; {}]", kv.render(), n),
             TyKind::ModelArray(name, n, _) => format!("[{}; {}]", name, n),
@@ -521,6 +790,7 @@ impl TyKind {
             TyKind::DynTensor(_) => cl::I64, // dyn tensors are i64 header pointers
             TyKind::Model(_, _)  => cl::I64,  // model instances are i64 pointers
             TyKind::Str       => cl::I64,  // strings are i64 forge pointers
+            TyKind::Port(_)   => cl::I64,  // port handles are i64 forge pointers
             TyKind::Map       => cl::I64,  // maps are i64 raw pointers
             TyKind::KvArray(_, _) => cl::I64, // KV arrays are i64 pointers to pointer arrays
             TyKind::ModelArray(_, _, _) => cl::I64, // model arrays are i64 pointers to pointer arrays
@@ -533,6 +803,9 @@ impl TyKind {
     }
     fn is_tensor(&self) -> bool { matches!(self, TyKind::Tensor(_)) }
     fn is_str(&self) -> bool { matches!(self, TyKind::Str) }
+    /// A process-port handle (PORTS.md §2). Never `is_str`: the handle is
+    /// opaque in both backends, so every str operation must miss it.
+    fn is_port(&self) -> bool { matches!(self, TyKind::Port(_)) }
     fn is_map(&self) -> bool { matches!(self, TyKind::Map) }
 }
 
@@ -660,7 +933,7 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                     }
                 }
             }
-            let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "KV type must contain a streaming `~` axis".into(),
                 line: span.line, col: span.col,
             })?;
@@ -672,6 +945,13 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
         Type::Named { name, span, .. } if name == "any" => err(span,
             "`any`-typed values are dynamically typed and cannot be JIT-compiled; use `dmc run`"),
         Type::Named { name, .. } if name == "Map" => Ok(TyKind::Map),
+        // `Port[python]` / bare `Port` (SPEC §3.11) — an open port's handle.
+        // SPEC says a handle "may be passed, returned, and closed explicitly",
+        // so it has to be writable in a signature; the runtime name in the
+        // brackets is not carried, because the JIT never dispatches on it (the
+        // shared registry does, from the handle text).
+        Type::Named { name, .. } if name == "Port" =>
+            Ok(TyKind::Port(crate::ports::port_type_lang(ty))),
         Type::Named { name, args, .. } => Ok(TyKind::Model(name.clone(), type_named_dims(args, env))),
         // `[KV[T, [.., ~, ..]]; N]` — a fixed-size array of KV cache pointers.
         // The element type may be bf16 (quantized weights); map to f32 internally
@@ -731,7 +1011,11 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
                 ScalarType::F32  => ScalarKind::F32,
                 ScalarType::F64  => ScalarKind::F64,
                 ScalarType::Bool => ScalarKind::Bool,
-                _ => ScalarKind::I64, // str, nil, etc. → opaque i64 pointer
+                // #544: a narrow-int model FIELD keeps its declared width, the
+                // same way the interpreter's `coerce_scalar_width` applies one
+                // at a declared field. Everything else (str, nil, …) is still
+                // an opaque i64 pointer.
+                other => narrow_scalar_kind(other).unwrap_or(ScalarKind::I64),
             };
             Ok(TyKind::Scalar(sk))
         }
@@ -847,6 +1131,33 @@ fn is_int_literal_leaf(e: &Expr) -> bool {
     }
 }
 
+/// The value and explicit type suffix of an integer-literal operand, seeing
+/// through a leading unary `-` the way `const_int_axis` does. `None` for
+/// anything that is not a *directly written* integer literal — only syntactic
+/// literals adopt a context (SPEC.md §3.1, and #295's range check draws the
+/// same line), so `200 - 100` is deliberately not one.
+fn int_literal_operand(e: &Expr) -> Option<(i64, Option<&ScalarType>)> {
+    match e {
+        Expr::Literal(Literal::Int(n, sfx), _) => Some((*n, sfx.as_ref())),
+        Expr::UnOp { op: UnOp::Neg, operand, .. } =>
+            int_literal_operand(operand).map(|(n, sfx)| (n.wrapping_neg(), sfx)),
+        _ => None,
+    }
+}
+
+/// The `ScalarKind` an integer literal's type suffix names (#545). Every
+/// fixed-width integer suffix is a width origin — SPEC §3.1, "an explicit type
+/// suffix on an integer literal types the literal concretely" — so this is the
+/// full table, not just the two kinds #541 could see. `None` only for a suffix
+/// that is not an integer type at all.
+fn scalar_kind_of_int_suffix(s: &ScalarType) -> Option<ScalarKind> {
+    match s {
+        ScalarType::I32 => Some(ScalarKind::I32),
+        ScalarType::I64 => Some(ScalarKind::I64),
+        other => narrow_scalar_kind(other),
+    }
+}
+
 fn const_int_axis(e: &Expr) -> Option<i64> {
     match e {
         Expr::Literal(Literal::Int(n, _), _) => Some(*n),
@@ -866,7 +1177,7 @@ fn resolve_shape_elem(
         ShapeElem::Expr(e) => resolve_shape_expr(e, env, span),
         ShapeElem::Wildcard(_) | ShapeElem::Streaming(_) | ShapeElem::Spread(_) => {
             err(span,
-                "JIT requires concrete dimensions (`~`, `..`, `_` need slice-4 support)")
+                "JIT requires concrete dimensions (`~`, `..`, `?` need slice-4 support)")
         }
     }
 }
@@ -878,7 +1189,7 @@ fn resolve_shape_expr(
 ) -> Result<i64, JitError> {
     match e {
         Expr::Literal(Literal::Int(n, _), _) => Ok(*n),
-        Expr::Ident(name, ispan) => env.get(name).copied().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        Expr::Ident(name, ispan) => env.get(name).copied().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("unbound shape parameter `{}`", name),
             line: ispan.line, col: ispan.col,
         }),
@@ -896,6 +1207,63 @@ fn resolve_shape_expr(
             }
         }
         _ => err(span, "shape elements must be literal ints, idents, or arithmetic"),
+    }
+}
+
+/// #511: the linear form `const + Σ coeff·ident` of an index expression, over
+/// the idents NOT bound in `env` (bound idents fold into the constant). Two
+/// slice bounds may each be runtime while their DIFFERENCE is compile-time
+/// (`i..i+1`): subtracting the linear forms cancels the ident terms and leaves
+/// the constant extent. Conservative: `None` whenever the expression is not
+/// affine in its idents.
+fn affine_index_expr(
+    e: &Expr,
+    env: &HashMap<String, i64>,
+) -> Option<(i64, HashMap<String, i64>)> {
+    match e {
+        Expr::Literal(Literal::Int(n, _), _) => Some((*n, HashMap::new())),
+        Expr::Ident(name, _) => match env.get(name) {
+            Some(v) => Some((*v, HashMap::new())),
+            None => Some((0, HashMap::from([(name.clone(), 1i64)]))),
+        },
+        // `(e)` — the parser builds a 1-tuple for grouping.
+        Expr::Tuple(es, _) if es.len() == 1 => affine_index_expr(&es[0], env),
+        Expr::UnOp { op: UnOp::Neg, operand, .. } => {
+            let (c, mut t) = affine_index_expr(operand, env)?;
+            for v in t.values_mut() { *v = -*v; }
+            Some((-c, t))
+        }
+        Expr::BinOp { op, lhs, rhs, .. } => {
+            let (lc, lt) = affine_index_expr(lhs, env)?;
+            let (rc, rt) = affine_index_expr(rhs, env)?;
+            match op {
+                BinOp::Add | BinOp::Sub => {
+                    let sign = if matches!(op, BinOp::Add) { 1 } else { -1 };
+                    let mut t = lt;
+                    for (k, v) in rt { *t.entry(k).or_insert(0) += sign * v; }
+                    t.retain(|_, v| *v != 0);
+                    Some((lc + sign * rc, t))
+                }
+                // Linear only: multiplication needs a pure-constant side.
+                BinOp::Mul if rt.is_empty() => {
+                    let mut t = lt;
+                    for v in t.values_mut() { *v *= rc; }
+                    t.retain(|_, v| *v != 0);
+                    Some((lc * rc, t))
+                }
+                BinOp::Mul if lt.is_empty() => {
+                    let mut t = rt;
+                    for v in t.values_mut() { *v *= lc; }
+                    t.retain(|_, v| *v != 0);
+                    Some((lc * rc, t))
+                }
+                BinOp::Div if rt.is_empty() && lt.is_empty() && rc != 0 => {
+                    Some((lc / rc, HashMap::new()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1028,6 +1396,10 @@ pub(crate) const JIT_BUILTINS: &[&str] = &[
     "print_i64", "print_f64", "print_bool", "print_nil",
     // HashMap builtins.
     "map_new", "map_get", "map_set", "map_contains",
+    // Process ports (PORTS.md §7.1) — same registry as the interpreter.
+    "port_open", "port_call", "port_close",
+    // Tensor copy mode (PORTS.md §3.2) — same wire format as the interpreter.
+    "port_tensor_encode", "port_tensor_decode",
     // Terminal / timing builtins (parity with the interpreter).
     "chr", "sleep_ms", "flush",
     // Stringification — sugar for `x as str`, sharing its formatters.
@@ -1225,13 +1597,13 @@ impl Jit {
         // time cost is small (single-digit ms for these kernels) and the
         // runtime win on tight loops / recursion is large.
         flag_builder.set("opt_level", "speed").map_err(setting_err)?;
-        let isa_builder = cranelift_native::builder().map_err(|e| JitError { kind: JitErrorKind::Error,
+        let isa_builder = cranelift_native::builder().map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("host ISA unsupported: {}", e),
             line: 0, col: 0,
         })?;
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
-            .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("isa finish: {}", e), line: 0, col: 0 })?;
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("isa finish: {}", e), line: 0, col: 0 })?;
 
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         // Builtins exposed to demoniC source by symbol name.
@@ -1280,12 +1652,21 @@ impl Jit {
         builder.symbol("__dmc_str_from_int",     dmc_str_from_int     as *const u8);
         builder.symbol("__dmc_str_from_f64",     dmc_str_from_f64     as *const u8);
         builder.symbol("__dmc_str_from_bool",    dmc_str_from_bool    as *const u8);
+        builder.symbol("__dmc_str_starts_with",  dmc_str_starts_with  as *const u8);
         builder.symbol("__dmc_chr",              dmc_chr              as *const u8);
         builder.symbol("__dmc_sleep_ms",         dmc_sleep_ms         as *const u8);
         builder.symbol("__dmc_flush",            dmc_flush            as *const u8);
         builder.symbol("__dmc_match_trap",       dmc_match_trap       as *const u8);
         builder.symbol("__dmc_nil_trap",         dmc_nil_trap         as *const u8);
         builder.symbol("__dmc_print_str",        dmc_print_str        as *const u8);
+        // Process ports (PORTS.md §7.1) — the protocol itself is in crate::ports.
+        builder.symbol("__dmc_port_render", dmc_port_render as *const u8);
+        builder.symbol("__dmc_port_open",  dmc_port_open  as *const u8);
+        builder.symbol("__dmc_port_expect_lang", dmc_port_expect_lang as *const u8);
+        builder.symbol("__dmc_port_call",  dmc_port_call  as *const u8);
+        builder.symbol("__dmc_port_close", dmc_port_close as *const u8);
+        builder.symbol("__dmc_port_tensor_encode", dmc_port_tensor_encode as *const u8);
+        builder.symbol("__dmc_port_tensor_decode", dmc_port_tensor_decode as *const u8);
         // HashMap runtime functions.
         builder.symbol("__dmc_map_new",      dmc_map_new      as *const u8);
         builder.symbol("__dmc_map_get",      dmc_map_get      as *const u8);
@@ -1316,6 +1697,8 @@ impl Jit {
         builder.symbol("__dmc_trit_sparsity",  dmc_trit_sparsity  as *const u8);
         // #259: OOB diagnostic helper — prints a clean error and exits(1).
         builder.symbol("__dmc_oob_trap", dmc_oob_trap as *const u8);
+        // #511: runtime-slice-start window trap — prints a clean error and exits(1).
+        builder.symbol("__dmc_slice_oob_trap", dmc_slice_oob_trap as *const u8);
         builder.symbol("__dmc_kv_cap_trap", dmc_kv_cap_trap as *const u8);
         // #265: runtime shift-count range trap — prints a clean error and exits(1).
         builder.symbol("__dmc_shift_trap", dmc_shift_trap as *const u8);
@@ -1411,19 +1794,23 @@ impl Jit {
                     let mut tys = Vec::with_capacity(v.fields.len());
                     for t in &v.fields {
                         // v1 supports the scalar kinds the JIT slot maps exactly,
-                        // guaranteeing interp/JIT parity: i32/i64/f32/f64/bool.
+                        // guaranteeing interp/JIT parity: i32/i64/f32/f64/bool,
+                        // plus (#544) the fixed-width integer kinds, which are
+                        // masked i64-backed values the slot round-trips as-is.
                         // Anything else (str/nil — which `lower_ty_for_model`
-                        // would silently collapse to an opaque i64 — narrow/
-                        // unsigned/exotic-float scalars, tensors, models) routes
-                        // the program cleanly out of the JIT subset.
+                        // would silently collapse to an opaque i64 —
+                        // exotic-float scalars, tensors, models) routes the
+                        // program cleanly out of the JIT subset.
                         let storable = matches!(t, Type::Scalar(
                             ScalarType::I32 | ScalarType::I64
                             | ScalarType::F32 | ScalarType::F64
-                            | ScalarType::Bool, _));
+                            | ScalarType::Bool, _))
+                            || matches!(t, Type::Scalar(s, _)
+                                if narrow_scalar_kind(s).is_some());
                         if !storable {
-                            return unsupported(&v.span, &format!(
+                            return unsupported(&v.span, Refusal::Item, &format!(
                                 "a non-scalar payload field in enum variant `{}.{}` \
-                                 (payload fields must be i32/i64/f32/f64/bool)",
+                                 (payload fields must be a fixed-width int, f32/f64 or bool)",
                                 e.name, v.name));
                         }
                         let k = enumify(lower_ty_for_model(t, &payload_env, &v.span)?, &self.enums);
@@ -1479,7 +1866,7 @@ impl Jit {
 
         let __t_fin = std::time::Instant::now();
         self.module.finalize_definitions()
-            .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("finalize: {}", e), line: 0, col: 0 })?;
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("finalize: {}", e), line: 0, col: 0 })?;
         let __fin = __t_fin.elapsed();
         self.finalized = true;
         if __timing {
@@ -1502,12 +1889,12 @@ impl Jit {
     /// `instantiate_template` at the call site; here we just wire up the
     /// body and shape env so `define_fn` can run.
     fn declare_monomorph(&mut self, p: &PendingMono) -> Result<FnMeta, JitError> {
-        let tmpl = self.templates.get(&p.template_name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let tmpl = self.templates.get(&p.template_name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("internal: template `{}` missing during monomorphization",
                          p.template_name),
             line: p.call_span.line, col: p.call_span.col,
         })?.clone();
-        let entry = self.fns.get(&p.mangled_name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let entry = self.fns.get(&p.mangled_name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("internal: entry `{}` missing during monomorphization",
                          p.mangled_name),
             line: p.call_span.line, col: p.call_span.col,
@@ -1522,7 +1909,12 @@ impl Jit {
             span: tmpl.span,
             shape_env: p.shape_env.clone(),
             grad_mode: GradMode::None,
-            mut_param_idxs: Vec::new(),
+            // #553: a template is the OTHER place a `!` tensor parameter
+            // reaches the JIT (`declare_template_signature` accepts one
+            // outside `@grad fn`, where `declare_fn` refuses), so the body
+            // needs the same copy-out at return. Dropping the indices here
+            // left `define_fn` blind to them.
+            mut_param_idxs: entry.mut_param_idxs,
             captures: Vec::new(),
         })
     }
@@ -1564,12 +1956,12 @@ impl Jit {
         }
         if let Some(abi) = &e.abi {
             if abi != "C" {
-                return unsupported(&e.span,
+                return unsupported(&e.span, Refusal::Extern,
                     &format!("extern \"{}\" ABI not yet supported in JIT (only C ABI)", abi));
             }
         }
         if !e.shape_params.is_empty() {
-            return unsupported(&e.span,
+            return unsupported(&e.span, Refusal::Extern,
                 "shape-generic extern fn not supported in JIT");
         }
 
@@ -1578,7 +1970,7 @@ impl Jit {
         let mut params: Vec<(String, TyKind, Span)> = Vec::new();
 
         for p in &e.params {
-            let ast_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let ast_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("extern fn `{}` param `{}` has no type annotation", e.name, p.name),
                 line: p.span.line, col: p.span.col,
             })?;
@@ -1601,7 +1993,7 @@ impl Jit {
         } else {
             let id = self.module
                 .declare_function(&e.name, Linkage::Import, &sig)
-                .map_err(|e_| JitError { kind: JitErrorKind::Error,
+                .map_err(|e_| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare extern fn `{}`: {}", e.name, e_),
                     line: e.span.line, col: e.span.col,
                 })?;
@@ -1623,7 +2015,7 @@ impl Jit {
     ) -> Result<(), JitError> {
         let id = self.module
             .declare_function(name, Linkage::Local, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare extern trampoline `{}`: {}", name, e),
                 line: span.line, col: span.col,
             })?;
@@ -1657,7 +2049,7 @@ impl Jit {
         builder.finalize(self.module.target_config());
         self.module
             .define_function(id, &mut self.ctx)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("define extern trampoline `{}`: {}", name, e),
                 line: span.line, col: span.col,
             })?;
@@ -1712,7 +2104,7 @@ impl Jit {
                         self.global_consts.insert(name.clone(), l.value.clone());
                         Ok(())
                     }
-                    _ => unsupported(&l.span,
+                    _ => unsupported(&l.span, Refusal::Item,
                         "top-level `let` bindings (only `let NAME = <literal>` constants are supported)"),
                 }
             }
@@ -1740,10 +2132,10 @@ impl Jit {
                     m.shape_params.iter().map(|p| p.name.clone()).collect());
                 Ok(())
             }
-            Item::TypeAlias(t) => unsupported(&t.span, "`type` aliases at top level"),
+            Item::TypeAlias(t) => unsupported(&t.span, Refusal::Item, "`type` aliases at top level"),
             Item::Enum(_) => Ok(()), // enums are compile-time metadata (no fns)
-            Item::Arena(a) => unsupported(&a.span, "arena blocks as items"),
-            Item::Use(u)   => unsupported(&u.span, "`use` imports (single-file only)"),
+            Item::Arena(a) => unsupported(&a.span, Refusal::Item, "arena blocks as items"),
+            Item::Use(u)   => unsupported(&u.span, Refusal::Import, "`use` imports (single-file only)"),
         }
     }
 
@@ -1756,7 +2148,7 @@ impl Jit {
     /// `tape_backward`.
     fn declare_grad_fn(&mut self, f: &FnDecl, out: &mut Vec<FnMeta>) -> Result<(), JitError> {
         if !f.shape_params.is_empty() {
-            return unsupported(&f.span,
+            return unsupported(&f.span, Refusal::Grad,
                 "shape-generic `@grad fn` (monomorphizing the backward) is a later slice");
         }
         // At least one mut param is required (AUTODIFF.md §2).
@@ -1815,18 +2207,18 @@ impl Jit {
         let mut sig = self.module.make_signature();
         for (idx, p) in f.params.iter().enumerate() {
             if p.is_self {
-                return unsupported(&p.span, "`self` parameters");
+                return unsupported(&p.span, Refusal::Signature, "`self` parameters");
             }
             if p.mutating {
                 // Only meaningful inside a `@grad fn`; outside, a mut tensor
                 // param has no gradient target and we don't yet write back.
                 if grad_mode == GradMode::None {
-                    return unsupported(&p.span,
+                    return unsupported(&p.span, Refusal::Signature,
                         "`!` mutating parameters outside `@grad fn`");
                 }
                 mut_param_idxs.push(idx);
             }
-            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("parameter `{}` needs a type annotation in the JIT", p.name),
                 line: p.span.line, col: p.span.col,
             })?;
@@ -1853,7 +2245,7 @@ impl Jit {
 
         let id = self.module
             .declare_function(mangled_name, Linkage::Export, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare_function `{}`: {}", mangled_name, e),
                 line: f.span.line, col: f.span.col,
             })?;
@@ -1901,7 +2293,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function(name, Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare builtin `{}`: {}", name, e),
                     line: 0, col: 0,
                 })?;
@@ -1924,7 +2316,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_forge_alloc", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare forge_alloc: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_forge_alloc".to_string(), FnEntry {
@@ -1941,7 +2333,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_forge_snapshot", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare forge_snapshot: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_forge_snapshot".to_string(), FnEntry {
@@ -1954,7 +2346,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_forge_restore", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare forge_restore: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_forge_restore".to_string(), FnEntry {
@@ -1969,7 +2361,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_print_tensor_1d_f32", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare print_tensor_1d_f32: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_print_tensor_1d_f32".to_string(), FnEntry {
@@ -1985,7 +2377,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_print_tensor_2d_f32", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare print_tensor_2d_f32: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_print_tensor_2d_f32".to_string(), FnEntry {
@@ -2006,7 +2398,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function(sym, Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare {}: {}", sym, e), line: 0, col: 0,
                 })?;
             self.fns.insert(sym.to_string(), FnEntry {
@@ -2028,7 +2420,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function(sym, Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare {}: {}", sym, e), line: 0, col: 0,
                 })?;
             self.fns.insert(sym.to_string(), FnEntry {
@@ -2050,7 +2442,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_capture_grad", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare capture_grad: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_capture_grad".to_string(), FnEntry {
@@ -2066,7 +2458,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_grad_prologue", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare grad_prologue: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_grad_prologue".to_string(), FnEntry {
@@ -2080,7 +2472,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_grad_epilogue", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare grad_epilogue: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_grad_epilogue".to_string(), FnEntry {
@@ -2098,7 +2490,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_take_grad_at", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("declare take_grad_at: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_take_grad_at".to_string(), FnEntry {
@@ -2116,7 +2508,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_powf_f32", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare powf: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_powf_f32".to_string(), FnEntry {
@@ -2132,7 +2524,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_powf_f64", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare powf_f64: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_powf_f64".to_string(), FnEntry {
@@ -2148,7 +2540,7 @@ impl Jit {
         sig.call_conv = CallConv::SystemV;
         let id = self.module
             .declare_function("__dmc_fmod_f64", Linkage::Import, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare fmod_f64: {}", e), line: 0, col: 0,
             })?;
         self.fns.insert("__dmc_fmod_f64".to_string(), FnEntry {
@@ -2165,34 +2557,38 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_new_from_raw", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_new_from_raw: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_new_from_raw: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_new_from_raw".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
         }
-        // __dmc_str_len(s: i64) -> i64
+        // __dmc_str_len(s: i64, line: i64, col: i64) -> i64
         {
             let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.returns.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_len", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_len: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_len: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_len".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
         }
-        // __dmc_str_get_char(s: i64, i: i64) -> i64
+        // __dmc_str_get_char(s: i64, i: i64, line: i64, col: i64) -> i64
         {
             let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.returns.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_get_char", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_get_char: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_get_char: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_get_char".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2206,7 +2602,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_eq", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_eq: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_eq: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_eq".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2220,7 +2616,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_concat", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_concat: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_concat: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_concat".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2233,7 +2629,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_from_int", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_from_int: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_from_int: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_from_int".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2246,7 +2642,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_from_f64", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_from_f64: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_from_f64: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_from_f64".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2259,9 +2655,123 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_str_from_bool", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_str_from_bool: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_from_bool: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_str_from_bool".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_str_starts_with(s: i64, prefix: i64, line: i64, col: i64) -> i64 (0/1)
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_str_starts_with", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_starts_with: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_str_starts_with".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // Process ports (PORTS.md §7.1). Each returns an i64 forge pointer:
+        // `open`/`call` a 2-slot `(value, Err)` tuple, `close` the bare Err
+        // (null = nil), which the lowering pairs with a literal nil.
+        // __dmc_port_render(handle: i64) -> i64 (forge string)
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_port_render", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_port_render: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_port_render".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_port_open(lang: i64, line: i64, col: i64) -> i64
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_port_open", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_port_open: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_port_open".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_port_expect_lang(handle: i64, want: i64, line: i64, col: i64)
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_port_expect_lang", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_port_expect_lang: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_port_expect_lang".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_port_call(handle: i64, name: i64, payload: i64, line: i64, col: i64) -> i64
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_port_call", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_port_call: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_port_call".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_port_close(handle: i64, line: i64, col: i64) -> i64
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_port_close", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_port_close: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_port_close".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // Tensor copy mode (PORTS.md §3.2). Both take the dtype code, the rank
+        // and a forge-materialized i64 shape array; `encode` hands back a forge
+        // string (the envelope), `decode` a 2-slot `(tensor, Err)` tuple.
+        // __dmc_port_tensor_encode(data, dtype, rank, shape, line, col) -> i64
+        // __dmc_port_tensor_decode(text, dtype, rank, shape, line, col) -> i64
+        for (name, ret) in [
+            ("__dmc_port_tensor_encode", TyKind::Str),
+            ("__dmc_port_tensor_decode", TyKind::Scalar(ScalarKind::I64)),
+        ] {
+            let mut sig = self.module.make_signature();
+            for _ in 0..6 { sig.params.push(AbiParam::new(cl::I64)); }
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function(name, Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare {}: {}", name, e), line: 0, col: 0 })?;
+            self.fns.insert(name.to_string(), FnEntry {
+                id, sig, params: vec![], ret, mut_param_idxs: vec![],
             });
         }
         // __dmc_chr(n: i64) -> i64 (forge string pointer)
@@ -2272,7 +2782,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_chr", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_chr: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_chr: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_chr".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
@@ -2284,7 +2794,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_sleep_ms", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_sleep_ms: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_sleep_ms: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_sleep_ms".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2295,7 +2805,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_flush", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_flush: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_flush: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_flush".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2306,7 +2816,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_match_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_match_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_match_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_match_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2317,7 +2827,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_nil_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_nil_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_nil_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_nil_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2329,7 +2839,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_print_str", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_print_str: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_print_str: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_print_str".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2341,7 +2851,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_new", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_new: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_map_new: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_new".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Map, mut_param_idxs: vec![],
             });
@@ -2355,7 +2865,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_get", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_get: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_map_get: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_get".to_string(), FnEntry {
                 id, sig,
                 params: vec![
@@ -2374,7 +2884,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_set", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_set: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_map_set: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_set".to_string(), FnEntry {
                 id, sig,
                 params: vec![
@@ -2394,7 +2904,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_map_contains", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_map_contains: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_map_contains: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_map_contains".to_string(), FnEntry {
                 id, sig,
                 params: vec![
@@ -2414,7 +2924,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_vault_load_raw", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_vault_load_raw: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_vault_load_raw: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_vault_load_raw".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2431,7 +2941,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_vault_load_npz", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_vault_load_npz: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_vault_load_npz: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_vault_load_npz".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2444,7 +2954,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_par", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_par: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_par: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_par".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2457,7 +2967,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_bf16: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2472,7 +2982,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16_gpu", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_bf16_gpu: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16_gpu".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2488,7 +2998,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16_gpu_batched", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu_batched: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_bf16_gpu_batched: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16_gpu_batched".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2503,7 +3013,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16_gpu_batched_deferred", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu_batched_deferred: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_bf16_gpu_batched_deferred: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16_gpu_batched_deferred".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2514,7 +3024,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_matmul_bf16_gpu_flush", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_matmul_bf16_gpu_flush: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_bf16_gpu_flush: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_matmul_bf16_gpu_flush".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2528,7 +3038,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_bf16_upconvert", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_bf16_upconvert: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_bf16_upconvert: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_bf16_upconvert".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2542,7 +3052,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_f32_to_bf16", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_f32_to_bf16: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_f32_to_bf16: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_f32_to_bf16".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2557,7 +3067,7 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_bf16_transpose_2d", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_bf16_transpose_2d: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_bf16_transpose_2d: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_bf16_transpose_2d".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2571,7 +3081,7 @@ impl Jit {
             sig.returns.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module.declare_function("__dmc_trit_quantize", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_trit_quantize: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_trit_quantize: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_trit_quantize".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2585,7 +3095,7 @@ impl Jit {
             sig.returns.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module.declare_function("__dmc_trit_neg", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_trit_neg: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_trit_neg: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_trit_neg".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -2599,7 +3109,7 @@ impl Jit {
             sig.returns.push(AbiParam::new(cl::F64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module.declare_function("__dmc_trit_sparsity", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_trit_sparsity: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_trit_sparsity: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_trit_sparsity".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::F64), mut_param_idxs: vec![],
             });
@@ -2612,8 +3122,22 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_oob_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_oob_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_oob_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_oob_trap".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // #511: __dmc_slice_oob_trap(start, extent, dim) -> ! (prints error + exit 1)
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_slice_oob_trap", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_slice_oob_trap: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_slice_oob_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
@@ -2626,34 +3150,38 @@ impl Jit {
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_kv_cap_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_kv_cap_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_kv_cap_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_kv_cap_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
-        // #265: __dmc_shift_trap(count: i64, op_is_shl: i64) -> ! (prints error + exit 1)
+        // #265: __dmc_shift_trap(count: i64, op_is_shl: i64, bits: i64) -> !
+        // (prints error + exit 1)
         {
             let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_shift_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_shift_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_shift_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_shift_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
-        // #297: __dmc_div_overflow_trap(l: i64, r: i64, op_is_div: i64) -> ! (prints error + exit 1)
+        // #297: __dmc_div_overflow_trap(l: i64, r: i64, op_is_div: i64, bits: i64)
+        // -> ! (prints error + exit 1)
         {
             let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.params.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_div_overflow_trap", Linkage::Import, &sig)
-                .map_err(|e| JitError { kind: JitErrorKind::Error, msg: format!("declare __dmc_div_overflow_trap: {}", e), line: 0, col: 0 })?;
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_div_overflow_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_div_overflow_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
@@ -2689,9 +3217,12 @@ impl Jit {
             lambda_counter: &mut self.lambda_counter,
             locals: HashMap::new(),
             local_tys: HashMap::new(),
+            field_aliases: HashSet::new(),
+            mut_param_out: Vec::new(),
             ret: meta.ret.clone(),
             gpu: self.gpu,
             gpu_defer_hint: false,
+            float_lit_hint: None,
             gpu_defer_pending: false,
             loop_stack: Vec::new(),
             shape_env: meta.shape_env.clone(),
@@ -2712,7 +3243,7 @@ impl Jit {
                 .to_string();
             // block_params: [__env, p0, p1, ...]
             // Skip __env (index 0); pass p0..pN to the real function.
-            let real_entry = tr.fns.get(&target_name).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let real_entry = tr.fns.get(&target_name).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("trampoline: target fn `{}` not found", target_name),
                 line: meta.span.line, col: meta.span.col,
             })?;
@@ -2736,8 +3267,8 @@ impl Jit {
             let __cg = std::time::Instant::now();
             self.module
                 .define_function(meta.id, &mut self.ctx)
-                .map_err(|e| JitError { kind: JitErrorKind::Error,
-                    msg: format!("define `{}`: {}", meta.name, e),
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("define `{}`: {}", meta.name, define_detail(&e)),
                     line: meta.span.line, col: meta.span.col,
                 })?;
             JIT_CODEGEN_NS.fetch_add(__cg.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2768,6 +3299,32 @@ impl Jit {
                     if meta.mut_param_idxs.contains(&ad_i) {
                         st.mut_params.push((ad_i, node));
                     }
+                }
+            }
+        }
+
+        // #553: `!` tensor parameters are copy-in/copy-out (see
+        // `emit_mut_param_copy_out`). Record the PARAMETER's own variable and
+        // the pointer it came in on, so every return can copy the buffer the
+        // parameter currently names back into that one. Capturing the variable
+        // here — rather than re-resolving the name at the return — is what
+        // keeps a shadowing `let` of the same name out of it: the parameter's
+        // variable still holds the incoming pointer, so the copy is skipped.
+        //
+        // Every entry `lower_call` reaches — a monomorphized template and the
+        // forward-only entry of a `@grad fn` — gets this; those are the calls
+        // that copy the argument in. The `$fwd_bwd` entries do not:
+        // `f.fwd_bwd(w)` hands the callee the caller's own tensor with no
+        // copy-in and no writeback on either backend, so writing through the
+        // parameter there would clobber the caller's `w`.
+        if !matches!(meta.grad_mode, GradMode::FwdBwd | GradMode::FwdBwdBwd) {
+            for &mi in &meta.mut_param_idxs {
+                let i = mi + user_params_start;
+                let (name, ty, _) = &meta.params[i];
+                if let TyKind::Tensor(t) = ty {
+                    let var = tr.locals[name];
+                    let incoming = tr.builder.block_params(entry)[i];
+                    tr.mut_param_out.push((var, incoming, t.clone()));
                 }
             }
         }
@@ -2852,6 +3409,9 @@ impl Jit {
             } else { None };
             let tail_val = tr.lower_block_value(&meta.body)?;
             if !tr.is_filled() {
+                // #553: ahead of the forge rewind below — a rebound `!`
+                // parameter names a buffer allocated after the snapshot.
+                tr.emit_mut_param_copy_out();
                 match (&meta.ret, tail_val) {
                     (TyKind::Scalar(ScalarKind::Nil), _) => { tr.ret_void(); }
                     (want, Some((v, k))) => {
@@ -2876,8 +3436,8 @@ impl Jit {
         let __cg = std::time::Instant::now();
         self.module
             .define_function(meta.id, &mut self.ctx)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
-                msg: format!("define `{}`: {}", meta.name, e),
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                msg: format!("define `{}`: {}", meta.name, define_detail(&e)),
                 line: meta.span.line, col: meta.span.col,
             })?;
         JIT_CODEGEN_NS.fetch_add(__cg.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2894,11 +3454,11 @@ impl Jit {
     /// `nil` test passes iff it runs to completion. The program must already be
     /// compiled (and finalized).
     pub fn run_test_fn(&mut self, name: &str) -> Result<bool, JitError> {
-        let meta = self.fns.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let meta = self.fns.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("no `fn {}()` to JIT-execute", name), line: 0, col: 0,
         })?.clone();
         if !meta.params.is_empty() {
-            return Err(JitError { kind: JitErrorKind::Error, msg: format!("`{}` must take no arguments", name), line: 0, col: 0 });
+            return Err(JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("`{}` must take no arguments", name), line: 0, col: 0 });
         }
         let ptr = self.module.get_finalized_function(meta.id);
         match meta.ret {
@@ -2911,16 +3471,16 @@ impl Jit {
                 unsafe { f(); }
                 Ok(true) // ran to completion
             }
-            _ => Err(JitError { kind: JitErrorKind::Error, msg: format!("test `{}` must return bool or nil", name), line: 0, col: 0 }),
+            _ => Err(JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("test `{}` must return bool or nil", name), line: 0, col: 0 }),
         }
     }
 
     pub fn run_main(&mut self) -> Result<i64, JitError> {
-        let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "no `fn main()` to JIT-execute".into(), line: 0, col: 0,
         })?.clone();
         if !meta.params.is_empty() {
-            return Err(JitError { kind: JitErrorKind::Error,
+            return Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "`fn main` must take no arguments in the JIT".into(),
                 line: 0, col: 0,
             });
@@ -2939,6 +3499,14 @@ impl Jit {
             TyKind::Scalar(ScalarKind::I32) => {
                 let f: unsafe extern "C" fn() -> i32 = unsafe { mem::transmute(ptr) };
                 Ok(unsafe { f() } as i64)
+            }
+            // #544: a masked narrow kind returns in an i64 register already
+            // holding the wrapped, sign-/zero-extended value.
+            TyKind::Scalar(ScalarKind::I8) | TyKind::Scalar(ScalarKind::I16)
+            | TyKind::Scalar(ScalarKind::I4) | TyKind::Scalar(ScalarKind::U8)
+            | TyKind::Scalar(ScalarKind::U16) | TyKind::Scalar(ScalarKind::U32) => {
+                let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
+                Ok(unsafe { f() })
             }
             TyKind::Scalar(ScalarKind::Bool) => {
                 let f: unsafe extern "C" fn() -> u8 = unsafe { mem::transmute(ptr) };
@@ -2962,58 +3530,73 @@ impl Jit {
                 println!("=> {}", v);
                 Ok(0)
             }
-            TyKind::Tensor(_) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::Tensor(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a Tensor is not supported (tensor lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::KV(_) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::KV(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a KV cache is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::DynTensor(_) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::DynTensor(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a dynamic-shape tensor is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Tuple(_) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::Tuple(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a tuple is not supported (its lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Model(_, _) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::Model(_, _) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a model instance is not supported".into(),
                 line: 0, col: 0,
             }),
             TyKind::Str => {
-                // Returns an i64 forge pointer — return it as i64 so callers
-                // can inspect it. (Str-returning main is valid for tests.)
+                // Returns an i64 forge pointer. Echo the *text* here, the way
+                // the f32/f64 arms echo their value: the caller only has the
+                // i64 and used to print the pointer, so `fn main() -> str`
+                // echoed an address under `dmc jit` and its own string under
+                // `dmc run`. Returns 0 — the echo is done.
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
-                Ok(unsafe { f() })
+                let s = unsafe { f() };
+                // Quoted, like the interpreter's `{:?}` echo of a `Value::Str`.
+                // A null pointer is `nil`, and the interpreter echoes nothing
+                // for a nil return.
+                if s != 0 { println!("=> {:?}", dmc_str_to_rust(s)); }
+                Ok(0)
             }
+            TyKind::Port(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
+                // Unreachable through the surface language — there is no `Port`
+                // type annotation to declare — but the arm is not `unreachable!`:
+                // an internal mistake should surface as an error, not a panic.
+                msg: "main returning a port handle is not supported (a handle does not outlive its run)".into(),
+                line: 0, col: 0,
+            }),
             TyKind::Map => {
                 // Returns an i64 raw pointer to a HashMap — return it as i64.
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
                 Ok(unsafe { f() })
             }
-            TyKind::KvArray(_, _) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::KvArray(_, _) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a KV array is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::ModelArray(_, _, _) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::ModelArray(_, _, _) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a model array is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Fn(_, _) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::Fn(_, _) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a function pointer is not supported by the JIT runner".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Scalar(ScalarKind::OptI64) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::Scalar(ScalarKind::OptI64) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a maybe-nil value is not supported; compare to nil or guard with map_contains first".into(),
                 line: 0, col: 0,
             }),
-            TyKind::TritTensor(_) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::TritTensor(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a trit tensor is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
-            TyKind::Bf16Tensor(_) => Err(JitError { kind: JitErrorKind::Error,
+            TyKind::Bf16Tensor(_) => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "main returning a bf16 tensor is not supported (lifetime crosses the JIT boundary)".into(),
                 line: 0, col: 0,
             }),
@@ -3035,11 +3618,11 @@ impl Jit {
     /// f64 / nil for completeness). Non-scalar returns are outside the scalar
     /// fuzz regime and error cleanly.
     pub fn run_main_scalar(&mut self) -> Result<ScalarRet, JitError> {
-        let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "no `fn main()` to JIT-execute".into(), line: 0, col: 0,
         })?.clone();
         if !meta.params.is_empty() {
-            return Err(JitError { kind: JitErrorKind::Error,
+            return Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "`fn main` must take no arguments in the JIT".into(),
                 line: 0, col: 0,
             });
@@ -3075,7 +3658,7 @@ impl Jit {
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
                 Ok(ScalarRet::I64(unsafe { f() }))
             }
-            other => Err(JitError { kind: JitErrorKind::Error,
+            other => Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("selftest: main returns non-scalar type {:?} (outside scalar fuzz regime)", other),
                 line: 0, col: 0,
             }),
@@ -3113,6 +3696,11 @@ enum IndexCat {
     Full,
     /// `a:b` — keeps the axis at `b - a` (must be literal-int in slice 4).
     Range { start: i64, end: i64 },
+    /// #511: `a..b` whose START is a runtime i64 but whose EXTENT `b - a`
+    /// folds to a compile-time constant (`t[i..i+1, ..]` with loop-var `i`).
+    /// The static extent keeps the result shape compile-time (spec invariant
+    /// 5); the runtime start lowers to address arithmetic.
+    DynRange { start: Value, extent: i64 },
 }
 
 fn classify_index_static(ie: &IndexElem, span: &Span) -> Result<StaticIndexCat, JitError> {
@@ -3121,11 +3709,11 @@ fn classify_index_static(ie: &IndexElem, span: &Span) -> Result<StaticIndexCat, 
         // `IndexElem::Expr(Expr::Range)`, not `IndexElem::Slice`. Recognize it as
         // a range with literal bounds (exclusive `a..b`, inclusive `a..=b`).
         IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => {
-            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "range slice start must be a literal int in the JIT".into(),
                 line: span.line, col: span.col,
             })?;
-            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "range slice end must be a literal int in the JIT".into(),
                 line: span.line, col: span.col,
             })?;
@@ -3137,11 +3725,11 @@ fn classify_index_static(ie: &IndexElem, span: &Span) -> Result<StaticIndexCat, 
             if step.is_some() {
                 return err(span, "strided slices (`a:b:c`) need slice-5 support");
             }
-            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "slice start must be a literal int in slice 4".into(),
                 line: span.line, col: span.col,
             })?;
-            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "slice end must be a literal int in slice 4".into(),
                 line: span.line, col: span.col,
             })?;
@@ -3666,7 +4254,7 @@ fn declare_template_signature(
     let mut params: Vec<(String, TyKind, Span)> = Vec::with_capacity(tmpl.params.len());
     let mut mut_param_idxs = Vec::new();
     for (idx, p) in tmpl.params.iter().enumerate() {
-        let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("template param `{}` needs a type annotation", p.name),
             line: p.span.line, col: p.span.col,
         })?;
@@ -3689,7 +4277,7 @@ fn declare_template_signature(
     sig.call_conv = CallConv::SystemV;
     let id = module
         .declare_function(mangled, Linkage::Export, &sig)
-        .map_err(|e| JitError { kind: JitErrorKind::Error,
+        .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("declare_function `{}`: {}", mangled, e),
             line: tmpl.span.line, col: tmpl.span.col,
         })?;
@@ -3697,7 +4285,7 @@ fn declare_template_signature(
 }
 
 fn setting_err(e: cranelift::codegen::settings::SetError) -> JitError {
-    JitError { kind: JitErrorKind::Error, msg: format!("cranelift setting: {}", e), line: 0, col: 0 }
+    JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("cranelift setting: {}", e), line: 0, col: 0 }
 }
 
 // ─── Translator: per-function lowering ───────────────────────────────────────
@@ -3735,6 +4323,21 @@ struct Translator<'a> {
     lambda_counter: &'a mut usize,
     locals: HashMap<String, Variable>,
     local_tys: HashMap<String, TyKind>,
+    /// #524: locals bound by `let !y = m.<tensor field>`. Per SPEC §3.4 such a
+    /// binding is a LIVE ALIAS of the field, not a snapshot: the tensor pointer
+    /// is shared with the field slot (so element writes already reach it), and
+    /// a whole-binding `=` or a compound op must write THROUGH the alias into
+    /// that storage instead of rebinding the Cranelift variable. Membership is
+    /// cleared by `declare_local`, so a later `let` shadowing the name drops
+    /// the alias.
+    field_aliases: HashSet<String>,
+    /// #553: this function's `!` tensor parameters, as (the PARAMETER's own
+    /// Cranelift variable, the pointer it came in on, its tensor type). Drives
+    /// `emit_mut_param_copy_out` at every return. Populated for the entries
+    /// `lower_call` reaches — a monomorphized template and the forward-only
+    /// entry of a `@grad fn` — and empty for every other function, `$fwd_bwd`
+    /// included.
+    mut_param_out: Vec<(Variable, Value, TensorTy)>,
     ret: TyKind,
     /// #326: copied from `Jit::gpu` — route the m==1 bf16 decode GEMV to Metal.
     gpu: bool,
@@ -3745,6 +4348,18 @@ struct Translator<'a> {
     /// statement by `lower_block_value`.
     #[allow(dead_code)] // read only on macOS + `--features gpu`
     gpu_defer_hint: bool,
+    /// #478 type-directed literal lowering: the scalar kind an *unsuffixed*
+    /// numeric literal should adopt in the position about to be lowered
+    /// (SPEC.md §"Untyped numeric literals" — a bare literal takes the type of
+    /// its context, including "the other operand at its use site"). Armed by
+    /// `lower_if` / `lower_match_expr` from the sibling branch's static type
+    /// and consumed — `take()`n — at the top of `lower_expr` and
+    /// `lower_block_value`, so it reaches exactly the value position it was
+    /// armed for and never leaks sideways. Only unsuffixed float literals
+    /// consult it; everything else lowers as before, which is what keeps
+    /// #209 (`let x: f64 = 0.1` stays f64) and #473 (a suffix decides the
+    /// width) untouched.
+    float_lit_hint: Option<ScalarKind>,
     /// Compile-time mirror of the GPU runtime's deferred-work state: set when
     /// a deferred batched call was emitted, cleared by the next sync batched
     /// call (which flushes at runtime) or by `emit_gpu_flush_if_pending`.
@@ -4013,6 +4628,10 @@ impl<'a> Translator<'a> {
     /// because `if`/`match` are keyword-led. Treat such a final stmt as the
     /// block's value.
     fn lower_block_value(&mut self, b: &Block_) -> Result<Option<(Value, TyKind)>, JitError> {
+        // #478: a block is value-transparent through its tail, but its
+        // *statements* are not — take the hint now so nothing in the body
+        // sees it, and re-arm it on the tail position below.
+        let want = self.float_lit_hint.take();
         let last_is_value = b.tail_expr.is_none()
             && b.stmts.last().map(|s| matches!(s,
                 Stmt::If(_) | Stmt::Match(_) | Stmt::DirectiveBlock { .. })).unwrap_or(false);
@@ -4031,8 +4650,11 @@ impl<'a> Translator<'a> {
         self.gpu_defer_hint = false;
         if last_is_value {
             match b.stmts.last() {
-                Some(Stmt::If(i)) => return self.lower_if(i),
-                Some(Stmt::Match(m)) => return self.lower_match_expr(m).map(Some),
+                Some(Stmt::If(i)) => { self.float_lit_hint = want; return self.lower_if(i) }
+                Some(Stmt::Match(m)) => {
+                    self.float_lit_hint = want;
+                    return self.lower_match_expr(m).map(Some)
+                }
                 // A directive block in tail position produces the block's value
                 // (e.g. an attention fn whose body ends in `@..@fuse { .. }`).
                 Some(Stmt::DirectiveBlock { directives, body, span }) => {
@@ -4040,18 +4662,20 @@ impl<'a> Translator<'a> {
                         return self.lower_fuse_block(body, span).map(Some);
                     }
                     if cast_directive_is_int_target(directives) {
-                        return unsupported(span, INT_CAST_BLOCK_UNSUPPORTED);
+                        return unsupported(span, Refusal::Directive, INT_CAST_BLOCK_UNSUPPORTED);
                     }
                     if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
+                        self.float_lit_hint = want;
                         return self.lower_block_value(body);
                     }
-                    return unsupported(span,
+                    return unsupported(span, Refusal::Directive,
                         "directive blocks in tail position (only @fuse, @deterministic, @cast are supported)");
                 }
                 _ => {}
             }
         }
         if let Some(tail) = &b.tail_expr {
+            self.float_lit_hint = want;
             let val = self.lower_expr(tail)?;
             return Ok(Some(val));
         }
@@ -4102,8 +4726,8 @@ impl<'a> Translator<'a> {
             Stmt::Loop { body, span } => self.lower_loop(body, span),
             Stmt::For { pattern, iter, body, span } => self.lower_for(pattern, iter, body, span),
             Stmt::Match(m) => self.lower_match_stmt(m),
-            Stmt::Stage { span, .. } => unsupported(span, "`stage` (pipeline parallelism)"),
-            Stmt::Directive { span, .. } => unsupported(span, "directives inside a fn body"),
+            Stmt::Stage { span, .. } => unsupported(span, Refusal::Construct, "`stage` (pipeline parallelism)"),
+            Stmt::Directive { span, .. } => unsupported(span, Refusal::Directive, "directives inside a fn body"),
             Stmt::DirectiveBlock { directives, body, span } => {
                 // @deterministic and @cast(bf16) are accepted as no-ops: bit-exactness
                 // and bf16-compute semantics are not yet enforced by the JIT.
@@ -4113,14 +4737,14 @@ impl<'a> Translator<'a> {
                     return Ok(());
                 }
                 if cast_directive_is_int_target(directives) {
-                    return unsupported(span, INT_CAST_BLOCK_UNSUPPORTED);
+                    return unsupported(span, Refusal::Directive, INT_CAST_BLOCK_UNSUPPORTED);
                 }
                 if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
                     // All directives are no-op pass-throughs; lower the block normally.
                     let _ = self.lower_block_value(body)?;
                     return Ok(());
                 }
-                unsupported(span, "directives inside a fn body (only @fuse, @deterministic, @cast are supported)")
+                unsupported(span, Refusal::Directive, "directives inside a fn body (only @fuse, @deterministic, @cast are supported)")
             }
         }
     }
@@ -4146,21 +4770,55 @@ impl<'a> Translator<'a> {
                 let _ = self.lower_expr(&l.value)?;
                 return Ok(());
             }
-            _ => return unsupported(&l.span, "destructuring `let` patterns"),
+            _ => return unsupported(&l.span, Refusal::Pattern, "destructuring `let` patterns"),
         };
+        // #524: `let !y = m.<field>` where the field is a KV stream. The JIT
+        // stores a `KV[...]` model field as an opaque i64 (`lower_ty_for_model`
+        // has no KV case), so the binding cannot carry the live stream SPEC
+        // §3.4 requires and `y <- frame` would append to nothing. Refuse at the
+        // construct rather than bind a value the appends silently miss.
+        if l.mutating {
+            if let Some((model, fname)) = self.as_model_field(&l.value) {
+                let is_kv_field = self.model_field_asts.get(&model)
+                    .and_then(|fs| fs.iter().find(|(n, _)| *n == fname))
+                    .map(|(_, t)| matches!(t, Type::KV(..)))
+                    .unwrap_or(false);
+                if is_kv_field {
+                    return unsupported(&l.span, Refusal::Construct, &format!(
+                        "binding the `KV[...]` field `{}.{}` — the JIT stores a KV \
+                         model field as an opaque pointer, so `let !{} = …` cannot \
+                         carry the live stream that `<-` appends to (SPEC §3.4)",
+                        model, fname, name));
+                }
+            }
+        }
         let (val, ty) = self.lower_expr(&l.value)?;
+        // #524: SPEC §3.4 — `let !y = m.w` on a TENSOR model field binds a LIVE
+        // ALIAS of the field, so it is the one place-expression bind that must
+        // NOT snapshot. Narrow on purpose: the receiver has to be a model
+        // instance, the field has to be tensor-typed, and the binding has to
+        // use the `!` spelling (`let mut y = m.w` and plain `let y = m.w` both
+        // still copy). Everything #249 fixed stays copied — a plain local
+        // (`let !y = x`), a row view (`let !r = grid[0]`), a constructor field
+        // (`M { w: t }`), and by-value arguments.
+        let field_alias = l.mutating
+            && matches!(ty, TyKind::Tensor(_))
+            && self.as_model_field(&l.value).is_some();
         // #249: `let y = x` (or `let y = m.w`) is a value copy — snapshot the
         // tensor so mutating `y` doesn't write through to `x`'s storage.
-        let alias = is_aliasing_place_expr(&l.value);
+        let alias = is_aliasing_place_expr(&l.value) && !field_alias;
         if let Some(ann) = &l.ty {
             let want = enumify(ty_from_ast(ann, &self.shape_env)?, self.enums);
             let coerced = self.coerce_to(val, &ty, &want, &l.span)?;
             let bound = if alias { self.copy_tensor_value(coerced, &want) } else { coerced };
-            self.declare_local(name, want, bound);
+            self.declare_local(name.clone(), want, bound);
         } else {
             let bound = if alias { self.copy_tensor_value(val, &ty) } else { val };
-            self.declare_local(name, ty, bound);
+            self.declare_local(name.clone(), ty, bound);
         }
+        // Registered after `declare_local`, which clears any stale alias for a
+        // shadowed name.
+        if field_alias { self.field_aliases.insert(name); }
         Ok(())
     }
 
@@ -4185,15 +4843,15 @@ impl<'a> Translator<'a> {
         let loss_name = match &pats[0] {
             Pattern::Ident(n, _) => n.clone(),
             Pattern::Wildcard(_) => "_".to_string(),
-            _ => return unsupported(span, "fwd_bwd loss binding must be an identifier"),
+            _ => return unsupported(span, Refusal::Pattern, "fwd_bwd loss binding must be an identifier"),
         };
         let grad_name = match &pats[1] {
             Pattern::Ident(n, _) => n.clone(),
             Pattern::Wildcard(_) => "_".to_string(),
-            _ => return unsupported(span, "fwd_bwd gradient binding must be an identifier"),
+            _ => return unsupported(span, Refusal::Pattern, "fwd_bwd gradient binding must be an identifier"),
         };
         let bwd = format!("{}${}", fname, method);
-        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: if method == "fwd_bwd_bwd" && self.fns.contains_key(&format!("{}$fwd_bwd", fname)) {
                 format!("`{}.fwd_bwd_bwd` (second-order autodiff) requires \
                          stacked `@grad @grad` on fn `{}`", fname, fname)
@@ -4211,7 +4869,7 @@ impl<'a> Translator<'a> {
         for (i, a) in args.iter().enumerate() {
             let e = match a {
                 CallArg::Positional(e) => e,
-                _ => return unsupported(span, "named/spread args to fwd_bwd"),
+                _ => return unsupported(span, Refusal::ArgForm, "named/spread args to fwd_bwd"),
             };
             let (v, k) = self.lower_expr(e)?;
             let v = self.coerce_to(v, &k, &entry.params[i].1, span)?;
@@ -4278,7 +4936,7 @@ impl<'a> Translator<'a> {
     ) -> Result<(), JitError> {
         // Piece count must be a compile-time positive int — the JIT needs a
         // static tuple arity (matching the checker's n-tuple typing).
-        let n = const_int_axis(n_expr).filter(|&k| k > 0).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let n = const_int_axis(n_expr).filter(|&k| k > 0).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`.split` requires a positive integer piece count, e.g. `t.split[3, axis=-1]`".into(),
             line: span.line, col: span.col,
         })? as usize;
@@ -4288,14 +4946,14 @@ impl<'a> Translator<'a> {
                 n, n, pats.len()));
         }
         let (ptr, recv_ty) = self.lower_expr(recv)?;
-        let t = recv_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = recv_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`.split` expects a tensor, got `{}`", recv_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
         let ndim = t.rank();
         // axis defaults to -1; negative axes resolve from the end (numpy-style).
         let axis_raw = match axis_expr {
-            Some(e) => const_int_axis(e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            Some(e) => const_int_axis(e).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "`.split` axis must be a compile-time integer in the JIT".into(),
                 line: span.line, col: span.col,
             })?,
@@ -4321,7 +4979,7 @@ impl<'a> Translator<'a> {
             let bind = match pat {
                 Pattern::Ident(name, _) => Some(name.clone()),
                 Pattern::Wildcard(_) => None,
-                _ => return unsupported(span, "`.split` bindings must be identifiers"),
+                _ => return unsupported(span, Refusal::Pattern, "`.split` bindings must be identifiers"),
             };
             let classified: Vec<IndexCat> = (0..ndim).map(|a| {
                 if a == axis {
@@ -4367,8 +5025,83 @@ impl<'a> Translator<'a> {
     fn declare_local(&mut self, name: String, ty: TyKind, value: Value) {
         let v = self.builder.declare_var(ty.cl());
         self.builder.def_var(v, value);
+        // #524: a fresh binding is never a field alias. Clearing here means a
+        // `let` that shadows an alias name drops the write-through.
+        self.field_aliases.remove(&name);
         self.locals.insert(name.clone(), v);
         self.local_tys.insert(name, ty);
+    }
+
+    /// #524: the model type a receiver expression denotes, resolved from the
+    /// locals table and the model layouts WITHOUT emitting any code (so the
+    /// caller can ask before deciding how to lower). Covers the receiver forms
+    /// a field binding actually uses — a bare binding (`m.w`, `self.w`) and a
+    /// nested model field (`self.blk.w`). Anything else answers `None`, which
+    /// keeps the binding on the value-copy path.
+    fn model_of_expr(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Ident(n, _) => match self.local_tys.get(n) {
+                Some(TyKind::Model(m, _)) => Some(m.clone()),
+                _ => None,
+            },
+            Expr::Postfix { expr, op: PostfixOp::Field(f), .. } => {
+                let base = self.model_of_expr(expr)?;
+                match self.model_layouts.get(&base)?.iter().find(|(n, _)| n == f) {
+                    Some((_, TyKind::Model(m, _))) => Some(m.clone()),
+                    _ => None,
+                }
+            }
+            Expr::Tuple(elems, _) if elems.len() == 1 => self.model_of_expr(&elems[0]),
+            _ => None,
+        }
+    }
+
+    /// #524: `(model, field)` when `e` reads a field off a model instance whose
+    /// type is statically known here. `Light.Red` (an enum value) and
+    /// `grads.W` (a `@grad` bundle, which lives in a synthesized `grads$W`
+    /// local) both answer `None` — neither receiver is a model binding.
+    fn as_model_field(&self, e: &Expr) -> Option<(String, String)> {
+        let Expr::Postfix { expr: base, op: PostfixOp::Field(fname), .. } = e else {
+            return None;
+        };
+        let model = self.model_of_expr(base)?;
+        Some((model, fname.clone()))
+    }
+
+    /// #524: copy `src`'s elements into `dst`'s EXISTING storage (rather than
+    /// into a fresh allocation), reading and writing at the tensor's own
+    /// element width — a `let !y = m.w` alias may be an i64/f64/bool tensor.
+    fn emit_typed_copy_into(&mut self, dst: Value, src: Value, t: &TensorTy) {
+        self.emit_memcpy_loop(dst, src, t.nelems(), t.elem.cl());
+    }
+
+    /// #553: a `!` tensor parameter is copy-in/copy-out — `lower_call` hands
+    /// the callee a private copy of the caller's tensor and copies that buffer
+    /// back into the caller's storage once the call returns. A whole-binding
+    /// assignment in the callee (`w = w .* 2.0`) rebinds the local to a FRESH
+    /// forge buffer, so the buffer the caller writes back is no longer the one
+    /// `w` names and the caller keeps the stale, unmodified values while
+    /// `dmc run` shows the new ones. Copy what the parameter names now back
+    /// into the buffer that came in, at every return, so the caller's writeback
+    /// names the callee's final values.
+    ///
+    /// The pointer compare makes this free when nothing rebound the parameter:
+    /// the variable still holds the incoming pointer, element writes already
+    /// landed in it, and the copy is skipped.
+    fn emit_mut_param_copy_out(&mut self) {
+        for (var, incoming, t) in self.mut_param_out.clone() {
+            let cur = self.builder.use_var(var);
+            let same = self.builder.ins().icmp(IntCC::Equal, cur, incoming);
+            let copy = self.builder.create_block();
+            let done = self.builder.create_block();
+            self.brif(same, done, copy);
+            self.builder.seal_block(copy);
+            self.enter(copy);
+            self.emit_typed_copy_into(incoming, cur, &t);
+            self.jump(done, &[]);
+            self.builder.seal_block(done);
+            self.enter(done);
+        }
     }
 
     fn lower_expr_stmt(
@@ -4392,14 +5125,14 @@ impl<'a> Translator<'a> {
             if matches!(op, AssignOp::StreamArrow) {
                 return self.lower_kv_array_append(expr, idxs, rhs, pspan);
             }
-            return unsupported(pspan, "compound assignment to tensor elements");
+            return unsupported(pspan, Refusal::AssignForm, "compound assignment to tensor elements");
         }
 
         let name = match lhs {
             Expr::Ident(n, _) => n.clone(),
-            _ => return unsupported(span, "assignment to non-identifier targets"),
+            _ => return unsupported(span, Refusal::AssignForm, "assignment to non-identifier targets"),
         };
-        let var = *self.locals.get(&name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let var = *self.locals.get(&name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("assignment to unknown binding `{}`", name),
             line: span.line, col: span.col,
         })?;
@@ -4409,12 +5142,51 @@ impl<'a> Translator<'a> {
         if matches!(op, AssignOp::StreamArrow) {
             return self.lower_stream_append(var, &ty, &name, rhs, span);
         }
+        // #524: `y` is a live alias of a model tensor field (`let !y = m.w`), so
+        // every write through it reaches the FIELD (SPEC §3.4) — copy into the
+        // aliased storage instead of rebinding the Cranelift variable, which
+        // would leave the field untouched and silently disagree with `dmc run`.
+        if self.field_aliases.contains(&name) {
+            if let TyKind::Tensor(t) = ty.clone() {
+                let src = match op {
+                    AssignOp::Eq | AssignOp::ColonEq => {
+                        let (v, k) = self.lower_expr(rhs)?;
+                        self.coerce_to(v, &k, &ty, span)?
+                    }
+                    // `y += t` on a tensor is the elementwise op (the
+                    // interpreter dispatches `+=` to `.+=` when either side is
+                    // a tensor). Lower `y .+ rhs` through the ordinary binop
+                    // path, then write the result back through the alias.
+                    AssignOp::PlusEq | AssignOp::MinusEq
+                    | AssignOp::StarEq | AssignOp::SlashEq => {
+                        let bin = match op {
+                            AssignOp::PlusEq  => BinOp::DotAdd,
+                            AssignOp::MinusEq => BinOp::DotSub,
+                            AssignOp::StarEq  => BinOp::DotMul,
+                            AssignOp::SlashEq => BinOp::DotDiv,
+                            _ => unreachable!(),
+                        };
+                        let lhs_expr = Expr::Ident(name.clone(), span.clone());
+                        let (v, k) = self.lower_binop(&bin, &lhs_expr, rhs, span)?;
+                        self.coerce_to(v, &k, &ty, span)?
+                    }
+                    AssignOp::StreamArrow => unreachable!("`<-` handled above"),
+                    AssignOp::AmpEq | AssignOp::BarEq | AssignOp::CaretEq => {
+                        return unsupported(span, Refusal::AssignForm,
+                            "compound bitwise assignment");
+                    }
+                };
+                let dst = self.builder.use_var(var);
+                self.emit_typed_copy_into(dst, src, &t);
+                return Ok(());
+            }
+        }
         let (rhs_val, rhs_ty) = self.lower_expr(rhs)?;
         let rhs_val = self.coerce_to(rhs_val, &rhs_ty, &ty, span)?;
         let new_val = match op {
             AssignOp::Eq | AssignOp::ColonEq => rhs_val,
             AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq => {
-                let sk = ty.as_scalar().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let sk = ty.as_scalar().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "compound assignment requires a scalar binding".into(),
                     line: span.line, col: span.col,
                 })?;
@@ -4430,7 +5202,7 @@ impl<'a> Translator<'a> {
             }
             AssignOp::StreamArrow => unreachable!("stream append `<-` handled before coercion"),
             AssignOp::AmpEq | AssignOp::BarEq | AssignOp::CaretEq => {
-                return unsupported(span, "compound bitwise assignment");
+                return unsupported(span, Refusal::AssignForm, "compound bitwise assignment");
             }
         };
         self.builder.def_var(var, new_val);
@@ -4442,15 +5214,20 @@ impl<'a> Translator<'a> {
         match (&ret, value) {
             (TyKind::Scalar(ScalarKind::Nil), None)
             | (TyKind::Scalar(ScalarKind::Nil), Some(Expr::Nil(_))) => {
+                self.emit_mut_param_copy_out();
                 self.ret_void();
             }
             (TyKind::Scalar(ScalarKind::Nil), Some(e)) => {
                 let _ = self.lower_expr(e)?;
+                self.emit_mut_param_copy_out();
                 self.ret_void();
             }
             (want, Some(e)) => {
                 let (v, k) = self.lower_expr(e)?;
                 let v = self.coerce_to(v, &k, want, span)?;
+                // #553: after the returned value is in hand, so the copy can
+                // never disturb an expression that reads the parameter.
+                self.emit_mut_param_copy_out();
                 self.ret_val(v);
             }
             (want, None) => return err(span, format!(
@@ -4538,17 +5315,17 @@ impl<'a> Translator<'a> {
         // Only range iteration is supported.
         let (lo_expr, hi_expr, inclusive) = match iter {
             Expr::Range { start, end, inclusive, .. } => {
-                let lo = start.as_deref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let lo = start.as_deref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "for-range requires a start bound".into(),
                     line: span.line, col: span.col,
                 })?;
-                let hi = end.as_deref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let hi = end.as_deref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "for-range requires an end bound".into(),
                     line: span.line, col: span.col,
                 })?;
                 (lo, hi, *inclusive)
             }
-            _ => return unsupported(span, "for-loop over collections (only range iteration supported)"),
+            _ => return unsupported(span, Refusal::LoopForm, "for-loop over collections (only range iteration supported)"),
         };
 
         // Evaluate bounds before entering the loop.
@@ -4566,7 +5343,7 @@ impl<'a> Translator<'a> {
         let bound_name: Option<String> = match pattern {
             Pattern::Ident(name, _) => Some(name.clone()),
             Pattern::Wildcard(_) => None,
-            _ => return unsupported(span, "destructuring patterns in `for` loops"),
+            _ => return unsupported(span, Refusal::Pattern, "destructuring patterns in `for` loops"),
         };
         if let Some(ref name) = bound_name {
             // Create a Cranelift variable for the body binding; we will
@@ -4722,7 +5499,7 @@ impl<'a> Translator<'a> {
             .expect("lower_enum_value on a non-payload enum").clone();
         let ord = self.enums.get(enum_name)
             .and_then(|vs| vs.iter().position(|v| v == variant))
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("enum `{}` has no variant `{}`", enum_name, variant),
                 line: span.line, col: span.col })? as i64;
         let tys = layout.variant_tys.get(variant).cloned().unwrap_or_default();
@@ -4778,7 +5555,7 @@ impl<'a> Translator<'a> {
                     self.local_tys.insert(name.clone(), fty);
                 }
                 Pattern::Wildcard(_) => {}
-                _ => return unsupported(span,
+                _ => return unsupported(span, Refusal::Pattern,
                     "nested sub-pattern in an enum payload binding (v1 binds identifiers; use `dmc run`)"),
             }
         }
@@ -4796,7 +5573,7 @@ impl<'a> Translator<'a> {
             }
             return Ok(scr_val);
         }
-        let scr_sk = scr_ty.as_scalar().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let scr_sk = scr_ty.as_scalar().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "match scrutinee must be a scalar (i64 / bool) or enum; tensors not supported".into(),
             line: span.line, col: span.col,
         })?;
@@ -4882,7 +5659,7 @@ impl<'a> Translator<'a> {
                     self.builder.seal_block(next_check);
                     continue;
                 }
-                _ => return unsupported(&m.span, "complex patterns in `match`"),
+                _ => return unsupported(&m.span, Refusal::Pattern, "complex patterns in `match`"),
             }
             }
 
@@ -4919,6 +5696,14 @@ impl<'a> Translator<'a> {
     /// `match <scrutinee> { arms... }` as an expression — all arm bodies must
     /// produce the same type; the result is the selected arm's value.
     fn lower_match_expr(&mut self, m: &MatchExpr) -> Result<(Value, TyKind), JitError> {
+        // #478: same up-front decision as `lower_if` — what an unsuffixed
+        // float literal in an arm body means, read off the other arms. Taken
+        // before the scrutinee is lowered so the scrutinee never sees it.
+        let inherited = self.float_lit_hint.take();
+        let lit_hint = Self::join_float_hint(
+            m.arms.iter().map(|a| self.static_float_kind(&a.body)),
+            inherited,
+        );
         let (scr_val, scr_ty) = self.lower_expr(&m.scrutinee)?;
         // #350: enums join the supported scrutinee kinds (already an i64 ordinal).
         let scr_i64 = self.match_scrutinee_i64(scr_val, &scr_ty, &m.span)?;
@@ -4963,10 +5748,11 @@ impl<'a> Translator<'a> {
                         self.enter(after_guard);
                         self.builder.seal_block(after_guard);
                     }
+                    self.float_lit_hint = lit_hint;
                     let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
                     if let Some(ref rk) = result_ty {
                         if rk != &arm_kind {
-                            return unsupported_msg(&m.span, format!(
+                            return unsupported_msg(&m.span, Refusal::BranchType, format!(
                                 "match arms disagree on type: `{}` vs `{}`",
                                 rk.render(), arm_kind.render(),
                             ));
@@ -4991,10 +5777,11 @@ impl<'a> Translator<'a> {
                         self.enter(after_guard);
                         self.builder.seal_block(after_guard);
                     }
+                    self.float_lit_hint = lit_hint;
                     let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
                     if let Some(ref rk) = result_ty {
                         if rk != &arm_kind {
-                            return unsupported_msg(&m.span, format!(
+                            return unsupported_msg(&m.span, Refusal::BranchType, format!(
                                 "match arms disagree on type: `{}` vs `{}`",
                                 rk.render(), arm_kind.render(),
                             ));
@@ -5008,7 +5795,7 @@ impl<'a> Translator<'a> {
                     self.builder.seal_block(next_check);
                     continue;
                 }
-                _ => return unsupported(&m.span, "complex patterns in `match`"),
+                _ => return unsupported(&m.span, Refusal::Pattern, "complex patterns in `match`"),
             }
             }
 
@@ -5024,6 +5811,7 @@ impl<'a> Translator<'a> {
                 self.enter(after_guard);
                 self.builder.seal_block(after_guard);
             }
+            self.float_lit_hint = lit_hint;
             let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
             if let Some(ref rk) = result_ty {
                 if rk != &arm_kind {
@@ -5050,7 +5838,7 @@ impl<'a> Translator<'a> {
         self.enter(merge);
         self.builder.seal_block(merge);
 
-        let rk = result_ty.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let rk = result_ty.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "match expression has no arms".into(),
             line: m.span.line, col: m.span.col,
         })?;
@@ -5068,7 +5856,7 @@ impl<'a> Translator<'a> {
     }
 
     fn lower_break(&mut self, span: &Span) -> Result<(), JitError> {
-        let exit = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let exit = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`break` outside of a loop".into(), line: span.line, col: span.col,
         })?.exit;
         self.jump(exit, &[]);
@@ -5076,7 +5864,7 @@ impl<'a> Translator<'a> {
     }
 
     fn lower_continue(&mut self, span: &Span) -> Result<(), JitError> {
-        let header = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let header = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`continue` outside of a loop".into(), line: span.line, col: span.col,
         })?.header;
         self.jump(header, &[]);
@@ -5086,25 +5874,38 @@ impl<'a> Translator<'a> {
     // ─── Expressions ────────────────────────────────────────────────────────
 
     fn lower_expr(&mut self, e: &Expr) -> Result<(Value, TyKind), JitError> {
+        // #478: consume the type-direction hint here, exactly once. Forms that
+        // are *value-transparent* — they yield one of their sub-expressions
+        // unchanged — re-arm it before recursing; every other form simply
+        // drops it. So the hint can only ever reach a literal that really is
+        // the value of the position `lower_if`/`lower_match_expr` armed it for.
+        let want = self.float_lit_hint.take();
         match e {
-            Expr::Literal(lit, span) => self.lower_literal(lit, span),
+            Expr::Literal(lit, span) => self.lower_literal(lit, span, want),
             Expr::Nil(_) => {
                 let v = self.builder.ins().iconst(cl::I8, 0);
                 Ok((v, TyKind::Scalar(ScalarKind::Nil)))
             }
             Expr::Ident(name, span) => self.lower_ident(name, span),
             Expr::BinOp { op, lhs, rhs, span } => self.lower_binop(op, lhs, rhs, span),
-            Expr::UnOp { op, operand, span } => self.lower_unop(op, operand, span),
+            Expr::UnOp { op, operand, span } => {
+                // `-0.1` is a negated literal, so the hint passes through the
+                // sign; `lower_unop` lowers the operand as its first act.
+                if matches!(op, UnOp::Neg) { self.float_lit_hint = want; }
+                self.lower_unop(op, operand, span)
+            }
             Expr::If(i) => {
+                self.float_lit_hint = want;
                 let v = self.lower_if(i)?;
-                v.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                v.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "if-expression has no value (both branches terminated)".into(),
                     line: i.span.line, col: i.span.col,
                 })
             }
             Expr::Block(b) => {
+                self.float_lit_hint = want;
                 let v = self.lower_block_value(b)?;
-                v.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                v.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "block expression has no tail value".into(),
                     line: b.span.line, col: b.span.col,
                 })
@@ -5125,7 +5926,7 @@ impl<'a> Translator<'a> {
                 // pointer as a scalar (silent garbage), so reject it cleanly.
                 if matches!(k, TyKind::Tensor(_)) {
                     if let Type::Scalar(_, _) = ty {
-                        return unsupported(span,
+                        return unsupported(span, Refusal::Construct,
                             "elementwise cast of a whole tensor to a scalar type");
                     }
                 }
@@ -5137,59 +5938,99 @@ impl<'a> Translator<'a> {
                 if let Type::Scalar(s, _) = ty {
                     if scalar_int_is_narrow(s) {
                         let r = self.lower_narrow_int_cast(v, &k, s, span)?;
-                        return Ok((r, TyKind::Scalar(ScalarKind::I64)));
+                        // #544: the cast's RESULT carries the target's width, so
+                        // what follows it wraps — SPEC §3.1's "the wrapped value
+                        // is the value". `u64` has no narrow kind and stays i64.
+                        let rk = narrow_scalar_kind(s).unwrap_or(ScalarKind::I64);
+                        return Ok((r, TyKind::Scalar(rk)));
                     }
                 }
                 let target = enumify(ty_from_ast(ty, &self.shape_env)?, self.enums);
                 let cv = self.coerce_to(v, &k, &target, span)?;
                 Ok((cv, target))
             }
-            Expr::Tuple(elems, _) if elems.len() == 1 => self.lower_expr(&elems[0]),
+            Expr::Tuple(elems, _) if elems.len() == 1 => {
+                self.float_lit_hint = want;
+                self.lower_expr(&elems[0])
+            }
             Expr::Tuple(els, span) => self.lower_tuple(els, span),
             Expr::TensorLit(elems, span) => self.lower_tensor_literal(elems, span),
-            Expr::Match(m) => self.lower_match_expr(m),
+            Expr::Match(m) => {
+                self.float_lit_hint = want;
+                self.lower_match_expr(m)
+            }
             Expr::FnLit(f) => self.lower_fn_lit(f),
-            Expr::ArenaBlock(a) => unsupported(&a.span, "arena blocks as expressions"),
+            Expr::ArenaBlock(a) => unsupported(&a.span, Refusal::Construct, "arena blocks as expressions"),
             Expr::DirectiveBlock { directives, body, span } => {
                 if directives.iter().any(|d| d.name == "fuse") {
                     return self.lower_fuse_block(body, span);
                 }
                 if cast_directive_is_int_target(directives) {
-                    return unsupported(span, INT_CAST_BLOCK_UNSUPPORTED);
+                    return unsupported(span, Refusal::Directive, INT_CAST_BLOCK_UNSUPPORTED);
                 }
                 // @deterministic and @cast(bf16) are accepted as no-ops: bit-exactness
                 // and bf16-compute semantics are not yet enforced by the JIT.
                 if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
-                    return self.lower_block_value(body)?.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                    self.float_lit_hint = want;
+                    return self.lower_block_value(body)?.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                         msg: "directive block (@deterministic/@cast) must yield a value".into(),
                         line: span.line, col: span.col,
                     });
                 }
-                unsupported(span, "directive blocks as expressions (only @fuse, @deterministic, @cast are supported)")
+                unsupported(span, Refusal::Directive, "directive blocks as expressions (only @fuse, @deterministic, @cast are supported)")
             }
             Expr::StructLit { name, type_args, fields, span } => {
                 self.lower_struct_lit(name, type_args, fields, span)
             }
-            Expr::Range { span, .. } => unsupported(span, "range expressions"),
+            Expr::Range { span, .. } => unsupported(span, Refusal::Construct, "range expressions"),
             Expr::Underscore(s) => err(s, "`_` is only legal in pipe stages, not as a value"),
             Expr::Spread(s) => err(s, "`...` is only legal in call arg lists"),
         }
     }
 
-    fn lower_literal(&mut self, lit: &Literal, span: &Span) -> Result<(Value, TyKind), JitError> {
+    fn lower_literal(&mut self, lit: &Literal, span: &Span, want: Option<ScalarKind>)
+        -> Result<(Value, TyKind), JitError>
+    {
         match lit {
+            // #545: the SUFFIX decides the width, exactly as it does for a
+            // float literal above. `2147483647i32` is an `i32` and the `+ 1i32`
+            // after it wraps; before this the suffix was dropped and the
+            // literal lowered as a plain i64 constant, so it did not.
+            // An UNSUFFIXED literal stays i64 and adopts its context at the
+            // operator (`adopt_int_literal_kind`) — §3.1's untyped-literal rule.
+            Literal::Int(n, Some(sfx)) if scalar_kind_of_int_suffix(sfx).is_some() => {
+                let k = scalar_kind_of_int_suffix(sfx).unwrap();
+                // check.rs range-checks a suffixed literal against its own
+                // width (#295), so the mask below is a formality for anything
+                // that type-checks; it is here so a 64-bit hex mask written
+                // with a narrow suffix cannot smuggle an out-of-width constant
+                // past the lowering.
+                let n = mask_const_to_kind(*n, k);
+                let v = self.builder.ins().iconst(k.cl(), n);
+                Ok((v, TyKind::Scalar(k)))
+            }
             Literal::Int(n, _) => {
                 let v = self.builder.ins().iconst(cl::I64, *n);
                 Ok((v, TyKind::Scalar(ScalarKind::I64)))
             }
             Literal::Float(f, sfx) => {
                 // #473: the SUFFIX decides the width. `0.1f32` is the f32
-                // number 0.100000001490116119384765625 and computes in f32;
-                // an unsuffixed literal stays f64, which is #209's rule and
-                // must not regress (`let x: f64 = 0.1` keeps full f64
-                // precision). f32 still fdemotes at a tensor-store boundary
-                // via coerce_to, unchanged.
-                if sfx.as_ref().is_some_and(scalar_is_f32_family) {
+                // number 0.100000001490116119384765625 and computes in f32.
+                //
+                // #478: an *unsuffixed* literal is untyped and adopts its
+                // context (SPEC.md §"Untyped numeric literals"), so when the
+                // caller knows the context — today, a sibling `if`/`match`
+                // branch that is statically f32 — the literal is born f32
+                // rather than born f64 and reconciled afterwards. `want` is
+                // `None` everywhere else, which is #209's rule and must not
+                // regress (`let x: f64 = 0.1` keeps full f64 precision). f32
+                // still fdemotes at a tensor-store boundary via coerce_to,
+                // unchanged.
+                let f32_wanted = match sfx {
+                    Some(t) => scalar_is_f32_family(t),
+                    None => want == Some(ScalarKind::F32),
+                };
+                if f32_wanted {
                     let v = self.builder.ins().f32const(*f as f32);
                     Ok((v, TyKind::Scalar(ScalarKind::F32)))
                 } else {
@@ -5205,25 +6046,29 @@ impl<'a> Translator<'a> {
                 let v = self.builder.ins().iconst(cl::I8, 0);
                 Ok((v, TyKind::Scalar(ScalarKind::Nil)))
             }
-            Literal::Char(_) => unsupported(span, "character literals"),
-            Literal::Str(s) => {
-                // Store the bytes in the global leak-list so the pointer stays
-                // valid for the lifetime of the process.
-                let bytes: Vec<u8> = s.as_bytes().to_vec();
-                let len = bytes.len() as i64;
-                let raw_ptr = bytes.as_ptr() as i64;
-                LEAKED_STRING_DATA.lock().unwrap().push(bytes);
-                // Emit: __dmc_str_new_from_raw(raw_ptr, len) -> i64 (forge ptr)
-                let ptr_val = self.builder.ins().iconst(cl::I64, raw_ptr);
-                let len_val = self.builder.ins().iconst(cl::I64, len);
-                let entry = self.fns.get("__dmc_str_new_from_raw")
-                    .expect("__dmc_str_new_from_raw not registered").clone();
-                let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-                let call = self.builder.ins().call(func_ref, &[ptr_val, len_val]);
-                let result = self.builder.inst_results(call)[0];
-                Ok((result, TyKind::Str))
-            }
+            Literal::Char(_) => unsupported(span, Refusal::Construct, "character literals"),
+            Literal::Str(s) => Ok((self.lower_str_literal(s), TyKind::Str)),
         }
+    }
+
+    /// Materialize a compile-time-known string as a forge string value. Used
+    /// for `Literal::Str` and wherever lowering needs to synthesize one (the
+    /// empty `port_call` payload, say).
+    fn lower_str_literal(&mut self, s: &str) -> Value {
+        // Store the bytes in the global leak-list so the pointer stays
+        // valid for the lifetime of the process.
+        let bytes: Vec<u8> = s.as_bytes().to_vec();
+        let len = bytes.len() as i64;
+        let raw_ptr = bytes.as_ptr() as i64;
+        LEAKED_STRING_DATA.lock().unwrap().push(bytes);
+        // Emit: __dmc_str_new_from_raw(raw_ptr, len) -> i64 (forge ptr)
+        let ptr_val = self.builder.ins().iconst(cl::I64, raw_ptr);
+        let len_val = self.builder.ins().iconst(cl::I64, len);
+        let entry = self.fns.get("__dmc_str_new_from_raw")
+            .expect("__dmc_str_new_from_raw not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[ptr_val, len_val]);
+        self.builder.inst_results(call)[0]
     }
 
     /// Lower a struct literal `ModelName { field: expr, ... }` by
@@ -5241,7 +6086,7 @@ impl<'a> Translator<'a> {
             return self.lower_expr(&els[0]);
         }
         if els.is_empty() {
-            return unsupported(span, "the empty tuple `()`");
+            return unsupported(span, Refusal::Construct, "the empty tuple `()`");
         }
         let ptr = self.forge_alloc(els.len() as i64 * 8);
         let mut tys = Vec::with_capacity(els.len());
@@ -5274,7 +6119,7 @@ impl<'a> Translator<'a> {
         let (ptr, ty) = self.lower_expr(value)?;
         let els = match &ty {
             TyKind::Tuple(els) => els.clone(),
-            other => return unsupported(span, &format!(
+            other => return unsupported(span, Refusal::Pattern, &format!(
                 "tuple destructuring needs a tuple on the right-hand side, got `{}`",
                 other.render())),
         };
@@ -5282,12 +6127,12 @@ impl<'a> Translator<'a> {
         let named = if rest_at.is_some() { pats.len() - 1 } else { pats.len() };
         if rest_at.is_some() {
             if named > els.len() {
-                return unsupported(span, &format!(
+                return unsupported(span, Refusal::Pattern, &format!(
                     "tuple has {} elements but the pattern binds at least {}",
                     els.len(), named));
             }
         } else if named != els.len() {
-            return unsupported(span, &format!(
+            return unsupported(span, Refusal::Pattern, &format!(
                 "tuple has {} elements but the pattern binds {}",
                 els.len(), pats.len()));
         }
@@ -5306,7 +6151,7 @@ impl<'a> Translator<'a> {
             let name = match pat {
                 Pattern::Ident(n, _) if n != "_" => n.clone(),
                 Pattern::Ident(_, _) | Pattern::Wildcard(_) => continue,
-                _ => return unsupported(span,
+                _ => return unsupported(span, Refusal::Pattern,
                     "only plain names, `_`, and `..` are supported in a tuple pattern"),
             };
             let ety = els[ei].clone();
@@ -5327,7 +6172,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         // Look up model layout.
-        let layout = self.model_layouts.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let layout = self.model_layouts.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("unknown model `{}`", name),
             line: span.line, col: span.col,
         })?.clone();
@@ -5341,7 +6186,7 @@ impl<'a> Translator<'a> {
         // For each field provided in the struct literal, lower and store it.
         for (fname, fexpr) in fields {
             let field_idx = layout.iter().position(|(n, _)| n == fname)
-                .ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("model `{}` has no field `{}`", name, fname),
                     line: span.line, col: span.col,
                 })?;
@@ -5402,7 +6247,7 @@ impl<'a> Translator<'a> {
         let empty_env: HashMap<String, i64> = HashMap::new();
         let mut params: Vec<(String, TyKind, Span)> = Vec::new();
         for p in &lit.params {
-            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("lambda param `{}` needs a type annotation in JIT", p.name),
                 line: lit.span.line, col: lit.span.col,
             })?;
@@ -5441,7 +6286,7 @@ impl<'a> Translator<'a> {
 
         let id = self.module
             .declare_function(&name, cranelift_module::Linkage::Local, &sig)
-            .map_err(|e| JitError { kind: JitErrorKind::Error,
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("declare lambda `{}`: {}", name, e),
                 line: lit.span.line, col: lit.span.col,
             })?;
@@ -5553,7 +6398,7 @@ impl<'a> Translator<'a> {
         for (a, expected) in args.iter().zip(param_tys.iter()) {
             let e = match a {
                 CallArg::Positional(e) => e,
-                _ => return unsupported(span, "named/spread args in indirect call"),
+                _ => return unsupported(span, Refusal::ArgForm, "named/spread args in indirect call"),
             };
             let (v, ty) = self.lower_expr(e)?;
             let v = self.coerce_to(v, &ty, expected, span)?;
@@ -5605,7 +6450,7 @@ impl<'a> Translator<'a> {
                     tram_sig.call_conv = cranelift::codegen::isa::CallConv::SystemV;
                     let tram_id = self.module
                         .declare_function(&trampoline_name, cranelift_module::Linkage::Local, &tram_sig)
-                        .map_err(|e| JitError { kind: JitErrorKind::Error,
+                        .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
                             msg: format!("declare trampoline `{}`: {}", trampoline_name, e),
                             line: span.line, col: span.col,
                         })?;
@@ -5675,7 +6520,110 @@ impl<'a> Translator<'a> {
         err(span, format!("unknown binding `{}` (JIT has no globals)", name))
     }
 
+    /// #478: the scalar float width this expression will lower to, answered
+    /// **without emitting any code**. Cranelift requires a block be terminated
+    /// before switching away from it, so a branch join cannot lower its second
+    /// branch first to find out what the first one should have been — the
+    /// answer has to be available up front, the same way `else_can_yield_value`
+    /// decides the join's phi param syntactically.
+    ///
+    /// Deliberately partial: `None` means "cannot say cheaply and certainly",
+    /// and a `None` answer changes nothing (an unsuffixed literal keeps #209's
+    /// f64 default and the join errors exactly as it does today). Only a
+    /// definite `Some` is allowed to move anything.
+    fn static_float_kind(&self, e: &Expr) -> Option<ScalarKind> {
+        let scalar_of = |k: &TyKind| match k {
+            TyKind::Scalar(s @ (ScalarKind::F32 | ScalarKind::F64)) => Some(*s),
+            _ => None,
+        };
+        match e {
+            // A suffix is the width, full stop (#473). An *unsuffixed* literal
+            // is the thing being decided, so it answers nothing.
+            Expr::Literal(Literal::Float(_, Some(t)), _) =>
+                Some(if scalar_is_f32_family(t) { ScalarKind::F32 } else { ScalarKind::F64 }),
+            Expr::Ident(name, _) => self.local_tys.get(name).and_then(scalar_of),
+            Expr::Cast { ty: Type::Scalar(s, _), .. } => match s {
+                _ if scalar_is_f32_family(s) => Some(ScalarKind::F32),
+                ScalarType::F64 => Some(ScalarKind::F64),
+                _ => None,
+            },
+            Expr::UnOp { op: UnOp::Neg, operand, .. } => self.static_float_kind(operand),
+            Expr::Tuple(els, _) if els.len() == 1 => self.static_float_kind(&els[0]),
+            Expr::Block(b) => self.static_float_kind_of_block(b),
+            Expr::If(i) => self.static_float_kind_of_if(i),
+            Expr::Match(m) => m.arms.iter().find_map(|a| self.static_float_kind(&a.body)),
+            // Arithmetic keeps the operands' width; a mixed pair is a JIT
+            // error anyway, so "the side that answered" is the only answer
+            // worth reporting and disagreement reports nothing.
+            Expr::BinOp { op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                          lhs, rhs, .. } => {
+                match (self.static_float_kind(lhs), self.static_float_kind(rhs)) {
+                    (Some(a), Some(b)) if a != b => None,
+                    (a, b) => a.or(b),
+                }
+            }
+            // A fully-subscripted read of a statically-typed tensor local is
+            // an element of that tensor — the #473 shape (`t[0]` vs a bare
+            // literal) that started this.
+            Expr::Postfix { expr, op: PostfixOp::Index(elems), .. } => {
+                let Expr::Ident(name, _) = &**expr else { return None };
+                let TyKind::Tensor(tt) = self.local_tys.get(name)? else { return None };
+                let all_points = elems.iter().all(|ie| matches!(ie, IndexElem::Expr(_)));
+                if !all_points || elems.len() != tt.rank() { return None; }
+                scalar_of(&TyKind::Scalar(tt.elem))
+            }
+            _ => None,
+        }
+    }
+
+    fn static_float_kind_of_block(&self, b: &Block_) -> Option<ScalarKind> {
+        if let Some(tail) = &b.tail_expr { return self.static_float_kind(tail); }
+        // #421: a trailing block-form `if`/`match` parses as a statement.
+        match b.stmts.last() {
+            Some(Stmt::If(i)) => self.static_float_kind_of_if(i),
+            Some(Stmt::Match(m)) => m.arms.iter().find_map(|a| self.static_float_kind(&a.body)),
+            _ => None,
+        }
+    }
+
+    fn static_float_kind_of_if(&self, i: &IfExpr) -> Option<ScalarKind> {
+        self.static_float_kind_of_block(&i.then_branch).or_else(|| match &i.else_branch {
+            Some(ElseBranch::Block(b)) => self.static_float_kind_of_block(b),
+            Some(ElseBranch::If(nested)) => self.static_float_kind_of_if(nested),
+            None => None,
+        })
+    }
+
+    /// Fold a join's per-branch answers into the hint an unsuffixed float
+    /// literal in *any* of those branches should adopt (SPEC.md: a bare
+    /// literal takes the type of "the other operand at its use site"). Only
+    /// `F32` is interesting — `F64` and "don't know" both leave #209's f64
+    /// default in place — and `inherited` carries an enclosing join's answer
+    /// down into a nested one.
+    fn join_float_hint(
+        branch_kinds: impl IntoIterator<Item = Option<ScalarKind>>,
+        inherited: Option<ScalarKind>,
+    ) -> Option<ScalarKind> {
+        if branch_kinds.into_iter().any(|k| k == Some(ScalarKind::F32)) {
+            return Some(ScalarKind::F32);
+        }
+        inherited.filter(|k| *k == ScalarKind::F32)
+    }
+
     fn lower_if(&mut self, i: &IfExpr) -> Result<Option<(Value, TyKind)>, JitError> {
+        // #478: decide up front what an unsuffixed float literal in either
+        // branch means, from the other branch's static type (and, failing
+        // that, from an enclosing join's answer). The condition is lowered
+        // first and must not see it.
+        let inherited = self.float_lit_hint.take();
+        let lit_hint = Self::join_float_hint([
+            self.static_float_kind_of_block(&i.then_branch),
+            match &i.else_branch {
+                Some(ElseBranch::Block(b)) => self.static_float_kind_of_block(b),
+                Some(ElseBranch::If(nested)) => self.static_float_kind_of_if(nested),
+                None => None,
+            },
+        ], inherited);
         let (c, ck) = self.lower_expr(&i.cond)?;
         let ck_sc = ck.as_scalar();
         if !ck_sc.map(|s| s.is_bool()).unwrap_or(false) {
@@ -5689,26 +6637,36 @@ impl<'a> Translator<'a> {
 
         // then
         self.enter(then_block);
+        self.float_lit_hint = lit_hint;
         let then_val = self.lower_block_value(&i.then_branch)?;
         let then_filled = self.is_filled();
-        // The join carries a phi param only if EVERY fall-through predecessor
-        // supplies a value. Previously the param was appended whenever the
-        // *then* branch produced one, so `if c { 5 }` (no else) and
-        // `if c { 5 } else { }` both gave the join a param while the else-side
-        // fall-through jumped with zero args — a Cranelift `mismatched
-        // argument count` verifier error, and a hard compile failure for any
-        // program containing that shape.
-        //
-        // The decision has to be made HERE, before the then-side jump:
-        // Cranelift's FunctionBuilder requires a block be terminated before
-        // switching away from it, so the else branch cannot be lowered first
-        // to find out. `else_can_yield_value` answers it syntactically instead
-        // — conservatively, so it only ever *removes* a phi in the shapes that
-        // currently fail to compile.
-        let mut join_ty: Option<TyKind> = if else_can_yield_value(&i.else_branch) {
-            then_val.as_ref().map(|(_, k)| k.clone())
-        } else {
+        // The join carries a phi param only if EVERY predecessor that reaches
+        // it supplies a value. The decision has to be made HERE, before the
+        // then-side jump: Cranelift's FunctionBuilder requires a block be
+        // terminated before switching away from it, so the else branch cannot
+        // be lowered first to find out what it does. The then side is known
+        // exactly by now; the else side is classified syntactically by
+        // `else_join_edge` (see `JoinEdge`).
+        let mut join_ty: Option<TyKind> = if then_filled {
+            // The then side never reaches the join, so it constrains nothing
+            // and emits no jump. Whatever the else side yields becomes the
+            // `if`'s value, adopted below once it has actually been lowered.
             None
+        } else {
+            match else_join_edge(&i.else_branch) {
+                // The else side either arrives with a value of its own or
+                // never arrives; either way a phi carrying the then value has
+                // an argument from every edge that exists.
+                JoinEdge::Value | JoinEdge::Diverges =>
+                    then_val.as_ref().map(|(_, k)| k.clone()),
+                // The else side arrives empty-handed, so the join cannot carry
+                // a value however good the then side's is. This is the shape
+                // that used to fail verification: `if c { 5 }` with no else,
+                // `if c { 5 } else { }`, and — the one that reached the port
+                // idiom — an else block whose trailing statement is itself an
+                // `if` with no `else`.
+                JoinEdge::Empty => None,
+            }
         };
         if !then_filled {
             match (&then_val, &join_ty) {
@@ -5720,10 +6678,11 @@ impl<'a> Translator<'a> {
 
         // else
         self.enter(else_block);
+        self.float_lit_hint = lit_hint;
         let else_val = match &i.else_branch {
             Some(ElseBranch::Block(b)) => self.lower_block_value(b)?,
             Some(ElseBranch::If(nested)) => self.lower_if(nested)?,
-            None => None,
+            None => { self.float_lit_hint = None; None }
         };
         let else_filled = self.is_filled();
         if let Some((_, k)) = &else_val {
@@ -5741,14 +6700,21 @@ impl<'a> Translator<'a> {
                     } else { "" };
                     // #480: a refusal, not a defect — the JIT cannot unify
                     // these two kinds (#478) and says so cleanly.
-                    return unsupported_msg(&i.span, format!(
+                    return unsupported_msg(&i.span, Refusal::BranchType, format!(
                         "if/else branches disagree on type: `{}` vs `{}`{}",
                         jk.render(), k.render(), hint,
                     ));
                 }
-            } else {
+            } else if then_filled {
+                // No then-side edge to disagree with, so the else side's value
+                // is the `if`'s value.
                 join_ty = Some(k.clone());
             }
+            // Otherwise the then side already fell through to the join without
+            // a value, so the join carries none and this one is discarded —
+            // which is what a statement-position `if` does with it anyway. In
+            // value position the checker has already rejected the program:
+            // the two branches disagree on type.
         }
         if !else_filled {
             match (&else_val, &join_ty) {
@@ -5989,7 +6955,7 @@ impl<'a> Translator<'a> {
                 dims.push(v);
             }
         }
-        let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`forge.kv` shape must contain a streaming `~` axis".into(),
             line: span.line, col: span.col,
         })?;
@@ -5998,7 +6964,7 @@ impl<'a> Translator<'a> {
         let cap_expr = args.iter().find_map(|a| match a {
             CallArg::Named { name, value, .. } if name == "capacity" => Some(value),
             _ => None,
-        }).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        }).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`forge.kv` requires a `capacity = N` argument".into(),
             line: span.line, col: span.col,
         })?;
@@ -6009,7 +6975,7 @@ impl<'a> Translator<'a> {
 
         let kv = KvTy { elem: ScalarKind::F32, dims, stream_axis, cap: Some(cap) };
         let frame = kv.frame_elems();
-        let data_elems = cap.checked_mul(frame).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let data_elems = cap.checked_mul(frame).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`forge.kv` capacity * frame size overflows i64".into(),
             line: span.line, col: span.col,
         })?;
@@ -6040,7 +7006,7 @@ impl<'a> Translator<'a> {
         rhs: &Expr,
         span: &Span,
     ) -> Result<(), JitError> {
-        let kv = kv_ty.as_kv().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let kv = kv_ty.as_kv().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`<-` stream-append requires a KV stream on the left; \
                           `{}` is `{}`", name, kv_ty.render()),
             line: span.line, col: span.col,
@@ -6059,7 +7025,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(), JitError> {
         let (src, src_ty) = self.lower_expr(rhs)?;
-        let st = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let st = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`<-` requires a tensor on the right, got `{}`", src_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -6153,7 +7119,7 @@ impl<'a> Translator<'a> {
         }
         let idx_expr = match &idxs[0] {
             IndexElem::Expr(e) => e,
-            _ => return unsupported(span, "non-expression KV array index for `<-`"),
+            _ => return unsupported(span, Refusal::Construct, "non-expression KV array index for `<-`"),
         };
         let (idx_v, idx_ty) = self.lower_expr(idx_expr)?;
         let idx_i64 = self.coerce_to(idx_v, &idx_ty, &TyKind::Scalar(ScalarKind::I64), span)?;
@@ -6497,7 +7463,7 @@ impl<'a> Translator<'a> {
         // Resolve shape → TensorTy
         let dims = self.const_dims(type_args[1], span)?;
         let numel: i64 = dims.iter().try_fold(1i64, |a, &d| a.checked_mul(d))
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "vault.load: shape overflow".into(), line: span.line, col: span.col })?;
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None, msg: "vault.load: shape overflow".into(), line: span.line, col: span.col })?;
 
         // Return type — use F32 as elem placeholder for sub-word dtypes
         let ret_elem = match elem_bytes {
@@ -6520,7 +7486,7 @@ impl<'a> Translator<'a> {
         let numel_v = self.builder.ins().iconst(cl::I64, numel);
         let elem_bytes_v = self.builder.ins().iconst(cl::I64, elem_bytes);
         let entry = self.fns.get("__dmc_vault_load_raw")
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "__dmc_vault_load_raw not registered".into(), line: span.line, col: span.col })?
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None, msg: "__dmc_vault_load_raw not registered".into(), line: span.line, col: span.col })?
             .clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[path_val, numel_v, elem_bytes_v]);
@@ -6578,7 +7544,7 @@ impl<'a> Translator<'a> {
         // Resolve shape → TensorTy
         let dims = self.const_dims(type_args[1], span)?;
         let numel: i64 = dims.iter().try_fold(1i64, |a, &d| a.checked_mul(d))
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "vault.load_npz: shape overflow".into(), line: span.line, col: span.col })?;
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None, msg: "vault.load_npz: shape overflow".into(), line: span.line, col: span.col })?;
 
         let ret_ty = if bf16_direct {
             TyKind::Bf16Tensor(Bf16TensorTy { shape: dims })
@@ -6596,10 +7562,10 @@ impl<'a> Translator<'a> {
                 _ => {}
             }
         }
-        let path_expr = path_expr.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let path_expr = path_expr.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "vault.load_npz requires a path argument".into(), line: span.line, col: span.col,
         })?;
-        let key_expr = key_expr.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let key_expr = key_expr.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "vault.load_npz requires `key=` argument".into(), line: span.line, col: span.col,
         })?;
 
@@ -6611,7 +7577,7 @@ impl<'a> Translator<'a> {
         let elem_bytes_v = self.builder.ins().iconst(cl::I64, elem_bytes);
         let convert_v = self.builder.ins().iconst(cl::I64, convert);
         let entry = self.fns.get("__dmc_vault_load_npz")
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error, msg: "__dmc_vault_load_npz not registered".into(), line: span.line, col: span.col })?
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None, msg: "__dmc_vault_load_npz not registered".into(), line: span.line, col: span.col })?
             .clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[path_val, key_val, numel_v, elem_bytes_v, convert_v]);
@@ -6713,7 +7679,7 @@ impl<'a> Translator<'a> {
                 match op {
                     BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
                     | BinOp::DotLt | BinOp::DotGt | BinOp::DotLe | BinOp::DotGe
-                    | BinOp::DotPow | BinOp::DotPow2 => {
+                    | BinOp::DotPow => {
                         // Scalar operands are valid as broadcast inputs; the tensor
                         // operand (whichever side has one) determines the output shape.
                         let l_tensor = self.fuse_try_infer_tensor_ty(lhs, bspan);
@@ -6754,6 +7720,8 @@ impl<'a> Translator<'a> {
                         "fuse-infeasible: dynamic-shape tensors are not yet supported inside @fuse"),
                     Some(TyKind::Str) => err(ispan,
                         "fuse-infeasible: string values are not supported inside @fuse"),
+                    Some(TyKind::Port(_)) => err(ispan,
+                        "fuse-infeasible: a port handle has no elementwise form"),
                     Some(TyKind::Map) => err(ispan,
                         "fuse-infeasible: map values are not supported inside @fuse"),
                     Some(TyKind::KvArray(_, _)) => err(ispan,
@@ -6964,12 +7932,24 @@ impl<'a> Translator<'a> {
                             for a in args {
                                 match a {
                                     CallArg::Positional(e) => arg_vals.push(self.lower_expr(e)?),
-                                    _ => return unsupported(span,
+                                    _ => return unsupported(span, Refusal::ArgForm,
                                         "named/spread argument in enum-variant construction"),
                                 }
                             }
                             return self.lower_enum_value(en, variant, arg_vals, span);
                         }
+                    }
+                }
+                // String methods are dispatched as builtins, never rewritten to
+                // free calls (SPEC §4.12), so they arrive here as Field+Call and
+                // would otherwise read as an indirect call. Only `starts_with`
+                // is lowered: `PORTS.md §6` makes prefix-matching the sanctioned
+                // way to read an error tag, so port-handling code needs it. The
+                // rest of the str-method family stays interpreter-only and keeps
+                // its located refusal.
+                if let Expr::Postfix { expr: recv, op: PostfixOp::Field(method), .. } = expr {
+                    if method == "starts_with" {
+                        return self.lower_str_starts_with(recv, args, span);
                     }
                 }
                 self.lower_call(expr, args, span)
@@ -7038,14 +8018,14 @@ impl<'a> Translator<'a> {
                 if let TyKind::Model(model_name, type_args) = &base_ty {
                     let model_name = model_name.clone();
                     let type_args = type_args.clone();
-                    let layout = self.model_layouts.get(model_name.as_str()).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                    let layout = self.model_layouts.get(model_name.as_str()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                         msg: format!("unknown model `{}`", model_name),
                         line: span.line, col: span.col,
                     })?.clone();
                     let (field_idx, mut field_ty) = layout.iter().enumerate()
                         .find(|(_, (n, _))| n == field)
                         .map(|(i, (_, t))| (i, t.clone()))
-                        .ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                        .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                             msg: format!("model `{}` has no field `{}`", model_name, field),
                             line: span.line, col: span.col,
                         })?;
@@ -7096,12 +8076,12 @@ impl<'a> Translator<'a> {
                     };
                     return Ok((loaded, field_ty));
                 }
-                unsupported(span, "field access on non-model type")
+                unsupported(span, Refusal::Construct, "field access on non-model type")
             }
-            PostfixOp::BracketArgs(_) => unsupported(span, "generic-style bracket args"),
-            PostfixOp::Constructor(_) => unsupported(span, "model constructor"),
+            PostfixOp::BracketArgs(_) => unsupported(span, Refusal::Construct, "generic-style bracket args"),
+            PostfixOp::Constructor(_) => unsupported(span, Refusal::Construct, "model constructor"),
             PostfixOp::Transpose => self.lower_transpose(expr, span),
-            PostfixOp::Query => unsupported(span, "error propagation `?`"),
+            PostfixOp::Query => unsupported(span, Refusal::Construct, "error propagation `?`"),
         }
     }
 
@@ -7169,10 +8149,19 @@ impl<'a> Translator<'a> {
                 }
                 match inner.as_ref() {
                     Expr::Ident(n, _) => n.clone(),
-                    _ => return unsupported(span, "indirect / dynamic calls"),
+                    _ => return unsupported(span, Refusal::IndirectCall, "indirect / dynamic calls"),
                 }
             }
-            _ => return unsupported(span, "indirect / dynamic calls"),
+            // A method call the JIT has no lowering for. This used to be
+            // reported as "indirect / dynamic calls", which named the wrong
+            // thing: the program wrote `e.trim()`, not a call through a value,
+            // and the refusal sent the reader looking for a closure. Name the
+            // method that was actually written.
+            Expr::Postfix { op: PostfixOp::Field(m), .. } =>
+                return unsupported(span, Refusal::UnknownFn, &format!(
+                    "the `.{}()` method — of the str methods the JIT lowers \
+                     `.starts_with`, and no other", m)),
+            _ => return unsupported(span, Refusal::IndirectCall, "indirect / dynamic calls"),
         };
 
         // Tensor-aware special-form builtins. These dispatch on the shape of
@@ -7191,13 +8180,21 @@ impl<'a> Translator<'a> {
                 }
                 let e = match &args[0] {
                     CallArg::Positional(e) => e,
-                    _ => return unsupported(span, "non-positional arg to `to_str`"),
+                    _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `to_str`"),
                 };
                 let (v, k) = self.lower_expr(e)?;
                 let out = self.coerce_to(v, &k, &TyKind::Str, span)?;
                 return Ok((out, TyKind::Str));
             }
             "len" => return self.lower_builtin_len(args, span),
+            // Process ports (PORTS.md §2/§6/§7.1). The protocol lives in
+            // `crate::ports`, shared with the interpreter; these three only
+            // marshal strings and shape the `(_, Err)` pair.
+            "port_open"    => return self.lower_builtin_port_open(args, span),
+            "port_call"    => return self.lower_builtin_port_call(args, span),
+            "port_tensor_encode" => return self.lower_builtin_port_tensor_encode(args, span),
+            "port_tensor_decode" => return self.lower_builtin_port_tensor_decode(args, span),
+            "port_close"   => return self.lower_builtin_port_close(args, span),
             "str_concat"   => return self.lower_builtin_str_concat(args, span),
             "str_eq"       => return self.lower_builtin_str_eq(args, span),
             "str_get_char" => return self.lower_builtin_str_get_char(args, span),
@@ -7209,6 +8206,11 @@ impl<'a> Translator<'a> {
             "print" if args.len() == 1 => {
                 if let CallArg::Positional(e) = &args[0] {
                     let (v, ty) = self.lower_expr(e)?;
+                    // A port handle prints as its opaque rendering, the same
+                    // text the interpreter's `Value::Opaque` Displays.
+                    let (v, ty) = if ty.is_port() {
+                        (self.lower_port_render(v), TyKind::Str)
+                    } else { (v, ty) };
                     if ty.is_str() {
                         let entry = self.fns.get("__dmc_print_str")
                             .expect("__dmc_print_str not registered").clone();
@@ -7246,11 +8248,14 @@ impl<'a> Translator<'a> {
                     }
                     // Not a string; dispatch to the appropriate typed print_* fn.
                     let fn_name = match &ty {
-                        TyKind::Scalar(ScalarKind::I64) | TyKind::Scalar(ScalarKind::I32) => "print_i64",
+                        // #544: every integer kind prints through `print_i64` —
+                        // a masked narrow kind is already the extended i64 the
+                        // interpreter would render.
+                        TyKind::Scalar(k) if k.is_int() => "print_i64",
                         TyKind::Scalar(ScalarKind::F64) | TyKind::Scalar(ScalarKind::F32) => "print_f64",
                         TyKind::Scalar(ScalarKind::Bool) => "print_bool",
                         TyKind::Scalar(ScalarKind::Nil)  => "print_nil",
-                        _ => return unsupported_msg(span, format!("print: unsupported type `{}`", ty.render())),
+                        _ => return unsupported_msg(span, Refusal::OperandType, format!("print: unsupported type `{}`", ty.render())),
                     };
                     let coerce_ty = match fn_name {
                         "print_i64"  => TyKind::Scalar(ScalarKind::I64),
@@ -7324,7 +8329,7 @@ impl<'a> Translator<'a> {
                     CallArg::Positional(Expr::Literal(Literal::Str(s), _)) => s.clone(),
                     _ => return err(span, "fn_ptr: argument must be a string literal"),
                 };
-                let entry = self.fns.get(&fname).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let entry = self.fns.get(&fname).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("fn_ptr: unknown function `{}`", fname),
                     line: span.line,
                     col: span.col,
@@ -7342,16 +8347,16 @@ impl<'a> Translator<'a> {
                 // First arg is the function pointer (i64).
                 let fp_val = match &args[0] {
                     CallArg::Positional(e) => self.lower_expr(e)?.0,
-                    CallArg::Named { span: s, .. } => return unsupported(s, "named call arguments"),
-                    CallArg::Spread(s) => return unsupported(s, "spread call arguments"),
+                    CallArg::Named { span: s, .. } => return unsupported(s, Refusal::ArgForm, "named call arguments"),
+                    CallArg::Spread(s) => return unsupported(s, Refusal::ArgForm, "spread call arguments"),
                 };
                 // Remaining args are the call arguments (all i64).
                 let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len() - 1);
                 for a in &args[1..] {
                     let v = match a {
                         CallArg::Positional(e) => self.lower_expr(e)?.0,
-                        CallArg::Named { span: s, .. } => return unsupported(s, "named call arguments"),
-                        CallArg::Spread(s) => return unsupported(s, "spread call arguments"),
+                        CallArg::Named { span: s, .. } => return unsupported(s, Refusal::ArgForm, "named call arguments"),
+                        CallArg::Spread(s) => return unsupported(s, Refusal::ArgForm, "spread call arguments"),
                     };
                     arg_vals.push(v);
                 }
@@ -7387,8 +8392,8 @@ impl<'a> Translator<'a> {
         for a in args {
             let e = match a {
                 CallArg::Positional(e) => e,
-                CallArg::Named { span, .. } => return unsupported(span, "named call arguments"),
-                CallArg::Spread(s) => return unsupported(s, "spread call arguments"),
+                CallArg::Named { span, .. } => return unsupported(span, Refusal::ArgForm, "named call arguments"),
+                CallArg::Spread(s) => return unsupported(s, Refusal::ArgForm, "spread call arguments"),
             };
             let (v, k) = self.lower_expr(e)?;
             arg_vals.push((v, k));
@@ -7435,7 +8440,7 @@ impl<'a> Translator<'a> {
             }
             self.instantiate_template(&tmpl, &arg_vals, &explicit, span)?
         } else {
-            return unsupported_msg(span, format!("unknown function `{}`", name));
+            return unsupported_msg(span, Refusal::UnknownFn, format!("unknown function `{}`", name));
         };
 
         if arg_vals.len() != entry.params.len() {
@@ -7469,7 +8474,7 @@ impl<'a> Translator<'a> {
         let call = self.builder.ins().call(func_ref, &vals);
         // Copy each mutated `!` tensor back into the caller's storage.
         for (orig, copy, t) in &writebacks {
-            self.emit_memcpy_loop(*orig, *copy, t.nelems(), t.elem_bytes());
+            self.emit_memcpy_loop(*orig, *copy, t.nelems(), t.elem.cl());
         }
         let results = self.builder.inst_results(call);
         if entry.ret == TyKind::Scalar(ScalarKind::Nil) {
@@ -7512,7 +8517,7 @@ impl<'a> Translator<'a> {
             }
         }
         for (p, (_v, k)) in tmpl.params.iter().zip(arg_vals.iter()) {
-            let p_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let p_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("template param `{}` needs a type annotation", p.name),
                 line: p.span.line, col: p.span.col,
             })?;
@@ -7554,7 +8559,7 @@ impl<'a> Translator<'a> {
         if matches!(op, BinOp::And | BinOp::Or) {
             return self.lower_short_circuit(op, lhs, rhs, span);
         }
-        // `x |> f` and `x >> f` desugar to `f(x)`. The placeholder-fusion form
+        // `x \|> f` desugars to `f(x)`. The placeholder-fusion form
         // `x |> _ .+ b` instead inlines `x` into the `_` slots and lowers the
         // fused expression directly — no indirect call, and the stages collapse
         // into the surrounding op sequence (the SIMD-fusion the syntax promises).
@@ -7659,6 +8664,25 @@ impl<'a> Translator<'a> {
                 return self.lower_matmul_general(l, &xt, r, &wt.shape, true, span);
             }
         }
+        // An untyped integer literal adopts the other operand's width before
+        // the kinds are compared (SPEC.md §3.1); see `adopt_int_literal_kind`.
+        let (l, lk, r, rk) = self.adopt_int_literal_kind(lhs, l, lk, rhs, r, rk, span)?;
+        // #256, now at the operand width. Cranelift masks a shift count mod the
+        // shifted value's width, so on an `i32` a count of 32..=63 passes the
+        // `0..=63` check above and then computes a different answer than the
+        // count says. That check runs before the operands are lowered and has
+        // no width to consult; here it does.
+        if matches!(op, BinOp::BitShl | BinOp::BitShr) {
+            if let (TyKind::Scalar(k), Some(count)) = (&lk, const_int_axis(rhs)) {
+                if k.is_int() && !(0..k.bits() as i64).contains(&count) {
+                    let op_str = if *op == BinOp::BitShl { "<<" } else { ">>" };
+                    return err(span, format!(
+                        "{} shift amount {} out of range (expected 0..={} for `{}`)",
+                        op_str, count, k.bits() as i64 - 1, k.name(),
+                    ));
+                }
+            }
+        }
         match (&lk, &rk) {
             (TyKind::Scalar(ls), TyKind::Scalar(rs)) => {
                 let (v, k) = self.scalar_binop(op, l, *ls, r, *rs, span)?;
@@ -7687,7 +8711,7 @@ impl<'a> Translator<'a> {
                 self.lower_scalar_dyn_broadcast(op, l, *s, r, &dt, span, true)
             }
             (TyKind::Model(_, _), _) | (_, TyKind::Model(_, _)) => {
-                unsupported(span, "binary operators are not supported on model instances")
+                unsupported(span, Refusal::OperandType, "binary operators are not supported on model instances")
             }
             // String operators: concatenation (`+`) and equality / inequality.
             (TyKind::Str, TyKind::Str) => {
@@ -7717,6 +8741,26 @@ impl<'a> Translator<'a> {
                         op,
                     )),
                 }
+            }
+            // `s == nil` / `s != nil`, and the same on a `Port` handle. Both are
+            // pointer-sized slots that hold NULL where the interpreter holds
+            // `nil` — that is how the `Err` half of a port result says "no
+            // error" and how a failed `port_open` says "no handle" (PORTS.md §6:
+            // ports return `(_, Err)`, never throw). The test is the pointer, so
+            // a real str — the empty one included — is never nil, exactly as in
+            // the interpreter. Comparing to `nil` is the ONLY comparison a Port
+            // supports in either backend; handle-to-handle is refused below.
+            (TyKind::Str, TyKind::Scalar(ScalarKind::Nil))
+            | (TyKind::Scalar(ScalarKind::Nil), TyKind::Str)
+            | (TyKind::Port(_), TyKind::Scalar(ScalarKind::Nil))
+            | (TyKind::Scalar(ScalarKind::Nil), TyKind::Port(_))
+                if matches!(op, BinOp::Eq | BinOp::NotEq) =>
+            {
+                let s = if matches!(lk, TyKind::Str | TyKind::Port(_)) { l } else { r };
+                let zero = self.builder.ins().iconst(cl::I64, 0);
+                let cc = if *op == BinOp::Eq { IntCC::Equal } else { IntCC::NotEqual };
+                let res = self.builder.ins().icmp(cc, s, zero);
+                Ok((res, TyKind::Scalar(ScalarKind::Bool)))
             }
             // `str + x` / `x + str` — stringify the non-string operand and
             // concatenate, matching the interpreter (#368 follow-up). `--check`
@@ -7755,7 +8799,7 @@ impl<'a> Translator<'a> {
         // the comparison masks join the arithmetic ops here.
         if !matches!(op,
             BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
-            | BinOp::DotPow | BinOp::DotPow2
+            | BinOp::DotPow
             | BinOp::DotLt | BinOp::DotGt | BinOp::DotLe | BinOp::DotGe) {
             return err(span, format!(
                 "operator `{:?}` is not defined on scalar/tensor mix; \
@@ -7764,7 +8808,7 @@ impl<'a> Translator<'a> {
             ));
         }
         if t_ty.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "scalar-tensor broadcast is f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "scalar-tensor broadcast is f32-only");
         }
         // Coerce the scalar to f32 so the kernel is uniform.
         let s_val = self.coerce_scalar(s_val, s_kind, ScalarKind::F32, span)?;
@@ -7819,7 +8863,7 @@ impl<'a> Translator<'a> {
     ) -> Result<(Value, TyKind), JitError> {
         if !matches!(op,
             BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
-            | BinOp::DotPow | BinOp::DotPow2
+            | BinOp::DotPow
             | BinOp::DotLt | BinOp::DotGt | BinOp::DotLe | BinOp::DotGe) {
             return err(span, format!(
                 "operator `{:?}` is not defined on scalar/dynamic-tensor mix; \
@@ -7828,7 +8872,7 @@ impl<'a> Translator<'a> {
             ));
         }
         if dt.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "scalar/dynamic-tensor broadcast is f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "scalar/dynamic-tensor broadcast is f32-only");
         }
         let s_val = self.coerce_scalar(s_val, s_kind, ScalarKind::F32, span)?;
 
@@ -7921,6 +8965,90 @@ impl<'a> Translator<'a> {
         self.builder.seal_block(join);
         let v = self.builder.block_params(join)[0];
         Ok((v, TyKind::Scalar(ScalarKind::Bool)))
+    }
+
+    /// SPEC.md §3.1 ("Untyped numeric literals"): a bare integer literal is
+    /// untyped and "adopts the type of its context — the annotation, return
+    /// type, parameter, or other operand at its use site". `lower_literal` has
+    /// no context to consult and always emits an i64 constant, so an `i32`
+    /// operand paired with a literal — `a + 2`, `a & 1`, `a << 2`, `a == 0` —
+    /// reached `scalar_binop` as `i32` vs `i64` and was refused as "operands
+    /// disagree", even though `check.rs` types the whole expression `i32` and
+    /// the interpreter evaluates it. In the JIT an `i32` could therefore only
+    /// ever meet another *non-literal* `i32`. (#537 follow-up.)
+    ///
+    /// Re-type the literal side here, where the operand expressions are still
+    /// in hand next to their lowered kinds. Three rules, all from §3.1:
+    ///
+    /// - Only a syntactic literal adopts (a leading unary `-` included), which
+    ///   is the line `int_literal_operand` and #295's range check both draw.
+    /// - A suffixed literal is typed concretely and "conflicts with a different
+    ///   annotation or parameter type as a normal type error", so only a suffix
+    ///   that already names the other side's kind is adopted: `a << 2i32`
+    ///   lowers, `a << 2i64` keeps the refusal (`check.rs` accepting that one
+    ///   is #539).
+    /// - The literal is range-checked against the width it adopts (#295), so
+    ///   one that does not fit is refused rather than silently truncated into a
+    ///   different answer than `dmc run` computes (`check.rs` not range-checking
+    ///   this position is #538; the wider `i32`-overflow split between the two
+    ///   backends is #540).
+    fn adopt_int_literal_kind(
+        &mut self,
+        lhs: &Expr, l: Value, lk: TyKind,
+        rhs: &Expr, r: Value, rk: TyKind,
+        span: &Span,
+    ) -> Result<(Value, TyKind, Value, TyKind), JitError> {
+        let (lsk, rsk) = match (&lk, &rk) {
+            (TyKind::Scalar(a), TyKind::Scalar(b))
+                if a != b && a.is_int() && b.is_int() => (*a, *b),
+            _ => return Ok((l, lk, r, rk)),
+        };
+        // Exactly one side must be the literal. Two literals both lower as i64
+        // and never reach here; with no literal at all there is nothing to
+        // re-type — an `i32` local meeting an `i64` one is a genuine type error
+        // and keeps its refusal.
+        let ((n, sfx), want, lit_is_lhs) =
+            match (int_literal_operand(lhs), int_literal_operand(rhs)) {
+                (Some(lit), None) => (lit, rsk, true),
+                (None, Some(lit)) => (lit, lsk, false),
+                _ => return Ok((l, lk, r, rk)),
+            };
+        if let Some(s) = sfx {
+            if scalar_kind_of_int_suffix(s) != Some(want) {
+                return Ok((l, lk, r, rk));
+            }
+        }
+        // #544: every fixed-width kind narrower than the i64 a literal is born
+        // as can be adopted, not just `i32`. Anything else (a genuine `i64`
+        // want) keeps its refusal.
+        if want != ScalarKind::I32 && !want.is_masked_int() {
+            return Ok((l, lk, r, rk));
+        }
+        // #295's range check, at the adopted width: a literal that does not fit
+        // is refused rather than silently truncated into a different answer
+        // than `dmc run` computes.
+        let w = want.int_bits() as u32;
+        let (lo, hi) = if want.is_signed_int() {
+            (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
+        } else {
+            (0i64, (1i64 << w) - 1)
+        };
+        if n < lo || n > hi {
+            return err(span, format!(
+                "integer literal {} does not fit in `{}`, the type it adopts \
+                 from the other operand", n, want.name(),
+            ));
+        }
+        // `I32` is a real `cl::I32`, so the constant has to be reduced into it.
+        // A masked kind is i64-backed and the literal is in range, so its
+        // machine value is already correct — adopting is a retag.
+        let ty = TyKind::Scalar(want);
+        if want.is_masked_int() {
+            return Ok(if lit_is_lhs { (l, ty, r, rk) } else { (l, lk, r, ty) });
+        }
+        let narrowed = self.builder.ins()
+            .ireduce(cl::I32, if lit_is_lhs { l } else { r });
+        Ok(if lit_is_lhs { (narrowed, ty, r, rk) } else { (l, lk, narrowed, ty) })
     }
 
     fn scalar_binop(
@@ -8024,9 +9152,9 @@ impl<'a> Translator<'a> {
                     // hardware #DE (SIGFPE) on x86 sdiv/srem. The interpreter
                     // returns a clean overflow error, so trap with the same
                     // message before the division can fault.
-                    self.div_overflow_check(l, r, matches!(op, BinOp::Div));
-                    let zero = self.builder.ins().iconst(cl::I64, 0);
-                    let one = self.builder.ins().iconst(cl::I64, 1);
+                    self.div_overflow_check(l, r, matches!(op, BinOp::Div), lk);
+                    let zero = self.builder.ins().iconst(lk.cl(), 0);
+                    let one = self.builder.ins().iconst(lk.cl(), 1);
                     let is_zero = self.builder.ins().icmp(IntCC::Equal, r, zero);
                     let safe_r = self.builder.ins().select(is_zero, one, r);
                     let q = if matches!(op, BinOp::Div) {
@@ -8039,21 +9167,29 @@ impl<'a> Translator<'a> {
                 BinOp::BitAnd => self.builder.ins().band(l, r),
                 BinOp::BitOr  => self.builder.ins().bor(l, r),
                 BinOp::BitXor => self.builder.ins().bxor(l, r),
-                // #265: a *runtime* shift count outside 0..=63 would be silently
-                // masked mod 64 by ishl/sshr; guard it so the JIT matches the
-                // interpreter's range error. Out-of-range *constants* are already
-                // rejected at lowering (#256, lower_binop); for an in-range
-                // constant the guard is a never-taken branch.
+                // #265: a *runtime* shift count outside the shifted value's
+                // width would be silently masked by ishl/sshr; guard it so the
+                // JIT matches the interpreter's range error. Out-of-range
+                // *constants* are already rejected at lowering (#256,
+                // lower_binop); for an in-range constant the guard is a
+                // never-taken branch.
                 BinOp::BitShl => {
-                    self.shift_range_check(r, true);
+                    self.shift_range_check(r, true, lk);
                     self.builder.ins().ishl(l, r)
                 }
                 BinOp::BitShr => {
-                    self.shift_range_check(r, false);
+                    self.shift_range_check(r, false, lk);
                     self.builder.ins().sshr(l, r)
                 }
-                _ => return unsupported_msg(span, format!("operator `{:?}` is not lowered for ints", op)),
+                _ => return unsupported_msg(span, Refusal::OperandType, format!("operator `{:?}` is not lowered for ints", op)),
             };
+            // #544: SPEC §3.1 — the result is computed AT the operand width, so
+            // an i64-backed narrow kind wraps here. `+ - * <<` and `~`/unary `-`
+            // are the ops that can leave the width; the rest re-mask harmlessly
+            // (reduction mod 2^w is a ring homomorphism, so masking late equals
+            // masking early). `I32` needs nothing: Cranelift's `cl::I32` wraps
+            // natively, which is what #540 relied on.
+            let v = self.mask_to_kind(v, lk);
             Ok((v, lk))
         } else if lk.is_float() {
             let v = match op {
@@ -8076,7 +9212,7 @@ impl<'a> Translator<'a> {
                 // (#241 records `powf` as the one op where round-after-f64 can
                 // differ from native f32 by an ulp; the two backends agree
                 // because they now do the identical thing.)
-                BinOp::Pow | BinOp::StarStar | BinOp::DotPow | BinOp::DotPow2 | BinOp::Mod => {
+                BinOp::Pow | BinOp::StarStar | BinOp::DotPow | BinOp::Mod => {
                     let sym = if matches!(op, BinOp::Mod) { "__dmc_fmod_f64" } else { "__dmc_powf_f64" };
                     let entry = self.fns.get(sym)
                         .unwrap_or_else(|| panic!("{} not registered", sym)).clone();
@@ -8091,7 +9227,7 @@ impl<'a> Translator<'a> {
                         self.builder.ins().fdemote(cl::F32, res)
                     } else { res }
                 }
-                _ => return unsupported_msg(span, format!("operator `{:?}` is not lowered for floats", op)),
+                _ => return unsupported_msg(span, Refusal::OperandType, format!("operator `{:?}` is not lowered for floats", op)),
             };
             Ok((v, lk))
         } else {
@@ -8123,7 +9259,7 @@ impl<'a> Translator<'a> {
         match ty {
             TyKind::Tensor(t) => {
                 let dst = self.forge_alloc(t.nbytes());
-                self.emit_memcpy_loop(dst, val, t.nelems(), t.elem_bytes());
+                self.emit_memcpy_loop(dst, val, t.nelems(), t.elem.cl());
                 dst
             }
             TyKind::DynTensor(dt) => self.dyn_copy(val, dt),
@@ -8166,9 +9302,16 @@ impl<'a> Translator<'a> {
     }
 
     fn tensor_load_elem(&mut self, ptr: Value, byte_off: Value, elem: ScalarKind) -> Value {
+        self.tensor_load_at(ptr, byte_off, elem.cl())
+    }
+
+    /// `tensor_load_elem` for a caller holding a Cranelift type rather than a
+    /// `ScalarKind` — bf16 elements have no `ScalarKind` but still load at a
+    /// fixed 2-byte width.
+    fn tensor_load_at(&mut self, ptr: Value, byte_off: Value, ty: ClType) -> Value {
         let addr = self.builder.ins().iadd(ptr, byte_off);
         let flags = cranelift::codegen::ir::MemFlagsData::new();
-        self.builder.ins().load(elem.cl(), flags, addr, 0)
+        self.builder.ins().load(ty, flags, addr, 0)
     }
 
     fn tensor_store_elem(&mut self, ptr: Value, byte_off: Value, val: Value) {
@@ -8227,6 +9370,54 @@ impl<'a> Translator<'a> {
         resolved
     }
 
+    /// #511: bounds-check a *runtime* slice START whose extent is
+    /// compile-time. The whole window must fit: `0 <= start && start +
+    /// extent <= dim`. A NEGATIVE start traps — it does NOT resolve from
+    /// the end: the static extent was derived affinely (`extent = b - a`),
+    /// but independently normalizing each bound (as the pre-#517
+    /// interpreter's `resolve_index_values` used to) would, for `i..i+1`
+    /// with `i = -1` on a size-4 axis, produce `3..0` — an EMPTY slice, not
+    /// the size-1 window end-resolution would pick. No resolution the JIT
+    /// can compute preserves both the static extent and the naively
+    /// normalized value, so a negative start is dynamic OOB and panics
+    /// loudly (SPEC §4.3) instead of silently returning a row. #517 brought
+    /// the interpreter's dynamic-extent path in line with this trap, so both
+    /// backends now agree here.
+    /// This path cannot clamp like the static-bound paths (#291.4) either:
+    /// clamping would shrink the extent, and the extent IS the static
+    /// result shape — so any window that does not fit is dynamic OOB,
+    /// which SPEC §4.3 makes a runtime panic (`__dmc_slice_oob_trap`:
+    /// clean message + exit 1).
+    fn bounds_check_slice_start(&mut self, start: Value, extent: i64, dim: i64) -> Value {
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        let dimc = self.builder.ins().iconst(cl::I64, dim);
+        let extc = self.builder.ins().iconst(cl::I64, extent);
+        let win_end = self.builder.ins().iadd(start, extc);
+        let lt0 = self.builder.ins().icmp(IntCC::SignedLessThan, start, zero);
+        let over = self.builder.ins().icmp(IntCC::SignedGreaterThan, win_end, dimc);
+        let oob = self.builder.ins().bor(lt0, over);
+
+        let oob_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.brif(oob, oob_block, ok_block);
+        self.builder.seal_block(oob_block);
+        self.builder.seal_block(ok_block);
+
+        // ── OOB block: call the runtime helper then trap (helper never returns) ──
+        self.enter(oob_block);
+        {
+            let entry = self.fns.get("__dmc_slice_oob_trap")
+                .expect("__dmc_slice_oob_trap not registered")
+                .clone();
+            let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+            self.builder.ins().call(func_ref, &[start, extc, dimc]);
+        }
+        self.trap_user(10);
+
+        self.enter(ok_block);
+        start
+    }
+
     /// Clamp/resolve a *runtime* slice bound to match the interpreter's
     /// `normalize` (interp.rs:503): a negative bound resolves from the end
     /// (`max(0, dim + v)`), a positive bound clamps to `min(dim, v)`. Unlike
@@ -8245,16 +9436,53 @@ impl<'a> Translator<'a> {
         self.builder.ins().select(is_neg, neg_branch, pos_branch)
     }
 
-    /// #265: range-check a *runtime* shift count against `0..=63`. If out of
-    /// range, calls `__dmc_shift_trap(count, op_is_shl)` (prints the same message
+    /// Sign-extend a narrower integer scalar to the i64 the `__dmc_*` runtime
+    /// helpers take. A no-op at i64 — and at every #544 masked kind, which is
+    /// already an i64 holding the correctly extended value (`bits()` is the
+    /// MACHINE width, so it answers 64 for those).
+    fn widen_to_i64(&mut self, v: Value, k: ScalarKind) -> Value {
+        if k.bits() >= 64 { v } else { self.builder.ins().sextend(cl::I64, v) }
+    }
+
+    /// #544: re-apply an i64-backed narrow kind's width to a freshly computed
+    /// value — sign-extend from bit `w-1` for a signed kind, zero-extend for an
+    /// unsigned one. This is the "mask after every arithmetic op" route the
+    /// issue names, and it is what makes `dmc jit` compute the same number as
+    /// the interpreter's `IW::wrap`.
+    ///
+    /// Written as `((v & mask) ^ signbit) - signbit` (the `- signbit` term
+    /// dropped when unsigned) rather than `ireduce`/`sextend`, so `int4` — a
+    /// width with no Cranelift type — needs no special case.
+    fn mask_to_kind(&mut self, v: Value, k: ScalarKind) -> Value {
+        if !k.is_masked_int() { return v; }
+        let w = k.int_bits() as u32;
+        let mask = self.builder.ins().iconst(cl::I64, ((1u64 << w) - 1) as i64);
+        let masked = self.builder.ins().band(v, mask);
+        if !k.is_signed_int() { return masked; }
+        let sign = self.builder.ins().iconst(cl::I64, 1i64 << (w - 1));
+        let flipped = self.builder.ins().bxor(masked, sign);
+        self.builder.ins().isub(flipped, sign)
+    }
+
+    /// #265: range-check a *runtime* shift count against the shifted value's
+    /// width. If out of range, calls `__dmc_shift_trap` (prints the same message
     /// the interpreter raises, then exits(1)); otherwise control continues.
     /// Modelled on `bounds_check_index`.
-    fn shift_range_check(&mut self, count: Value, op_is_shl: bool) {
-        let zero = self.builder.ins().iconst(cl::I64, 0);
-        let max  = self.builder.ins().iconst(cl::I64, 63);
+    ///
+    /// `width` is the *shifted value's* kind, which is also the count's — the
+    /// operands-disagree guard has already made them the same. It sets both the
+    /// legal range (Cranelift masks the count mod that width, so an `i32` shift
+    /// tops out at 31, not 63) and the type of the constants compared against,
+    /// which must match the count's or Cranelift's verifier rejects the icmp.
+    fn shift_range_check(&mut self, count: Value, op_is_shl: bool, width: ScalarKind) {
+        let ity = width.cl();
+        let zero = self.builder.ins().iconst(ity, 0);
+        // #544: the legal range is the ARITHMETIC width, which for a masked
+        // i64-backed kind is narrower than the register it lives in.
+        let max  = self.builder.ins().iconst(ity, width.int_bits() as i64 - 1);
         let lt0  = self.builder.ins().icmp(IntCC::SignedLessThan, count, zero);
-        let gt63 = self.builder.ins().icmp(IntCC::SignedGreaterThan, count, max);
-        let oob  = self.builder.ins().bor(lt0, gt63);
+        let gt_max = self.builder.ins().icmp(IntCC::SignedGreaterThan, count, max);
+        let oob  = self.builder.ins().bor(lt0, gt_max);
 
         let oob_block = self.builder.create_block();
         let ok_block  = self.builder.create_block();
@@ -8270,7 +9498,12 @@ impl<'a> Translator<'a> {
                 .expect("__dmc_shift_trap not registered")
                 .clone();
             let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-            self.builder.ins().call(func_ref, &[count, flag]);
+            // The helper's ABI is i64; widen a narrower count so the message
+            // reports the count the program wrote, and pass the width so it
+            // names the range that was actually violated.
+            let count = self.widen_to_i64(count, width);
+            let bits = self.builder.ins().iconst(cl::I64, width.int_bits() as i64);
+            self.builder.ins().call(func_ref, &[count, flag, bits]);
         }
         self.trap_user(10);
 
@@ -8278,14 +9511,24 @@ impl<'a> Translator<'a> {
         self.enter(ok_block);
     }
 
-    /// #297: trap on the one signed integer division that overflows i64 —
-    /// `INT_MIN / -1` (and `% -1`) — which raises a hardware #DE (SIGFPE) on
+    /// #297: trap on the one signed integer division that overflows —
+    /// `MIN / -1` (and `% -1`) — which raises a hardware #DE (SIGFPE) on
     /// x86 sdiv/srem. Calls `__dmc_div_overflow_trap(l, r)` (clean message +
     /// exit 1) so the JIT matches the interpreter's overflow error instead of
     /// crashing. Modelled on `shift_range_check`.
-    fn div_overflow_check(&mut self, l: Value, r: Value, op_is_div: bool) {
-        let imin = self.builder.ins().iconst(cl::I64, i64::MIN);
-        let neg1 = self.builder.ins().iconst(cl::I64, -1);
+    ///
+    /// `width` is the operands' kind. `MIN / -1` overflows at every width, so
+    /// the guard follows the operands down to `i32` — and the constants it
+    /// compares against must be that type, or Cranelift's verifier rejects the
+    /// icmp.
+    fn div_overflow_check(&mut self, l: Value, r: Value, op_is_div: bool, width: ScalarKind) {
+        // #544: `MIN / -1` is a SIGNED-only overflow, and its `MIN` is the
+        // operands' arithmetic width. At an unsigned width both operands are
+        // zero-extended non-negative i64s, so `-1` is not a divisor they can
+        // hold and `sdiv`/`srem` cannot fault — emit no guard at all.
+        let Some(min) = width.int_min() else { return };
+        let imin = self.builder.ins().iconst(width.cl(), min);
+        let neg1 = self.builder.ins().iconst(width.cl(), -1);
         let l_is_min  = self.builder.ins().icmp(IntCC::Equal, l, imin);
         let r_is_neg1 = self.builder.ins().icmp(IntCC::Equal, r, neg1);
         let overflow  = self.builder.ins().band(l_is_min, r_is_neg1);
@@ -8303,7 +9546,13 @@ impl<'a> Translator<'a> {
                 .expect("__dmc_div_overflow_trap not registered")
                 .clone();
             let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-            self.builder.ins().call(func_ref, &[l, r, flag]);
+            // The helper's ABI is i64; widen narrower operands so the message
+            // reports the values the program divided, and pass the width so it
+            // names the range that overflowed.
+            let l = self.widen_to_i64(l, width);
+            let r = self.widen_to_i64(r, width);
+            let bits = self.builder.ins().iconst(cl::I64, width.int_bits() as i64);
+            self.builder.ins().call(func_ref, &[l, r, flag, bits]);
         }
         self.trap_user(11);
 
@@ -8532,7 +9781,7 @@ impl<'a> Translator<'a> {
             }
             let idx_expr = match &idxs[0] {
                 IndexElem::Expr(e) => e,
-                _ => return unsupported(span, "non-expression KV array index"),
+                _ => return unsupported(span, Refusal::Construct, "non-expression KV array index"),
             };
             let (idx_v, idx_ty) = self.lower_expr(idx_expr)?;
             let idx_i64 = self.coerce_to(idx_v, &idx_ty, &TyKind::Scalar(ScalarKind::I64), span)?;
@@ -8554,7 +9803,7 @@ impl<'a> Translator<'a> {
             }
             let idx_expr = match &idxs[0] {
                 IndexElem::Expr(e) => e,
-                _ => return unsupported(span, "non-expression model array index"),
+                _ => return unsupported(span, Refusal::Construct, "non-expression model array index"),
             };
             let (idx_v, idx_ty) = self.lower_expr(idx_expr)?;
             let idx_i64 = self.coerce_to(idx_v, &idx_ty, &TyKind::Scalar(ScalarKind::I64), span)?;
@@ -8569,7 +9818,7 @@ impl<'a> Translator<'a> {
         // tensor of the full shape (exact while the stream is filled to
         // capacity). The header pointer skips its 16-byte [len, cap] prefix.
         if let TyKind::KV(kv) = &base_ty {
-            let t = kv.as_full_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let t = kv.as_full_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "indexing a KV parameter of compile-time-unknown capacity \
                       is not yet supported in the JIT (read needs the runtime length)".into(),
                 line: span.line, col: span.col,
@@ -8584,7 +9833,7 @@ impl<'a> Translator<'a> {
             }
             let idx_expr = match &idxs[0] {
                 IndexElem::Expr(e) => e,
-                _ => return unsupported(span, "non-expr string index"),
+                _ => return unsupported(span, Refusal::Construct, "non-expr string index"),
             };
             let (idx_v, idx_ty) = self.lower_expr(idx_expr)?;
             if idx_ty.as_scalar().map(|s| !s.is_int()).unwrap_or(true) {
@@ -8594,12 +9843,14 @@ impl<'a> Translator<'a> {
             let entry = self.fns.get("__dmc_str_get_char")
                 .expect("__dmc_str_get_char not registered").clone();
             let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-            let call = self.builder.ins().call(func_ref, &[base_v, idx_i64]);
+            let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+            let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+            let call = self.builder.ins().call(func_ref, &[base_v, idx_i64, line, col]);
             let result = self.builder.inst_results(call)[0];
             return Ok((result, TyKind::Scalar(ScalarKind::I64)));
         }
         // Tensor load — dispatch to the inner helper with already-lowered ptr+type.
-        let t = base_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = base_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("indexing requires a tensor or str, got `{}`", base_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -8641,7 +9892,7 @@ impl<'a> Translator<'a> {
             match c {
                 IndexCat::Scalar(_) => { if first_kept { contiguous = false; } }
                 IndexCat::Full => { first_kept = true; }
-                IndexCat::Range { .. } => {
+                IndexCat::Range { .. } | IndexCat::DynRange { .. } => {
                     if first_kept { contiguous = false; }
                     first_kept = true;
                 }
@@ -8696,6 +9947,26 @@ impl<'a> Translator<'a> {
                     base_off += s * stride;
                     first_kept_seen = true;
                     result_shape.push((e - s).max(0));
+                }
+                IndexCat::DynRange { start, extent } => {
+                    if first_kept_seen {
+                        return err(span,
+                            "slice 4 only supports contiguous slicing: \
+                             a range slice may only appear as the FIRST \
+                             kept axis. Trailing kept axes must be `:`.");
+                    }
+                    // #511: the runtime start is resolved/checked (negative
+                    // counts from the end, the static-extent window must fit),
+                    // then folded into the runtime offset like a scalar index.
+                    let ri = self.bounds_check_slice_start(*start, *extent, dim);
+                    let stride_v = self.builder.ins().iconst(cl::I64, stride);
+                    let scaled = self.builder.ins().imul(ri, stride_v);
+                    dyn_off = Some(match dyn_off {
+                        Some(prev) => self.builder.ins().iadd(prev, scaled),
+                        None => scaled,
+                    });
+                    first_kept_seen = true;
+                    result_shape.push(*extent);
                 }
             }
         }
@@ -8781,6 +10052,14 @@ impl<'a> Translator<'a> {
                     extents.push((e - s).max(0));
                     kept.push(true);
                 }
+                IndexCat::DynRange { start, extent } => {
+                    // #511: runtime start, static extent — resolve/check the
+                    // start; the copy loop already takes runtime starts.
+                    let ri = self.bounds_check_slice_start(*start, *extent, dim);
+                    starts.push(ri);
+                    extents.push(*extent);
+                    kept.push(true);
+                }
             }
         }
         let out_shape: Vec<i64> = (0..t.rank()).filter(|&a| kept[a]).map(|a| extents[a]).collect();
@@ -8852,16 +10131,52 @@ impl<'a> Translator<'a> {
         // shape-parametric range (`cos_table[0..S, ..]`, S bound at
         // monomorphization) works — not only literal-int bounds.
         if let IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) = ie {
-            let s = match start.as_deref() {
-                Some(e) => resolve_shape_expr(e, &self.shape_env, span)?,
-                None => 0,
-            };
-            let mut e = match end.as_deref() {
-                Some(e) => resolve_shape_expr(e, &self.shape_env, span)?,
+            let end_expr = match end.as_deref() {
+                Some(e) => e,
                 None => return err(span, "range slice needs an explicit end in the JIT"),
             };
-            if *inclusive { e += 1; }
-            return Ok(IndexCat::Range { start: s, end: e });
+            // Fully static bounds — the pre-#511 path, unchanged.
+            let s_static = match start.as_deref() {
+                Some(e) => resolve_shape_expr(e, &self.shape_env, span),
+                None => Ok(0),
+            };
+            if let (Ok(s), Ok(e)) = (&s_static, resolve_shape_expr(end_expr, &self.shape_env, span)) {
+                let mut e = e;
+                if *inclusive { e += 1; }
+                return Ok(IndexCat::Range { start: *s, end: e });
+            }
+            // #511: runtime START, compile-time EXTENT (`t[i..i+1, ..]` with a
+            // loop-var `i`). Subtract the bounds' linear forms: if every
+            // runtime ident cancels, the extent is a constant and the result
+            // shape stays compile-time (spec invariant 5) — only the start
+            // needs lowering to a runtime i64.
+            let sa = match start.as_deref() {
+                Some(e) => affine_index_expr(e, &self.shape_env),
+                None => Some((0, HashMap::new())),
+            };
+            let ea = affine_index_expr(end_expr, &self.shape_env);
+            if let (Some((sc, st)), Some((ec, et))) = (sa, ea) {
+                if st == et {
+                    let mut extent = ec - sc;
+                    if *inclusive { extent += 1; }
+                    let extent = extent.max(0);
+                    if st.is_empty() {
+                        // Static after all (e.g. parenthesized bounds the
+                        // shape-expr resolver does not recognize).
+                        return Ok(IndexCat::Range { start: sc, end: sc + extent });
+                    }
+                    // A non-empty term map means the start carried runtime
+                    // idents, so a start expression must exist.
+                    let start_expr = start.as_deref()
+                        .expect("runtime ident terms require an explicit start");
+                    let (v, k) = self.lower_expr(start_expr)?;
+                    let v = self.coerce_to(v, &k, &TyKind::Scalar(ScalarKind::I64), span)?;
+                    return Ok(IndexCat::DynRange { start: v, extent });
+                }
+            }
+            return err(span,
+                "slice with a runtime bound needs a compile-time extent: \
+                 in `a..b`, `b - a` must fold to a constant (e.g. `i..i+1`)");
         }
         let static_cat = classify_index_static(ie, span)?;
         match (ie, static_cat) {
@@ -8960,7 +10275,7 @@ impl<'a> Translator<'a> {
             }
             let idx_expr = match &idxs[0] {
                 IndexElem::Expr(e) => e.clone(),
-                _ => return unsupported(span, "non-expression model array index in assign"),
+                _ => return unsupported(span, Refusal::Construct, "non-expression model array index in assign"),
             };
             let (idx_v, idx_ty) = self.lower_expr(&idx_expr)?;
             let idx_i64 = self.coerce_to(idx_v, &idx_ty, &TyKind::Scalar(ScalarKind::I64), span)?;
@@ -8981,7 +10296,7 @@ impl<'a> Translator<'a> {
             }
             let idx_expr = match &idxs[0] {
                 IndexElem::Expr(e) => e.clone(),
-                _ => return unsupported(span, "non-expression KV array index in assign"),
+                _ => return unsupported(span, Refusal::Construct, "non-expression KV array index in assign"),
             };
             let (idx_v, idx_ty) = self.lower_expr(&idx_expr)?;
             let idx_i64 = self.coerce_to(idx_v, &idx_ty, &TyKind::Scalar(ScalarKind::I64), span)?;
@@ -8993,7 +10308,7 @@ impl<'a> Translator<'a> {
             self.builder.ins().store(flags, rv, elem_addr, 0);
             return Ok(());
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("index-assign requires a tensor, got `{}`", ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -9037,7 +10352,7 @@ impl<'a> Translator<'a> {
     ) -> Result<(), JitError> {
         // Lower destination tensor.
         let (dst_ptr, dst_ty) = self.lower_expr(base)?;
-        let dst_t = dst_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let dst_t = dst_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("slice-assign requires a tensor, got `{}`", dst_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -9050,7 +10365,7 @@ impl<'a> Translator<'a> {
 
         // Lower source tensor.
         let (src_ptr, src_ty) = self.lower_expr(rhs)?;
-        let src_t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let src_t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("slice-assign RHS must be a tensor, got `{}`", src_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -9315,7 +10630,7 @@ impl<'a> Translator<'a> {
         match op {
             BinOp::Matmul => self.lower_matmul(l, lt, r, rt, span),
             BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
-            | BinOp::DotPow | BinOp::DotPow2
+            | BinOp::DotPow
             | BinOp::DotLt | BinOp::DotGt | BinOp::DotLe | BinOp::DotGe => {
                 self.lower_elementwise(op, l, lt, r, rt, span)
             }
@@ -9338,7 +10653,7 @@ impl<'a> Translator<'a> {
             BinOp::DotSub => self.builder.ins().fsub(lhs, rhs),
             BinOp::DotMul => self.builder.ins().fmul(lhs, rhs),
             BinOp::DotDiv => self.builder.ins().fdiv(lhs, rhs),
-            BinOp::DotPow | BinOp::DotPow2 => {
+            BinOp::DotPow => {
                 let entry = self.fns.get("__dmc_powf_f32")
                     .expect("powf symbol registered").clone();
                 let fr = self.module.declare_func_in_func(entry.id, self.builder.func);
@@ -9447,7 +10762,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         if lt.elem != ScalarKind::F32 || rt.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "elementwise ops are f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "elementwise ops are f32-only");
         }
         // NumPy-style axis broadcasting when shapes differ but are
         // compatible (e.g. ray grid `[1, W] .op [H, 1]` -> `[H, W]`).
@@ -9585,19 +10900,19 @@ impl<'a> Translator<'a> {
         let loss_name = match &pats[0] {
             Pattern::Ident(n, _) => n.clone(),
             Pattern::Wildcard(_) => "_".to_string(),
-            _ => return unsupported(span, "fwd_bwd loss binding must be an identifier"),
+            _ => return unsupported(span, Refusal::Pattern, "fwd_bwd loss binding must be an identifier"),
         };
         let grad_name = match &pats[1] {
             Pattern::Ident(n, _) => n.clone(),
             Pattern::Wildcard(_) => "_".to_string(),
-            _ => return unsupported(span, "fwd_bwd gradient binding must be an identifier"),
+            _ => return unsupported(span, Refusal::Pattern, "fwd_bwd gradient binding must be an identifier"),
         };
         let bwd = format!("{}$fwd_bwd", fname);
-        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let entry = self.fns.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`{}` is not a `@grad fn` (no fwd_bwd entry)", fname),
             line: span.line, col: span.col,
         })?;
-        let schema = self.grad_schemas.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let schema = self.grad_schemas.get(&bwd).cloned().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`{}.fwd_bwd` has no gradient schema (no `!` mut params?)", fname),
             line: span.line, col: span.col,
         })?;
@@ -9612,7 +10927,7 @@ impl<'a> Translator<'a> {
         for (i, a) in args.iter().enumerate() {
             let e = match a {
                 CallArg::Positional(e) => e,
-                _ => return unsupported(span, "named/spread args to fwd_bwd"),
+                _ => return unsupported(span, Refusal::ArgForm, "named/spread args to fwd_bwd"),
             };
             let (v, k) = self.lower_expr(e)?;
             let v = self.coerce_to(v, &k, &entry.params[i].1, span)?;
@@ -9704,13 +11019,13 @@ impl<'a> Translator<'a> {
                         self.ad_lower_fwd_bwd_destructure(pats, fname, args, &l.span)?;
                         return Ok(());
                     }
-                    return unsupported(&l.span,
+                    return unsupported(&l.span, Refusal::Pattern,
                         "tuple destructuring inside `@grad fn` is only \
                          supported for `let (loss, g) = f.fwd_bwd(...)`");
                 }
                 let name = match &l.pattern {
                     Pattern::Ident(n, _) => n.clone(),
-                    _ => return unsupported(&l.span, "destructuring `let` inside `@grad fn`"),
+                    _ => return unsupported(&l.span, Refusal::Pattern, "destructuring `let` inside `@grad fn`"),
                 };
                 let (_v, _ty, node) = self.ad_lower_expr(&l.value, &l.span)?;
                 self.ad.as_mut().unwrap().env.insert(name, node);
@@ -9723,7 +11038,7 @@ impl<'a> Translator<'a> {
                 let node = match op {
                     AssignOp::Eq => self.ad_lower_expr(rhs, sp)?.2,
                     AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq => {
-                        let acc_node = *self.ad.as_ref().unwrap().env.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                        let acc_node = *self.ad.as_ref().unwrap().env.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                             msg: format!("@grad: `{}` reassigned before it was bound", name),
                             line: sp.line, col: sp.col,
                         })?;
@@ -9738,7 +11053,7 @@ impl<'a> Translator<'a> {
                         let lhs_expr = Expr::Ident(name.clone(), sp.clone());
                         self.ad_lower_binop(&binop, &lhs_expr, rhs, sp)?.2
                     }
-                    _ => return unsupported(sp,
+                    _ => return unsupported(sp, Refusal::AssignForm,
                         "compound assignment in `@grad fn` supports only `=` `+=` `-=` `*=` `/=` \
                          (bitwise / stream ops have no VJP)"),
                 };
@@ -9755,14 +11070,14 @@ impl<'a> Translator<'a> {
                 let (lo_e, hi_e, inclusive) = match iter {
                     Expr::Range { start: Some(s), end: Some(e), inclusive, .. } =>
                         (s.as_ref(), e.as_ref(), *inclusive),
-                    _ => return unsupported(sp,
+                    _ => return unsupported(sp, Refusal::LoopForm,
                         "`@grad fn` for-loop needs a bounded range `for k in lo..hi`"),
                 };
-                let lo = self.ad_const_int(lo_e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let lo = self.ad_const_int(lo_e).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "`@grad fn` for-loop bound must be a compile-time constant (a literal or \
                           shape parameter) — reverse-mode unrolls the loop".into(),
                     line: sp.line, col: sp.col })?;
-                let hi = self.ad_const_int(hi_e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let hi = self.ad_const_int(hi_e).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "`@grad fn` for-loop bound must be a compile-time constant (a literal or \
                           shape parameter) — reverse-mode unrolls the loop".into(),
                     line: sp.line, col: sp.col })?;
@@ -9770,7 +11085,7 @@ impl<'a> Translator<'a> {
                 let idx_name = match pattern {
                     Pattern::Ident(n, _) => Some(n.clone()),
                     Pattern::Wildcard(_) => None,
-                    _ => return unsupported(sp, "destructuring pattern in `@grad fn` for-loop"),
+                    _ => return unsupported(sp, Refusal::Pattern, "destructuring pattern in `@grad fn` for-loop"),
                 };
                 // Declare the index local once; redefine it per unrolled
                 // iteration so the body reads the concrete value via lower_ident
@@ -9797,7 +11112,7 @@ impl<'a> Translator<'a> {
             }
             other => {
                 let s = stmt_span(other);
-                unsupported(&s,
+                unsupported(&s, Refusal::Grad,
                     "unsupported statement inside `@grad fn` (slice 6): supported are `let`, \
                      accumulator reassignment, and compile-time `for` loops; runtime `if` / \
                      `while` fall back to the interpreter")
@@ -9844,7 +11159,17 @@ impl<'a> Translator<'a> {
                 if target == sty {
                     Ok((v, sty, node))
                 } else {
-                    let (cv, _) = self.lower_expr(e)?;
+                    // Convert the value we just lowered. Re-lowering the whole
+                    // cast through `lower_expr` used to look the operand up as
+                    // a plain local, but a `let` inside a `@grad fn` body binds
+                    // only into the AD env — so `let s = sum(w)  s as f64` died
+                    // with "unknown binding `s`" on a program the interpreter
+                    // runs (#422 wall 2's neighbourhood).
+                    let cv = match (&sty, &target) {
+                        (TyKind::Scalar(from), TyKind::Scalar(to)) =>
+                            self.coerce_scalar(v, *from, *to, cspan)?,
+                        _ => self.lower_expr(e)?.0,
+                    };
                     let cnode = self.ad.as_mut().unwrap()
                         .push(AdOp::Const, vec![], target.clone(), cv);
                     Ok((cv, target, cnode))
@@ -9852,7 +11177,7 @@ impl<'a> Translator<'a> {
             }
             Expr::UnOp { op: UnOp::ReLU, operand: relu_op, span: uspan } => {
                 let (v, ty, inode) = self.ad_lower_expr(relu_op, uspan)?;
-                let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "`\\>` in @grad requires a tensor operand".into(),
                     line: uspan.line, col: uspan.col,
                 })?.clone();
@@ -9865,7 +11190,7 @@ impl<'a> Translator<'a> {
                 match op {
                     PostfixOp::Transpose => {
                         let (v, ty, inode) = self.ad_lower_expr(expr, pspan)?;
-                        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                             msg: "transpose in @grad requires a tensor".into(),
                             line: pspan.line, col: pspan.col,
                         })?.clone();
@@ -9882,7 +11207,7 @@ impl<'a> Translator<'a> {
                         // through inner gradients would be full MAML, not FOMAML.
                         let base_name = match expr.as_ref() {
                             Expr::Ident(n, _) => n.clone(),
-                            _ => return unsupported(pspan,
+                            _ => return unsupported(pspan, Refusal::Construct,
                                 "field access on non-identifier base in @grad fn"),
                         };
                         let flat = format!("{}${}", base_name, field);
@@ -9897,13 +11222,13 @@ impl<'a> Translator<'a> {
                             .push(AdOp::Const, vec![], ty.clone(), v);
                         Ok((v, ty, node))
                     }
-                    _ => unsupported(pspan,
+                    _ => unsupported(pspan, Refusal::Grad,
                         "this postfix op is not differentiable in slice 6"),
                 }
             }
             Expr::BinOp { op, lhs, rhs, span: bspan } => self.ad_lower_binop(op, lhs, rhs, bspan),
             Expr::Tuple(elems, _) if elems.len() == 1 => self.ad_lower_expr(&elems[0], span),
-            _ => unsupported(span,
+            _ => unsupported(span, Refusal::Grad,
                 "expression form not differentiable in slice 6 \
                  (supported: matmul, .+ .- .* ./, transpose, sum, mean, scalar f32 math)"),
         }
@@ -9914,7 +11239,7 @@ impl<'a> Translator<'a> {
     {
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
-            _ => return unsupported(span, "indirect calls in @grad"),
+            _ => return unsupported(span, Refusal::IndirectCall, "indirect calls in @grad"),
         };
         // Fused tensor ops with their own arity handled before the 1-arg gate.
         if name == "softmax" {
@@ -9937,14 +11262,14 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg in @grad reduction"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg in @grad reduction"),
         };
 
         // Tensor elementwise activations.
         match name.as_str() {
             "relu" | "tanh" | "gelu" | "sigmoid" | "silu" | "elu" | "mish" => {
                 let (inp_v, ty, inode) = self.ad_lower_expr(e, span)?;
-                let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+                let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("`{}` in @grad requires a tensor argument", name),
                     line: span.line, col: span.col,
                 })?.clone();
@@ -9979,13 +11304,13 @@ impl<'a> Translator<'a> {
         let kind = match name.as_str() {
             "sum" => AdOp::Sum,
             "mean" => AdOp::Mean,
-            _ => return unsupported(span, format!(
+            _ => return unsupported(span, Refusal::Grad, format!(
                 "`{}` is not differentiable in slice 6 (supported: `sum`, `mean`, `relu`, `tanh`, `gelu`, `sigmoid`)",
                 name,
             ).as_str()),
         };
         let (_v, ty, inode) = self.ad_lower_expr(e, span)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`{}` requires a tensor argument", name),
             line: span.line, col: span.col,
         })?.clone();
@@ -10015,18 +11340,18 @@ impl<'a> Translator<'a> {
         }
         let xe = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to softmax in @grad"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to softmax in @grad"),
         };
         let (inp_v, ty, inode) = self.ad_lower_expr(xe, span)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "softmax in @grad requires a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return unsupported(span, "@grad softmax is f32-only");
+            return unsupported(span, Refusal::F32Only, "@grad softmax is f32-only");
         }
         if t.rank() < 2 {
-            return unsupported(span,
+            return unsupported(span, Refusal::DynamicShape,
                 "@grad softmax requires a rank ≥ 2 static tensor (1D softmax VJP not JIT-lowered); use `dmc run`");
         }
         let last = (t.rank() - 1) as i64;
@@ -10034,7 +11359,7 @@ impl<'a> Translator<'a> {
             if let Some(a) = const_int_axis(ae) {
                 let norm = if a < 0 { a + t.rank() as i64 } else { a };
                 if norm != last {
-                    return unsupported(span,
+                    return unsupported(span, Refusal::Axis,
                         "@grad softmax reduces over the last axis only; a non-last axis needs `dmc run`");
                 }
             }
@@ -10065,20 +11390,20 @@ impl<'a> Translator<'a> {
         }
         let (x_e, g_e, eps_e) = match (&args[0], &args[1], &args[2]) {
             (CallArg::Positional(a), CallArg::Positional(b), CallArg::Positional(c)) => (a, b, c),
-            _ => return unsupported(span, "non-positional args to rms_norm in @grad"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args to rms_norm in @grad"),
         };
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (g_v, g_ty, g_node) = self.ad_lower_expr(g_e, span)?;
         let (eps_raw, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps_raw, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rms_norm: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rms_norm: gain must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
         if xt.elem != ScalarKind::F32 || gt.elem != ScalarKind::F32 {
-            return unsupported(span, "@grad rms_norm is f32-only");
+            return unsupported(span, Refusal::F32Only, "@grad rms_norm is f32-only");
         }
         let d_size = *xt.shape.last().unwrap();
         if gt.rank() != 1 || gt.nelems() != d_size {
@@ -10129,27 +11454,27 @@ impl<'a> Translator<'a> {
         let (x_e, g_e, b_e, eps_e) = match (&args[0], &args[1], &args[2], &args[3]) {
             (CallArg::Positional(a), CallArg::Positional(b), CallArg::Positional(c),
              CallArg::Positional(d)) => (a, b, c, d),
-            _ => return unsupported(span, "non-positional args to layer_norm in @grad"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args to layer_norm in @grad"),
         };
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (g_v, g_ty, g_node) = self.ad_lower_expr(g_e, span)?;
         let (b_v, b_ty, b_node) = self.ad_lower_expr(b_e, span)?;
         let (eps_raw, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps_raw, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: gain must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let bt = b_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let bt = b_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: bias must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
         if xt.elem != ScalarKind::F32 || gt.elem != ScalarKind::F32 || bt.elem != ScalarKind::F32 {
-            return unsupported(span, "@grad layer_norm is f32-only");
+            return unsupported(span, Refusal::F32Only, "@grad layer_norm is f32-only");
         }
         if xt.rank() < 2 {
-            return unsupported(span,
+            return unsupported(span, Refusal::DynamicShape,
                 "@grad layer_norm requires a rank ≥ 2 static tensor; use `dmc run`");
         }
         let d_size = *xt.shape.last().unwrap();
@@ -10202,25 +11527,25 @@ impl<'a> Translator<'a> {
         }
         let (x_e, cos_e, sin_e) = match (&args[0], &args[1], &args[2]) {
             (CallArg::Positional(a), CallArg::Positional(b), CallArg::Positional(c)) => (a, b, c),
-            _ => return unsupported(span, "non-positional args to rope in @grad"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args to rope in @grad"),
         };
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (cos_v, cos_ty, cos_node) = self.ad_lower_expr(cos_e, span)?;
         let (sin_v, sin_ty, sin_node) = self.ad_lower_expr(sin_e, span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let ct = cos_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let ct = cos_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: cos must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
-        let st = sin_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let st = sin_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: sin must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
         if xt.elem != ScalarKind::F32 || ct.elem != ScalarKind::F32 || st.elem != ScalarKind::F32 {
-            return unsupported(span, "@grad rope is f32-only");
+            return unsupported(span, Refusal::F32Only, "@grad rope is f32-only");
         }
         if xt.rank() < 2 {
-            return unsupported(span, "@grad rope requires a rank ≥ 2 static tensor [..., S, D]; use `dmc run`");
+            return unsupported(span, Refusal::DynamicShape, "@grad rope requires a rank ≥ 2 static tensor [..., S, D]; use `dmc run`");
         }
         let rank = xt.rank();
         let s_dim = xt.shape[rank - 2];
@@ -10235,7 +11560,7 @@ impl<'a> Translator<'a> {
         // Forward y: copy x, then rotate in place (same kernel as the builtin).
         let out_ty = xt.clone();
         let out_ptr = self.forge_alloc(out_ty.nbytes());
-        self.emit_memcpy_loop(out_ptr, x_v, xt.nelems(), 4);
+        self.emit_memcpy_loop(out_ptr, x_v, xt.nelems(), xt.elem.cl());
         self.rope_rotate_inplace(out_ptr, cos_v, sin_v, &xt, false);
         let node = self.ad.as_mut().unwrap().push(
             AdOp::Rope, vec![x_node, cos_node, sin_node],
@@ -10259,7 +11584,7 @@ impl<'a> Translator<'a> {
         }
         let (q_e, k_e, v_e) = match (&args[0], &args[1], &args[2]) {
             (CallArg::Positional(a), CallArg::Positional(b), CallArg::Positional(c)) => (a, b, c),
-            _ => return unsupported(span, "non-positional args to attn in @grad"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args to attn in @grad"),
         };
         let (q_v, q_ty, q_node) = self.ad_lower_expr(q_e, span)?;
         let (k_v, k_ty, k_node) = self.ad_lower_expr(k_e, span)?;
@@ -10275,26 +11600,26 @@ impl<'a> Translator<'a> {
                     }
                     // The interpreter also accepts numeric 0/1 masks; that
                     // form stays outside the JIT subset rather than erroring.
-                    other => return unsupported(span, format!(
+                    other => return unsupported(span, Refusal::OperandType, format!(
                         "@grad attn mask must be a bool [S,S] tensor or nil under the JIT \
                          (got `{}`); use `dmc run`", other.render()).as_str()),
                 }
             }
-            Some(_) => return unsupported(span, "non-positional mask arg to attn in @grad"),
+            Some(_) => return unsupported(span, Refusal::ArgForm, "non-positional mask arg to attn in @grad"),
         };
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("{}: q must be a tensor", name), line: span.line, col: span.col })?.clone();
-        let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("{}: k must be a tensor (KV-cache operands in @grad need `dmc run`)", name),
             line: span.line, col: span.col })?.clone();
-        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("{}: v must be a tensor (KV-cache operands in @grad need `dmc run`)", name),
             line: span.line, col: span.col })?.clone();
         if qt.rank() != 4 || kt.rank() != 4 || vt.rank() != 4 {
             return err(span, format!("{}: q/k/v must be rank-4 [B,H,S,D]", name));
         }
         if qt.elem != ScalarKind::F32 || kt.elem != ScalarKind::F32 || vt.elem != ScalarKind::F32 {
-            return unsupported(span, "@grad attn is f32-only");
+            return unsupported(span, Refusal::F32Only, "@grad attn is f32-only");
         }
         let b   = qt.shape[0];
         let h_q = qt.shape[1];
@@ -10317,7 +11642,7 @@ impl<'a> Translator<'a> {
             .and_then(|x| x.checked_mul(s))
             .and_then(|x| x.checked_mul(s))
             .and_then(|x| x.checked_mul(4))
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("{}: B*H*S*S*4 overflows i64 (shape too large for @grad)", name),
                 line: span.line, col: span.col })?;
         let p_buf = self.forge_alloc(p_bytes);
@@ -10342,12 +11667,19 @@ impl<'a> Translator<'a> {
             (TyKind::Scalar(ls), TyKind::Scalar(rs)) if ls.is_float() && rs.is_float() => {
                 let lf = self.coerce_scalar(lv, *ls, ScalarKind::F32, span)?;
                 let rf = self.coerce_scalar(rv, *rs, ScalarKind::F32, span)?;
+                // The coercion has to reach the TAPE, not just the forward
+                // instruction: `d(a*b)/da = adj * b` reads the operand's
+                // recorded forward value back off the tape, so recording the
+                // pre-coercion `lv`/`rv` emitted `fmul` across two float
+                // widths. See `ad_scalar_operand_f32` — #422 wall 2.
+                let ln = self.ad_scalar_operand_f32(ln, *ls, lf, span)?;
+                let rn = self.ad_scalar_operand_f32(rn, *rs, rf, span)?;
                 let fwd = match op {
                     BinOp::Add => self.builder.ins().fadd(lf, rf),
                     BinOp::Sub => self.builder.ins().fsub(lf, rf),
                     BinOp::Mul => self.builder.ins().fmul(lf, rf),
                     BinOp::Div => self.builder.ins().fdiv(lf, rf),
-                    _ => return unsupported(span, "scalar op not differentiable in slice 6"),
+                    _ => return unsupported(span, Refusal::Grad, "scalar op not differentiable in slice 6"),
                 };
                 let node = self.ad.as_mut().unwrap().push(
                     AdOp::ScalarBin(op.clone()), vec![ln, rn],
@@ -10375,6 +11707,7 @@ impl<'a> Translator<'a> {
                 if matches!(op, BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv) =>
             {
                 let sf = self.coerce_scalar(lv, *s, ScalarKind::F32, span)?;
+                let ln = self.ad_scalar_operand_f32(ln, *s, sf, span)?;
                 let (out, out_ty) = self.lower_scalar_tensor_broadcast(
                     op, sf, ScalarKind::F32, rv, tt, span, true)?;
                 let node = self.ad.as_mut().unwrap().push(
@@ -10389,6 +11722,7 @@ impl<'a> Translator<'a> {
                 if matches!(op, BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv) =>
             {
                 let sf = self.coerce_scalar(rv, *s, ScalarKind::F32, span)?;
+                let rn = self.ad_scalar_operand_f32(rn, *s, sf, span)?;
                 let (out, out_ty) = self.lower_scalar_tensor_broadcast(
                     op, sf, ScalarKind::F32, lv, tt, span, false)?;
                 let node = self.ad.as_mut().unwrap().push(
@@ -10399,8 +11733,52 @@ impl<'a> Translator<'a> {
                     vec![ln], out_ty.clone(), out);
                 Ok((out, out_ty, node))
             }
-            _ => unsupported(span, "operand kinds not differentiable in slice 6"),
+            _ => unsupported(span, Refusal::Grad, "operand kinds not differentiable in slice 6"),
         }
+    }
+
+    /// Give a scalar operand a tape node whose recorded forward value is f32.
+    ///
+    /// The tape is f32 end to end: `emit_backward` seeds the loss adjoint with
+    /// `f32const 1.0` and every adjoint it derives is f32. The multiplicative
+    /// rules read an operand's forward value straight back off the tape —
+    /// `d(a*b)/da = adj * b` is `fmul(adj, nodes[b].fwd)` — so a node recorded
+    /// at f64 made Cranelift see `fmul` on two different float types:
+    ///
+    ///     inst19 (v20 = fmul.f32 v19, v2): arg 1 (v2) has type f64,
+    ///                                      expected f32
+    ///
+    /// where v19 is the seeded loss adjoint and v2 the f64 operand. That is
+    /// malformed IR: the verifier rejected the whole `f$fwd_bwd` and `dmc jit`
+    /// surfaced a bare "Verifier errors" (#422 wall 2). `sum(w) * 2.0` was
+    /// enough — an unsuffixed float literal is f64 in the JIT — and `Mul`/`Div`
+    /// are exactly the two rules that read operands back, which is why `+`/`-`
+    /// always compiled. f64 is the only foreign width a scalar can currently
+    /// have here, but the check is written on the width, not on f64.
+    ///
+    /// Recording the *coerced* f32 value as a fresh stop-gradient node fixes
+    /// the width without changing what is differentiated: only an `AdOp::Const`
+    /// can carry a non-f32 scalar in the first place (every traced scalar node
+    /// — `Sum`, `Mean`, `ScalarBin` — is built as f32), so such an operand is a
+    /// constant on either side of the coercion. If a traced node ever shows up
+    /// at another width, refuse to lower rather than silently drop its
+    /// gradient: the interpreter is the reference and gets it right.
+    fn ad_scalar_operand_f32(
+        &mut self,
+        node: usize,
+        from: ScalarKind,
+        coerced: Value,
+        span: &Span,
+    ) -> Result<usize, JitError> {
+        if from == ScalarKind::F32 { return Ok(node); }
+        if !matches!(self.ad.as_ref().unwrap().nodes[node].kind, AdOp::Const) {
+            return unsupported(span, Refusal::F32Only, &format!(
+                "a differentiated `{}` scalar in `@grad` (the JIT tape is f32)",
+                from.name(),
+            ));
+        }
+        Ok(self.ad.as_mut().unwrap().push(
+            AdOp::Const, vec![], TyKind::Scalar(ScalarKind::F32), coerced))
     }
 
     /// Emit the reverse pass: seed the loss adjoint to 1.0, propagate
@@ -10409,7 +11787,7 @@ impl<'a> Translator<'a> {
     fn emit_backward(&mut self, span: &Span) -> Result<Vec<(usize, Value)>, JitError> {
         let AdState { nodes, mut adjoint, mut_params, loss, env: _ } =
             self.ad.take().expect("emit_backward without AD state");
-        let loss = loss.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let loss = loss.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "no loss node recorded".into(), line: span.line, col: span.col,
         })?;
         let one = self.builder.ins().f32const(1.0_f32);
@@ -10728,7 +12106,7 @@ impl<'a> Translator<'a> {
                         // Allocate a zeros tensor as the gradient.
                         self.forge_alloc(tt.nbytes())
                     } else {
-                        return Err(JitError { kind: JitErrorKind::Error,
+                        return Err(JitError { kind: JitErrorKind::Error, refusal: None,
                             msg: "mut parameter received no gradient (loss does not depend on it?)".into(),
                             line: span.line, col: span.col,
                         });
@@ -10811,7 +12189,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<AdState, JitError> {
         let AdState { nodes: fwd_nodes, mut_params: fwd_mut_params, loss, .. } = forward_ad;
-        let loss = loss.ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let loss = loss.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "tape_backward: no loss node in forward AdState".into(),
             line: span.line, col: span.col,
         })?;
@@ -10902,7 +12280,7 @@ impl<'a> Translator<'a> {
                 AdOp::ActivationSilu | AdOp::ActivationElu | AdOp::ActivationMish
                 | AdOp::Softmax | AdOp::RmsNorm | AdOp::LayerNorm | AdOp::Rope
                 | AdOp::Attn =>
-                    return unsupported(span,
+                    return unsupported(span, Refusal::SecondOrder,
                         "second-order (@grad @grad) for silu/elu/mish/softmax/rms_norm/layer_norm/rope/attn is not JIT-lowered yet; use `dmc run`"),
 
                 AdOp::Sum => {
@@ -11328,7 +12706,7 @@ impl<'a> Translator<'a> {
             };
             st.loss = Some(final_loss_node);
         } else {
-            return Err(JitError { kind: JitErrorKind::Error,
+            return Err(JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "tape_backward: first mut param has no gradient (loss independent of it?)".into(),
                 line: span.line, col: span.col,
             });
@@ -11367,7 +12745,7 @@ impl<'a> Translator<'a> {
                 AdOp::ActivationSilu | AdOp::ActivationElu | AdOp::ActivationMish
                 | AdOp::Softmax | AdOp::RmsNorm | AdOp::LayerNorm | AdOp::Rope
                 | AdOp::Attn =>
-                    return unsupported(span,
+                    return unsupported(span, Refusal::SecondOrder,
                         "second-order (@grad @grad) for silu/elu/mish/softmax/rms_norm/layer_norm/rope/attn is not JIT-lowered yet; use `dmc run`"),
 
                 AdOp::Elem(bop) => {
@@ -11581,7 +12959,7 @@ impl<'a> Translator<'a> {
         if let TyKind::Bf16Tensor(bt) = &ty {
             return self.bf16_transpose(ptr, &bt.clone(), span);
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("transpose `'` requires a tensor, got `{}`", ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -11605,7 +12983,7 @@ impl<'a> Translator<'a> {
                 // Transpose of a vector is a no-op on layout — copy the bytes
                 // so the result doesn't alias the source weight.
                 let dst = self.forge_alloc(bt.nbytes());
-                self.emit_memcpy_loop(dst, ptr, bt.nelems(), 2);
+                self.emit_memcpy_loop(dst, ptr, bt.nelems(), cl::I16);
                 Ok((dst, TyKind::Bf16Tensor(bt.clone())))
             }
             2 => {
@@ -11635,13 +13013,13 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TensorTy), JitError> {
         if t.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "transpose `'` is f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "transpose `'` is f32-only");
         }
         match t.rank() {
             1 => {
                 let out_ptr = self.forge_alloc(t.nbytes());
                 let n = t.nelems();
-                self.emit_memcpy_loop(out_ptr, ptr, n, t.elem_bytes());
+                self.emit_memcpy_loop(out_ptr, ptr, n, t.elem.cl());
                 Ok((out_ptr, t.clone()))
             }
             2 => {
@@ -11707,6 +13085,26 @@ impl<'a> Translator<'a> {
                 self.builder.seal_block(i_exit);
 
                 Ok((out_ptr, out_ty))
+            }
+            3 => {
+                // [B, M, N] -> [B, N, M]. The interpreter transposes the last
+                // two axes at every rank ≥ 2 (interp.rs, `PostfixOp::Transpose`),
+                // and a rank-3 buffer has the same bytes as a rank-4 one with a
+                // leading 1 — so view it that way and reuse the batched kernel
+                // below instead of open-coding a third loop nest.
+                //
+                // The hole this closes is not the `'` operator (rank-3 rarely
+                // gets transposed by hand) but the reverse pass: `da = g @ b'`
+                // and `db = a' @ g` transpose their operands, so a rank-3
+                // batched matmul inside a `@grad fn` — which lowers and runs
+                // fine forward — used to fail its whole `f$fwd_bwd` with a hard
+                // `jit error` naming an operator the source never wrote.
+                let as4 = TensorTy {
+                    elem: t.elem,
+                    shape: vec![1, t.shape[0], t.shape[1], t.shape[2]],
+                };
+                let (out_ptr, out4) = self.raw_transpose(ptr, &as4, span)?;
+                Ok((out_ptr, TensorTy { elem: t.elem, shape: out4.shape[1..].to_vec() }))
             }
             4 => {
                 // Swap last two axes: [B, H, M, N] -> [B, H, N, M].
@@ -11829,18 +13227,27 @@ impl<'a> Translator<'a> {
 
                 Ok((out_ptr, out_ty))
             }
-            r => err(span, format!(
-                "transpose `'` supports 1D, 2D, and 4D tensors; got rank {}", r,
+            // Not a miscompile, a missing case: refuse it as `unsupported` so
+            // the caller falls back to the interpreter (#480's error/gap split)
+            // instead of failing the program with a bug-flavoured `jit error`.
+            r => unsupported_msg(span, Refusal::OperandType, format!(
+                "transpose `'` supports tensor ranks 1..=4 in the JIT; got rank {}", r,
             )),
         }
     }
 
-    /// Emit a tight loop copying `n` f32 elements from `src` to `dst`.
-    fn emit_memcpy_loop(&mut self, dst: Value, src: Value, n: i64, elem_bytes: i64) {
+    /// Emit a tight loop copying `n` elements of type `elem_ty` from `src` to
+    /// `dst`. The stride is derived from `elem_ty`, so the load width and the
+    /// element width can never disagree: passing `cl::F32` for an i64/f64
+    /// tensor used to copy only the low 4 bytes of every element and leave the
+    /// high 4 bytes as whatever the destination arena already held (#552).
+    /// Copies are bit-preserving, so a caller with no `ScalarKind` for its
+    /// element (bf16 weights) passes the same-width integer type.
+    fn emit_memcpy_loop(&mut self, dst: Value, src: Value, n: i64, elem_ty: ClType) {
         let zero = self.builder.ins().iconst(cl::I64, 0);
         let one = self.builder.ins().iconst(cl::I64, 1);
         let cap = self.builder.ins().iconst(cl::I64, n);
-        let eb = self.builder.ins().iconst(cl::I64, elem_bytes);
+        let eb = self.builder.ins().iconst(cl::I64, elem_ty.bytes() as i64);
 
         let hdr = self.builder.create_block();
         let body = self.builder.create_block();
@@ -11855,7 +13262,7 @@ impl<'a> Translator<'a> {
 
         self.enter(body);
         let off = self.builder.ins().imul(i, eb);
-        let v = self.tensor_load_elem(src, off, ScalarKind::F32);
+        let v = self.tensor_load_at(src, off, elem_ty);
         self.tensor_store_elem(dst, off, v);
         let inext = self.builder.ins().iadd(i, one);
         self.jump(hdr, &[inext]);
@@ -11877,7 +13284,7 @@ impl<'a> Translator<'a> {
         // `lower_matmul_general` instead, after its fast-path check.)
         self.emit_gpu_flush_if_pending();
         if lt.elem != ScalarKind::F32 || rt.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "matmul `@` is f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "matmul `@` is f32-only");
         }
         match (lt.rank(), rt.rank()) {
             (2, 2) => {
@@ -12430,7 +13837,7 @@ impl<'a> Translator<'a> {
             _ => return Ok(None),
         };
         let (q_ptr, qk) = self.lower_expr(lhs)?;
-        let qt = qk.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let qt = qk.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("attention `q @ k_cache'` requires a dense tensor `q`, got `{}`",
                          qk.render()),
             line: span.line, col: span.col,
@@ -12564,7 +13971,7 @@ impl<'a> Translator<'a> {
             return err(span, "attention `probs @ v_cache` requires rank-4 operands");
         }
         if pdt.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "attention output is f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "attention output is f32-only");
         }
         // probs: [B,H,1,len], all of B,H,1 static; axis 3 runtime.
         let (b, h) = match (pdt.dims[0], pdt.dims[1]) {
@@ -13042,7 +14449,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to `len`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `len`"),
         };
         let (v, ty) = self.lower_expr(e)?;
         // String: call __dmc_str_len at runtime.
@@ -13050,11 +14457,13 @@ impl<'a> Translator<'a> {
             let entry = self.fns.get("__dmc_str_len")
                 .expect("__dmc_str_len not registered").clone();
             let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-            let call = self.builder.ins().call(func_ref, &[v]);
+            let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+            let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+            let call = self.builder.ins().call(func_ref, &[v, line, col]);
             let result = self.builder.inst_results(call)[0];
             return Ok((result, TyKind::Scalar(ScalarKind::I64)));
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`len` requires a tensor or str argument".into(),
             line: span.line, col: span.col,
         })?;
@@ -13075,8 +14484,8 @@ impl<'a> Translator<'a> {
         if args.len() != 2 {
             return err(span, "`str_concat` takes exactly 2 arguments");
         }
-        let e1 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `str_concat`") };
-        let e2 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `str_concat`") };
+        let e1 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str_concat`") };
+        let e2 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str_concat`") };
         let (v1, ty1) = self.lower_expr(e1)?;
         let (v2, ty2) = self.lower_expr(e2)?;
         if !ty1.is_str() { return err(span, format!("`str_concat` arg 1 must be str, got `{}`", ty1.render())); }
@@ -13097,8 +14506,8 @@ impl<'a> Translator<'a> {
         if args.len() != 2 {
             return err(span, "`str_eq` takes exactly 2 arguments");
         }
-        let e1 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `str_eq`") };
-        let e2 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `str_eq`") };
+        let e1 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str_eq`") };
+        let e2 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str_eq`") };
         let (v1, ty1) = self.lower_expr(e1)?;
         let (v2, ty2) = self.lower_expr(e2)?;
         if !ty1.is_str() { return err(span, format!("`str_eq` arg 1 must be str, got `{}`", ty1.render())); }
@@ -13110,6 +14519,286 @@ impl<'a> Translator<'a> {
         Ok((result, TyKind::Scalar(ScalarKind::I64)))
     }
 
+    /// `s.starts_with(prefix)` (SPEC §4.12 — a str method, never UFCS-rewritten).
+    /// Lowered because `PORTS.md §6` makes prefix-matching the *only* sanctioned
+    /// way to read an error tag; a program that handles port errors cannot be
+    /// written without it.
+    fn lower_str_starts_with(
+        &mut self,
+        recv: &Expr,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Result<(Value, TyKind), JitError> {
+        if args.len() != 1 {
+            return err(span, format!(
+                "`str.starts_with` takes exactly 1 argument, got {}", args.len()));
+        }
+        let a = match &args[0] {
+            CallArg::Positional(e) => e,
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str.starts_with`"),
+        };
+        let (sv, sty) = self.lower_expr(recv)?;
+        if !sty.is_str() {
+            return unsupported(span, Refusal::OperandType, &format!(
+                "`.starts_with` on a `{}` receiver (str only in the JIT)", sty.render()));
+        }
+        let (pv, pty) = self.lower_expr(a)?;
+        if !pty.is_str() {
+            return err(span, format!(
+                "`str.starts_with` needs a str argument, got `{}`", pty.render()));
+        }
+        let entry = self.fns.get("__dmc_str_starts_with")
+            .expect("__dmc_str_starts_with not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[sv, pv, line, col]);
+        let raw = self.builder.inst_results(call)[0];
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        let res = self.builder.ins().icmp(IntCC::NotEqual, raw, zero);
+        Ok((res, TyKind::Scalar(ScalarKind::Bool)))
+    }
+
+    /// Lower one positional argument that must already be a `str`.
+    fn lower_str_arg(&mut self, args: &[CallArg], i: usize, what: &str, span: &Span)
+        -> Result<Value, JitError>
+    {
+        let e = match &args[i] {
+            CallArg::Positional(e) => e,
+            _ => return unsupported(span, Refusal::ArgForm, &format!("non-positional arg to `{}`", what)),
+        };
+        let (v, ty) = self.lower_expr(e)?;
+        if !ty.is_str() {
+            return err(span, format!("`{}` must be str, got `{}`", what, ty.render()));
+        }
+        Ok(v)
+    }
+
+    /// Lower the port-handle argument of `port_call`/`port_close`.
+    ///
+    /// Only a `Port` will do. The handle *text* is an ordinary string, so
+    /// accepting a `str` here would let a program forge one — `port_call("port#1:python", …)`
+    /// would reach a registry entry the caller never opened. The interpreter
+    /// refuses that (its handle is a `Value::Opaque`, and a `Value::Str` never
+    /// reads as one); the type is how the JIT refuses the same thing. A `Port`
+    /// whose value is nil — the handle a failed `port_open` hands back — still
+    /// reaches the runtime check, which raises the interpreter's error verbatim.
+    fn lower_port_handle_arg(&mut self, args: &[CallArg], what: &str, span: &Span)
+        -> Result<Value, JitError>
+    {
+        let e = match &args[0] {
+            CallArg::Positional(e) => e,
+            _ => return unsupported(span, Refusal::ArgForm, &format!("non-positional arg to `{}`", what)),
+        };
+        let (v, ty) = self.lower_expr(e)?;
+        if !ty.is_port() {
+            return err(span, format!(
+                "`{}` must be a Port handle from port_open, got `{}`", what, ty.render()));
+        }
+        Ok(v)
+    }
+
+    /// Render a `Port` handle to its display text (`<opaque port#1:python>`),
+    /// which is what the interpreter's `Value::Opaque` prints and stringifies to.
+    fn lower_port_render(&mut self, v: Value) -> Value {
+        let entry = self.fns.get("__dmc_port_render")
+            .expect("__dmc_port_render not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[v]);
+        self.builder.inst_results(call)[0]
+    }
+
+    /// `port_open(lang) -> (Port, Err)` (PORTS.md §2). The handle is the opaque
+    /// `port#<id>:<lang>` handle the shared registry mints; on failure it is nil
+    /// (a null pointer) and the `Err` half carries the `port-open` tag.
+    fn lower_builtin_port_open(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        if args.len() != 1 {
+            return err(span, format!(
+                "`port_open` takes exactly 1 argument (the runtime name), got {}", args.len()));
+        }
+        let lang = self.lower_str_arg(args, 0, "port_open: lang", span)?;
+        let entry = self.fns.get("__dmc_port_open").expect("__dmc_port_open not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[lang, line, col]);
+        let pair = self.builder.inst_results(call)[0];
+        Ok((pair, TyKind::Tuple(vec![TyKind::Port(None), TyKind::Str])))
+    }
+
+    /// `port_call(p, name, payload) -> (str, Err)` (PORTS.md §2). `payload` may
+    /// be omitted or `nil`, both meaning "call with no arguments"; the JSON
+    /// argument-vector rules are the shared registry's, not the JIT's.
+    fn lower_builtin_port_call(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        if args.len() != 2 && args.len() != 3 {
+            return err(span, format!(
+                "`port_call` takes (port, name) or (port, name, payload), got {} arguments",
+                args.len()));
+        }
+        let handle = self.lower_port_handle_arg(args, "port_call: first arg", span)?;
+        let name = self.lower_str_arg(args, 1, "port_call: name", span)?;
+        let payload = if args.len() == 3 {
+            let e = match &args[2] {
+                CallArg::Positional(e) => e,
+                _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `port_call`"),
+            };
+            let (v, ty) = self.lower_expr(e)?;
+            match ty {
+                TyKind::Str => v,
+                // `nil` is the written-out form of "no arguments"; the registry
+                // reads an empty payload the same way.
+                TyKind::Scalar(ScalarKind::Nil) => self.lower_str_literal(""),
+                other => return err(span, format!(
+                    "`port_call: payload` must be a JSON str or nil, got `{}`", other.render())),
+            }
+        } else {
+            self.lower_str_literal("")
+        };
+        let entry = self.fns.get("__dmc_port_call").expect("__dmc_port_call not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[handle, name, payload, line, col]);
+        let pair = self.builder.inst_results(call)[0];
+        Ok((pair, TyKind::Tuple(vec![TyKind::Str, TyKind::Str])))
+    }
+
+    /// Materialize a tensor's static shape as an i64 array in the forge, and
+    /// return `(rank, ptr)` for the copy-mode helpers.
+    fn lower_shape_array(&mut self, dims: &[i64]) -> (Value, Value) {
+        let ptr = self.forge_alloc(dims.len() as i64 * 8);
+        let flags = cranelift::codegen::ir::MemFlagsData::new();
+        for (i, &d) in dims.iter().enumerate() {
+            let v = self.builder.ins().iconst(cl::I64, d);
+            self.builder.ins().store(flags, v, ptr, (i * 8) as i32);
+        }
+        let rank = self.builder.ins().iconst(cl::I64, dims.len() as i64);
+        (rank, ptr)
+    }
+
+    /// The `PORTS.md §3.2` wire dtype and shape of a tensor-typed JIT value.
+    ///
+    /// Keyed on the *storage* type, never on the annotation that produced it.
+    /// `Tensor[bf16, ..]` is f32-backed in the JIT (#179), so it crosses as
+    /// `f32` with 4-byte elements; only a genuine 2-byte `Bf16Tensor` crosses
+    /// as `bf16`. Wire dtype and payload width agree in both cases — the #292
+    /// invariant, stated at the port boundary.
+    fn port_tensor_wire_ty(ty: &TyKind, what: &str, span: &Span)
+        -> Result<(crate::ports::WireDType, Vec<i64>), JitError>
+    {
+        use crate::ports::WireDType as W;
+        match ty {
+            TyKind::Tensor(t) => {
+                let w = match t.elem {
+                    ScalarKind::I64 => W::I64,
+                    ScalarKind::I32 => W::I32,
+                    ScalarKind::F64 => W::F64,
+                    ScalarKind::F32 => W::F32,
+                    ScalarKind::Bool => W::Bool,
+                    other => return err(span, format!(
+                        "`{}`: tensor element `{}` has no copy-mode wire dtype (PORTS.md §3.2)",
+                        what, other.name())),
+                };
+                Ok((w, t.shape.clone()))
+            }
+            TyKind::Bf16Tensor(b) => Ok((W::Bf16, b.shape.clone())),
+            // A packed ternary tensor is its own `TyKind`, not a `Tensor` with
+            // a trit element, so it never reaches the elem match above. Word it
+            // the way the interpreter does: a `trit` tensor is a tensor, and
+            // the reason it cannot cross is that §3.2 gives it no wire dtype —
+            // not that the argument was the wrong kind of thing.
+            TyKind::TritTensor(_) => err(span, format!(
+                "{}: a `trit` tensor has no copy-mode wire dtype (PORTS.md §3.2)", what)),
+            other => err(span, format!(
+                "`{}` takes a tensor, got `{}`", what, other.render())),
+        }
+    }
+
+    /// `port_tensor_encode(t) -> str` (PORTS.md §3.2) — the copy-mode envelope.
+    fn lower_builtin_port_tensor_encode(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        if args.len() != 1 {
+            return err(span, format!(
+                "`port_tensor_encode` takes exactly 1 argument (the tensor), got {}", args.len()));
+        }
+        let CallArg::Positional(e) = &args[0] else {
+            return unsupported(span, Refusal::ArgForm, "non-positional arg to `port_tensor_encode`");
+        };
+        let (data, ty) = self.lower_expr(e)?;
+        let (dt, dims) = Self::port_tensor_wire_ty(&ty, "port_tensor_encode", span)?;
+        let (rank, shape) = self.lower_shape_array(&dims);
+        let dtype = self.builder.ins().iconst(cl::I64, dt.code());
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let entry = self.fns.get("__dmc_port_tensor_encode")
+            .expect("__dmc_port_tensor_encode not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[data, dtype, rank, shape, line, col]);
+        Ok((self.builder.inst_results(call)[0], TyKind::Str))
+    }
+
+    /// `port_tensor_decode(s, like) -> (Tensor, Err)` (PORTS.md §3.2).
+    ///
+    /// `like` is the *declaration*: its dtype and shape are what the envelope
+    /// must present, and they are the type of the tensor that comes back. Only
+    /// its type is read — the value itself never reaches the helper — which is
+    /// what lets the JIT know the result type statically without a type-argument
+    /// form the interpreter would have to grow too.
+    fn lower_builtin_port_tensor_decode(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        if args.len() != 2 {
+            return err(span, format!(
+                "`port_tensor_decode` takes (envelope, like_tensor), got {} arguments", args.len()));
+        }
+        let text = self.lower_str_arg(args, 0, "port_tensor_decode: first arg", span)?;
+        let CallArg::Positional(e) = &args[1] else {
+            return unsupported(span, Refusal::ArgForm, "non-positional arg to `port_tensor_decode`");
+        };
+        let (_like, ty) = self.lower_expr(e)?;
+        let (dt, dims) = Self::port_tensor_wire_ty(&ty, "port_tensor_decode", span)?;
+        let (rank, shape) = self.lower_shape_array(&dims);
+        let dtype = self.builder.ins().iconst(cl::I64, dt.code());
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let entry = self.fns.get("__dmc_port_tensor_decode")
+            .expect("__dmc_port_tensor_decode not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let call = self.builder.ins().call(func_ref, &[text, dtype, rank, shape, line, col]);
+        let pair = self.builder.inst_results(call)[0];
+        Ok((pair, TyKind::Tuple(vec![ty, TyKind::Str])))
+    }
+
+    /// `port_close(p) -> (nil, Err)` (PORTS.md §2). A second close of the same
+    /// handle is `port-closed`, not a crash — ids are never reused.
+    fn lower_builtin_port_close(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        if args.len() != 1 {
+            return err(span, format!(
+                "`port_close` takes exactly 1 argument (the port), got {}", args.len()));
+        }
+        let handle = self.lower_port_handle_arg(args, "port_close: arg", span)?;
+        let entry = self.fns.get("__dmc_port_close").expect("__dmc_port_close not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[handle, line, col]);
+        let errv = self.builder.inst_results(call)[0];
+        // The first half is a genuine `nil`, exactly as in the interpreter.
+        let pair = self.forge_alloc(16);
+        let flags = cranelift::codegen::ir::MemFlagsData::new();
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        self.builder.ins().store(flags, zero, pair, 0);
+        self.builder.ins().store(flags, errv, pair, 8);
+        Ok((pair, TyKind::Tuple(vec![TyKind::Scalar(ScalarKind::Nil), TyKind::Str])))
+    }
+
     /// `str_get_char(s, i)` — return byte at index i as i64.
     fn lower_builtin_str_get_char(
         &mut self,
@@ -13119,8 +14808,8 @@ impl<'a> Translator<'a> {
         if args.len() != 2 {
             return err(span, "`str_get_char` takes exactly 2 arguments");
         }
-        let e1 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `str_get_char`") };
-        let e2 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `str_get_char`") };
+        let e1 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str_get_char`") };
+        let e2 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `str_get_char`") };
         let (v1, ty1) = self.lower_expr(e1)?;
         let (v2, ty2) = self.lower_expr(e2)?;
         if !ty1.is_str() { return err(span, format!("`str_get_char` arg 1 must be str, got `{}`", ty1.render())); }
@@ -13130,7 +14819,9 @@ impl<'a> Translator<'a> {
         let idx = self.coerce_to(v2, &ty2, &TyKind::Scalar(ScalarKind::I64), span)?;
         let entry = self.fns.get("__dmc_str_get_char").expect("__dmc_str_get_char not registered").clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-        let call = self.builder.ins().call(func_ref, &[v1, idx]);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[v1, idx, line, col]);
         let result = self.builder.inst_results(call)[0];
         Ok((result, TyKind::Scalar(ScalarKind::I64)))
     }
@@ -13144,7 +14835,7 @@ impl<'a> Translator<'a> {
         if args.len() != 1 {
             return err(span, "`print_str` takes exactly 1 argument");
         }
-        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `print_str`") };
+        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `print_str`") };
         let (v, ty) = self.lower_expr(e)?;
         if !ty.is_str() { return err(span, format!("`print_str` requires a str argument, got `{}`", ty.render())); }
         let entry = self.fns.get("__dmc_print_str").expect("__dmc_print_str not registered").clone();
@@ -13164,7 +14855,7 @@ impl<'a> Translator<'a> {
         if args.len() != 1 {
             return err(span, "`chr` takes exactly 1 argument");
         }
-        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `chr`") };
+        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `chr`") };
         let (v, ty) = self.lower_expr(e)?;
         let n = self.coerce_to(v, &ty, &TyKind::Scalar(ScalarKind::I64), span)?;
         let entry = self.fns.get("__dmc_chr").expect("__dmc_chr not registered").clone();
@@ -13183,7 +14874,7 @@ impl<'a> Translator<'a> {
         if args.len() != 1 {
             return err(span, "`sleep_ms` takes exactly 1 argument");
         }
-        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `sleep_ms`") };
+        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `sleep_ms`") };
         let (v, ty) = self.lower_expr(e)?;
         let ms = self.coerce_to(v, &ty, &TyKind::Scalar(ScalarKind::F64), span)?;
         let entry = self.fns.get("__dmc_sleep_ms").expect("__dmc_sleep_ms not registered").clone();
@@ -13234,8 +14925,8 @@ impl<'a> Translator<'a> {
         if args.len() != 2 {
             return err(span, "`map_get` takes exactly 2 arguments (map, key)");
         }
-        let e0 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_get`") };
-        let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_get`") };
+        let e0 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_get`") };
+        let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_get`") };
         let (m, mty) = self.lower_expr(e0)?;
         let (k, kty) = self.lower_expr(e1)?;
         if !mty.is_map() { return err(span, format!("`map_get` arg 1 must be a Map, got `{}`", mty.render())); }
@@ -13282,9 +14973,9 @@ impl<'a> Translator<'a> {
         if args.len() != 3 {
             return err(span, "`map_set` takes exactly 3 arguments (map, key, val)");
         }
-        let e0 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_set`") };
-        let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_set`") };
-        let e2 = match &args[2] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_set`") };
+        let e0 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_set`") };
+        let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_set`") };
+        let e2 = match &args[2] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_set`") };
         let (m, mty) = self.lower_expr(e0)?;
         let (k, kty) = self.lower_expr(e1)?;
         let (v, vty) = self.lower_expr(e2)?;
@@ -13309,8 +15000,8 @@ impl<'a> Translator<'a> {
         if args.len() != 2 {
             return err(span, "`map_contains` takes exactly 2 arguments (map, key)");
         }
-        let e0 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_contains`") };
-        let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to `map_contains`") };
+        let e0 = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_contains`") };
+        let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_contains`") };
         let (m, mty) = self.lower_expr(e0)?;
         let (k, kty) = self.lower_expr(e1)?;
         if !mty.is_map() { return err(span, format!("`map_contains` arg 1 must be a Map, got `{}`", mty.render())); }
@@ -13336,9 +15027,9 @@ impl<'a> Translator<'a> {
         if args.len() != 1 {
             return err(span, "`trit_quantize` takes exactly 1 argument");
         }
-        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to trit_quantize") };
+        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to trit_quantize") };
         let (src, src_ty) = self.lower_expr(e)?;
-        let t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`trit_quantize` requires a 2-D f32 tensor, got `{}`", src_ty.render()),
             line: span.line, col: span.col,
         })?.clone();
@@ -13364,7 +15055,7 @@ impl<'a> Translator<'a> {
         if args.len() != 1 {
             return err(span, "`trit_neg` takes exactly 1 argument");
         }
-        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to trit_neg") };
+        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to trit_neg") };
         let (src, src_ty) = self.lower_expr(e)?;
         let tt = match &src_ty {
             TyKind::TritTensor(tt) => tt.clone(),
@@ -13388,7 +15079,7 @@ impl<'a> Translator<'a> {
         if args.len() != 1 {
             return err(span, "`trit_sparsity` takes exactly 1 argument");
         }
-        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, "non-positional arg to trit_sparsity") };
+        let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to trit_sparsity") };
         let (src, src_ty) = self.lower_expr(e)?;
         let tt = match &src_ty {
             TyKind::TritTensor(tt) => tt.clone(),
@@ -13426,7 +15117,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to `sum`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `sum`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
         // #324: summing a bf16 weight field — upconvert to f32 first.
@@ -13456,7 +15147,7 @@ impl<'a> Translator<'a> {
                 (d, n)
             }
             TyKind::Tensor(_) | TyKind::KV(_) | TyKind::DynTensor(_) =>
-                return unsupported_msg(span, "`sum` is f32-only"),
+                return unsupported_msg(span, Refusal::F32Only, "`sum` is f32-only"),
             _ => return err(span, "`sum` requires a tensor or KV argument"),
         };
         let total = self.fused_sum_v(data_ptr, count);
@@ -13476,7 +15167,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to a reduction"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to a reduction"),
         };
         let is_max = name == "max";
         let (ptr, ty) = self.lower_expr(e)?;
@@ -13512,7 +15203,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to a reduction"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to a reduction"),
         };
         let want_max = name == "argmax";
         let (ptr, ty) = self.lower_expr(e)?;
@@ -13683,10 +15374,10 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to `variance`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `variance`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`variance` requires a tensor argument".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -13766,10 +15457,10 @@ impl<'a> Translator<'a> {
         }
         let (t_expr, a_expr) = match (&args[0], &args[1]) {
             (CallArg::Positional(t), CallArg::Positional(a)) => (t, a),
-            _ => return unsupported(span, "non-positional args to `pull_to_mean`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args to `pull_to_mean`"),
         };
         let (ptr, ty) = self.lower_expr(t_expr)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`pull_to_mean` first arg must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -13967,7 +15658,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg"),
         };
         let (v, k) = self.lower_expr(e)?;
         // #209: scalar transcendentals compute in f64 (match the interpreter).
@@ -13992,7 +15683,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg"),
         };
         let (v, k) = self.lower_expr(e)?;
         // #287: compute in f64, matching the interpreter and the libm path
@@ -14020,7 +15711,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg"),
         };
         let (v, k) = self.lower_expr(e)?;
         let v = self.coerce_to(v, &k, &TyKind::Scalar(ScalarKind::F32), span)?;
@@ -14041,7 +15732,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg"),
         };
         let (v, k) = self.lower_expr(e)?;
         let v = self.coerce_to(v, &k, &TyKind::Scalar(ScalarKind::I64), span)?;
@@ -14062,12 +15753,12 @@ impl<'a> Translator<'a> {
     ) -> Result<(Value, TyKind), JitError> {
         let (t_expr, axis) = self.parse_reduce_args(args, span)?;
         let (ptr, ty) = self.lower_expr(t_expr)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "reduce_along requires a tensor argument".into(),
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return unsupported_msg(span, "per-axis reductions are f32-only");
+            return unsupported_msg(span, Refusal::F32Only, "per-axis reductions are f32-only");
         }
         if t.rank() < 2 {
             return err(span, format!(
@@ -14202,7 +15893,7 @@ impl<'a> Translator<'a> {
         }
         let (t_expr, a_expr) = match (&args[0], &args[1]) {
             (CallArg::Positional(t), CallArg::Positional(a)) => (t, a),
-            _ => return unsupported(span, "non-positional args"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args"),
         };
         let axis = match a_expr {
             Expr::Literal(Literal::Int(n, _), _) => *n,
@@ -14323,7 +16014,7 @@ impl<'a> Translator<'a> {
         let (t_expr, a_expr, alpha_expr) = match (&args[0], &args[1], &args[2]) {
             (CallArg::Positional(t), CallArg::Positional(a), CallArg::Positional(al)) =>
                 (t, a, al),
-            _ => return unsupported(span, "non-positional args"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args"),
         };
         let axis = match a_expr {
             Expr::Literal(Literal::Int(n, _), _) => *n,
@@ -14437,7 +16128,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
 
@@ -14464,7 +16155,7 @@ impl<'a> Translator<'a> {
             _ => {}
         }
 
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "softmax requires a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -14482,7 +16173,7 @@ impl<'a> Translator<'a> {
                     if let Some(a) = const_int_axis(ae) {
                         let norm = if a < 0 { a + t.rank() as i64 } else { a };
                         if norm != last {
-                            return unsupported(span,
+                            return unsupported(span, Refusal::Axis,
                                 "JIT softmax reduces over the last axis only; \
                                  a non-last axis needs `dmc run`");
                         }
@@ -14631,7 +16322,7 @@ impl<'a> Translator<'a> {
         }
         let (vp, vty) = match &args[0] {
             CallArg::Positional(e) => self.lower_expr(e)?,
-            _ => return unsupported(span, "non-positional arg to `embed`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `embed`"),
         };
         // #324: a bf16 weight as the embedding table — upconvert to f32 first.
         let (vp, vty) = match &vty {
@@ -14640,7 +16331,7 @@ impl<'a> Translator<'a> {
         };
         let (ip, ity) = match &args[1] {
             CallArg::Positional(e) => self.lower_expr(e)?,
-            _ => return unsupported(span, "non-positional arg to `embed`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `embed`"),
         };
         let vt = match vty {
             TyKind::Tensor(t) if t.elem == ScalarKind::F32 && t.shape.len() == 2 => t,
@@ -14720,7 +16411,7 @@ impl<'a> Translator<'a> {
         let (x_e, g_e, eps_e) = match (&args[0], &args[1], &args[2]) {
             (CallArg::Positional(a), CallArg::Positional(b), CallArg::Positional(c))
                 => (a, b, c),
-            _ => return unsupported(span, "non-positional args"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args"),
         };
         let (x_ptr, x_ty) = self.lower_expr(x_e)?;
         let (g_ptr, g_ty) = self.lower_expr(g_e)?;
@@ -14731,11 +16422,11 @@ impl<'a> Translator<'a> {
         };
         let (eps, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rms_norm: x must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rms_norm: g must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -14992,7 +16683,7 @@ impl<'a> Translator<'a> {
         let (x_e, g_e, b_e, eps_e) = match (&args[0], &args[1], &args[2], &args[3]) {
             (CallArg::Positional(a), CallArg::Positional(b), CallArg::Positional(c),
              CallArg::Positional(d)) => (a, b, c, d),
-            _ => return unsupported(span, "non-positional args"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional args"),
         };
         let (x_ptr, x_ty) = self.lower_expr(x_e)?;
         let (g_ptr, g_ty) = self.lower_expr(g_e)?;
@@ -15000,15 +16691,15 @@ impl<'a> Translator<'a> {
         let (eps, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
 
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: x must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
-        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let gt = g_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: g must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
-        let bt = b_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let bt = b_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: b must be a tensor".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -15205,9 +16896,9 @@ impl<'a> Translator<'a> {
         if let Some(a) = args.get(1) {
             let axis_e = match a {
                 CallArg::Positional(e) => e,
-                _ => return unsupported(span, "softmax: non-positional axis arg"),
+                _ => return unsupported(span, Refusal::ArgForm, "softmax: non-positional axis arg"),
             };
-            let axis = const_int_axis(axis_e).ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            let axis = const_int_axis(axis_e).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: "softmax over a dynamic/KV tensor requires a constant axis".into(),
                 line: span.line, col: span.col,
             })?;
@@ -15390,11 +17081,11 @@ impl<'a> Translator<'a> {
             Some(_) => return err(span, "non-positional mask arg to `attn`"),
         };
 
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn: q must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let kt_in = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let kt_in = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn: k must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn: v must be a tensor".into(), line: span.line, col: span.col })?.clone();
 
         if qt.rank() != 4 || kt_in.rank() != 4 || vt.rank() != 4 {
@@ -15442,11 +17133,11 @@ impl<'a> Translator<'a> {
         let (cos_ptr, cos_ty) = self.lower_expr(cos_e)?;
         let (sin_ptr, sin_ty) = self.lower_expr(sin_e)?;
 
-        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: x must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let ct = cos_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let ct = cos_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: cos must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let st = sin_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let st = sin_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: sin must be a tensor".into(), line: span.line, col: span.col })?.clone();
 
         if xt.rank() < 2 {
@@ -15469,7 +17160,7 @@ impl<'a> Translator<'a> {
 
         let out_ptr = self.forge_alloc(xt.nbytes());
         // Copy x to out first, then rotate in place.
-        self.emit_memcpy_loop(out_ptr, x_ptr, xt.nelems(), 4);
+        self.emit_memcpy_loop(out_ptr, x_ptr, xt.nelems(), xt.elem.cl());
         self.rope_rotate_inplace(out_ptr, cos_ptr, sin_ptr, &xt, false);
         Ok((out_ptr, TyKind::Tensor(xt)))
     }
@@ -15607,7 +17298,7 @@ impl<'a> Translator<'a> {
     /// them). Allocates and returns the `dx` buffer.
     fn tensor_rope_backward(&mut self, adj: Value, cos_ptr: Value, sin_ptr: Value, xt: &TensorTy) -> Value {
         let out = self.forge_alloc(xt.nbytes());
-        self.emit_memcpy_loop(out, adj, xt.nelems(), 4);
+        self.emit_memcpy_loop(out, adj, xt.nelems(), xt.elem.cl());
         self.rope_rotate_inplace(out, cos_ptr, sin_ptr, xt, true);
         out
     }
@@ -15831,11 +17522,11 @@ impl<'a> Translator<'a> {
             return self.lower_attn_gqa_cached(q_ptr, &q_ty, k_ptr, &k_ty, v_ptr, &v_ty, mask, span);
         }
 
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn_gqa: q must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn_gqa: k must be a tensor".into(), line: span.line, col: span.col })?.clone();
-        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let vt = v_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn_gqa: v must be a tensor".into(), line: span.line, col: span.col })?.clone();
 
         if qt.rank() != 4 || kt.rank() != 4 || vt.rank() != 4 {
@@ -16051,7 +17742,7 @@ impl<'a> Translator<'a> {
         self.emit_2d_matmul_at(scores_buf, v_head, head_out_scratch, s, s, d);
 
         // Copy head_out_scratch into o_head
-        self.emit_memcpy_loop(o_head, head_out_scratch, s * d, 4);
+        self.emit_memcpy_loop(o_head, head_out_scratch, s * d, cl::F32);
 
         let hqin = self.builder.ins().iadd(hqi, one);
         self.jump(hqi_hdr, &[hqin]);
@@ -16089,7 +17780,7 @@ impl<'a> Translator<'a> {
         mask: Option<(Value, TensorTy)>,
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
-        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "attn_gqa: q must be a dense tensor".into(),
             line: span.line, col: span.col })?.clone();
         // Materialize KV caches to contiguous DynTensors [B,H_kv,len,D]; a
@@ -16291,10 +17982,10 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to `print_tensor`"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `print_tensor`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error,
+        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`print_tensor` requires a tensor argument".into(),
             line: span.line, col: span.col,
         })?.clone();
@@ -16333,51 +18024,57 @@ impl<'a> Translator<'a> {
                 return match op {
                     UnOp::ReLU  => self.lower_tensor_relu(v, tt, span),
                     UnOp::GeLU  => self.lower_tensor_gelu(v, tt, span),
-                    _ => unsupported(span,
+                    _ => unsupported(span, Refusal::OperandType,
                         "only `\\>` (ReLU) and `\\<` (GeLU) are defined on tensors; \
                          use elementwise ops otherwise"),
                 };
             }
             TyKind::KV(_) => {
-                return unsupported(span, "unary operators are not supported on KV caches");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on KV caches");
             }
             TyKind::DynTensor(_) => {
-                return unsupported(span, "unary operators on dynamic-shape tensors are not yet lowered");
+                return unsupported(span, Refusal::DynamicShape, "unary operators on dynamic-shape tensors are not yet lowered");
             }
             TyKind::Model(_, _) => {
-                return unsupported(span, "unary operators are not supported on model instances");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on model instances");
             }
             TyKind::Tuple(_) => {
-                return unsupported(span, "unary operators are not supported on tuples");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on tuples");
             }
             TyKind::Str => {
-                return unsupported(span, "unary operators are not defined on str");
+                return unsupported(span, Refusal::OperandType, "unary operators are not defined on str");
+            }
+            TyKind::Port(_) => {
+                return unsupported(span, Refusal::OperandType, "unary operators are not defined on a port handle");
             }
             TyKind::Map => {
-                return unsupported(span, "unary operators are not supported on map values");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on map values");
             }
             TyKind::KvArray(_, _) => {
-                return unsupported(span, "unary operators are not supported on KV-cache arrays");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on KV-cache arrays");
             }
             TyKind::ModelArray(_, _, _) => {
-                return unsupported(span, "unary operators are not supported on model arrays");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on model arrays");
             }
             TyKind::Fn(_, _) => {
-                return unsupported(span, "unary operators are not supported on function pointers");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on function pointers");
             }
             TyKind::TritTensor(_) => {
-                return unsupported(span, "unary operators are not supported on trit tensors");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on trit tensors");
             }
             TyKind::Bf16Tensor(_) => {
-                return unsupported(span, "unary operators are not supported on bf16 tensors; upconvert to f32 first");
+                return unsupported(span, Refusal::OperandType, "unary operators are not supported on bf16 tensors; upconvert to f32 first");
             }
             TyKind::Enum(_) => {
-                return unsupported(span, "unary operators are not defined on enums; cast to `i64` first");
+                return unsupported(span, Refusal::OperandType, "unary operators are not defined on enums; cast to `i64` first");
             }
         };
         match op {
             UnOp::Neg => {
-                if sk.is_int()       { Ok((self.builder.ins().ineg(v), TyKind::Scalar(sk))) }
+                // #544: negation is `0 - n`, so it wraps at the operand's width
+                // (`-i8::MIN` is `i8::MIN`), matching `interp::apply_unop`.
+                if sk.is_int()       { let n = self.builder.ins().ineg(v);
+                                       Ok((self.mask_to_kind(n, sk), TyKind::Scalar(sk))) }
                 else if sk.is_float(){ Ok((self.builder.ins().fneg(v), TyKind::Scalar(sk))) }
                 else { err(span, "unary `-` requires a numeric operand") }
             }
@@ -16390,10 +18087,13 @@ impl<'a> Translator<'a> {
                 }
             }
             UnOp::BitNot => {
-                if sk.is_int() { Ok((self.builder.ins().bnot(v), TyKind::Scalar(sk))) }
+                // #544: `~` complements the operand's WIDTH — `~0u8` is 255,
+                // not -1 — so the result is re-masked like any other int op.
+                if sk.is_int() { let n = self.builder.ins().bnot(v);
+                                 Ok((self.mask_to_kind(n, sk), TyKind::Scalar(sk))) }
                 else { err(span, "unary `~` requires an int") }
             }
-            UnOp::Deref => unsupported(span, "pointer deref (no raw pointers in slice 2)"),
+            UnOp::Deref => unsupported(span, Refusal::Construct, "pointer deref (no raw pointers in slice 2)"),
             UnOp::ReLU => {
                 // max(x, 0) on a scalar f32.
                 if !sk.is_float() {
@@ -16603,7 +18303,7 @@ impl<'a> Translator<'a> {
         let out_ptr = self.forge_alloc(out_ty.nbytes());
         let n = out_ty.nelems();
         let entry = self.fns.get(sym)
-            .ok_or_else(|| JitError { kind: JitErrorKind::Error,
+            .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("activation symbol `{}` not registered", sym),
                 line: span.line, col: span.col,
             })?.clone();
@@ -16647,7 +18347,7 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
-            _ => return unsupported(span, "non-positional arg to activation"),
+            _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to activation"),
         };
         let (v, k) = self.lower_expr(e)?;
         match k.clone() {
@@ -17530,6 +19230,31 @@ impl<'a> Translator<'a> {
             // i64 → Fn: treat an opaque i64 (e.g., from map_get) as a function
             // pointer when the target type is explicitly annotated as fn(...).
             (TyKind::Scalar(ScalarKind::I64), TyKind::Fn(_, _)) => Ok(v),
+            // `p as str` / `to_str(p)` / `"…" + p` on a port handle. The handle
+            // is opaque, but the interpreter still *renders* one — its
+            // `Value::Opaque` Displays as `<opaque port#1:python>` — so the JIT
+            // renders the identical text rather than refusing and diverging.
+            // The result is not a handle and cannot be fed back to `port_call`.
+            // Port → Port. Reflexive like Model→Model and Fn→Fn: a handle is
+            // one i64 either way, so nothing is converted. What this arm adds
+            // is the `L` check — when the position names a runtime, the handle
+            // is asked at run time whether it is one, because the annotation is
+            // static and the handle's runtime name is not. `from == to` above
+            // already short-circuits the identical-annotation case, so the only
+            // work here is a genuine or unknown mismatch.
+            (TyKind::Port(_), TyKind::Port(want)) => {
+                if let Some(l) = want {
+                    let want_v = self.lower_str_literal(l);
+                    let entry = self.fns.get("__dmc_port_expect_lang")
+                        .expect("__dmc_port_expect_lang not registered").clone();
+                    let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+                    let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+                    let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+                    self.builder.ins().call(func_ref, &[v, want_v, line, col]);
+                }
+                Ok(v)
+            }
+            (TyKind::Port(_), TyKind::Str) => Ok(self.lower_port_render(v)),
             // `b as str` — a bool renders as "true"/"false" (matching the
             // interpreter's Display for Value::Bool), NOT the "1"/"0" that
             // __dmc_str_from_int would give. Widen the cl::I8 bool to the i64 the
@@ -17599,17 +19324,22 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<Value, JitError> {
         // (target bit width, signed?) — None width means "no narrowing".
+        // #544: `int8`/`int4` are the packed SIGNED 8-/4-bit types of §3.1, so
+        // a cast to them narrows like any other; they used to be listed with
+        // `u64` as "no narrowing", which left a value outside the width
+        // carrying that width's tag.
         let (bits, signed): (Option<u32>, bool) = match s {
-            ScalarType::I8  => (Some(8),  true),
+            ScalarType::I8 | ScalarType::Int8 => (Some(8),  true),
             ScalarType::I16 => (Some(16), true),
+            ScalarType::Int4 => (Some(4), true),
             ScalarType::U8  => (Some(8),  false),
             ScalarType::U16 => (Some(16), false),
             ScalarType::U32 => (Some(32), false),
-            // u64 / int4 / int8: no narrowing, value is the i64 as-is.
+            // u64: no narrowing, value is the i64 as-is.
             _ => (None, false),
         };
         let Some(bits) = bits else {
-            // No narrowing (u64 / int4 / int8 / i64). For u64 from a float we
+            // No narrowing (u64 / i64). For u64 from a float we
             // need *unsigned* saturation to the full u64 range (`-5.0 as u64`
             // == 0, `1e30 as u64` == u64::MAX); a signed convert would give -5
             // / i64::MAX. Everything else is the plain (signed) coercion.
@@ -17638,15 +19368,19 @@ impl<'a> Translator<'a> {
             let above = self.builder.ins().icmp(IntCC::SignedGreaterThan, v1, hi_c);
             Ok(self.builder.ins().select(above, hi_c, v1))
         } else {
-            // integer source: down to i64, then two's-complement reduce/re-widen.
-            let wt = match bits { 8 => cl::I8, 16 => cl::I16, _ => cl::I32 };
+            // integer source: down to i64, then two's-complement mask/extend at
+            // the target width. `mask_to_kind` covers `int4`, which has no
+            // Cranelift type to `ireduce` into.
             let i64v = self.coerce_to(v, k, &TyKind::Scalar(ScalarKind::I64), span)?;
-            let narrowed = self.builder.ins().ireduce(wt, i64v);
-            if signed {
-                Ok(self.builder.ins().sextend(cl::I64, narrowed))
-            } else {
-                Ok(self.builder.ins().uextend(cl::I64, narrowed))
-            }
+            let target = match (bits, signed) {
+                (8, true) => ScalarKind::I8,
+                (16, true) => ScalarKind::I16,
+                (4, true) => ScalarKind::I4,
+                (8, false) => ScalarKind::U8,
+                (16, false) => ScalarKind::U16,
+                _ => ScalarKind::U32,
+            };
+            Ok(self.mask_to_kind(i64v, target))
         }
     }
 
@@ -17671,6 +19405,19 @@ impl<'a> Translator<'a> {
                 ScalarKind::Nil => Ok(self.builder.ins().iconst(cl::I128, 0)),
                 _ => err(span, format!("cannot convert `{}` to a maybe-nil value", from.name())),
             };
+        }
+        // #544: a masked narrow kind IS an i64 holding the extended value, so
+        // every conversion involving one is "view it as i64, convert, re-mask".
+        // Reading it as i64 is free; writing one wraps the source into the
+        // target width, which is the same two's-complement narrowing SPEC §3.1
+        // gives an `as` cast (and the only way a wider value gets here is a
+        // literal, since implicit numeric conversion is forbidden).
+        if from.is_masked_int() {
+            return self.coerce_scalar(v, ScalarKind::I64, to, span);
+        }
+        if to.is_masked_int() {
+            let i = self.coerce_scalar(v, from, ScalarKind::I64, span)?;
+            return Ok(self.mask_to_kind(i, to));
         }
         // Allow only the explicit-cast set; SPEC.md §3.1 forbids implicit
         // numeric conversion, but `let x: i64 = 0` and `let x: f64 = 0`
@@ -17746,6 +19493,20 @@ extern "C" fn dmc_oob_trap(idx: i64, dim: i64) -> ! {
     std::process::exit(1);
 }
 
+// #511: a runtime slice start whose static-extent window does not fit the
+// axis — including any NEGATIVE start (see `bounds_check_slice_start`). A
+// clamped start would change the extent — the result's compile-time shape —
+// so the JIT panics instead, per SPEC §4.3 ("dynamic OOB is a runtime
+// panic"). #517: the interpreter's `resolve_index_values` (interp.rs) now
+// raises this identical message for the same dynamic-extent case, so both
+// backends agree; it still clamps independently-normalized STATIC bounds
+// (both literal, interp.rs:503-ish / #291.4), which this trap never sees.
+extern "C" fn dmc_slice_oob_trap(start: i64, extent: i64, dim: i64) -> ! {
+    eprintln!("runtime error: slice start {} with extent {} out of bounds for axis of size {}",
+              start, extent, dim);
+    std::process::exit(1);
+}
+
 // #399: a `<-` stream append that would exceed the KV reservation. Prints a
 // clean message + exit(1), matching the interpreter, instead of the bare
 // Cranelift trap (silent SIGILL) the capacity guard used to raise.
@@ -17756,21 +19517,26 @@ extern "C" fn dmc_kv_cap_trap(len: i64, l_frames: i64, cap: i64) -> ! {
 }
 
 /// #265: called by JIT-compiled code when a *runtime* shift count is outside
-/// `0..=63`. Prints the same message the interpreter raises (#215/#256) then
-/// exits(1), so the JIT no longer silently wraps the count mod 64. `op_is_shl`
-/// selects the `<<`/`>>` spelling to match the interpreter's diagnostic.
-extern "C" fn dmc_shift_trap(count: i64, op_is_shl: i64) -> ! {
+/// the shifted value's width. Prints the same message the interpreter raises
+/// (#215/#256) then exits(1), so the JIT no longer silently wraps the count.
+/// `op_is_shl` selects the `<<`/`>>` spelling to match the interpreter's
+/// diagnostic; `bits` is the shifted value's width, so an `i32` shift names
+/// `0..=31` rather than i64's `0..=63`.
+extern "C" fn dmc_shift_trap(count: i64, op_is_shl: i64, bits: i64) -> ! {
     let op = if op_is_shl != 0 { "<<" } else { ">>" };
-    eprintln!("runtime error: {} shift amount {} out of range (expected 0..=63)", op, count);
+    eprintln!("runtime error: {} shift amount {} out of range (expected 0..={})",
+        op, count, bits - 1);
     std::process::exit(1);
 }
 
 /// #297: called by JIT-compiled code on `INT_MIN / -1` (or `% -1`), the one
-/// signed division that overflows i64 and would otherwise raise SIGFPE. Prints
-/// the same overflow error the interpreter raises (#296), then exits(1).
-extern "C" fn dmc_div_overflow_trap(l: i64, r: i64, op_is_div: i64) -> ! {
+/// signed division that overflows and would otherwise raise SIGFPE. Prints the
+/// same overflow error the interpreter raises (#296), then exits(1). `bits` is
+/// the operands' width, so an `i32` division names the i32 range.
+extern "C" fn dmc_div_overflow_trap(l: i64, r: i64, op_is_div: i64, bits: i64) -> ! {
     let op = if op_is_div != 0 { "/" } else { "%" };
-    eprintln!("runtime error: integer overflow: {} {} {} exceeds the i64 range", l, op, r);
+    eprintln!("runtime error: integer overflow: {} {} {} exceeds the i{} range",
+        l, op, r, bits);
     std::process::exit(1);
 }
 
@@ -17967,6 +19733,12 @@ struct ForgeArena {
     /// Default size for freshly pushed chunks. A single allocation larger
     /// than this gets its own right-sized chunk instead.
     chunk_size: usize,
+    /// #400: hard ceiling on the bytes this arena may commit, from
+    /// `--forge=<size>` (`MEMORY.md §1.1`). `None` is unbounded — the pre-#400
+    /// behavior. Exceeding it is a runtime error, not an OOM.
+    limit: Option<usize>,
+    /// Bytes committed across `chunks`. Compared against `limit`.
+    committed: usize,
 }
 
 impl ForgeArena {
@@ -17979,15 +19751,112 @@ impl ForgeArena {
     const DEFAULT_CHUNK: usize = 512 * 1024 * 1024;
 
     fn new() -> Self {
-        Self::with_chunk_size(Self::DEFAULT_CHUNK)
+        // #400: `--forge=<size>` caps the arena. A budget below the default
+        // chunk also shrinks the chunk, so the cap is the usable size rather
+        // than a bound the very first chunk already blows through.
+        match forge_limit() {
+            Some(limit) => Self::with_limit(Self::DEFAULT_CHUNK.min(limit), limit),
+            None => Self::with_chunk_size(Self::DEFAULT_CHUNK),
+        }
     }
 
-    /// Construct an arena whose default chunk size is `chunk_size`. The first
-    /// chunk is allocated lazily on the first `alloc`, so an unused arena
-    /// costs nothing. (Small `chunk_size` values are used by the unit tests
-    /// to exercise chunk chaining cheaply.)
+    /// Construct an unbounded arena whose default chunk size is `chunk_size`.
+    /// The first chunk is allocated lazily on the first `alloc`, so an unused
+    /// arena costs nothing. (Small `chunk_size` values are used by the unit
+    /// tests to exercise chunk chaining cheaply.)
     fn with_chunk_size(chunk_size: usize) -> Self {
-        ForgeArena { chunks: Vec::new(), cur: 0, cursor: 0, chunk_size }
+        ForgeArena { chunks: Vec::new(), cur: 0, cursor: 0, chunk_size, limit: None, committed: 0 }
+    }
+
+    /// As `with_chunk_size`, plus a hard ceiling on committed bytes.
+    fn with_limit(chunk_size: usize, limit: usize) -> Self {
+        ForgeArena {
+            chunks: Vec::new(), cur: 0, cursor: 0,
+            chunk_size: chunk_size.max(1), limit: Some(limit), committed: 0,
+        }
+    }
+
+    /// Would committing `add` more bytes on top of `committed` break the
+    /// budget? Pure, so the exhaustion decision is testable without the exit
+    /// that follows it. `committed` is a parameter because the reused-chunk
+    /// path in `alloc` first gives back the old chunk's bytes.
+    fn exceeds_budget_from(&self, committed: usize, add: usize) -> bool {
+        match self.limit {
+            Some(limit) => committed.saturating_add(add) > limit,
+            None => false,
+        }
+    }
+
+    /// `exceeds_budget_from` against the current `committed`. Only the tests
+    /// want this shorthand — `alloc` always has an explicit base, because the
+    /// reused-chunk path releases the old chunk's bytes first.
+    #[cfg(test)]
+    fn exceeds_budget(&self, add: usize) -> bool {
+        self.exceeds_budget_from(self.committed, add)
+    }
+
+    /// How big should the next chunk be, given that the allocation in flight
+    /// needs `need` aligned bytes and `committed` bytes are already booked?
+    ///
+    /// #400: the answer used to be `chunk_size.max(need)`, which over-reserves
+    /// against a budget. With the 512 MiB default chunk and `--forge=768M`,
+    /// the second chunk asked for another 512 MiB — 1 GiB against a 768 MiB
+    /// budget — so only `floor(768/512) * 512 = 512 MiB` of the budget was
+    /// ever usable and the program died claiming a 64 MiB tensor did not fit
+    /// with 512 MiB committed of 768 MiB. Capping the chunk at what is left
+    /// makes `usable == budget` for every budget.
+    ///
+    /// The cap never shrinks below `need`: a single allocation larger than
+    /// the remaining budget must still be attempted as one right-sized chunk,
+    /// so the diagnostic reports the real shortfall rather than a rounding
+    /// artifact. That is also what makes the diagnostic arithmetic honest —
+    /// whenever this chunk fails the budget check, its size *is* the aligned
+    /// allocation size.
+    fn chunk_size_for(&self, need: usize, committed: usize) -> usize {
+        let base = self.chunk_size.max(need);
+        match self.limit {
+            Some(limit) => base.min(limit.saturating_sub(committed).max(need)),
+            None => base,
+        }
+    }
+
+    /// Check a pending commit of `add` bytes on top of `committed` against
+    /// `--forge`. The JIT's allocator is an `extern "C"` callback with no
+    /// error channel back into compiled code, so by default exhaustion exits
+    /// the process the same way an oversized chunk does. Under `dmc test` the
+    /// policy is switched to `Record` (see `FORGE_ON_EXHAUSTION`): the
+    /// diagnostic is stashed for the harness to report as that file's FAIL
+    /// and the commit is allowed through, because killing the process mid-run
+    /// takes the whole suite — and every later file — with it.
+    ///
+    /// The wording matches the interpreter's exhaustion error verbatim
+    /// (`Interpreter::charge_arena`); only the source location differs, which
+    /// the JIT does not have at the allocation callback.
+    fn check_budget_from(&self, committed: usize, add: usize) {
+        if !self.exceeds_budget_from(committed, add) {
+            return;
+        }
+        let limit = self.limit.unwrap_or(0);
+        let msg = format!(
+            "forge arena exhausted: this allocation needs {}, but only {} of the \
+             {} --forge budget is free",
+            crate::arena::fmt_bytes(add as u64),
+            crate::arena::fmt_bytes(limit.saturating_sub(committed) as u64),
+            crate::arena::fmt_bytes(limit as u64),
+        );
+        match forge_on_exhaustion() {
+            // #485: the abort still aborts, and still says the same sentence —
+            // it just says it in whichever encoding the run asked for. This is
+            // the one fatal that cannot come back through `real_main`.
+            OnExhaustion::Abort => {
+                crate::diag::out_of_band_fatal(&format!("runtime error: {}", msg));
+            }
+            OnExhaustion::Record => record_forge_exhaustion(msg),
+        }
+    }
+
+    fn check_budget(&self, add: usize) {
+        self.check_budget_from(self.committed, add);
     }
 
     #[inline]
@@ -18022,7 +19891,9 @@ impl ForgeArena {
         // lazily-committed zero pages, so a chunk costs only the pages
         // actually touched.
         if self.chunks.is_empty() {
-            let sz = self.chunk_size.max(Self::align_up(nbytes));
+            let sz = self.chunk_size_for(Self::align_up(nbytes), self.committed);
+            self.check_budget(sz);
+            self.committed += sz;
             self.chunks.push(Self::alloc_zeroed_chunk(sz, self.chunk_size));
         }
         loop {
@@ -18044,13 +19915,21 @@ impl ForgeArena {
             self.cursor = 0;
             let need = Self::align_up(nbytes);
             if self.cur == self.chunks.len() {
-                let sz = self.chunk_size.max(need);
+                let sz = self.chunk_size_for(need, self.committed);
+                self.check_budget(sz);
+                self.committed += sz;
                 self.chunks.push(Self::alloc_zeroed_chunk(sz, self.chunk_size));
             } else if self.chunks[self.cur].len() < need {
                 // A reused (above-cursor, hence free) chunk that is too small
                 // for this allocation. Nothing points into it, so replacing
-                // it is safe.
-                let sz = self.chunk_size.max(need);
+                // it is safe — and its bytes go back to the budget before the
+                // replacement is sized and checked, so a grow is metered as
+                // the difference rather than as a fresh commit.
+                let old = self.chunks[self.cur].len();
+                let freed = self.committed - old;
+                let sz = self.chunk_size_for(need, freed);
+                self.check_budget_from(freed, sz);
+                self.committed = freed + sz;
                 self.chunks[self.cur] = Self::alloc_zeroed_chunk(sz, self.chunk_size);
             }
         }
@@ -18094,6 +19973,83 @@ impl ForgeArena {
 thread_local! {
     static FORGE: std::cell::RefCell<Option<ForgeArena>> =
         const { std::cell::RefCell::new(None) };
+    /// #400: the `--forge=<size>` budget, read when the arena is first created.
+    /// Thread-local like the arena itself; `set_forge_limit` is called on the
+    /// same thread that later runs the compiled code.
+    static FORGE_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// #400: what happens when a commit does not fit the budget. See
+    /// `OnExhaustion`.
+    static FORGE_ON_EXHAUSTION: std::cell::Cell<OnExhaustion> =
+        const { std::cell::Cell::new(OnExhaustion::Abort) };
+    /// #400: the first exhaustion diagnostic recorded under
+    /// `OnExhaustion::Record`, waiting to be taken by the test harness.
+    static FORGE_EXHAUSTED: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #400: what `ForgeArena::check_budget_from` does when the budget is blown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OnExhaustion {
+    /// Print the diagnostic and exit(1). The right answer for a single-shot
+    /// `dmc jit <file>`: there is no error channel back into compiled code,
+    /// and there is nothing left to run.
+    Abort,
+    /// Record the diagnostic and let the commit through. `dmc test --jit` uses
+    /// this: the harness turns the record into that file's FAIL and keeps
+    /// going. Letting the allocation land is deliberate — handing compiled
+    /// code a null or short buffer would corrupt memory, and the run is
+    /// already a failure — so under this policy the budget is a *detector*,
+    /// not a hard ceiling.
+    Record,
+}
+
+/// Install the `--forge=<size>` budget for JIT-compiled code on this thread.
+/// Must be called before the first allocation; the arena reads the limit once,
+/// when it is lazily created.
+pub fn set_forge_limit(bytes: Option<u64>) {
+    FORGE_LIMIT.with(|c| c.set(bytes.map(|b| b.min(usize::MAX as u64) as usize)));
+}
+
+fn forge_limit() -> Option<usize> {
+    FORGE_LIMIT.with(|c| c.get())
+}
+
+fn forge_on_exhaustion() -> OnExhaustion {
+    FORGE_ON_EXHAUSTION.with(|c| c.get())
+}
+
+fn record_forge_exhaustion(msg: String) {
+    FORGE_EXHAUSTED.with(|c| {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            *g = Some(msg);
+        }
+    });
+}
+
+/// #400: switch arena exhaustion from "exit the process" to "record it".
+/// `dmc test --jit` turns this on so one over-budget file is that file's FAIL
+/// instead of the death of the whole suite.
+pub fn set_forge_exhaustion_recoverable(on: bool) {
+    FORGE_ON_EXHAUSTION.with(|c| {
+        c.set(if on { OnExhaustion::Record } else { OnExhaustion::Abort })
+    });
+}
+
+/// Take the exhaustion diagnostic recorded since the last reset, if any.
+pub fn take_forge_exhaustion() -> Option<String> {
+    FORGE_EXHAUSTED.with(|c| c.borrow_mut().take())
+}
+
+/// #400: drop this thread's Forge arena so the next program starts with the
+/// whole `--forge` budget again. `dmc test` builds a fresh `Interpreter` for
+/// every test; without this the JIT's arena is process-wide, `committed`
+/// never falls, and the budget is silently shared out across the whole suite
+/// until some unlucky file in the middle exhausts it. Safe to call only
+/// between runs — every pointer the arena handed out dies with it.
+pub fn reset_forge_arena() {
+    FORGE.with(|cell| *cell.borrow_mut() = None);
+    FORGE_EXHAUSTED.with(|c| *c.borrow_mut() = None);
 }
 
 extern "C" fn forge_alloc(bytes: i64) -> i64 {
@@ -18206,26 +20162,46 @@ extern "C" fn dmc_str_new_from_raw(data_ptr: i64, len: i64) -> i64 {
 }
 
 /// Return the length (number of bytes) of a forge string.
-extern "C" fn dmc_str_len(s: i64) -> i64 {
+///
+/// A null pointer is the JIT's `nil` in a str-typed slot (see `dmc_print_str`).
+/// `len(nil)` is a runtime error in the interpreter; raise the same one word
+/// for word instead of dereferencing null or inventing a length.
+extern "C" fn dmc_str_len(s: i64, line: i64, col: i64) -> i64 {
+    if s == 0 {
+        eprintln!("runtime error at {}:{}: len: requires tensor, tuple, str, list, or map",
+            line, col);
+        std::process::exit(1);
+    }
     unsafe { *(s as *const i64) }
 }
 
 /// Return the byte at index `i` of the forge string, or -1 if out of bounds.
-extern "C" fn dmc_str_get_char(s: i64, i: i64) -> i64 {
+extern "C" fn dmc_str_get_char(s: i64, i: i64, line: i64, col: i64) -> i64 {
+    if s == 0 {
+        // A null str pointer is `nil` (see `dmc_print_str`); the interpreter
+        // refuses to index it rather than reading a phantom empty string.
+        eprintln!("runtime error at {}:{}: cannot index nil", line, col);
+        std::process::exit(1);
+    }
     let len = unsafe { *(s as *const i64) };
     // Resolve negative indices from the end and trap on genuine OOB, matching
     // the interpreter (#297): previously this returned a -1 sentinel for both
     // negative and out-of-range indices, so `s[-1]` and `s[100]` diverged.
     let resolved = if i < 0 { len + i } else { i };
     if resolved < 0 || resolved >= len {
-        eprintln!("runtime error: string index {} out of range (len {})", i, len);
+        eprintln!("runtime error at {}:{}: string index {} out of range (len {})",
+            line, col, i, len);
         std::process::exit(1);
     }
     unsafe { *((s + 8 + resolved) as *const u8) as i64 }
 }
 
 /// Return 1 if the two forge strings are byte-equal, 0 otherwise.
+///
+/// A null pointer is `nil` (see `dmc_print_str`), and the interpreter's `nil`
+/// equals only `nil` — never a str, not even the empty one.
 extern "C" fn dmc_str_eq(s1: i64, s2: i64) -> i64 {
+    if s1 == 0 || s2 == 0 { return if s1 == s2 { 1 } else { 0 }; }
     let len1 = unsafe { *(s1 as *const i64) };
     let len2 = unsafe { *(s2 as *const i64) };
     if len1 != len2 { return 0; }
@@ -18235,7 +20211,16 @@ extern "C" fn dmc_str_eq(s1: i64, s2: i64) -> i64 {
 }
 
 /// Concatenate two forge strings and return a new forge string.
+///
+/// A null operand is `nil` (see `dmc_print_str`) and renders as the word "nil",
+/// which is what the interpreter's `str + nil` produces.
 extern "C" fn dmc_str_concat(s1: i64, s2: i64) -> i64 {
+    if s1 == 0 || s2 == 0 {
+        let nil = forge_str_from_rust("nil");
+        return if s1 == 0 && s2 == 0 { dmc_str_concat(nil, nil) }
+               else if s1 == 0 { dmc_str_concat(nil, s2) }
+               else { dmc_str_concat(s1, nil) };
+    }
     let len1 = unsafe { *(s1 as *const i64) };
     let len2 = unsafe { *(s2 as *const i64) };
     let total = len1 + len2;
@@ -18372,6 +20357,14 @@ extern "C" fn dmc_nil_trap() -> ! {
 }
 
 extern "C" fn dmc_print_str(s: i64) {
+    // A null str pointer is the JIT's `nil` in a str-typed slot (the `Err`
+    // half of a port result, or a `port_open` handle that failed to open).
+    // The interpreter holds a real `nil` there and prints "nil"; print the
+    // same word rather than dereferencing null.
+    if s == 0 {
+        println!("nil");
+        return;
+    }
     let len = unsafe { *(s as *const i64) };
     let text = if len > 0 {
         let bytes = unsafe { std::slice::from_raw_parts((s + 8) as *const u8, len as usize) };
@@ -18382,6 +20375,231 @@ extern "C" fn dmc_print_str(s: i64) {
     // #211: print is line-oriented — append a trailing newline so JIT string
     // print matches the scalar print helpers and the (now line-oriented) interp.
     println!("{}", text);
+}
+
+/// `s.starts_with(prefix)` — 1 if `s` begins with `prefix`, 0 otherwise.
+/// Byte-wise, which is what `str::starts_with` does in the interpreter too.
+///
+/// This is the test `PORTS.md §6` mandates for reading an error: "code must
+/// match only the tag prefix". A null pointer is `nil` on either side, and
+/// `nil` has no methods and is not a str argument — both raise the
+/// interpreter's error, span and all. `line`/`col` are baked in at lowering
+/// time from the call's span.
+extern "C" fn dmc_str_starts_with(s: i64, prefix: i64, line: i64, col: i64) -> i64 {
+    if s == 0 {
+        eprintln!("runtime error at {}:{}: cannot call method `starts_with` on nil", line, col);
+        std::process::exit(1);
+    }
+    if prefix == 0 {
+        eprintln!("runtime error at {}:{}: str.starts_with: needs str arg", line, col);
+        std::process::exit(1);
+    }
+    let n = unsafe { *(s as *const i64) };
+    let m = unsafe { *(prefix as *const i64) };
+    if m > n { return 0; }
+    let a = unsafe { std::slice::from_raw_parts((s + 8) as *const u8, n as usize) };
+    let b = unsafe { std::slice::from_raw_parts((prefix + 8) as *const u8, m as usize) };
+    if a.starts_with(b) { 1 } else { 0 }
+}
+
+// ─── Process ports (PORTS.md §7.1) ───────────────────────────────────────────
+//
+// The JIT does not speak the port protocol: `crate::ports` does, and the
+// interpreter drives the identical `PortRegistry`. These three helpers are the
+// whole JIT half — marshal forge strings in, marshal the `(value, Err)` pair
+// back out. Every error tag therefore comes from one place, so the two backends
+// cannot drift on a tag, on the argument-vector envelope, or on the framing.
+//
+// The pair is a 2-slot forge tuple, the JIT's ordinary `TyKind::Tuple` layout.
+// In a str-typed slot a NULL pointer is `nil` — that is how the `Err` half says
+// "no error" and how a failed `port_open` says "no handle". `dmc_str_eq`,
+// `dmc_print_str`, `dmc_str_concat`, `dmc_str_len` and the `str == nil` lowering
+// all honour that convention, so a null str behaves like the interpreter's nil.
+
+thread_local! {
+    /// The open ports of this run, one registry per JIT thread — the mirror of
+    /// the interpreter's `Interpreter::ports` field.
+    static PORTS: std::cell::RefCell<crate::ports::PortRegistry> =
+        std::cell::RefCell::new(crate::ports::PortRegistry::new());
+}
+
+/// Forge-allocate the 2-slot `(value, Err)` tuple every port builtin returns.
+fn forge_pair(a: i64, b: i64) -> i64 {
+    let p = forge_alloc(16);
+    unsafe {
+        *(p as *mut i64) = a;
+        *((p + 8) as *mut i64) = b;
+    }
+    p
+}
+
+/// Resolve a `Port` handle str to its registry id, or die the way the
+/// interpreter does when the argument is not a handle from `port_open`. This
+/// is not a port error — PORTS.md §6 tags describe the *port*, and a caller
+/// who passed something that was never a handle has a program bug — so it is
+/// the interpreter's `RuntimeError`, span and all, reproduced word for word.
+/// `line`/`col` are baked in at lowering time from the call's span.
+fn port_id_or_die(handle: i64, builtin: &str, arg: &str, line: i64, col: i64) -> i64 {
+    match crate::ports::handle_id(&dmc_str_to_rust(handle)) {
+        Some(id) => id,
+        None => {
+            eprintln!("runtime error at {}:{}: {}: {} must be a Port handle from port_open",
+                line, col, builtin, arg);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Render a `Port` handle the way the interpreter renders the `Value::Opaque`
+/// it carries one in: `<opaque port#1:python>`. A handle is opaque, so this is
+/// the only text form of one either backend produces — it is display only, and
+/// deliberately not a handle: feeding it back to `port_call` would not parse as
+/// one. A null handle is `nil` (a failed `port_open`), which the interpreter
+/// prints as the bare word.
+extern "C" fn dmc_port_render(handle: i64) -> i64 {
+    if handle == 0 { return forge_str_from_rust("nil"); }
+    forge_str_from_rust(&format!("<opaque {}>", dmc_str_to_rust(handle)))
+}
+
+/// A port argument that must be a real `str`.
+///
+/// A null forge pointer is `nil`, not the empty string — PORTS.md §7.1 is
+/// explicit that "a real `str`, the empty one included, is never `nil`". Only
+/// the *static* type was being checked, so a `str`-typed expression that was
+/// nil at runtime went straight through `dmc_str_to_rust(0)`, which answers
+/// `""`, and reached the wire: `port_open(nil)` opened a runtime named nothing
+/// and `port_call(p, nil, ..)` sent a call named nothing. The interpreter
+/// raises at that point; so does this, with the same words at the same span.
+fn port_str_or_die(s: i64, msg: &str, line: i64, col: i64) -> String {
+    if s == 0 {
+        eprintln!("runtime error at {}:{}: {}", line, col, msg);
+        std::process::exit(1);
+    }
+    dmc_str_to_rust(s)
+}
+
+/// Check a handle against the `L` of the `Port[L]` position it is entering.
+///
+/// `L` used to be decoration: a `Port[lua]` parameter took a python handle
+/// without complaint in either backend, so the signature implied a check that
+/// did not exist. The handle carries its runtime name in its own text, so this
+/// is the one place that can answer honestly — the annotation is static, the
+/// handle is not. A null handle is `nil`, which is not a lang error: whatever
+/// reads it next reports it as the missing handle it is.
+extern "C" fn dmc_port_expect_lang(handle: i64, want: i64, line: i64, col: i64) {
+    if handle == 0 { return; }
+    let want = dmc_str_to_rust(want);
+    if let Some(msg) = crate::ports::lang_mismatch(&want, &dmc_str_to_rust(handle)) {
+        eprintln!("runtime error at {}:{}: {}", line, col, msg);
+        std::process::exit(1);
+    }
+}
+
+/// `port_open(lang)` → `(Port, Err)`.
+extern "C" fn dmc_port_open(lang: i64, line: i64, col: i64) -> i64 {
+    let lang = port_str_or_die(lang, "port_open: lang must be str", line, col);
+    match PORTS.with(|p| p.borrow_mut().open(&lang)) {
+        Ok(handle) => forge_pair(forge_str_from_rust(&handle), 0),
+        Err(tag) => forge_pair(0, forge_str_from_rust(&tag)),
+    }
+}
+
+/// `port_call(p, name, payload)` → `(str, Err)`. The result half is `""` on
+/// error, matching the interpreter.
+extern "C" fn dmc_port_call(handle: i64, name: i64, payload: i64, line: i64, col: i64) -> i64 {
+    let id = port_id_or_die(handle, "port_call", "first arg", line, col);
+    let name = port_str_or_die(name, "port_call: name must be str", line, col);
+    // The payload is the one port `str` argument that may legitimately be
+    // null: `nil` is the written-out form of "call with no arguments", and the
+    // interpreter reads a nil payload as the empty one (PORTS.md §2). So this
+    // stays `dmc_str_to_rust`, on purpose.
+    let payload = dmc_str_to_rust(payload);
+    match PORTS.with(|p| p.borrow_mut().call(id, &name, &payload)) {
+        Ok(out) => forge_pair(forge_str_from_rust(&out), 0),
+        Err(tag) => forge_pair(forge_str_from_rust(""), forge_str_from_rust(&tag)),
+    }
+}
+
+/// Read the `rank`-element i64 shape array the lowering materialized.
+fn port_shape_from(rank: i64, shape: i64) -> Vec<i64> {
+    (0..rank).map(|i| unsafe { *((shape + i * 8) as *const i64) }).collect()
+}
+
+/// The dtype code the lowering baked in, or a hard stop. The code is produced
+/// by `WireDType::code()` at compile time, so a bad one is a compiler bug, not
+/// a program error — it dies rather than inventing a dtype.
+fn port_dtype_or_die(dtype: i64, line: i64, col: i64) -> crate::ports::WireDType {
+    match crate::ports::WireDType::from_code(dtype) {
+        Some(d) => d,
+        None => {
+            eprintln!("runtime error at {}:{}: port tensor: unknown dtype code {}",
+                      line, col, dtype);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `port_tensor_encode(t)` → the `PORTS.md §3.2` envelope str.
+///
+/// The JIT's tensor storage *is* the wire layout — row-major, little-endian,
+/// at the element's own width — so the payload is the buffer itself. That is
+/// also why the dtype code is derived from the JIT's `TyKind` and not from a
+/// source annotation: a `Tensor[bf16, ..]` binding is f32-*backed* here (#179),
+/// and calling its 4-byte data `bf16` on the wire is exactly the half-width
+/// lie #292 was. A tensor that really is 2-byte bf16 storage is a
+/// `Bf16Tensor`, and that one does cross as `bf16`.
+extern "C" fn dmc_port_tensor_encode(
+    data: i64, dtype: i64, rank: i64, shape: i64, line: i64, col: i64,
+) -> i64 {
+    let dt = port_dtype_or_die(dtype, line, col);
+    let dims = port_shape_from(rank, shape);
+    let numel: usize = dims.iter().product::<i64>() as usize;
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data as *const u8, numel * dt.bytes())
+    };
+    match crate::ports::pack_from_raw(dt, &dims, bytes) {
+        Ok(text) => forge_str_from_rust(&text),
+        Err(msg) => {
+            eprintln!("runtime error at {}:{}: port_tensor_encode: {}", line, col, msg);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `port_tensor_decode(s, like)` → `(Tensor, Err)`. The tensor half is a fresh
+/// forge buffer of the declared type; on failure it is that type's zero, so the
+/// pair stays well-typed on the error path exactly as in the interpreter.
+extern "C" fn dmc_port_tensor_decode(
+    text: i64, dtype: i64, rank: i64, shape: i64, line: i64, col: i64,
+) -> i64 {
+    let dt = port_dtype_or_die(dtype, line, col);
+    let dims = port_shape_from(rank, shape);
+    let numel: usize = dims.iter().product::<i64>() as usize;
+    let nbytes = numel * dt.bytes();
+    let buf = forge_alloc(nbytes as i64);
+    let dst = unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, nbytes) };
+    // A nil `s` is not the empty str (PORTS.md §7.1) — but it is not JSON
+    // either, so it takes the same `decode-parse` path the interpreter gives it.
+    match crate::ports::unpack_raw(&dmc_str_to_rust(text), dt, &dims) {
+        Ok(bytes) => {
+            dst.copy_from_slice(&bytes);
+            forge_pair(buf, 0)
+        }
+        Err(tag) => {
+            dst.fill(0);
+            forge_pair(buf, forge_str_from_rust(&tag))
+        }
+    }
+}
+
+/// `port_close(p)` → `(nil, Err)`. Only the `Err` half is returned here; the
+/// lowering pairs it with a literal nil.
+extern "C" fn dmc_port_close(handle: i64, line: i64, col: i64) -> i64 {
+    let id = port_id_or_die(handle, "port_close", "arg", line, col);
+    match PORTS.with(|p| p.borrow_mut().close(id)) {
+        Ok(()) => 0,
+        Err(tag) => forge_str_from_rust(&tag),
+    }
 }
 
 // ─── HashMap builtins ────────────────────────────────────────────────────────
@@ -18531,13 +20749,13 @@ extern "C" fn dmc_vault_load_raw(path_str: i64, numel: i64, elem_bytes: i64) -> 
 /// NumPy NPZ archive (ZIP of .npy files) into a forge-allocated buffer.
 /// Widen an IEEE bf16 (the upper 16 bits of an f32) to f32. #292.
 #[inline]
-fn bf16_bits_to_f32(h: u16) -> f32 {
+pub(crate) fn bf16_bits_to_f32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
 /// Widen an IEEE 754 half (f16) to f32. #292.
 #[inline]
-fn f16_bits_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = ((h & 0x8000) as u32) << 16;
     let exp = (h >> 10) & 0x1f;
     let mant = (h & 0x03ff) as u32;
@@ -19356,7 +21574,7 @@ mod tests {
         let mut interp = crate::interp::Interpreter::new();
         let v = interp.run(&prog, None).map_err(|e| format!("{:?}", e))?;
         match v {
-            crate::interp::Value::Int(n) => Ok(n),
+            crate::interp::Value::Int(n, _) => Ok(n),
             crate::interp::Value::Float(f, _) => Ok(f as i64),
             crate::interp::Value::Bool(b) => Ok(b as i64),
             crate::interp::Value::Nil => Ok(0),
@@ -19478,6 +21696,165 @@ mod tests {
         unsafe {
             for i in 0..128 { assert_eq!(*q.add(i), 0, "reused byte {i} not re-zeroed"); }
         }
+    }
+
+    // ─── ForgeArena budget (#400, MEMORY.md §1.1) ────────────────────────────
+
+    #[test]
+    fn forge_arena_within_budget_allocates() {
+        // 1 KiB budget, 1 KiB of chunk: four 256-byte allocations all fit.
+        let mut a = ForgeArena::with_limit(1024, 1024);
+        for i in 0..4 {
+            let p = a.alloc(256);
+            touch(p, 256, i as u8);
+        }
+        assert_eq!(a.committed, 1024, "committed more than the single budgeted chunk");
+        assert!(!a.exceeds_budget(0));
+    }
+
+    #[test]
+    fn forge_arena_reports_a_commit_past_the_budget() {
+        // Filling the budget leaves no room for another chunk. `alloc` would
+        // exit the process here, so assert on the pure predicate instead.
+        let mut a = ForgeArena::with_limit(1024, 1024);
+        let p = a.alloc(1024);
+        touch(p, 1024, 0x5A);
+        assert!(a.exceeds_budget(1), "a full arena claimed room for one more byte");
+        assert!(a.exceeds_budget(1024));
+    }
+
+    #[test]
+    fn forge_arena_budget_catches_an_oversized_single_alloc() {
+        // A tensor bigger than the whole budget is rejected on its first chunk.
+        let a = ForgeArena::with_limit(1024, 1024);
+        assert!(a.exceeds_budget(ForgeArena::align_up(4096)));
+    }
+
+    #[test]
+    fn forge_arena_without_a_budget_never_exceeds() {
+        let a = ForgeArena::with_chunk_size(256);
+        assert!(!a.exceeds_budget(usize::MAX));
+    }
+
+    #[test]
+    fn forge_arena_budget_survives_snapshot_restore() {
+        // `restore` rewinds the cursor but keeps the chunks, so the committed
+        // total — the thing the budget meters — does not move.
+        let mut a = ForgeArena::with_limit(1024, 1024);
+        let mark = a.snapshot();
+        let p = a.alloc(512);
+        touch(p, 512, 3);
+        let committed = a.committed;
+        a.restore(mark);
+        assert_eq!(a.committed, committed, "restore changed the committed total");
+        let q = a.alloc(512);
+        assert_eq!(p, q, "restore did not rewind the cursor");
+        assert_eq!(a.committed, committed, "re-fill after restore re-committed");
+    }
+
+    #[test]
+    fn a_forge_limit_shrinks_the_default_chunk() {
+        // Without the clamp the very first 512 MiB chunk would blow a small
+        // budget before a single tensor was allocated.
+        set_forge_limit(Some(4096));
+        let a = ForgeArena::new();
+        set_forge_limit(None);
+        assert_eq!(a.chunk_size, 4096);
+        assert_eq!(a.limit, Some(4096));
+    }
+
+    #[test]
+    fn no_forge_limit_keeps_the_default_chunk() {
+        set_forge_limit(None);
+        let a = ForgeArena::new();
+        assert_eq!(a.chunk_size, ForgeArena::DEFAULT_CHUNK);
+        assert_eq!(a.limit, None);
+    }
+
+    #[test]
+    fn the_whole_budget_is_usable_when_it_is_not_a_chunk_multiple() {
+        // #400: the quantization bug in miniature. A 6 KiB budget with 4 KiB
+        // chunks used to deliver only 4 KiB — the second chunk asked for
+        // another full 4 KiB (8 KiB total) and was refused, even though
+        // 4 KiB + 1 KiB is comfortably inside 6 KiB. Six 1 KiB allocations
+        // must all land, and `committed` must stop exactly at the budget.
+        let mut a = ForgeArena::with_limit(4096, 6144);
+        for i in 0..6 {
+            let p = a.alloc(1024);
+            touch(p, 1024, i as u8);
+        }
+        assert_eq!(a.committed, 6144, "the budget was not fully usable");
+        assert!(a.exceeds_budget(1), "a full arena claimed room for one more byte");
+    }
+
+    #[test]
+    fn a_chunk_never_reserves_past_the_budget() {
+        // The exact arithmetic of the shipped repro: 512 MiB chunks under
+        // `--forge=768M`. With 512 MiB committed and a 64 MiB tensor in hand,
+        // the next chunk must be the 256 MiB that is left, not another
+        // 512 MiB that overshoots the budget by 256 MiB.
+        const MIB: usize = 1 << 20;
+        let mut a = ForgeArena::with_limit(512 * MIB, 768 * MIB);
+        assert_eq!(a.chunk_size_for(64 * MIB, 0), 512 * MIB);
+        assert_eq!(a.chunk_size_for(64 * MIB, 512 * MIB), 256 * MIB);
+        a.committed = 512 * MIB;
+        assert!(
+            !a.exceeds_budget(a.chunk_size_for(64 * MIB, a.committed)),
+            "a 64 MiB tensor was refused with 256 MiB of the budget free",
+        );
+
+        // Once the budget really is gone, the chunk collapses to the aligned
+        // allocation itself — which is what makes the diagnostic honest: the
+        // size it decides on is the size it prints.
+        a.committed = 768 * MIB;
+        let need = ForgeArena::align_up(64 * MIB);
+        assert_eq!(a.chunk_size_for(need, a.committed), need);
+        assert!(a.exceeds_budget(need));
+    }
+
+    #[test]
+    fn a_budget_above_the_default_chunk_reserves_only_what_is_left() {
+        // Through `new()` + `alloc`, with a budget larger than the 512 MiB
+        // default chunk — the shape that shipped broken. The allocation is
+        // deliberately small: proving the *sizing* needs no half-gigabyte of
+        // touched pages in CI, and `the_whole_budget_is_usable_when_it_is_not_a_chunk_multiple`
+        // above already drives the same code path to real exhaustion.
+        const MIB: usize = 1 << 20;
+        set_forge_limit(Some(768 * MIB as u64));
+        let mut a = ForgeArena::new();
+        set_forge_limit(None);
+        assert_eq!(a.chunk_size, ForgeArena::DEFAULT_CHUNK, "768 MiB should not shrink the chunk");
+        assert_eq!(a.limit, Some(768 * MIB));
+
+        let p = a.alloc(1024);
+        touch(p, 1024, 0x11);
+        assert_eq!(a.committed, 512 * MIB, "the first chunk is the default chunk");
+        // The second chunk is the 256 MiB remainder. Pre-#400-fix this asked
+        // for 512 MiB and exited the process claiming a tensor did not fit.
+        assert_eq!(a.chunk_size_for(64 * MIB, a.committed), 256 * MIB);
+        assert!(!a.exceeds_budget(a.chunk_size_for(64 * MIB, a.committed)));
+    }
+
+    #[test]
+    fn an_exhausted_budget_can_be_recorded_instead_of_exiting() {
+        // `dmc test --jit` needs exhaustion to be a FAIL line, not a process
+        // exit that kills the harness mid-suite.
+        set_forge_exhaustion_recoverable(true);
+        assert!(take_forge_exhaustion().is_none());
+        let mut a = ForgeArena::with_limit(1024, 1024);
+        let p = a.alloc(1024);
+        touch(p, 1024, 7);
+        // Over budget: under `Abort` this line would end the test process.
+        let q = a.alloc(1024);
+        touch(q, 1024, 8);
+        let diag = take_forge_exhaustion().expect("exhaustion was not recorded");
+        set_forge_exhaustion_recoverable(false);
+        assert_eq!(
+            diag,
+            "forge arena exhausted: this allocation needs 1 KiB, but only 0 B \
+             of the 1 KiB --forge budget is free",
+        );
+        assert!(take_forge_exhaustion().is_none(), "the diagnostic was not consumed");
     }
 
     fn jit_run_i64(src: &str) -> Result<i64, String> {
@@ -19708,6 +22085,77 @@ mod tests {
         assert_eq!(
             jit_run_i64("fn f(c: bool) -> i64 { if c { return 7 } else { 3 } }\n                         fn main() -> i64 { f(false) }").unwrap(),
             3,
+        );
+    }
+
+    #[test]
+    fn jit_trailing_no_else_if_does_not_give_the_join_a_phi() {
+        // The join's phi was decided from a two-valued "might this side yield
+        // a value?", and any *trailing* block-form `if` answered "might" — but
+        // an `if` with no `else` never yields one. So an outer `if/else` in
+        // statement position whose else block ended in a bare `if` gave the
+        // join a param that the else-side jump could not supply: `jump block3:
+        // got 0, expected 1`, a hard compile failure for the whole function.
+        //
+        // This is the shape the PORTS.md §6 guarded idiom is written in —
+        // `if e != nil { .. } else { <destructure>  if err != nil { .. } }` —
+        // but nothing about it is port-specific, as these port-free cases show.
+        assert_eq!(
+            jit_run_i64(
+                "fn main() -> i64 { let n = 5  if n > 3 { 0 } else { if n != 1 { print(\"x\") } }  n }"
+            ).unwrap(),
+            5,
+        );
+        // The same trailing `if` carrying a value it cannot deliver, because
+        // it still has no `else`.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { let n = 5  if n > 3 { 0 } else { if n != 1 { 7 } }  n }")
+                .unwrap(),
+            5,
+        );
+        // The mirror: the *then* side is the one that falls through with no
+        // value, and the else side's value must not conjure a phi param the
+        // then-side jump never supplied.
+        assert_eq!(
+            jit_run_i64(
+                "fn main() -> i64 { let n = 5  if n > 3 { if n != 1 { print(\"x\") } } else { 0 }  n }"
+            ).unwrap(),
+            5,
+        );
+        // An `else if` chain ending without a final `else`: the last link
+        // yields nothing, so neither does the chain.
+        assert_eq!(
+            jit_run_i64(
+                "fn main() -> i64 { let n = 5  if n > 3 { 0 } else if n != 1 { print(\"x\") }  n }"
+            ).unwrap(),
+            5,
+        );
+        // Still a value when the trailing `if` really does have both sides.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { let n = 5  let x = if n > 3 { 1 } else { if n != 1 { 2 } else { 3 } }  x }")
+                .unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn jit_a_diverging_else_leaves_the_then_value_at_the_join() {
+        // The other half of the same conflation: a side that reaches the join
+        // carrying nothing and a side that never reaches it were both scored
+        // "does not yield". So `else { return .. }` suppressed the phi and the
+        // `if` was reported as valueless — "if-expression has no value (both
+        // branches terminated)" — when only one branch had terminated and the
+        // other's value was the answer.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { let n = 5  let x = if n > 3 { 5 } else { return 0 }  x }")
+                .unwrap(),
+            5,
+        );
+        // …and it really is the else side that decides when the guard fails.
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 { let n = 1  let x = if n > 3 { 5 } else { return 42 }  x }")
+                .unwrap(),
+            42,
         );
     }
 
@@ -20454,6 +22902,61 @@ mod tests {
             // empty range (start >= end) yields a zero-extent slice, sum == 0
             "fn main()->i64{ let !t=forge.zeros[f32,[5]] t[2]=9.0 sum(t[3..1]) as i64 }",
         ] { assert_jit_eq_interp(src); }
+    }
+
+    #[test]
+    fn jit_runtime_start_slice_parity() {
+        // #511: a slice with a RUNTIME start and a COMPILE-TIME extent
+        // (`t[i..i+1, ..]`, loop-var `i`) — the JIT used to reject it with
+        // "unbound shape parameter". In-range (non-negative) starts must
+        // match the interpreter exactly on both the view path (leading axis)
+        // and the strided copy path (trailing axis). OOB starts — negative
+        // ones included — are covered by tests/runtime_slice.rs (the JIT
+        // traps per SPEC §4.3 where the interpreter clamps — it exits(1),
+        // so not testable in-process).
+        let build = "let !t=forge.zeros[f32,[4,3]] \
+                     for i in 0..4 { for j in 0..3 { t[i,j]=(i as f32)*3.0+(j as f32) } }";
+        for src in [
+            // loop-var start, leading axis (contiguous view path)
+            &format!("fn main()->i64{{ {build} let !a=0.0 \
+                      for i in 0..4 {{ a=a+sum(t[i..i+1, ..]) }} a as i64 }}"),
+            // runtime start on a trailing axis (element-wise copy path)
+            &format!("fn main()->i64{{ {build} let !m=1 sum(t[.., m..m+2]) as i64 }}"),
+            // extent 2 + the inclusive spelling
+            &format!("fn main()->i64{{ {build} let !m=1 sum(t[m..m+2, ..]) as i64 }}"),
+            &format!("fn main()->i64{{ {build} let !m=1 sum(t[m..=m+1, ..]) as i64 }}"),
+            // a matmul consuming the slice (the qwen3 decode shape)
+            &format!("fn main()->i64{{ {build} let !w=forge.zeros[f32,[3,1]] \
+                      for j in 0..3 {{ w[j,0]=1.0 }} let !p=2 \
+                      sum(t[p..p+1, ..] @ w) as i64 }}"),
+        ] { assert_jit_eq_interp(src); }
+        // Pin the repro's exact value: rows 0..5 of a [8,4] table of
+        // 10i + j sum to Σ(40i + 6) = 430 (issue #511).
+        let repro = "fn main()->i64{ let !t=forge.zeros[f32,[8,4]] \
+                     for i in 0..8 { for j in 0..4 { t[i,j]=(i as f32)*10.0+(j as f32) } } \
+                     let !a=0.0 for i in 0..5 { a=a+sum(t[i..i+1, ..]) } a as i64 }";
+        assert_eq!(jit_run_i64(repro).unwrap(), 430);
+    }
+
+    #[test]
+    fn jit_runtime_extent_slice_rejected() {
+        // #511 scope line: a runtime EXTENT would make the result shape
+        // runtime (spec invariant 5) — still a compile-time refusal, now with
+        // an actionable message instead of "unbound shape parameter". The
+        // message says "runtime bound", not "runtime start": it also fires
+        // when only the END is runtime (`t[0..b]`), covered below.
+        for src in [
+            // both bounds runtime
+            "fn main()->i64{ let !t=forge.zeros[f32,[4,3]] let !a=1 let !b=3 \
+             sum(t[a..b, ..]) as i64 }",
+            // static start, runtime end — same refusal, wording must fit
+            "fn main()->i64{ let !t=forge.zeros[f32,[4,3]] let !b=3 \
+             sum(t[0..b, ..]) as i64 }",
+        ] {
+            let e = jit_run_i64(src).unwrap_err();
+            assert!(e.contains("slice with a runtime bound needs a compile-time extent"),
+                    "unexpected error: {}", e);
+        }
     }
 
     #[test]
@@ -21237,6 +23740,204 @@ fn main() -> i64 {
             }
         "#;
         assert_eq!(jit_run_i64(src).unwrap(), 12);
+    }
+
+    // ─── #422 wall 2: non-f32 float scalars on the reverse tape ─────────────
+    //
+    // `f$fwd_bwd` used to be rejected by Cranelift's verifier — reported to the
+    // user as the bare string "Verifier errors" — whenever a `@grad` body did
+    // scalar `*` or `/` against a float operand that was not already f32. The
+    // forward instruction coerced its operands; the TAPE recorded the
+    // uncoerced values, and `d(a*b)/da = adj * b` reads them back, so the
+    // reverse pass emitted `fmul` across two float widths.
+    //
+    // An unsuffixed float literal is f64 in the JIT, so `sum(W) * 2.0` was
+    // enough to hit it. Only `Mul` and `Div` read operand values back, which is
+    // why `+` and `-` always compiled — and why the residual disagreement they
+    // exposed is a separate defect (the interpreter's `.fwd_bwd` skipping its
+    // declared return width; see `interp_tests::grad_fwd_bwd_loss_honors_*`).
+
+    #[test]
+    fn jit_grad_unsuffixed_literal_scalar_mul() {
+        // #422 wall 2, minimal: L = sum(W) * 2.0, dW = 2 (broadcast).
+        // Before the fix this did not produce a wrong number — it failed to
+        // compile at all, taking the whole program with it.
+        let src = r#"
+            @grad fn concrete(!W: Tensor[f32, [3]]) -> f32 {
+                let s = sum(W)
+                s * 2.0
+            }
+        "#;
+        let w = [1.0_f32, 2.0, 3.0];
+        let (loss, grads) = jit_grad(src, "concrete", &[&w], &[3])
+            .expect("`sum(W) * 2.0` must lower — #422 wall 2");
+        assert!(approx(loss, 12.0), "loss {}", loss);
+        for &g in &grads[0] { assert!(approx(g, 2.0), "dW {:?}", grads[0]); }
+    }
+
+    #[test]
+    fn jit_grad_unsuffixed_literal_scalar_div() {
+        // The other operand-reading rule. L = sum(W) / 4.0 ; dW = 1/4.
+        let src = r#"
+            @grad fn concrete(!W: Tensor[f32, [3]]) -> f32 {
+                let s = sum(W)
+                s / 4.0
+            }
+        "#;
+        let w = [1.0_f32, 2.0, 3.0];
+        let (loss, grads) = jit_grad(src, "concrete", &[&w], &[3]).unwrap();
+        assert!(approx(loss, 1.5), "loss {}", loss);
+        for &g in &grads[0] { assert!(approx(g, 0.25), "dW {:?}", grads[0]); }
+    }
+
+    #[test]
+    fn jit_grad_explicit_f64_scalar_operand_both_sides() {
+        // Explicit f64 on either side of `*` and `/`, and nested so the same
+        // f64 node is read back twice. L = (s*c) + (c/s) with c = 2, s = ΣW.
+        // At W=[1,2,3]: s=6, L = 12 + 1/3. dL/ds = c - c/s² = 2 - 1/18, and
+        // ds/dW = 1, so every dW is the same.
+        let src = r#"
+            @grad fn concrete(!W: Tensor[f32, [3]]) -> f32 {
+                let c = 2.0f64
+                let s = sum(W)
+                (s * c) + (c / s)
+            }
+        "#;
+        let w = [1.0_f32, 2.0, 3.0];
+        let (loss, grads) = jit_grad(src, "concrete", &[&w], &[3]).unwrap();
+        assert!(approx(loss, 12.0 + 1.0 / 3.0), "loss {}", loss);
+        let expect = 2.0 - 2.0 / 36.0;
+        for &g in &grads[0] { assert!(approx(g, expect), "dW {:?}", grads[0]); }
+    }
+
+    #[test]
+    fn jit_grad_bf16_scalar_operand() {
+        // Companion to the above, and deliberately NOT claimed as a repro:
+        // reverting the fix leaves this test passing. The JIT has no bf16
+        // *scalar* kind (`ScalarKind` is i32/i64/f32/f64/bool/nil/opt), so a
+        // `2.0bf16` literal is already an f32 value and never put a foreign
+        // width on the tape. It is here to keep that true — if bf16 ever
+        // becomes a scalar kind of its own, this is the test that notices.
+        // L = sum(W) * 2.0bf16.
+        let src = r#"
+            @grad fn concrete(!W: Tensor[f32, [2]]) -> f32 {
+                let c = 2.0bf16
+                let s = sum(W)
+                s * c
+            }
+        "#;
+        let w = [1.0_f32, 3.0];
+        let (loss, grads) = jit_grad(src, "concrete", &[&w], &[2]).unwrap();
+        assert!(approx(loss, 8.0), "loss {}", loss);
+        for &g in &grads[0] { assert!(approx(g, 2.0), "dW {:?}", grads[0]); }
+    }
+
+    #[test]
+    fn jit_grad_never_reports_a_verifier_error() {
+        // The contract this whole family serves (AUTODIFF §6.1): the JIT may
+        // decline to lower a `@grad fn`, but it must never hand the user a
+        // backend complaint about IR it generated itself. Assert on the error
+        // TEXT across the shapes that used to produce one, so a future
+        // regression is caught even if it moves to a different rule.
+        let bodies = [
+            "let s = sum(W)  s * 2.0",
+            "let s = sum(W)  s / 2.0",
+            "let s = sum(W)  2.0 * s",
+            "let s = sum(W)  2.0 / s",
+            "let c = 3.0f64  let s = sum(W)  s * c",
+            "let c = 3.0f64  let s = sum(W)  c / s",
+            "let s = sum(W)  s * (s as f64)",
+            "let c = 0.5f64  sum(W .* c)",
+        ];
+        for body in bodies {
+            let src = format!(
+                "@grad fn concrete(!W: Tensor[f32, [2]]) -> f32 {{ {} }}", body);
+            let toks = Lexer::new(&src).tokenize().unwrap();
+            let prog = Parser::new(toks).parse_program().unwrap();
+            let mut jit = Jit::new().unwrap();
+            if let Err(e) = jit.compile_program(&prog) {
+                assert!(!e.msg.contains("Verifier"),
+                    "malformed IR from `{}`: {}", body, e.msg);
+                assert!(e.kind == JitErrorKind::Unsupported,
+                    "`{}` must refuse cleanly, not error: {}", body, e.msg);
+            }
+        }
+    }
+
+    #[test]
+    fn jit_grad_cast_reads_the_ad_environment() {
+        // `s as f64` inside a `@grad` body re-lowered the whole cast through
+        // the non-AD path, which looks operands up as plain locals — but a
+        // `let` in a `@grad` body binds only into the AD env, so this died with
+        // "unknown binding `s`" on a program `dmc run` executes. The cast is a
+        // stop-gradient (the interpreter agrees), so only the left `s` carries
+        // gradient: L = s * s with ds/dW = 1 gives dW = s = ΣW = 6.
+        let src = r#"
+            @grad fn concrete(!W: Tensor[f32, [3]]) -> f32 {
+                let s = sum(W)
+                s * (s as f64)
+            }
+        "#;
+        let w = [1.0_f32, 2.0, 3.0];
+        let (loss, grads) = jit_grad(src, "concrete", &[&w], &[3]).unwrap();
+        assert!(approx(loss, 36.0), "loss {}", loss);
+        for &g in &grads[0] { assert!(approx(g, 6.0), "dW {:?}", grads[0]); }
+    }
+
+    #[test]
+    fn jit_grad_matmul_rank3_batched() {
+        // The reverse pass of `a @ b` transposes both operands, and the JIT's
+        // transpose had a hole at rank 3 (1, 2 and 4 were implemented). So a
+        // rank-3 batched matmul that lowers and runs correctly FORWARD failed
+        // its `$fwd_bwd` with a hard `jit error` naming `'` — an operator the
+        // source never wrote. L = sum((a@b) ⊙ (a@b)); dA = 2(a@b)@bᵀ.
+        //
+        // a = [[[1,2]]], b = [[[3,4],[5,6]]]  (batch 1, so it also pins that
+        // the leading axis is carried, not folded away).
+        // y = [[13, 16]] ; L = 169+256 = 425
+        // dY = 2y = [[26, 32]] ; dA = dY @ bᵀ = [[26*3+32*4, 26*5+32*6]]
+        //                            = [[206, 322]]
+        // dB = aᵀ @ dY = [[26,32],[52,64]]
+        let src = r#"
+            @grad fn concrete(!a: Tensor[f32, [1, 1, 2]], !b: Tensor[f32, [1, 2, 2]]) -> f32 {
+                let y = a @ b
+                sum(y .* y)
+            }
+        "#;
+        let a = [1.0_f32, 2.0];
+        let b = [3.0_f32, 4.0, 5.0, 6.0];
+        let (loss, grads) = jit_grad(src, "concrete", &[&a, &b], &[2, 4])
+            .expect("rank-3 batched matmul must differentiate");
+        assert!(approx(loss, 425.0), "loss {}", loss);
+        assert!(approx(grads[0][0], 206.0), "dA {:?}", grads[0]);
+        assert!(approx(grads[0][1], 322.0), "dA {:?}", grads[0]);
+        assert_eq!(grads[1].len(), 4);
+        assert!(approx(grads[1][0], 26.0), "dB {:?}", grads[1]);
+        assert!(approx(grads[1][1], 32.0), "dB {:?}", grads[1]);
+        assert!(approx(grads[1][2], 52.0), "dB {:?}", grads[1]);
+        assert!(approx(grads[1][3], 64.0), "dB {:?}", grads[1]);
+    }
+
+    #[test]
+    fn jit_transpose_rank3_swaps_the_last_two_axes() {
+        // The rank-3 arm must match the interpreter, which permutes the last
+        // two axes at every rank ≥ 2 — not reverse all of them. On a [2,2,2]
+        // those two readings give DIFFERENT answers, so this pins the choice.
+        // t[b,i,j] = 4b + 2i + j  ->  t'[b,j,i] = t[b,i,j].
+        // t' flat = [0,2,1,3, 4,6,5,7]; reversing all axes would give
+        //           [0,4,2,6, 1,5,3,7].
+        let src = r#"
+            fn main() -> i64 {
+                let !t = forge.zeros[f32, [2, 2, 2]]
+                for b in 0..2 { for i in 0..2 { for j in 0..2 {
+                    t[b, i, j] = (b * 4 + i * 2 + j) as f32
+                } } }
+                let u = t'
+                # read the two entries that separate the two readings
+                (u[0, 0, 1] * 10.0 + u[1, 0, 1]) as i64   # 2*10 + 6 = 26
+            }
+        "#;
+        assert_eq!(jit_run_i64(src).unwrap(), 26);
     }
 
     // ─── Slice 7: .fwd_bwd source surface — pure-demoniC training loop ──────
@@ -22723,12 +25424,7 @@ fn main() -> i64 {
         // Write to a temp file and invoke the dmc binary.
         let tmp = std::env::temp_dir().join("dmc_oob_test_259.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target/release/dmc");
-        if !bin.exists() {
-            // Binary not built; skip subprocess check.
-            return;
-        }
+        let bin = dmc_bin();
         let out = Command::new(&bin)
             .args(["jit", tmp.to_str().unwrap()])
             .output()
@@ -24008,22 +26704,124 @@ fn main() -> i64 { 0 }
         );
     }
 
+    /// #478's repro, parameterized on which branch the condition takes.
+    /// `(z + 0.2f32) as f64` scaled into an i64 is the width probe: the f32
+    /// answer is 0.30000001192092896 → 300000011920928, the f64 one is
+    /// 0.3000000029802322 → 300000002980232. `f32_to_bits` would NOT do — it
+    /// rounds its argument to f32 and would erase the very difference under
+    /// test, which is how two of #473's tests originally proved nothing.
+    const F32_ANSWER: i64 = 300000011920928;
+
+    /// NB the newlines: a `}` immediately followed by `(` parses as an
+    /// indirect call, so the width probe has to start its own line.
+    fn r478_if(cond: &str) -> String {
+        format!("fn main() -> i64 {{
+            let a = 0.1f32
+            let z = if a > {cond} {{ a }} else {{ 0.1 }}
+            (((z + 0.2f32) as f64) * 1000000000000000.0) as i64
+        }}")
+    }
+
+    fn r478_match(n: i64) -> String {
+        format!("fn main() -> i64 {{
+            let a = 0.1f32
+            let n = {n}
+            let z = match n {{ 1 => a, _ => 0.1 }}
+            (((z + 0.2f32) as f64) * 1000000000000000.0) as i64
+        }}")
+    }
+
     #[test]
-    fn f32_branch_with_unsuffixed_literal_is_a_clean_jit_error() {
-        // The known #473 follow-up gap, pinned so it stays LOUD. The checker
-        // constrains an unsuffixed literal to the other branch's type, so
-        // `if c { x_f32 } else { 0.0 }` type-checks as f32; the JIT lowers an
-        // unsuffixed literal as f64 with no context and the join disagrees.
-        // Neither unification is safe — promoting silently widens a real f32,
-        // demoting silently narrows a real f64 and would undo #209 — so this
-        // errors rather than miscompiling. `dmc run` handles it.
+    fn f32_branch_with_unsuffixed_literal_lowers_type_directed() {
+        // #478, the #473 follow-up. The checker constrains an unsuffixed
+        // literal to the other branch's type (SPEC.md §"Untyped numeric
+        // literals"), so `if c { x_f32 } else { 0.1 }` type-checks as f32 —
+        // and now BOTH backends give that literal the f32 it was inferred to
+        // be, instead of defaulting to f64 and reconciling at the join. This
+        // used to be a clean JIT refusal ("branches disagree on type"); it is
+        // a lowered program now, and the two backends must agree on it.
+        //
+        // Both branch-taken directions matter, for different reasons: the THEN
+        // direction never evaluates the literal at all (the JIT still has to
+        // have typed it right, or the join would not unify), while the ELSE
+        // direction returns the literal's own value and so pins its width.
+        // `if` and `match` are separate join sites and both are covered.
+        for src in [r478_if("0.0f32"), r478_if("1.0f32"), r478_match(1), r478_match(2)] {
+            assert_jit_eq_interp(&src);
+            assert_eq!(
+                jit_run_i64(&src).unwrap(), F32_ANSWER,
+                "the unsuffixed literal did not adopt f32 in:\n{}", src,
+            );
+        }
+    }
+
+    #[test]
+    fn type_directed_literal_reaches_nested_joins_and_negation() {
+        // The hint follows every value-transparent form on the way down — a
+        // nested `if`, a block tail, a leading `-` — because those are exactly
+        // the positions whose value IS the join's value.
+        let src = r#"
+            fn main() -> i64 {
+                let a = 0.1f32
+                let n = 3
+                let z = if a > 1.0f32 { a } else { if n > 2 { -0.1 } else { 0.2 } }
+                (((z + 0.2f32) as f64) * 1000000000000000.0) as i64
+            }
+        "#;
+        assert_jit_eq_interp(src);
+        // -0.1f32 + 0.2f32 = 0.10000000149011612, not the f64 0.10000000000000003.
+        assert_eq!(jit_run_i64(src).unwrap(), 100000001490116);
+    }
+
+    #[test]
+    fn type_direction_never_narrows_an_f64() {
+        // The half of #478 that must NOT move. An all-f64 join stays f64 at
+        // full precision (#209): the hint is armed only by a definite f32
+        // sibling, so a join with no f32 in it lowers exactly as before.
+        let src = r#"
+            fn main() -> i64 {
+                let a = 0.5
+                let z = if a > 1.0 { a } else { 0.1 }
+                (z * 100000000000000000.0) as i64
+            }
+        "#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 10000000000000000);
+
+        // And a *computed* f64 beside an f32 is still a refusal rather than a
+        // silent narrowing — only a syntactic unsuffixed literal consults the
+        // hint, so `b` keeps its f64 kind and the join reports the mismatch.
+        // (`dmc jit` never gets this far: the checker rejects the program
+        // first since #490. The JIT must not narrow it if it ever does.)
         let e = jit_compile_err(
-            "fn main() -> i64 { let a = 0.1f32  let z = if a > 0.0f32 { a } else { 0.0 }  f32_to_bits(z) }",
+            "fn main() -> i64 { let a = 0.1f32  let b = 0.1 + 0.2  \
+             let z = if a > 0.0f32 { a } else { b }  f32_to_bits(z) }",
         );
         assert!(
             e.contains("branches disagree on type"),
-            "expected a clean branch-type error, got: {}", e,
+            "a computed f64 was narrowed at the join instead of refused: {}", e,
         );
+    }
+
+    #[test]
+    fn type_direction_does_not_leak_out_of_the_branch_value() {
+        // The hint is armed for one value position and consumed there. It must
+        // not reach the condition, or a statement inside the branch, or the
+        // code after the `if` — each of those keeps #209's f64 default. `w` is
+        // a plain `0.1` STATEMENT inside the f32-hinted then-branch and `d` is
+        // an f64 binding after the join; if the hint leaked into either, the
+        // total would shift.
+        let src = r#"
+            fn main() -> i64 {
+                let a = 0.1f32
+                let z = if a > 0.0f32 { let w = 0.1  let q = w * 3.0  a } else { 0.1 }
+                let d = 0.1
+                (((z + 0.2f32) as f64) * 1000000000000000.0) as i64
+                    + (d * 100000000000000000.0) as i64
+            }
+        "#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), F32_ANSWER + 10000000000000000);
     }
 
     // ─── f32 tensor reductions (#481) ────────────────────────────────────────
@@ -24305,8 +27103,13 @@ fn main() -> i64 { 0 }
             "fn main() -> i64 {\n\
              let r = 0..5\n\
              1 }",
-            // via unsupported_msg(), #478: the JIT cannot unify these branch kinds.
-            "fn main() -> i64 { let a = 0.1f32  let z = if a > 0.0f32 { a } else { 0.0 }  f32_to_bits(z) }",
+            // via unsupported_msg(): the JIT cannot unify these branch kinds.
+            // #478 removed the f32-vs-unsuffixed-float-literal case from this
+            // family (that literal is now lowered as the f32 the checker
+            // inferred), but an *integer* literal never adopts a float context
+            // — SPEC.md §"Untyped numeric literals" — so f32-vs-i64 still
+            // reaches the same join and must still be classified a refusal.
+            "fn main() -> i64 { let a = 0.1f32  let z = if a > 0.0f32 { a } else { 1 }  f32_to_bits(z) }",
             // via unsupported_msg(): reductions are f32-only.
             "fn main() -> f64 { let !t = forge.uninit[f64, [2]]  t[0] = 0.1  t[1] = 0.2  sum(t) }",
         ] {
@@ -24346,6 +27149,20 @@ fn main() -> i64 { 0 }
             "a genuine error was classified as an allowlistable gap: {}", e,
         );
         assert!(e.to_string().starts_with("jit error at "), "{}", e);
+    }
+
+    #[test]
+    fn jit_dynamic_dim_refusal_names_query_501() {
+        // The JIT's slice-4 gap on non-concrete dims is unchanged, but the
+        // refusal listed `_` among the spellings it cannot resolve. `_` is not
+        // a dimension since #501; the message names `?`.
+        let e = jit_compile_jiterr(
+            "fn total(x: Tensor[f32, [?, ?]]) -> f32 { sum(x) }\n\
+             fn main() -> i64 { total([[1.0f32, 2.0f32]]) as i64 }",
+        );
+        let s = e.to_string();
+        assert!(s.contains('?'), "refusal must name `?`, got: {s}");
+        assert!(!s.contains('_'), "refusal must not name `_` as a dim, got: {s}");
     }
 
     #[test]
@@ -24819,12 +27636,13 @@ fn main() -> i64 { 0 }
     }
 
     #[test]
-    fn jit_rshift_operator_as_pipe() {
-        // >> is identical to |> — both desugar to f(x).
+    fn jit_canonical_pipe_operator() {
+        // `\|>` is the canonical spelling and desugars the same as `|>`.
+        // (`>>` was a third spelling until #501 ruling S1a reserved the token.)
         assert_jit_eq_interp(r#"
             fn main() -> i64 {
                 let a = [1.0, 2.0, 3.0, 4.0]
-                (a >> sum) as i64
+                (a \|> sum) as i64
             }
         "#);
     }
@@ -25607,8 +28425,7 @@ fn main() -> i64 {
         let src = "fn main() -> i64 { let x = 5  match x { n if n > 100 => 10, n if n > 200 => 11 } }";
         let tmp = std::env::temp_dir().join("dmc_match_trap_test.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; }
+        let bin = dmc_bin();
         let out = Command::new(&bin).args(["jit", tmp.to_str().unwrap()]).output().expect("run dmc");
         assert_eq!(out.status.code(), Some(1),
             "expected exit 1 (clean no-arm error), got {:?}\nstderr: {}",
@@ -25642,8 +28459,7 @@ fn main() -> i64 {
         // in-process `Jit` API still lowers unchecked AST by design (that is
         // what `jit_run_i64` and the whole test battery above rely on).
         use std::process::Command;
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; }
+        let bin = dmc_bin();
         let tmp = std::env::temp_dir().join("dmc_jit_typecheck_test.dmc");
         std::fs::write(&tmp, "fn main() -> i64 { let z: str = 5  1 }").expect("write temp file");
         let out = Command::new(&bin).args(["jit", tmp.to_str().unwrap()]).output().expect("run dmc");
@@ -25719,8 +28535,7 @@ fn main() -> i64 {
         let src = r#"fn main() -> i64 { let a: i64 = -9223372036854775807 - 1  a / (0 - 1) }"#;
         let tmp = std::env::temp_dir().join("dmc_div_overflow_test_297.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; }
+        let bin = dmc_bin();
         let out = Command::new(&bin).args(["jit", tmp.to_str().unwrap()]).output().expect("run dmc");
         assert_eq!(out.status.code(), Some(1),
             "expected exit 1 (clean overflow error), got {:?}\nstderr: {}",
@@ -25737,8 +28552,7 @@ fn main() -> i64 {
         let src = r#"fn main() -> i64 { let s = "hi"  s[100] }"#;
         let tmp = std::env::temp_dir().join("dmc_str_oob_test_297.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; }
+        let bin = dmc_bin();
         let out = Command::new(&bin).args(["jit", tmp.to_str().unwrap()]).output().expect("run dmc");
         assert_eq!(out.status.code(), Some(1),
             "expected exit 1 (clean OOB error), got {:?}\nstderr: {}",
@@ -26239,6 +29053,276 @@ fn main() -> i64 {
 "#;
         assert_jit_eq_interp(src);
         assert_eq!(jit_run_i64(src).unwrap(), 77);
+    }
+
+    // ── #524: `let !y = m.<tensor field>` binds a LIVE ALIAS (SPEC §3.4) ─────
+    //
+    // The one carve-out from #249's value-copy rule above: a TENSOR model field
+    // bound through the `!` spelling aliases the field, so every write through
+    // the binding reaches it. `let mut y = m.w`, `let y = m.w`, a scalar field,
+    // and a plain local all keep copying — the tests below pin both sides.
+
+    #[test]
+    fn jit_model_tensor_field_bind_aliases_element_write_524() {
+        // Element write through the binding reaches the field. Pre-fix the JIT
+        // copied here (m.w[0] stayed 0) while `dmc run` printed 42.
+        let src = r#"
+model M { !w: Tensor[f32, [2]] }
+fn main() -> i64 {
+    let !m = M { w: forge.zeros[f32, [2]] }
+    let !y = m.w
+    y[0] = 42.0
+    m.w[0] as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 42);
+    }
+
+    #[test]
+    fn jit_model_tensor_field_bind_whole_assign_writes_through_524() {
+        // Whole-binding `=` through the alias writes the FIELD; it must not
+        // rebind the local and leave the field at its old contents.
+        let src = r#"
+model M { !w: Tensor[f32, [4]] }
+fn main() -> i64 {
+    let !m = M { w: forge.zeros[f32, [4]] }
+    let !y = m.w
+    y = forge.ones[f32, [4]] .* 7.0
+    (m.w[0] + m.w[3]) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 14);
+    }
+
+    #[test]
+    fn jit_model_tensor_field_bind_compound_assign_writes_through_524() {
+        // `+=` on a tensor alias is the elementwise op, read from and written
+        // back to the field — two bumps land as 2.
+        let src = r#"
+model M { !w: Tensor[f32, [2]] }
+fn main() -> i64 {
+    let !m = M { w: forge.zeros[f32, [2]] }
+    let !y = m.w
+    y += forge.ones[f32, [2]]
+    y += forge.ones[f32, [2]]
+    m.w[1] as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 2);
+    }
+
+    #[test]
+    fn jit_model_scalar_field_bind_copies_524() {
+        // A SCALAR field binds its current VALUE — the snapshot must not track
+        // a later write through the binding, and the field must not move.
+        let src = r#"
+model M { !n: i64 }
+fn main() -> i64 {
+    let !m = M { n: 7 }
+    let !s = m.n
+    s = 99
+    m.n * 100 + s
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 799);
+    }
+
+    #[test]
+    fn jit_let_mut_from_tensor_field_copies_524() {
+        // `let mut y = m.w` is NOT the `!` spelling and never aliases — this is
+        // exactly where the two mutable-binding forms differ (SPEC §3.4).
+        let src = r#"
+model M { !w: Tensor[f32, [2]] }
+fn main() -> i64 {
+    let !m = M { w: forge.zeros[f32, [2]] }
+    let mut y = m.w
+    y[0] = 42.0
+    (m.w[0] + y[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 4200); // field 0, copy 42
+    }
+
+    #[test]
+    fn jit_immutable_bind_from_tensor_field_copies_524() {
+        // An immutable binding is a snapshot: a later element write to the
+        // FIELD must not be visible through it.
+        let src = r#"
+model M { !w: Tensor[f32, [2]] }
+fn main() -> i64 {
+    let !m = M { w: forge.zeros[f32, [2]] }
+    let y = m.w
+    m.w[0] = 42.0
+    (y[0] + m.w[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 4200); // snapshot 0, field 42
+    }
+
+    #[test]
+    fn jit_field_alias_shadowed_by_plain_let_stops_writing_through_524() {
+        // A later `let !y = <fresh tensor>` drops the alias: `y = …` after the
+        // shadow must rebind the local, not write the field.
+        let src = r#"
+model M { !w: Tensor[f32, [2]] }
+fn main() -> i64 {
+    let !m = M { w: forge.zeros[f32, [2]] }
+    let !y = m.w
+    y[0] = 5.0
+    let !y = forge.zeros[f32, [2]]
+    y[0] = 9.0
+    (m.w[0] + y[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 905); // field 5, shadow 9
+    }
+
+    // ── #553: a rebound `!` parameter writes back the buffer it now names ────
+    //
+    // A `!` tensor parameter is copy-in/copy-out (#249 above): the caller hands
+    // the callee a private copy and copies that buffer back on return. A
+    // whole-binding assignment in the callee rebinds the local to a FRESH forge
+    // buffer, so the buffer the caller wrote back was the stale one it passed
+    // in. Element writes never showed it — they mutate the copy in place — so
+    // the gap only opened on reassignment.
+
+    #[test]
+    fn jit_mut_param_reassign_writes_back_553() {
+        // The reported repro. Pre-fix: `dmc run` 220, `dmc jit` 120 — the loss
+        // agreed, only the writeback diverged.
+        let src = r#"
+@grad fn f(!w: Tensor[f32, [2]]) -> f32 { w = w .* 2.0   sum(w .* w) }
+fn main() -> i64 {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 1.0   w[1] = 2.0
+    let s = f(w)
+    (s + w[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 220); // loss 20, w[0] 2
+    }
+
+    #[test]
+    fn jit_mut_param_reassign_writes_back_in_template_553() {
+        // The other place a `!` parameter reaches the JIT: a template, where
+        // `declare_template_signature` accepts one outside `@grad fn`. Same
+        // defect, and `declare_monomorph` was dropping the indices that make
+        // the copy-out fire.
+        let src = r#"
+fn scale[N](!t: Tensor[f32, [N]]) -> f32 {
+    t = t .* 2.0
+    t[0]
+}
+fn main() -> i64 {
+    let !x = forge.zeros[f32, [3]]
+    x[0] = 1.0
+    let d = scale(x)
+    (d + x[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 202); // callee saw 2, caller 2
+    }
+
+    #[test]
+    fn jit_mut_param_reassign_leaves_other_params_alone_553() {
+        // Only the reassigned parameter moves: `b` is `!` too but is never
+        // rebound, so it comes back exactly as it went in.
+        let src = r#"
+@grad fn f(!a: Tensor[f32, [2]], !b: Tensor[f32, [2]]) -> f32 {
+    a = a .* 3.0
+    sum(a .* b)
+}
+fn main() -> i64 {
+    let !a = forge.zeros[f32, [2]]
+    let !b = forge.zeros[f32, [2]]
+    a[0] = 1.0   a[1] = 2.0
+    b[0] = 5.0   b[1] = 7.0
+    let s = f(a, b)
+    (s + a[0] * 100.0 + b[0] * 10000.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 50357); // loss 57, a[0] 3, b[0] 5
+    }
+
+    #[test]
+    fn jit_mut_param_reassign_does_not_leak_through_an_aliased_arg_553() {
+        // #249's isolation still holds: `f(t, t)` with only param 0 `!` must
+        // not let the reassignment reach the plain `b` during the call.
+        let src = r#"
+@grad fn f(!a: Tensor[f32, [2]], b: Tensor[f32, [2]]) -> f32 {
+    a = a .* 2.0
+    sum(a) + sum(b)
+}
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [2]]
+    t[0] = 1.0   t[1] = 2.0
+    let s = f(t, t)
+    (s + t[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 209); // during 9 (6+3), t[0] 2
+    }
+
+    #[test]
+    fn jit_mut_param_no_reassign_still_writes_back_553() {
+        // The copy-out is skipped when the parameter still names the buffer it
+        // came in on — element writes had already landed there, and #249's
+        // writeback carries them out unchanged.
+        let src = r#"
+fn poke[N](!t: Tensor[f32, [N]]) -> nil { t[0] = 77.0  nil }
+fn main() -> i64 {
+    let !x = forge.zeros[f32, [3]]
+    poke(x)
+    x[0] as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 77);
+    }
+
+    #[test]
+    fn jit_mut_param_reassign_gradient_is_wrt_the_incoming_value_553() {
+        // The copy-out runs after the backward pass, so it cannot disturb the
+        // tape: `L = sum((2w).^2) = 4·sum(w²)`, so `∂L/∂w = 8w`.
+        let src = r#"
+@grad fn f(!w: Tensor[f32, [2]]) -> f32 { w = w .* 2.0   sum(w .* w) }
+fn main() -> i64 {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 1.0   w[1] = 2.0
+    let (l, g) = f.fwd_bwd(w)
+    (l + g[0] * 100.0 + g[1] * 10000.0) as i64
+}
+"#;
+        assert_eq!(jit_run_i64(src).unwrap(), 160820); // loss 20, g = (8, 16)
+    }
+
+    #[test]
+    fn jit_mut_param_fwd_bwd_does_not_write_back_553() {
+        // `f.fwd_bwd(w)` passes the caller's own tensor with no copy-in and no
+        // writeback on either backend. The copy-out must stay off that entry,
+        // or the reassignment would clobber the caller's `w`.
+        let src = r#"
+@grad fn f(!w: Tensor[f32, [2]]) -> f32 { w = w .* 2.0   sum(w .* w) }
+fn main() -> i64 {
+    let !w = forge.zeros[f32, [2]]
+    w[0] = 1.0   w[1] = 2.0
+    let (l, _g) = f.fwd_bwd(w)
+    (l + w[0] * 100.0 + w[1] * 10000.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 20120); // loss 20, w unmoved (1, 2)
     }
 
     /// `forge.uninit` followed by element-wise copy from a known tensor.
@@ -26802,6 +29886,316 @@ fn main() -> i64 {
         assert_jit_eq_interp("fn main() -> i64 { 1 << 3 }");
     }
 
+    // ─── an `i32` operand meeting an integer literal (#537 follow-up) ───────
+    //
+    // SPEC.md §3.1: an untyped integer literal "adopts the type of its context
+    // — the annotation, return type, parameter, or other operand at its use
+    // site". The JIT used to lower every integer literal as i64 regardless, so
+    // an `i32` could only ever meet another *non-literal* `i32`; `a + 2` was
+    // refused as "operands disagree" while `--check` typed it `i32` and the
+    // interpreter computed it.
+
+    /// The reported repro, plus the rest of the arithmetic and bitwise
+    /// operators, in both operand orders. Values stay well inside i32 so the
+    /// interpreter's own (unrelated) refusal to narrow `i32` arithmetic cannot
+    /// muddy the parity assertion.
+    #[test]
+    fn jit_i32_operand_adopts_an_untyped_int_literal() {
+        for expr in [
+            "a + 2", "2 + a", "a - 2", "300 - a", "a * 2", "2 * a",
+            "a / 5", "a % 5", "a & 1", "a | 1", "a ^ 1", "a + -2",
+        ] {
+            assert_jit_eq_interp(&format!(
+                "fn main() -> i64 {{\n let a: i32 = 257\n ({}) as i64\n}}", expr,
+            ));
+        }
+    }
+
+    /// Comparisons take the same path and were refused the same way.
+    #[test]
+    fn jit_i32_operand_adopts_a_literal_in_comparisons() {
+        for expr in ["a < 300", "a > 300", "a <= 257", "a >= 257", "a == 257", "a != 257"] {
+            assert_jit_eq_interp(&format!(
+                "fn main() -> i64 {{\n let a: i32 = 257\n if {} {{ 1 }} else {{ 0 }}\n}}", expr,
+            ));
+        }
+    }
+
+    /// Shifts too — `a << 2` was in the repro. The shifted value is i32, so the
+    /// guards around the shift have to be emitted at i32 width as well. (`>>`
+    /// does not lex today — it is a reserved token, #530 — so `<<` is the only
+    /// shift a test can spell.)
+    #[test]
+    fn jit_i32_shift_by_a_literal_count() {
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i32 = 5\n (a << 2) as i64\n}");
+    }
+
+    /// A suffix that already names the other operand's kind is adopted, so
+    /// `a << 2i32` lowers.
+    #[test]
+    fn jit_i32_literal_with_a_matching_suffix_lowers() {
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 {\n let a: i32 = 5\n (a << 2i32) as i64\n}").unwrap(), 20);
+        assert_eq!(
+            jit_run_i64("fn main() -> i64 {\n let a: i32 = 257\n (a + 2i32) as i64\n}").unwrap(), 259);
+    }
+
+    /// A suffix naming a *different* kind types the literal concretely (SPEC.md
+    /// §3.1: it "conflicts with a different annotation or parameter type as a
+    /// normal type error"), so the operands genuinely disagree and the refusal
+    /// stands. `--check` accepting this today is a separate defect (#539).
+    #[test]
+    fn jit_i32_literal_with_a_conflicting_suffix_is_still_refused() {
+        let err = jit_compile_err("fn main() -> i64 {\n let a: i32 = 5\n (a << 2i64) as i64\n}");
+        assert!(err.contains("operands disagree"), "got: {}", err);
+    }
+
+    /// #295 range-checks a literal against the width it adopts. A literal that
+    /// does not fit `i32` is refused rather than silently truncated into a
+    /// different answer than `dmc run` computes.
+    #[test]
+    fn jit_int_literal_too_wide_for_the_i32_it_adopts_is_refused() {
+        let err = jit_compile_err("fn main() -> i64 {\n let a: i32 = 256\n (a + 5000000000) as i64\n}");
+        assert!(
+            err.contains("does not fit in `i32`"),
+            "expected a range refusal naming i32, got: {}", err,
+        );
+    }
+
+    /// Only a *literal* adopts. Two locals of different declared widths are a
+    /// real type error and keep the operands-disagree refusal — the adoption
+    /// rule must not become a general implicit cast.
+    #[test]
+    fn jit_i32_and_i64_locals_still_disagree() {
+        let err = jit_compile_err(
+            "fn main() -> i64 {\n let a: i32 = 256\n let b: i64 = 2\n (a + b) as i64\n}");
+        assert!(err.contains("operands disagree"), "got: {}", err);
+    }
+
+    /// i64 arithmetic is untouched: a literal meeting an i64 was already i64.
+    #[test]
+    fn jit_i64_operand_with_a_literal_is_unchanged() {
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i64 = 256\n a + 2\n}");
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i64 = 5\n a << 40\n}");
+    }
+
+    // ─── `i32` division and shifts, at i32 width ────────────────────────────
+    //
+    // #208's div-by-zero guard, #297's overflow guard and #265's shift-range
+    // guard all built their constants at i64. On an `i32` that produced a
+    // Cranelift verifier error — reachable before this change with two `i32`
+    // locals, and reachable from the repro above once a literal can be one.
+
+    /// `/` and `%` on two i32 locals compile and agree with the interpreter,
+    /// division by zero included (#208: integer `/` and `%` by zero are TOTAL
+    /// and yield 0).
+    #[test]
+    fn jit_i32_div_and_mod_lower_at_i32_width() {
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i32 = 257\n let b: i32 = 5\n (a / b) as i64\n}");
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i32 = 257\n let b: i32 = 5\n (a % b) as i64\n}");
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i32 = 257\n let b: i32 = 0\n (a / b) as i64\n}");
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i32 = 257\n let b: i32 = 0\n (a % b) as i64\n}");
+    }
+
+    /// A shift between two i32 locals compiles and agrees.
+    #[test]
+    fn jit_i32_shift_by_an_i32_local() {
+        assert_jit_eq_interp("fn main() -> i64 {\n let a: i32 = 5\n let c: i32 = 2\n (a << c) as i64\n}");
+    }
+
+    /// Cranelift masks a shift count mod the shifted value's width, so a count
+    /// of 32..=63 on an `i32` would compute something other than what the count
+    /// says. #256's constant check runs before the operands are lowered and
+    /// only knows i64's `0..=63`; the width-aware one refuses this. i64 keeps
+    /// the full `0..=63` range (`jit_i64_operand_with_a_literal_is_unchanged`).
+    #[test]
+    fn jit_i32_shift_count_past_the_i32_width_is_refused() {
+        let err = jit_compile_err("fn main() -> i64 {\n let a: i32 = 5\n (a << 40) as i64\n}");
+        assert!(
+            err.contains("shift amount 40") && err.contains("0..=31") && err.contains("i32"),
+            "expected an i32-width range refusal, got: {}", err,
+        );
+    }
+
+    // ─── #530: `>>` — arithmetic right shift, at parity with the interpreter ──
+
+    /// The JIT lowers `>>` to Cranelift `sshr` — an *arithmetic* shift. The
+    /// interpreter uses Rust's `>>` on `i64`, also arithmetic. Both must agree
+    /// on the cases where arithmetic and logical shifts diverge: a negative
+    /// left operand. A logical shift would give a huge positive here.
+    ///
+    /// Every case is typed `i64` deliberately. The interpreter carries all
+    /// integers as `i64`, while the JIT lowers an `i32`-typed slot to a 32-bit
+    /// `sshr`; the two only have a shared answer at 64 bits, which is where the
+    /// operator's semantics are defined (`OPERATORS.md §8a`).
+    #[test]
+    fn jit_shr_arithmetic_on_negatives_parity() {
+        for expr in ["256 >> 2", "-8 >> 1", "-1 >> 1", "-1 >> 63", "-7 >> 1"] {
+            assert_jit_eq_interp(&format!("fn main() -> i64 {{ {} }}", expr));
+        }
+        // Pinned values, so a *both-backends* regression cannot pass silently.
+        assert_eq!(jit_run_i64("fn main() -> i64 { -8 >> 1 }").unwrap(), -4);
+        assert_eq!(jit_run_i64("fn main() -> i64 { -1 >> 63 }").unwrap(), -1);
+        // Floor, not truncate-toward-zero: `-7 / 2` is -3, `-7 >> 1` is -4.
+        assert_eq!(jit_run_i64("fn main() -> i64 { -7 >> 1 }").unwrap(), -4);
+    }
+
+    /// The 0 and 63 boundaries of the `0..=63` range, in i64. 63 is the only
+    /// count that reaches the sign bit; 0 must be the identity on both signs.
+    #[test]
+    fn jit_shr_range_boundaries_parity() {
+        for expr in ["256 >> 0", "-256 >> 0", "(1 << 63) >> 63",
+                     "9223372036854775807 >> 63"] {
+            assert_jit_eq_interp(&format!("fn main() -> i64 {{ {} }}", expr));
+        }
+        assert_eq!(jit_run_i64("fn main() -> i64 { -256 >> 0 }").unwrap(), -256);
+        assert_eq!(jit_run_i64("fn main() -> i64 { (1 << 63) >> 63 }").unwrap(), -1);
+    }
+
+    /// #256, mirroring `jit_shl_const_out_of_range_64`: a constant count
+    /// outside `0..=63` is rejected at JIT lowering with the interpreter's
+    /// range message, naming `>>`. Cranelift's `sshr` would mask it mod 64.
+    #[test]
+    fn jit_shr_const_out_of_range() {
+        for src in ["fn main() -> i64 { 1 >> 64 }", "fn main() -> i64 { 1 >> -1 }"] {
+            let err = jit_run_i64(src).unwrap_err();
+            assert!(err.contains(">> shift amount") && err.contains("out of range"),
+                    "expected a `>>` range error for {}, got: {}", src, err);
+        }
+    }
+
+    /// #265, mirroring `jit_shl_runtime_out_of_range_traps`: a *runtime* count
+    /// outside the range traps cleanly (exit 1) rather than wrapping mod 64.
+    /// Run in a subprocess — the trap calls `process::exit`.
+    #[test]
+    fn jit_shr_runtime_out_of_range_traps() {
+        use std::process::Command;
+        let src = r#"fn main() -> nil { let !n = 64 let x = 256 print(x >> n) nil }"#;
+        let tmp = std::env::temp_dir().join("dmc_shift_test_530.dmc");
+        std::fs::write(&tmp, src).expect("write temp file");
+        let out = Command::new(dmc_bin())
+            .args(["jit", tmp.to_str().unwrap()])
+            .output()
+            .expect("run dmc");
+        assert_eq!(out.status.code(), Some(1),
+            "expected exit 1 (clean shift range error), got {:?}\nstderr: {}",
+            out.status.code(), String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(">> shift amount") && stderr.contains("out of range"),
+            "expected a `>>` range error in stderr, got: {}", stderr);
+    }
+
+    /// #265: an in-range *runtime* count still computes, and agrees with the
+    /// interpreter — including on a negative left operand, where the guard is
+    /// a never-taken branch in front of `sshr`.
+    #[test]
+    fn jit_shr_runtime_in_range_parity() {
+        assert_jit_eq_interp(r#"fn main() -> i64 { let !n = 4 let x = 256 x >> n }"#);
+        assert_jit_eq_interp(r#"fn main() -> i64 { let !n = 4 let x = -256 x >> n }"#);
+        assert_jit_eq_interp(r#"fn main() -> i64 { let !n = 63 let x = -1 x >> n }"#);
+    }
+
+    // ─── i32 shift operands: the count is checked at the operand's width ─────
+
+    /// An `i32` shift used to fail the Cranelift verifier outright: the count
+    /// carries the operand's type (I32 for an i32 slot) while
+    /// `shift_range_check` built its bounds and its trap argument at I64, so
+    /// `define main` was rejected before it could run. Both shifts, both
+    /// backends, on the values where a 32-bit and a 64-bit shift agree — a
+    /// result that fits in i32 (`OPERATORS.md §8a`).
+    #[test]
+    fn jit_shift_i32_operands_parity() {
+        // Statements on their own lines: a `let` bound to a literal, followed by
+        // a parenthesized expression, would otherwise parse as a call on it.
+        for (a, op, n) in [("256", "<<", "2"), ("1", "<<", "30"), ("256", "<<", "0"),
+                           ("-8", ">>", "1"), ("-1", ">>", "31"),
+                           ("2147483647", ">>", "31")] {
+            assert_jit_eq_interp(&i32_shift_src(a, op, n));
+        }
+        // Pinned, so a *both-backends* regression cannot pass silently.
+        assert_eq!(jit_run_i64(&i32_shift_src("256", "<<", "2")).unwrap(), 1024);
+        assert_eq!(jit_run_i64(&i32_shift_src("-8", ">>", "1")).unwrap(), -4);
+    }
+
+    /// The same shape through a function boundary, where the count is a
+    /// parameter rather than a local — the i32 slot the verifier tripped on
+    /// first. `>>` too, since both arms share the guard.
+    #[test]
+    fn jit_shift_i32_params_parity() {
+        assert_jit_eq_interp(
+            "fn f(a: i32, n: i32) -> i32 { a << n }\nfn main() -> i64 { f(256, 2) as i64 }");
+        assert_jit_eq_interp(
+            "fn f(a: i32, n: i32) -> i32 { a >> n }\nfn main() -> i64 { f(-256, 4) as i64 }");
+    }
+
+    /// An i32 shift is a *32-bit* shift: it keeps the low 32 bits, exactly as
+    /// i32 `+` and `*` already do (`OPERATORS.md §8a`). #537 pinned this as the
+    /// one i32 shift with no shared answer, because the interpreter then
+    /// carried every integer at 64 bits and replied 2147483648. #540 gave the
+    /// interpreter the same narrow width, so it is a parity case now — asserted
+    /// as one, so a future width change has to rewrite it rather than quietly
+    /// drop it.
+    #[test]
+    fn jit_shift_i32_is_a_32_bit_shift() {
+        let src = i32_shift_src("1", "<<", "31");
+        assert_jit_eq_interp(&src);
+        assert_eq!(jit_run_i64(&src).unwrap(), -2147483648);     // i32::MIN, sign-extended
+    }
+
+    /// A count of 32 is in range for an i64 and out of range for an i32, so the
+    /// guard has to know the operand's width — and the message has to name the
+    /// range the program was actually judged against, not a blanket `0..=63`.
+    /// Both shifts; run in a subprocess, since the trap calls `process::exit`.
+    #[test]
+    fn jit_shift_i32_out_of_range_count_traps() {
+        for (op, count, want_op) in [("<<", "32", "<< shift amount 32"),
+                                     (">>", "32", ">> shift amount 32"),
+                                     ("<<", "-1", "<< shift amount -1")] {
+            let src = format!(
+                "fn main() -> nil {{\n  let a: i32 = 256\n  let n: i32 = {}\n  print((a {} n) as i64)\n  nil\n}}",
+                count, op);
+            let stderr = jit_subprocess_stderr(&src, &format!("dmc_shift_i32_{}_{}.dmc",
+                if op == "<<" { "shl" } else { "shr" }, count.replace('-', "neg")));
+            assert!(stderr.contains(want_op) && stderr.contains("expected 0..=31"),
+                "expected an i32 range error naming 0..=31 for `{} {}`, got: {}",
+                op, count, stderr);
+        }
+    }
+
+    /// The i64 message is unchanged by the width-aware bound: 63 is still the
+    /// largest i64 count, and the range it prints is still `0..=63`.
+    #[test]
+    fn jit_shift_i64_out_of_range_message_unchanged() {
+        let stderr = jit_subprocess_stderr(
+            "fn main() -> nil { let !n = 64 let x = 256 print(x << n) nil }",
+            "dmc_shift_i64_shl_64.dmc");
+        assert!(stderr.contains("<< shift amount 64") && stderr.contains("expected 0..=63"),
+            "expected the i64 range error to still name 0..=63, got: {}", stderr);
+    }
+
+    /// `fn main` returning `(a <op> n) as i64` over two `i32` locals, one
+    /// statement per line.
+    fn i32_shift_src(a: &str, op: &str, n: &str) -> String {
+        format!("fn main() -> i64 {{\n  let a: i32 = {}\n  let n: i32 = {}\n  (a {} n) as i64\n}}",
+                a, n, op)
+    }
+
+    /// Compile-and-run `src` through the `dmc jit` binary, assert it exited 1
+    /// (a clean trap, not a crash), and hand back its stderr.
+    fn jit_subprocess_stderr(src: &str, file: &str) -> String {
+        use std::process::Command;
+        let tmp = std::env::temp_dir().join(file);
+        std::fs::write(&tmp, src).expect("write temp file");
+        let out = Command::new(dmc_bin())
+            .args(["jit", tmp.to_str().unwrap()])
+            .output()
+            .expect("run dmc");
+        assert_eq!(out.status.code(), Some(1),
+            "expected exit 1 (clean shift range error), got {:?}\nstderr: {}",
+            out.status.code(), String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
     /// #272: tensor `max`/`min`/`argmax`/`argmin` reductions lower in the JIT,
     /// at parity with the interpreter (argmax/argmin now return a scalar index on
     /// both, so the result is usable as an index).
@@ -26892,8 +30286,7 @@ fn main() -> i64 {
     #[test]
     fn jit_main_prints_zero_return() {
         use std::process::Command;
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; }
+        let bin = dmc_bin();
         for (src, want) in [
             ("fn main() -> i64 { 0 }", "=> 0"),
             ("fn main() -> bool { false }", "=> false"),
@@ -26919,8 +30312,7 @@ fn main() -> i64 {
         let src = r#"fn main() -> nil { let !n = 64 let x = 1 print(x << n) nil }"#;
         let tmp = std::env::temp_dir().join("dmc_shift_test_265.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; } // binary not built; skip subprocess check
+        let bin = dmc_bin();
         let out = Command::new(&bin)
             .args(["jit", tmp.to_str().unwrap()])
             .output()
@@ -26951,8 +30343,7 @@ fn main() -> i64 {
             c <- a  c <- a  c <- a\n  0\n}";
         let tmp = std::env::temp_dir().join("dmc_kv_cap_test_399.dmc");
         std::fs::write(&tmp, src).expect("write temp file");
-        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/dmc");
-        if !bin.exists() { return; } // binary not built; skip subprocess check
+        let bin = dmc_bin();
         let out = Command::new(&bin)
             .args(["jit", tmp.to_str().unwrap()])
             .output()
@@ -26976,35 +30367,798 @@ fn main() -> i64 {
             c <- a  c <- a\n  \
             sum(c) as i64\n}");
     }
+
+    // ─── Process ports (PORTS.md §7.1) ───────────────────────────────────────
+    //
+    // The point of these is drift: both backends now call one `PortRegistry`,
+    // and the tests below are written so that a second implementation sneaking
+    // into either backend fails them. Every tag assertion is on the WHOLE
+    // message, and every one of them is also asserted equal to what the
+    // interpreter produces for the same source.
+
+    /// Compile `src` and run its `fn main() -> str`, returning the text —
+    /// `None` for a nil return (a null forge pointer). `run_main` echoes the
+    /// value rather than handing it back, so this drives the entry directly.
+    fn jit_run_str(src: &str) -> Result<Option<String>, String> {
+        let toks = Lexer::new(src).tokenize().map_err(|e| e.to_string())?;
+        let prog = Parser::new(toks).parse_program().map_err(|e| e.to_string())?;
+        let mut jit = Jit::new().map_err(|e| e.to_string())?;
+        jit.compile_program(&prog).map_err(|e| e.to_string())?;
+        let meta = jit.fns.get("main").ok_or("no `fn main`")?.clone();
+        if !matches!(meta.ret, TyKind::Str) {
+            return Err(format!("`main` returns `{}`, expected str", meta.ret.render()));
+        }
+        let ptr = jit.module.get_finalized_function(meta.id);
+        let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
+        let s = unsafe { f() };
+        Ok(if s == 0 { None } else { Some(dmc_str_to_rust(s)) })
+    }
+
+    /// The same, under the interpreter.
+    fn interp_run_str(src: &str) -> Result<Option<String>, String> {
+        let toks = Lexer::new(src).tokenize().map_err(|e| e.to_string())?;
+        let prog = Parser::new(toks).parse_program().map_err(|e| e.to_string())?;
+        let mut interp = crate::interp::Interpreter::new();
+        match interp.run(&prog, None).map_err(|e| format!("{:?}", e))? {
+            crate::interp::Value::Str(s) => Ok(Some(s)),
+            crate::interp::Value::Nil => Ok(None),
+            other => Err(format!("interp returned non-str: {:?}", other)),
+        }
+    }
+
+    /// Run `src` under both backends and assert they produce the identical
+    /// string (or identical nil), then assert that string is exactly `want`.
+    /// Both halves matter: equality alone would pass if both backends drifted
+    /// together, and `want` alone would not catch one backend drifting.
+    fn assert_port_str(src: &str, want: Option<&str>) {
+        let j = jit_run_str(src).expect("JIT run failed");
+        let i = interp_run_str(src).expect("interp run failed");
+        assert_eq!(j, i, "JIT/interp divergence for:\n{}", src);
+        assert_eq!(j.as_deref(), want, "unexpected result for:\n{}", src);
+    }
+
+    /// `port-open` — a runtime that is not wired up. Needs no python3.
+    #[test]
+    fn jit_port_open_tags_unsupported_runtime() {
+        assert_port_str(
+            r#"fn main() -> str { let (p, e) = port_open("lua")  e }"#,
+            Some("port-open: unsupported runtime `lua` — the process-port floor implements `python`"),
+        );
+    }
+
+    /// …and the handle half of that pair is nil in both backends, so nothing
+    /// downstream can mistake a failed open for a live port.
+    #[test]
+    fn jit_port_open_failure_yields_a_nil_handle() {
+        // A nil handle renders as the bare word, in both backends.
+        assert_port_str(
+            r#"fn main() -> str { let (p, e) = port_open("lua")  to_str(p) }"#,
+            Some("nil"));
+        // The nil test is the pointer: `p == nil` is true, `p != nil` false.
+        assert_jit_eq_interp(
+            r#"fn main() -> i64 { let (p, e) = port_open("lua")  if p == nil { 1 } else { 0 } }"#);
+        assert_jit_eq_interp(
+            r#"fn main() -> i64 { let (p, e) = port_open("lua")  if p != nil { 1 } else { 0 } }"#);
+        // A LIVE handle is not nil — the same pointer test, other way round.
+        if crate::ports::have_python() {
+            assert_port_str(r#"
+fn main() -> str {
+    let (p, e) = port_open("python")
+    let live = to_str(p != nil)
+    let (_, _) = port_close(p)
+    live
+}"#, Some("true"));
+        }
+    }
+
+    /// A handle cannot be forged. The text a handle carries is an ordinary
+    /// string, so a `str` in the handle position would reach a registry entry
+    /// the caller never opened; the interpreter refuses it (its handle is a
+    /// `Value::Opaque`, and a `Value::Str` never reads as one) and the JIT's
+    /// `Port` type refuses the same thing, at compile time.
+    #[test]
+    fn jit_port_call_refuses_a_forged_str_handle() {
+        assert_eq!(
+            jit_compile_err(r#"fn main() -> nil { let (o, e) = port_call("port#1:python", "len", "[]") }"#),
+            "`port_call: first arg` must be a Port handle from port_open, got `str`");
+        assert_eq!(
+            jit_compile_err(r#"fn main() -> nil { let (x, e) = port_close("port#1:python") }"#),
+            "`port_close: arg` must be a Port handle from port_open, got `str`");
+        // The interpreter refuses it too — at runtime, since it has no static
+        // type for a handle — so no program is accepted by one backend only.
+        let src = r#"fn main() -> nil { let (o, e) = port_call("port#1:python", "len", "[]") }"#;
+        assert!(interp_run_str(src).is_err(), "interp accepted a forged handle");
+    }
+
+    /// SPEC §3.11: a handle "may be passed, returned, and closed explicitly".
+    /// `Port[python]` is therefore writable in a signature, and the value
+    /// crossing a call boundary is still a live port on the other side.
+    #[test]
+    fn jit_port_handle_crosses_a_function_boundary() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn spawn() -> Port[python] {
+    let (p, _) = port_open("python")
+    p
+}
+fn ask(q: Port[python], payload: str) -> str {
+    let (out, _) = port_call(q, "len", payload)
+    out
+}
+fn main() -> str {
+    let p = spawn()
+    let a = ask(p, "[[1, 2, 3]]")
+    let b = ask(p, "[[1]]")
+    let (_, _) = port_close(p)
+    a + b
+}"#, Some("31"));
+    }
+
+    /// Everything else a handle could be dragged into is refused, cleanly and
+    /// with a location. These are not gaps waiting to be filled: `nil` is the
+    /// only thing the interpreter will compare a handle against either, and a
+    /// handle has no length and no elements there.
+    #[test]
+    fn jit_port_handle_refuses_every_other_operation() {
+        for (src, want) in [
+            (r#"fn main() -> nil { let (p,_) = port_open("lua")  let (q,_) = port_open("lua")
+                                   let b = p == q }"#,
+             "operator `Eq` is not defined for types `Port` and `Port`"),
+            (r#"fn main() -> nil { let (p,_) = port_open("lua")  let b = p == "port#1:python" }"#,
+             "operator `Eq` is not defined for types `Port` and `str`"),
+            (r#"fn main() -> nil { let (p,_) = port_open("lua")  let n = len(p) }"#,
+             "`len` requires a tensor or str argument"),
+            (r#"fn main() -> nil { let (p,_) = port_open("lua")  let c = p[0] }"#,
+             "indexing requires a tensor or str, got `Port`"),
+        ] {
+            assert_eq!(jit_compile_err(src), want, "for:\n{}", src);
+        }
+    }
+
+    /// `port-closed` on a call through a closed handle, and on a second close.
+    /// Needs no python3 either: an id that was never opened is already closed.
+    #[test]
+    fn jit_port_call_on_a_stale_handle_tags_port_closed() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (_, _) = port_close(p)
+    let (out, e) = port_call(p, "len", "[[1, 2, 3]]")
+    e
+}"#, Some("port-closed: handle was already closed"));
+    }
+
+    #[test]
+    fn jit_port_double_close_tags_port_closed() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (_, first) = port_close(p)
+    let (_, second) = port_close(p)
+    second
+}"#, Some("port-closed: handle was already closed"));
+        // The *first* close is clean — the tag is not sprayed at every close.
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (_, first) = port_close(p)
+    first
+}"#, None);
+    }
+
+    /// `port-call` — the foreign runtime raised. The detail after the tag is
+    /// python's own message, so assert the whole thing.
+    #[test]
+    fn jit_port_call_tags_a_foreign_exception() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, e) = port_call(p, "math.sqrt", "[\"sixteen\"]")
+    let (_, _) = port_close(p)
+    e
+}"#, Some("port-call: must be real number, not str"));
+    }
+
+    /// `port-protocol` — the payload is not an argument vector (PORTS.md §2).
+    #[test]
+    fn jit_port_call_tags_a_bare_scalar_payload() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, e) = port_call(p, "math.sqrt", "16")
+    let (_, _) = port_close(p)
+    e
+}"#, Some("port-protocol: payload must be a JSON array, an {args, kwargs} object, or null"));
+    }
+
+    /// `port-protocol` for an unknown envelope key, which is a *different*
+    /// message from the bare-scalar one — the tag is not the whole story.
+    #[test]
+    fn jit_port_call_tags_an_unknown_envelope_key() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, e) = port_call(p, "round", "{\"args\": [1.5], \"nkwargs\": {}}")
+    let (_, _) = port_close(p)
+    e
+}"#, Some("port-protocol: payload object must contain only \"args\"/\"kwargs\", got nkwargs"));
+    }
+
+    /// The whole argument-vector ABI, one call per mode, results compared
+    /// against the interpreter's. `port_call` re-encodes through demoniC's own
+    /// JSON writer, so 1024.0 comes back as "1024" from both backends.
+    #[test]
+    fn jit_port_call_covers_every_argument_mode() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        // nil payload -> no arguments.
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, _) = port_call(p, "list", nil)
+    let (_, _) = port_close(p)
+    out
+}"#, Some("[]"));
+        // An omitted payload is the same thing.
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, _) = port_call(p, "list")
+    let (_, _) = port_close(p)
+    out
+}"#, Some("[]"));
+        // A JSON array spreads positionally.
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, _) = port_call(p, "math.pow", "[2, 10]")
+    let (_, _) = port_close(p)
+    out
+}"#, Some("1024"));
+        // The {args, kwargs} envelope.
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (out, _) = port_call(p, "round", "{\"args\": [3.14159], \"kwargs\": {\"ndigits\": 2}}")
+    let (_, _) = port_close(p)
+    out
+}"#, Some("3.14"));
+    }
+
+    /// An error leaves the port usable, and the result half is `""` (not nil) —
+    /// the shape PORTS.md §6 specifies for `(_, Err)`.
+    #[test]
+    fn jit_port_survives_an_error_and_returns_an_empty_result() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (bad, _) = port_call(p, "math.sqrt", "[\"sixteen\"]")
+    let (good, e) = port_call(p, "math.gcd", "[462, 1071]")
+    let (_, _) = port_close(p)
+    bad + "|" + good + "|" + to_str(e == nil)
+}"#, Some("|21|true"));
+    }
+
+    /// Handle ids are never reused, so a stale handle cannot reach the port
+    /// opened after it — the property that makes `port-closed` safe rather
+    /// than merely polite.
+    #[test]
+    fn jit_port_ids_are_not_reused() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (_, _) = port_close(p)
+    let (q, _) = port_open("python")
+    let (stale, se) = port_call(p, "len", "[[1, 2, 3]]")
+    let (fresh, fe) = port_call(q, "len", "[[1, 2, 3]]")
+    let (_, _) = port_close(q)
+    se + "|" + fresh + "|" + to_str(fe == nil)
+}"#, Some("port-closed: handle was already closed|3|true"));
+    }
+
+    /// A quote and a newline inside the payload must survive the frame — the
+    /// request line is built with the canonical JSON escaper — and the port
+    /// must still be in sync afterwards.
+    #[test]
+    fn jit_port_payload_escaping_keeps_the_frame_in_sync() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, _) = port_open("python")
+    let (n, _) = port_call(p, "len", "[\"he said \\\"hi\\\"\\n\"]")
+    let (after, _) = port_call(p, "len", "[[1, 2, 3]]")
+    let (_, _) = port_close(p)
+    n + "|" + after
+}"#, Some("13|3"));
+    }
+
+    /// `.starts_with` is how PORTS.md §6 says to read a tag; it must agree with
+    /// the interpreter on the boundary cases, not just the happy one.
+    #[test]
+    fn jit_starts_with_matches_the_tag_prefix() {
+        assert_jit_eq_interp(r#"
+fn main() -> i64 {
+    let (p, e) = port_open("lua")
+    let a = if e.starts_with("port-open") { 1 } else { 0 }
+    let b = if e.starts_with("port-close") { 10 } else { 0 }
+    let c = if e.starts_with("") { 100 } else { 0 }
+    let d = if e.starts_with(e) { 1000 } else { 0 }
+    a + b + c + d
+}"#);
+        // A prefix longer than the subject is not a match (and must not read
+        // off the end of the buffer).
+        assert_jit_eq_interp(r#"
+fn main() -> i64 {
+    let s = "ab"
+    if s.starts_with("abc") { 1 } else { 0 }
+}"#);
+    }
+
+    // ─── port lowering refusals (compile-time) ───────────────────────────────
+
+    #[test]
+    fn jit_port_open_rejects_a_non_str_runtime() {
+        assert_eq!(
+            jit_compile_err("fn main() -> nil { let (p, e) = port_open(7) }"),
+            "`port_open: lang` must be str, got `i64`");
+    }
+
+    #[test]
+    fn jit_port_open_rejects_a_bad_arity() {
+        assert_eq!(
+            jit_compile_err(r#"fn main() -> nil { let (p, e) = port_open() }"#),
+            "`port_open` takes exactly 1 argument (the runtime name), got 0");
+        assert_eq!(
+            jit_compile_err(r#"fn main() -> nil { let (p, e) = port_open("python", "x") }"#),
+            "`port_open` takes exactly 1 argument (the runtime name), got 2");
+    }
+
+    #[test]
+    fn jit_port_call_rejects_a_non_str_payload() {
+        assert_eq!(
+            jit_compile_err(r#"
+fn main() -> nil {
+    let (p, _) = port_open("python")
+    let (out, e) = port_call(p, "math.sqrt", 16)
+}"#),
+            "`port_call: payload` must be a JSON str or nil, got `i64`");
+    }
+
+    #[test]
+    fn jit_port_call_rejects_a_bad_arity() {
+        assert_eq!(
+            jit_compile_err(r#"
+fn main() -> nil {
+    let (p, _) = port_open("python")
+    let (out, e) = port_call(p)
+}"#),
+            "`port_call` takes (port, name) or (port, name, payload), got 1 arguments");
+    }
+
+    #[test]
+    fn jit_port_close_rejects_a_non_port_argument() {
+        assert_eq!(
+            jit_compile_err("fn main() -> nil { let (x, e) = port_close(7) }"),
+            "`port_close: arg` must be a Port handle from port_open, got `i64`");
+    }
+
+    // ─── tensor copy mode (PORTS.md §3.2) ────────────────────────────────────
+
+    /// The envelope the JIT writes is the envelope the interpreter writes, byte
+    /// for byte, for every dtype both backends can hold. `assert_port_str` runs
+    /// both and diffs them, so a drift in either half fails here rather than at
+    /// the far end of a port.
+    #[test]
+    fn jit_port_tensor_envelope_is_byte_identical_to_the_interpreters() {
+        assert_port_str(r#"
+fn main() -> str {
+    let !g = forge.zeros[i64, [2, 3]]
+    g[0, 0] = 1  g[0, 1] = 2  g[0, 2] = 3
+    g[1, 0] = -4 g[1, 1] = 5  g[1, 2] = 6
+    port_tensor_encode(g)
+}"#, Some("{\"data\":\"AQAAAAAAAAACAAAAAAAAAAMAAAAAAAAA/P////////8FAAAAAAAAAAYAAAAAAAAA\",\
+            \"dmc_tensor\":1,\"dtype\":\"i64\",\"layout\":\"row_major\",\"shape\":[2,3]}"));
+        // bool is the 1-byte case — the width the wire dtype claims is the
+        // width of the payload, which is the #292 invariant at this boundary.
+        assert_port_str(r#"
+fn main() -> str {
+    let !b = forge.uninit[bool, [3]]
+    b[0] = true  b[1] = false  b[2] = true
+    port_tensor_encode(b)
+}"#, Some("{\"data\":\"AQAB\",\"dmc_tensor\":1,\"dtype\":\"bool\",\
+            \"layout\":\"row_major\",\"shape\":[3]}"));
+        assert_port_str(r#"
+fn main() -> str {
+    let !f = forge.zeros[f32, [2]]
+    f[0] = 0.5  f[1] = -1.25
+    port_tensor_encode(f)
+}"#, Some("{\"data\":\"AAAAPwAAoL8=\",\"dmc_tensor\":1,\"dtype\":\"f32\",\
+            \"layout\":\"row_major\",\"shape\":[2]}"));
+    }
+
+    /// A round trip through the envelope returns the same values on both
+    /// backends, and the error path agrees too — same tag, same wording.
+    #[test]
+    fn jit_port_tensor_round_trips_and_refuses_alike() {
+        assert_port_str(r#"
+fn main() -> str {
+    let !g = forge.zeros[i64, [2, 2]]
+    g[0, 0] = 10  g[0, 1] = -20  g[1, 0] = 30  g[1, 1] = -40
+    let (back, e) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2, 2]])
+    if e != nil { e } else { to_str(back[1, 0] - back[0, 1]) }
+}"#, Some("50"));
+        assert_port_str(r#"
+fn main() -> str {
+    let !b = forge.uninit[bool, [3]]
+    b[0] = true  b[1] = false  b[2] = true
+    let (back, e) = port_tensor_decode(port_tensor_encode(b), forge.uninit[bool, [3]])
+    if e != nil { e } else { to_str(back[0]) + to_str(back[1]) + to_str(back[2]) }
+}"#, Some("truefalsetrue"));
+        // A shape the caller did not declare, and a float envelope read as an
+        // integer tensor: `decode-type` in both, worded once in `crate::ports`.
+        assert_port_str(r#"
+fn main() -> str {
+    let !g = forge.zeros[i64, [4]]
+    let (back, e) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2]])
+    e
+}"#, Some("decode-type: expected tensor shape [2], got [4]"));
+        assert_port_str(r#"
+fn main() -> str {
+    let !f = forge.zeros[f32, [2]]
+    let (back, e) = port_tensor_decode(port_tensor_encode(f), forge.zeros[i64, [2]])
+    e
+}"#, Some("decode-type: expected a `i64` tensor, got `f32`"));
+        // Text that is not JSON, and the declared zero riding the error path.
+        assert_port_str(r#"
+fn main() -> str {
+    let (back, e) = port_tensor_decode("{oops", forge.zeros[i64, [2]])
+    to_str(back[0]) + " " + to_str(e.starts_with("decode-parse"))
+}"#, Some("0 true"));
+    }
+
+    /// A tensor really crosses the port and comes back, on both backends.
+    #[test]
+    fn jit_port_tensor_crosses_a_real_port_by_copy() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_port_str(r#"
+fn main() -> str {
+    let (p, e1) = port_open("python")
+    let !g = forge.zeros[i64, [2, 2]]
+    g[0, 0] = 1  g[0, 1] = 2  g[1, 0] = 3  g[1, 1] = 4
+    let (out, e2) = port_call(p, "dmc.echo", "[" + port_tensor_encode(g) + "]")
+    let (sh, e3) = port_call(p, "dmc.shape", "[" + port_tensor_encode(g) + "]")
+    let (_, e4) = port_close(p)
+    let (back, e5) = port_tensor_decode(out, forge.zeros[i64, [2, 2]])
+    if e5 != nil { e5 } else {
+        sh + " " + to_str(back[0, 0] + back[0, 1] + back[1, 0] + back[1, 1])
+    }
+}"#, Some("[2,2] 10"));
+    }
+
+    /// The boundary is explicit (§3.2): there is no implicit array form, so a
+    /// non-tensor in either position is refused while the program compiles.
+    #[test]
+    fn jit_port_tensor_refuses_a_non_tensor() {
+        assert_eq!(
+            jit_compile_err("fn main() -> nil { let s = port_tensor_encode(7) }"),
+            "`port_tensor_encode` takes a tensor, got `i64`");
+        assert_eq!(
+            jit_compile_err("fn main() -> nil { let (t, e) = port_tensor_decode(\"{}\", 7) }"),
+            "`port_tensor_decode` takes a tensor, got `i64`");
+    }
+
+    /// A `trit` tensor *is* a tensor, and §3.2's reason for refusing it is that
+    /// it has no wire dtype — packed ternary is a demoniC storage format, not a
+    /// portable element type. The JIT reached that case through its own
+    /// `TyKind::TritTensor`, which is not `Tensor` with a trit element, so the
+    /// refusal fell through to "takes a tensor, got `TritTensor[2, 2]`" and
+    /// told the user their tensor was not one. Same words as the interpreter
+    /// now — the two backends should not disagree about *why* a program is bad.
+    #[test]
+    fn jit_a_trit_tensor_is_refused_the_way_the_interpreter_refuses_it() {
+        assert_eq!(
+            jit_compile_err("fn main() -> nil { let !t = forge.trit[2, 2]  \
+                             let s = port_tensor_encode(t) }"),
+            "port_tensor_encode: a `trit` tensor has no copy-mode wire dtype (PORTS.md §3.2)");
+        assert_eq!(
+            jit_compile_err("fn main() -> nil { let !t = forge.trit[2, 2]  \
+                             let (v, e) = port_tensor_decode(\"{}\", t) }"),
+            "port_tensor_decode: a `trit` tensor has no copy-mode wire dtype (PORTS.md §3.2)");
+    }
+
+    // ─── port runtime errors, driven through the real CLI ────────────────────
+    //
+    // These run `dmc run` and `dmc jit` as subprocesses, for two reasons the
+    // in-process helpers cannot cover: the failures below call `exit(1)` from
+    // the JIT's runtime helpers (which would take the test harness with them),
+    // and the JIT's port registry is a thread-local shared by every test on the
+    // same harness thread, so a handle id is only reproducible in a fresh
+    // process.
+
+    /// The `dmc` binary, located from the running test executable rather than
+    /// from a hard-coded `compiler/target/release/dmc`. `cargo test` builds the
+    /// binary into whatever target dir is in force, so the hard-coded path is a
+    /// silent skip (or, worse, a *stale* binary from an earlier build) whenever
+    /// `CARGO_TARGET_DIR` is set or only a debug build exists.
+    fn dmc_bin() -> std::path::PathBuf {
+        if let Some(p) = option_env!("CARGO_BIN_EXE_dmc") {
+            return std::path::PathBuf::from(p);
+        }
+        // …/<target>/<profile>/deps/<harness> → …/<target>/<profile>/dmc
+        let exe = std::env::current_exe().expect("current_exe");
+        let deps = exe.parent().expect("deps dir");
+        for cand in [deps.join("dmc"), deps.join("../dmc")] {
+            if cand.is_file() { return cand; }
+        }
+        panic!("cannot locate the `dmc` binary near {}", exe.display());
+    }
+
+    /// Run `src` under both backends in fresh processes and assert they agree
+    /// on exit status, stdout and stderr — then assert those are what `want_rc`
+    /// / `want_out` / `want_err` say. `main` must not *return* a value: the two
+    /// CLIs spell the `=> <ret>` echo differently (the interpreter prefixes a
+    /// blank line), which is a presentation difference this is not about.
+    fn assert_cli_agree(name: &str, src: &str, want_rc: i32, want_out: &str, want_err: &str) {
+        let bin = dmc_bin();
+        let tmp = std::env::temp_dir().join(format!("dmc_port_{}.dmc", name));
+        std::fs::write(&tmp, src).expect("write temp file");
+        let mut seen = Vec::new();
+        for mode in ["run", "jit"] {
+            let out = std::process::Command::new(&bin)
+                .args([mode, tmp.to_str().unwrap()])
+                .output().expect("run dmc");
+            let rc = out.status.code();
+            let so = String::from_utf8_lossy(&out.stdout).to_string();
+            let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            assert_eq!(rc, Some(want_rc), "[{} {}] stderr: {}", mode, name, se);
+            assert_eq!(so, want_out, "[{} {}] stdout", mode, name);
+            assert_eq!(se, want_err, "[{} {}] stderr", mode, name);
+            seen.push((rc, so, se));
+        }
+        assert_eq!(seen[0], seen[1], "run/jit divergence for {}", name);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A handle that is nil — what a failed `port_open` hands back — is not a
+    /// handle. Both backends die on the same line, with the same span and the
+    /// same wording, rather than inventing a `port-closed` tag or dereferencing
+    /// the null pointer.
+    #[test]
+    fn jit_port_on_a_nil_handle_dies_like_the_interpreter() {
+        assert_cli_agree("nil_handle_call",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"lua\")\n    \
+             let (o, e2) = port_call(p, \"len\", \"[[1]]\")\n}\n",
+            1, "", "runtime error at 3:19: port_call: first arg must be a Port handle from port_open");
+        assert_cli_agree("nil_handle_close",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"lua\")\n    \
+             let (x, e2) = port_close(p)\n}\n",
+            1, "", "runtime error at 3:19: port_close: arg must be a Port handle from port_open");
+    }
+
+    /// A `str`-typed port argument that is *nil at runtime* is not a `str`.
+    ///
+    /// The argument lowering checked only the static `TyKind::Str`, and a JIT
+    /// `nil` str is a null forge pointer — which `dmc_str_to_rust` answers as
+    /// `""`. So `port_open(e)` on a nil `e` opened a runtime named nothing
+    /// (silently, rc 0) and `port_call(p, e, ..)` sent that empty name across
+    /// the pipe, where the interpreter had raised a located error at the same
+    /// spot. The check is now where it has to be — at run time, in the helper,
+    /// against the null pointer — and both backends say the same thing.
+    #[test]
+    fn jit_a_nil_str_port_argument_dies_like_the_interpreter() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        // A nil `lang`: `e` is nil precisely because the open succeeded.
+        assert_cli_agree("nil_lang",
+            "fn main() -> nil {\n    let (p0, e0) = port_open(\"python\")\n    \
+             let (_, _) = port_close(p0)\n    let (p, e) = port_open(e0)\n}\n",
+            1, "", "runtime error at 4:18: port_open: lang must be str");
+        // A nil call name — the one that used to cross the wire.
+        assert_cli_agree("nil_call_name",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             let (o, e2) = port_call(p, e, \"[]\")\n    let (_, _) = port_close(p)\n}\n",
+            1, "", "runtime error at 3:19: port_call: name must be str");
+    }
+
+    /// The payload is the one port `str` argument a null pointer is *allowed*
+    /// to reach, because `nil` there is the written-out form of "call with no
+    /// arguments" (PORTS.md §2) and the interpreter reads it as the empty
+    /// payload. Pinned so the null check above is never widened onto it.
+    #[test]
+    fn jit_a_nil_payload_still_means_no_arguments() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_cli_agree("nil_payload",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             let (o, e2) = port_call(p, \"list\", nil)\n    print(o)\n    \
+             let (_, _) = port_close(p)\n}\n",
+            0, "[]\n", "");
+    }
+
+    /// `nil` has no methods. The PORTS.md §6 idiom written *without* its nil
+    /// guard — `e.starts_with("port-open")` on an `Err` that is nil because
+    /// nothing went wrong — used to answer "no" under the interpreter (it fell
+    /// through to a forward-compat opaque, which is falsy) while the JIT raised.
+    /// Both now raise, on the same line, with the same words.
+    #[test]
+    fn jit_starts_with_on_a_nil_err_dies_like_the_interpreter() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_cli_agree("nil_starts_with",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             let b = e.starts_with(\"port-open\")\n    let (_, _) = port_close(p)\n}\n",
+            1, "", "runtime error at 3:13: cannot call method `starts_with` on nil");
+    }
+
+    /// Indexing a nil `Err` is the same located error in both backends. The
+    /// JIT already refused it; it just did so without a span, while the
+    /// interpreter answered `<opaque index>` and exited 0.
+    #[test]
+    fn jit_indexing_a_nil_err_dies_like_the_interpreter() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_cli_agree("nil_index",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             let (_, _) = port_close(p)\n    let c = e[0]\n}\n",
+            1, "", "runtime error at 4:13: cannot index nil");
+    }
+
+    /// `Port[L]` names a runtime, and now means it. A `Port[lua]` parameter
+    /// used to take a python handle in *both* backends without a word, so the
+    /// annotation implied a check that did not exist. The handle carries its
+    /// own runtime name, so the check is at run time, at the binding, in both.
+    #[test]
+    fn jit_a_port_annotation_checks_its_runtime_name() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_cli_agree("port_lang_mismatch",
+            "fn ask(q: Port[lua]) -> str {\n    let (o, _) = port_call(q, \"list\", nil)\n    o\n}\n\
+             fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             let r = ask(p)\n    let (_, _) = port_close(p)\n}\n",
+            1, "",
+            "runtime error at 7:13: port lang mismatch: expected a `Port[lua]` handle, \
+             got one opened for `python`");
+        // A typed `let` is the same position by another name, and agrees to
+        // the byte. (A declared *return* also refuses in both, with the same
+        // message, but not yet at the same span: `dmc run` points at the call
+        // site and `dmc jit` at the function declaration. The refusal is the
+        // contract; the span there is not pinned.)
+        assert_cli_agree("port_lang_let",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             let q: Port[lua] = p\n    let (_, _) = port_close(p)\n}\n",
+            1, "",
+            "runtime error at 3:5: port lang mismatch: expected a `Port[lua]` handle, \
+             got one opened for `python`");
+        // The matching annotation still binds, and still drives the port.
+        assert_cli_agree("port_lang_match",
+            "fn ask(q: Port[python]) -> str {\n    let (o, _) = port_call(q, \"list\", nil)\n    o\n}\n\
+             fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             print(ask(p))\n    let (_, _) = port_close(p)\n}\n",
+            0, "[]\n", "");
+    }
+
+    /// A live handle is opaque, but both backends still *render* one the same
+    /// way when a program insists on seeing it: the interpreter Displays its
+    /// `Value::Opaque`, and the JIT emits the identical text rather than
+    /// leaking the bare handle or refusing. Display only — what comes out is
+    /// not itself a handle. Run in a fresh process because the rendering
+    /// carries the id, and the JIT's registry is a thread-local shared by
+    /// every in-process test on the same harness thread.
+    #[test]
+    fn jit_port_handle_prints_as_the_interpreters_opaque() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_cli_agree("print_handle",
+            "fn main() -> nil {\n    let (p, e) = port_open(\"python\")\n    \
+             print(p)\n    print(to_str(p))\n    print(p as str)\n    print(\"x=\" + p)\n    \
+             let (_, _) = port_close(p)\n}\n",
+            0, "<opaque port#1:python>\n<opaque port#1:python>\n\
+                <opaque port#1:python>\nx=<opaque port#1:python>\n", "");
+    }
+
+    /// End to end through the CLI: every §6 tag, in one program, printed rather
+    /// than returned so the comparison is on the program's own output.
+    #[test]
+    fn jit_port_every_tag_agrees_through_the_cli() {
+        if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+        assert_cli_agree("all_tags", r#"
+fn main() -> nil {
+    let (bad, e1) = port_open("lua")
+    print(e1)
+    let (p, _) = port_open("python")
+    let (_, e2) = port_call(p, "math.sqrt", "[\"sixteen\"]")
+    print(e2)
+    let (_, e3) = port_call(p, "math.sqrt", "16")
+    print(e3)
+    let (_, _) = port_close(p)
+    let (_, e4) = port_close(p)
+    print(e4)
+    let (_, e5) = port_call(p, "len", "[[1]]")
+    print(e5)
+}
+"#, 0, "port-open: unsupported runtime `lua` — the process-port floor implements `python`\n\
+        port-call: must be real number, not str\n\
+        port-protocol: payload must be a JSON array, an {args, kwargs} object, or null\n\
+        port-closed: handle was already closed\n\
+        port-closed: handle was already closed\n", "");
+    }
 }
 
-/// Can this else-side fall through *carrying a value*? Purely syntactic, so it
-/// is answerable before the branch is lowered — which is what `lower_if` needs,
-/// since Cranelift requires a block be terminated before switching away from
-/// it and therefore forces the then-side jump to be emitted first.
+/// What one side of an `if` does at the join block.
 ///
-/// Conservative in the safe direction: `true` means "might yield", `false`
-/// means "definitely does not". A `false` result is the only thing that
-/// changes behaviour, and it only suppresses a phi param that would otherwise
-/// have made the function fail to compile.
-fn else_can_yield_value(e: &Option<ElseBranch>) -> bool {
-    match e {
-        None => false,
-        Some(ElseBranch::Block(b)) => block_can_yield_value(b),
-        // An `else if` chain: assume it might. Saying "might" preserves the
-        // pre-existing behaviour, which is correct whenever both sides really
-        // do carry a value; only a definite "no" is allowed to change anything.
-        Some(ElseBranch::If(_)) => true,
+/// `lower_if` has to decide whether the join carries a phi param *before* the
+/// else side is lowered: Cranelift requires a block be terminated before
+/// switching away from it, so the then-side jump is already emitted by the
+/// time the else side is looked at. Both jumps must then agree with that one
+/// decision, or the function fails IR verification.
+///
+/// The predicate this replaces was two-valued — "might yield a value" or not —
+/// and that conflated two genuinely different things: a side that *reaches*
+/// the join carrying nothing, and a side that never reaches the join at all.
+/// Both answered "no", and each was wrong in its own direction:
+///
+/// - `if c { 0 } else { if d { .. } }` — the trailing no-else `if` yields
+///   nothing, but the old answer was "might" (any trailing `Stmt::If` was),
+///   so the join got a param the else-side jump could not supply.
+/// - `let x = if c { 5 } else { return 0 }` — the else side never arrives, so
+///   the then value is the only one at the join, but the old answer was "no",
+///   suppressing the phi and reporting the `if` as valueless.
+///
+/// Three values keep those apart. Only `Diverges` can make the IR
+/// inconsistent if it is wrong, so it is read off the one terminator the
+/// syntax states outright.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JoinEdge {
+    /// Falls through to the join carrying a value.
+    Value,
+    /// Falls through to the join carrying nothing.
+    Empty,
+    /// Never reaches the join.
+    Diverges,
+}
+
+/// Combine the two sides of a nested `if` into the single edge it presents to
+/// an enclosing join. A side that never arrives constrains nothing; otherwise
+/// the join carries a value only if every side that does arrive brings one.
+fn join_edges(t: JoinEdge, e: JoinEdge) -> JoinEdge {
+    match (t, e) {
+        (JoinEdge::Diverges, other) | (other, JoinEdge::Diverges) => other,
+        (JoinEdge::Value, JoinEdge::Value) => JoinEdge::Value,
+        _ => JoinEdge::Empty,
     }
 }
 
-/// Might this block fall through carrying a value? A block yields its
-/// `tail_expr`, but note that a *trailing block-form* `if`/`match` parses as a
-/// statement rather than a tail expression (#421), so an empty `tail_expr`
-/// alone does not mean "no value".
-fn block_can_yield_value(b: &crate::ast::Block) -> bool {
-    if b.tail_expr.is_some() {
-        return true;
+fn else_join_edge(e: &Option<ElseBranch>) -> JoinEdge {
+    match e {
+        // No `else` at all: the else-side edge runs straight to the join
+        // empty-handed. An `if` without an `else` never yields a value.
+        None => JoinEdge::Empty,
+        Some(ElseBranch::Block(b)) => block_join_edge(b),
+        Some(ElseBranch::If(nested)) => if_join_edge(nested),
     }
-    matches!(b.stmts.last(), Some(Stmt::If(_)) | Some(Stmt::Match(_)))
+}
+
+fn if_join_edge(i: &IfExpr) -> JoinEdge {
+    join_edges(block_join_edge(&i.then_branch), else_join_edge(&i.else_branch))
+}
+
+/// How does this block leave, as far as an enclosing join is concerned?
+fn block_join_edge(b: &crate::ast::Block) -> JoinEdge {
+    if b.tail_expr.is_some() {
+        return JoinEdge::Value;
+    }
+    match b.stmts.last() {
+        // A *trailing block-form* `if`/`match` parses as a statement rather
+        // than a tail expression (#421), so it is still what the block yields
+        // — but only if it yields anything, which is the recursion.
+        Some(Stmt::If(i)) => if_join_edge(i),
+        Some(Stmt::Match(_)) => JoinEdge::Value,
+        // `return` is the one exit the syntax states outright, so it is the
+        // only thing classified `Diverges`. A `break`/`continue` leaves this
+        // block too, but it lands somewhere an enclosing loop owns rather than
+        // at this join, and calling it `Empty` costs only a phi — while a
+        // wrong `Diverges` would cost a compile.
+        Some(Stmt::Return { .. }) => JoinEdge::Diverges,
+        _ => JoinEdge::Empty,
+    }
 }

@@ -1,0 +1,201 @@
+# port_payloads.dmc -- building a port payload out of demoniC values.
+#
+# The companion to port_python.dmc. That file writes every payload as the
+# literal JSON text that crosses the pipe, so what you read there is what the
+# runtime receives; this one builds the same payloads the way a real program
+# does -- `list()` / `list_push` / `map()` / `map_set` / `json_encode` -- and
+# decodes the results back into demoniC values with the typed-decode family
+# (PORTS.md §3.1). Between them the two files cover both directions of the
+# boundary: the wire text, and the values on either side of it.
+#
+# The split is not cosmetic. `list`, `map` and `json_encode` are outside the
+# JIT's lowered subset, so a file using them is refused by `dmc jit` as a
+# whole -- and the refusal is the honest outcome, not a failure:
+#
+#     dmc jit examples/port_payloads.dmc
+#     jit unsupported at ...: unknown function `list`; use `dmc run` for ...
+#
+# Keeping these tests here means `dmc test --jit` records this file as 0 ran
+# (outside the subset) and port_python.dmc as fully run, instead of one number
+# that averages a real gate with a refusal. The baseline says exactly that.
+#
+# Run: dmc run examples/port_payloads.dmc   (python3 is a dev prerequisite)
+
+# A positional argument vector, built rather than spelled: [a, b].
+# Compare port_python.dmc's `pos2`, which formats the same JSON by hand.
+fn pos2(a: i64, b: i64) -> str {
+    let xs = list()
+    let xs = list_push(xs, a)
+    let xs = list_push(xs, b)
+    json_encode(xs)
+}
+
+fn main() -> str {
+    let (p, e1) = port_open("python")
+    if e1 != nil {
+        print("port open failed: " + e1)
+        return e1
+    }
+
+    let (g, e2) = port_call(p, "math.gcd", pos2(462, 1071))
+    if e2 != nil {
+        print("gcd failed: " + e2)
+        let (_, _) = port_close(p)
+        return e2
+    }
+    print("gcd(462, 1071) = " + g)     # -> 21
+
+    let (_, e3) = port_close(p)
+    if e3 != nil { return e3 }
+    g
+}
+
+# --- tests ---
+
+# One positional argument that is itself a list: sum([1, 2, 3]) == 6. The
+# nesting the ABI requires (§2) is visible in the construction -- `payload`
+# holds one element, and that element is the list python receives.
+fn test_positional_vector_from_a_list() -> bool {
+    let one = list()
+    let one = list_push(one, 1)
+    let one = list_push(one, 2)
+    let one = list_push(one, 3)
+    let payload = list()
+    let payload = list_push(payload, one)
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "sum", json_encode(payload))
+    let (_, _) = port_close(p)
+    err == nil && out == "6"
+}
+
+# The {args, kwargs} envelope built as a map of a list and a map:
+# sorted([3, 1, 2], reverse=true) == [3, 2, 1].
+fn test_kwargs_envelope_from_a_map() -> bool {
+    let inner = list()
+    let inner = list_push(inner, 3)
+    let inner = list_push(inner, 1)
+    let inner = list_push(inner, 2)
+    let args = list()
+    let args = list_push(args, inner)
+    let kwargs = map()
+    let kwargs = map_set(kwargs, "reverse", true)
+    let env = map()
+    let env = map_set(env, "args", args)
+    let env = map_set(env, "kwargs", kwargs)
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "sorted", json_encode(env))
+    let (_, _) = port_close(p)
+    err == nil && out == "[3,2,1]"
+}
+
+# A float keyword argument through the same envelope:
+# round(3.14159, ndigits=2) == 3.14.
+fn test_float_kwarg_from_a_map() -> bool {
+    let args = list()
+    let args = list_push(args, 3.14159)
+    let kwargs = map()
+    let kwargs = map_set(kwargs, "ndigits", 2)
+    let env = map()
+    let env = map_set(env, "args", args)
+    let env = map_set(env, "kwargs", kwargs)
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "round", json_encode(env))
+    let (_, _) = port_close(p)
+    err == nil && out == "3.14"
+}
+
+# A built payload reaches a foreign exception the same way a literal one does:
+# the encoder is not what decides the tag (PORTS.md §6).
+fn test_a_built_payload_still_tags_port_call() -> bool {
+    let bad = list()
+    let bad = list_push(bad, "sixteen")
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.sqrt", json_encode(bad))
+    let (_, _) = port_close(p)
+    err != nil && err.starts_with("port-call") && out == ""
+}
+
+# `json_encode` escapes on the way out, so a string carrying a quote and a
+# newline crosses intact without the caller quoting anything: python counts
+# the 12 characters of `he said "hi"` plus the newline -- 13.
+fn test_json_encode_escapes_the_payload() -> bool {
+    let args = list()
+    let args = list_push(args, "he said \"hi\"\n")
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "len", json_encode(args))
+    # The frame stayed in sync: the next call still answers correctly.
+    let (after, aerr) = port_call(p, "math.gcd", pos2(462, 1071))
+    let (_, _) = port_close(p)
+    err == nil && out == "13" && after == "21" && aerr == nil
+}
+
+# Typed decode (PORTS.md §3.1) turns the result str into a demoniC value, so a
+# port result composes with arithmetic instead of string comparison. Compare
+# test_positional_vector_from_a_list above, which asserts `out == "6"`.
+fn test_typed_decode_gives_a_real_int() -> bool {
+    let one = list()
+    let one = list_push(one, 1)
+    let one = list_push(one, 2)
+    let one = list_push(one, 3)
+    let payload = list()
+    let payload = list_push(payload, one)     # [[1,2,3]]
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "sum", json_encode(payload))
+    let (_, _) = port_close(p)
+    if err != nil { return false }
+    let (n, derr) = json_decode_i64(out)
+    derr == nil && n * 7 == 42
+}
+
+# A typed decode never coerces. `repr(5)` comes back as the JSON string "5",
+# and asking for an i64 is a `decode-type` tag, not a silent 5. That tag is how
+# a generated wrapper reports that its descriptor promised the wrong type.
+fn test_typed_decode_mismatch_tags_decode_type() -> bool {
+    let args = list()
+    let args = list_push(args, 5)
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "repr", json_encode(args))
+    let (_, _) = port_close(p)
+    if err != nil { return false }
+    let (n, derr) = json_decode_i64(out)
+    n == 0 && derr != nil && derr.starts_with("decode-type")
+}
+
+# A whole-valued result larger than i64 is still a well-formed JSON number.
+# math.fabs(1e20) comes back as 21 digits (the canonical writer drops a whole
+# float's fraction, PORTS.md §2), and a typed f64 decode takes it. It used to
+# be a `decode-parse`, which was doubly wrong: the text is JSON, and the caller
+# was pointed at a corrupt payload instead of a range.
+fn test_typed_decode_takes_a_result_past_i64() -> bool {
+    let args = list()
+    let args = list_push(args, 1.0e20)
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "math.fabs", json_encode(args))
+    let (_, _) = port_close(p)
+    if err != nil { return false }
+    let (x, derr) = json_decode_f64(out)
+    if derr != nil { return false }
+    # Asking the same text for an i64 is a range mismatch, not a broken payload.
+    let (n, ierr) = json_decode_i64(out)
+    x > 9.0e19 && n == 0 && ierr != nil && ierr.starts_with("decode-type")
+}
+
+# The disclosed gap (PORTS.md §3.1). math.fabs returns a python float, but the
+# canonical writer prints 5.0 as `5`, so an i64 decode of that result succeeds
+# and nothing at this boundary can tell it was a float. Pinned as documented
+# behavior. Only a non-whole result keeps its fraction and gets caught.
+fn test_typed_decode_cannot_see_a_whole_float() -> bool {
+    let a = list()
+    let a = list_push(a, 5.0)
+    let b = list()
+    let b = list_push(b, 5.5)
+    let (p, _) = port_open("python")
+    let (whole, e1) = port_call(p, "math.fabs", json_encode(a))
+    let (frac, e2) = port_call(p, "math.fabs", json_encode(b))
+    let (_, _) = port_close(p)
+    if e1 != nil || e2 != nil { return false }
+    let (n, nerr) = json_decode_i64(whole)
+    let (m, merr) = json_decode_i64(frac)
+    whole == "5" && n == 5 && nerr == nil
+        && m == 0 && merr != nil && merr.starts_with("decode-type")
+}

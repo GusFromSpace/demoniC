@@ -18,7 +18,7 @@ use crate::ast::{Expr, Literal, BinOp, UnOp};
 // ─── SymDim ──────────────────────────────────────────────────────────────────
 
 /// Symbolic dimension. Supports a small algebra: constants, variables,
-/// add/sub/mul/div/mod. `Streaming` (`~`) and `Wildcard` (`_`) are
+/// add/sub/mul/div/mod. `Streaming` (`~`) and `Wildcard` (`?`) are
 /// special markers; `Unknown` is the bottom for cases we can't analyze.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SymDim {
@@ -31,7 +31,7 @@ pub enum SymDim {
     Mod(Box<SymDim>, Box<SymDim>),
     Neg(Box<SymDim>),
     Streaming,   // `~` — growing axis (per-step extent)
-    Wildcard,    // `_` — matches anything in shape patterns
+    Wildcard,    // `?` — the dynamic dim (SPEC §3.2); matches anything
     Unknown,     // analysis failure; conservative ⊥
 }
 
@@ -41,9 +41,11 @@ impl SymDim {
     pub fn from_expr(expr: &Expr) -> SymDim {
         match expr {
             Expr::Literal(Literal::Int(n, _), _) => SymDim::Const(*n),
+            // No `_` arm: `_` is not a dimension (#501, S3), and it could not
+            // arrive here regardless — the parser lowers a bare `_` to
+            // `Expr::Underscore`, never to an ident.
             Expr::Ident(name, _) => {
-                if name == "_" { SymDim::Wildcard }
-                else if name == "~" { SymDim::Streaming }
+                if name == "~" { SymDim::Streaming }
                 else { SymDim::Var(name.clone()) }
             }
             Expr::UnOp { op: UnOp::Neg, operand, .. } => {
@@ -172,8 +174,12 @@ impl fmt::Display for SymDim {
             Mod(l, r) => write!(f, "({}%{})", l, r),
             Neg(x) => write!(f, "-{}", x),
             Streaming => write!(f, "~"),
-            Wildcard => write!(f, "_"),
-            Unknown => write!(f, "?"),
+            // A dim the user wrote `?` is handed back as `?`: since #501 that
+            // is its only spelling, and `_` here produced a rendered type that
+            // no longer re-parses. `??` is not lexable (`TOKENIZER.md §2`),
+            // which is the point — an unanalyzable dim is not a writable type.
+            Wildcard => write!(f, "?"),
+            Unknown => write!(f, "??"),
         }
     }
 }

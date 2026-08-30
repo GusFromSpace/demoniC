@@ -48,6 +48,15 @@ pub enum TyType {
     /// We store the model name; method resolution looks up in Env.models.
     Named { name: String, args: Vec<TyType> },
 
+    /// A *shape argument* inside a `Named` type's argument list — the `2, 2`
+    /// of `Box[2, 2]`, the `H, W` of `Inner[H, W]` (#474). A model declares
+    /// shape parameters, never type parameters, so every argument a model
+    /// name carries is a dim and has to compare as one: `SymDim` equivalence,
+    /// not type compatibility. Reusing `IntLit` here would be wrong in the
+    /// worst way — two int literals are compatible with each other, so
+    /// `Inner[2]` and `Inner[3]` would unify.
+    Dim(SymDim),
+
     /// A C-like enum type (#336). Carries the enum's name; variant values are
     /// i64 ordinals. Distinct from a plain `i64` so `match` can do real
     /// (closed-set) exhaustiveness and a stray int can't silently flow in.
@@ -88,8 +97,9 @@ impl TyType {
 
     /// Is this an integral type (signed/unsigned int family, or an untyped int
     /// literal)? Floats and trit are excluded. Used by literal inference (#295):
-    /// an int literal may adopt an integral context but not a float one.
-    #[allow(dead_code)]
+    /// an int literal may adopt an integral context but not a float one; and
+    /// by `check_binop` (#539) to scope the operand-position strict-typing
+    /// check to the integral family only.
     pub fn is_integral(&self) -> bool {
         matches!(self, TyType::IntLit(_)) || matches!(self, TyType::Scalar(s) if matches!(s,
             ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 |
@@ -194,8 +204,21 @@ impl TyType {
                 a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.compatible_with(y))
             }
             (Named { name: a, args: aa }, Named { name: b, args: ba }) => {
-                a == b && aa.len() == ba.len() && aa.iter().zip(ba).all(|(x, y)| x.compatible_with(y))
+                // #474: one side written without its shape args (`Inner` where
+                // the other says `Inner[4, 5]`) carries no information to
+                // contradict, so the name alone decides — the pre-#474
+                // behaviour, when *no* model type carried args. Where both
+                // sides spell their args out, they are compared.
+                a == b
+                    && (aa.is_empty() || ba.is_empty()
+                        || (aa.len() == ba.len()
+                            && aa.iter().zip(ba).all(|(x, y)| x.compatible_with(y))))
             }
+            // #474: shape args compare as dims. `Equiv::Unknown` (a shape
+            // variable against a constant) is a *failure* here, not a shrug:
+            // an unbound `Inner[H, W]` expectation is exactly the case that
+            // must keep reporting, and `Shape::same` treats it the same way.
+            (Dim(a), Dim(b)) => matches!(a.equivalent(b), crate::shape::Equiv::Equal),
             // #336: enums are nominal — same name only. An int does NOT implicitly
             // flow into an enum (or vice versa); use `as i64` for the ordinal.
             (Enum(a), Enum(b)) => a == b,
@@ -260,6 +283,7 @@ impl std::fmt::Display for TyType {
                 }
                 Ok(())
             }
+            Dim(d) => write!(f, "{}", d),
             Unit => write!(f, "nil"),
             Map => write!(f, "map"),
             Unknown => write!(f, "?"),
@@ -290,6 +314,10 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         ret,
     };
     let u = TyType::Unknown;
+    // `(T, Err)` — the fallible convention (SPEC §3.9/§4.9), used by the typed
+    // JSON decode family.
+    let decoded = |t: TyType| TyType::Tuple(vec![
+        t, TyType::Named { name: "Err".to_string(), args: Vec::new() }]);
     match name {
         // Elementwise math — 1 arg, return mirrors input type (generic over T).
         "sqrt" | "exp" | "log" | "abs" | "sin" | "cos" | "floor" | "ceil"
@@ -386,6 +414,17 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         // JSON
         "json_encode" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::Str))),
         "json_decode" => Some(mk(1, TyType::Unknown)),
+        // Typed decode (PORTS.md §6): `(T, Err)`, with a real T so an
+        // assimilated wrapper's declared return type is checked, not asserted.
+        // The Err slot is the nil-or-str alias (SPEC §3.9), so `!= nil` and the
+        // `?` operator both see the shape they expect.
+        "json_decode_i64"  => Some(mk(1, decoded(TyType::Scalar(crate::ast::ScalarType::I64)))),
+        "json_decode_f64"  => Some(mk(1, decoded(TyType::Scalar(crate::ast::ScalarType::F64)))),
+        "json_decode_str"  => Some(mk(1, decoded(TyType::Scalar(crate::ast::ScalarType::Str)))),
+        "json_decode_bool" => Some(mk(1, decoded(TyType::Scalar(crate::ast::ScalarType::Bool)))),
+        // A list has no element type in the checker's view, so the value slot
+        // is Unknown — the primitive still refuses a non-list at runtime.
+        "json_decode_list" => Some(mk(1, decoded(TyType::Unknown))),
         // List functional combinators
         "list_map" => Some(mk(2, u.clone())),
         "list_filter" => Some(mk(2, u.clone())),
@@ -422,6 +461,13 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         "port_open"  => Some(mk(1, TyType::Unknown)),
         "port_call"  => Some(mk(3, TyType::Unknown)),
         "port_close" => Some(mk(1, TyType::Unknown)),
+        // Tensor copy mode (PORTS.md §3.2). `encode` yields the envelope text;
+        // `decode` is the fallible half, so it wears the `(T, Err)` shape the
+        // typed JSON decodes wear. The tensor slot is Unknown for the same
+        // reason `json_decode_list`'s is: the checker has no element type to
+        // put there, and the primitive still refuses a non-tensor at runtime.
+        "port_tensor_encode" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::Str))),
+        "port_tensor_decode" => Some(mk(2, decoded(TyType::Unknown))),
         // Regex
         "regex_match"       => Some(mk(2, TyType::Scalar(crate::ast::ScalarType::Bool))),
         "regex_find"        => Some(mk(2, TyType::Unknown)),
@@ -557,6 +603,13 @@ pub struct Env {
     /// Mutating one outside a `vault { … }` context is a cross-arena write.
     /// Same scoping discipline as `uninit_bindings`.
     vault_bindings: Vec<std::collections::HashSet<String>>,
+    /// #533 (PORTS.md §3.2): bindings whose RHS was a `forge.trit`/`vault.trit`
+    /// constructor. `forge.trit[K, N]` takes its dims as bare integers with no
+    /// element-type argument, so `ctor_tensor_ty` does not recognise it and the
+    /// binding types as `Unknown` — but a `trit` tensor has no copy-mode wire
+    /// dtype, and that is a static property the port primitives must be able to
+    /// see. Same scoping discipline as `vault_bindings`.
+    trit_bindings: Vec<std::collections::HashSet<String>>,
     /// Symbolic shape parameters in scope, mapped to their declared bounds
     /// (None if unbounded, Some(c) if `= c` was provided).
     pub shape_params: Vec<HashMap<String, Option<SymDim>>>,
@@ -588,6 +641,7 @@ impl Env {
         self.ctor_shapes.push(HashMap::new());
         self.uninit_bindings.push(std::collections::HashSet::new());
         self.vault_bindings.push(std::collections::HashSet::new());
+        self.trit_bindings.push(std::collections::HashSet::new());
     }
     pub fn pop_scope(&mut self)  {
         self.scopes.pop();
@@ -595,6 +649,29 @@ impl Env {
         self.ctor_shapes.pop();
         self.uninit_bindings.pop();
         self.vault_bindings.pop();
+        self.trit_bindings.pop();
+    }
+
+    /// #533: record (or clear) that a binding holds a packed `trit` tensor.
+    /// Called on every `let` with a simple pattern, so a rebind to anything
+    /// else drops the stale tag in this scope.
+    pub fn set_trit_origin(&mut self, name: impl Into<String>, is_trit: bool) {
+        if let Some(scope) = self.trit_bindings.last_mut() {
+            let n: String = name.into();
+            if is_trit { scope.insert(n); } else { scope.remove(&n); }
+        }
+    }
+
+    /// #533: is `name` bound to a packed `trit` tensor? Walks inside-out and
+    /// stops at the first scope that binds the name at all, so a shadowing
+    /// binding masks an outer tag rather than seeing through it — the
+    /// `lookup_ctor_shape` discipline.
+    pub fn is_trit_binding(&self, name: &str) -> bool {
+        for (vals, trits) in self.scopes.iter().rev().zip(self.trit_bindings.iter().rev()) {
+            if trits.contains(name) { return true; }
+            if vals.contains_key(name) { return false; }
+        }
+        false
     }
 
     /// #442 (MEMORY §3.1): record that a binding's value lives in the Vault.
@@ -662,6 +739,51 @@ impl Env {
             if vals.contains_key(name) { return false; }
         }
         false
+    }
+
+    // ── #476 (MEMORY §2): one level of reach through model fields ────────────
+    //
+    // A model-array field initialized straight from `uninit` — `Holder { cells:
+    // vault.uninit[Cell, [3]] }` — is exactly as undefined as the local
+    // `let !cs = vault.uninit[Cell, [3]]`, but the binding-level check could
+    // not see it: the array is not a binding, it is a field of one. Such
+    // fields are tracked under the dotted path `binding.field`, marked with
+    // the same `mark_uninit` and read with the accessors below, which mask on
+    // the ROOT binding so an inner shadow of `h` hides an outer `h.cells`.
+    //
+    // Deliberately one level deep and model-array-only. A tensor field binds
+    // as a live alias (`let !v = h.buf` is a FieldRef), so filling through it
+    // really works and flagging it would be a false positive; a model-array
+    // field binds by value, which is the whole bug.
+
+    /// #476: is `root.field` an unwritten uninit model-array field?
+    pub fn is_uninit_field(&self, root: &str, field: &str) -> bool {
+        let path = format!("{root}.{field}");
+        for (vals, marks) in self.scopes.iter().rev().zip(self.uninit_bindings.iter().rev()) {
+            if marks.contains(&path) { return true; }
+            if vals.contains_key(root) { return false; }
+        }
+        false
+    }
+
+    /// #476: the first write landed (or the read was reported).
+    pub fn clear_uninit_field(&mut self, root: &str, field: &str) {
+        let path = format!("{root}.{field}");
+        for (vals, marks) in self.scopes.iter().rev().zip(self.uninit_bindings.iter_mut().rev()) {
+            if marks.remove(&path) { return; }
+            if vals.contains_key(root) { return; }
+        }
+    }
+
+    /// #476: `root` was rebound, or handed to something that could fill it
+    /// (a model instance aliases through its `Rc`, so any call taking it may
+    /// initialize the field). Drop every field mark under it — the check errs
+    /// toward silence rather than toward a false report.
+    pub fn clear_uninit_fields_under(&mut self, root: &str) {
+        let prefix = format!("{root}.");
+        for marks in self.uninit_bindings.iter_mut().rev() {
+            marks.retain(|p| !p.starts_with(&prefix));
+        }
     }
     pub fn push_shape_scope(&mut self) { self.shape_params.push(HashMap::new()); }
     pub fn pop_shape_scope(&mut self)  { self.shape_params.pop(); }
@@ -814,6 +936,8 @@ impl Env {
             "rand_seed", "rand_float", "rand_int", "rand_normal", "rand_choice",
             // JSON
             "json_encode", "json_decode",
+            "json_decode_i64", "json_decode_f64", "json_decode_str",
+            "json_decode_bool", "json_decode_list",
             // List functional combinators
             "list_map", "list_filter", "list_reduce", "list_sort", "list_sort_by",
             "list_zip", "list_enumerate", "list_flatten", "list_uniq",
@@ -826,8 +950,9 @@ impl Env {
             "path_exists", "path_is_dir", "path_is_file",
             // Process execution
             "exec_cmd",
-            // Ports (#402, PORTS.md §2)
+            // Ports (#402, PORTS.md §2) + tensor copy mode (PORTS.md §3.2)
             "port_open", "port_call", "port_close",
+            "port_tensor_encode", "port_tensor_decode",
             // Regex
             "regex_match", "regex_find", "regex_find_all",
             "regex_replace", "regex_replace_all", "regex_split",

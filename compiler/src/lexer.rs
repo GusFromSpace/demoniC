@@ -78,7 +78,6 @@ pub enum TokenKind {
     DotMul,        // `.*`
     DotDiv,        // `./`
     DotPow,        // `.^`
-    DotPow2,       // `.**`
 
     // Elementwise comparison
     DotGt,         // `.>`
@@ -100,7 +99,12 @@ pub enum TokenKind {
 
     // Pipe operators
     Pipe,          // `|>`
-    RShift,        // `>>`  (bitwise right shift / pipeline fan-out)
+    // `>>` — the arithmetic right shift (#530). It spelled the pipe until the
+    // pre-0.1.0 redundancy sweep (#501, ruling S1a) freed the token; the
+    // parser now folds it onto `BinOp::BitShr`, the mirror of `<<`/`BitShl`.
+    // (The separate, still-unconstructible `BinOp::RShift` is the pipe-era
+    // AST variant ruling S16 keeps reserved — it is not this token's node.)
+    RShift,        // `>>`  (arithmetic right shift)
 
     // Stream assignment
     StreamArrow,   // `<-`
@@ -791,7 +795,12 @@ impl<'src> Lexer<'src> {
                         self.advance(); TokenKind::DotSub
                     } else if self.peek() == Some(b'*') {
                         self.advance();
-                        if self.eat(b'*') { TokenKind::DotPow2 } else { TokenKind::DotMul }
+                        if self.eat(b'*') {
+                            // `.**` was a second spelling of `.^`; removed in the
+                            // pre-0.1.0 redundancy sweep (#501).
+                            return Err(self.err("`.**` is not an operator; elementwise power is `.^`"));
+                        }
+                        TokenKind::DotMul
                     } else if self.peek() == Some(b'/') {
                         self.advance(); TokenKind::DotDiv
                     } else if self.peek() == Some(b'^') {
@@ -860,6 +869,8 @@ impl<'src> Lexer<'src> {
                 // `>` — `>=`, `>>`, `>`
                 b'>' => {
                     if self.eat(b'=') { TokenKind::GtEq }
+                    // #530: `>>` is the arithmetic right shift. It was the pipe
+                    // until #501 ruling S1a, and a lex error in between.
                     else if self.eat(b'>') { TokenKind::RShift }
                     else { TokenKind::Gt }
                 }

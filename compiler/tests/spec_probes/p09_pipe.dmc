@@ -1,10 +1,13 @@
-# Probe 09 — Spec §4.6: pipe / chain `|>` and `>>`
+# Probe 09 — Spec §4.6: pipe / chain `\|>` and the bare `|>`
+# `>>` was a third spelling until the #501 sweep (ruling S1a) freed the token;
+# it is the right shift since #530 (probe 57), so this probe covers only the
+# two pipe spellings.
 fn double(x: i64) -> i64 { x * 2 }
 fn inc(x: i64)    -> i64 { x + 1 }
 
 fn main() -> nil {
     let a = 5 |> double |> inc       # ((5*2)+1) = 11
-    let b = 5 >> double >> inc       # equivalent
+    let b = 5 \|> double \|> inc     # canonical spelling — same node
     print(a); print(" ")
     print(b); print("\n")
     nil

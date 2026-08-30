@@ -14,12 +14,12 @@ fn meta_test_has_teeth() {
 
 #[test]
 fn comparison_semantics() {
-    assert!(agree(&Value::Int(5), &ScalarRet::I64(5)));
-    assert!(!agree(&Value::Int(5), &ScalarRet::I64(6)));
+    assert!(agree(&Value::Int(5, IW::I64), &ScalarRet::I64(5)));
+    assert!(!agree(&Value::Int(5, IW::I64), &ScalarRet::I64(6)));
     assert!(agree(&Value::Bool(false), &ScalarRet::Bool(false)));
     assert!(!agree(&Value::Bool(true), &ScalarRet::Bool(false)));
     // Cross-type is always a divergence.
-    assert!(!agree(&Value::Int(1), &ScalarRet::Bool(true)));
+    assert!(!agree(&Value::Int(1, IW::I64), &ScalarRet::Bool(true)));
     // #473: float agreement is EXACT — a one-ulp gap is a divergence, not
     // noise. The old tolerant window (1e-4 + 1e-3*|b|) was three orders of
     // magnitude wider than the scalar-f32 divergence #473 fixed, which is why

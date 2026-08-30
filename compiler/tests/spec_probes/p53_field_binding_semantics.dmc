@@ -5,6 +5,12 @@
 # Previously scalars aliased (snapshots tracked later writes) and whole-binding
 # assignment silently rebound the local, which produced two no-op framebuffer
 # mutators.
+#
+# #524 adds the other half of the rule: `let mut b = m.fb` is a VALUE binding
+# for every field kind, tensor included, so the two mutable-binding spellings
+# are not interchangeable here — and this is the only construct where they
+# differ. (The alias itself is now honored by `dmc jit` too; the cross-backend
+# cases live in tools/jit_probes.py, since this runner is interpreter-only.)
 model Machine {
     !sp: i64
     !fb: Tensor[i64, [4]]
@@ -46,4 +52,21 @@ fn test_element_write_still_reaches_field() -> bool {
     let !b = m.fb
     b[2] = 8
     m.fb[2] == 8
+}
+
+# #524: the `mut` spelling is a value binding — the write stays in the local.
+fn test_mut_spelling_copies_the_field() -> bool {
+    let !m = Machine { sp: 2, fb: forge.zeros[i64, [4]] }
+    let mut b = m.fb
+    b[2] = 8
+    m.fb[2] == 0 && b[2] == 8
+}
+
+# #524: a plain `let` from a tensor field is a snapshot in the other direction —
+# a later write to the FIELD is not visible through the binding.
+fn test_immutable_bind_snapshots_the_field() -> bool {
+    let !m = Machine { sp: 2, fb: forge.zeros[i64, [4]] }
+    let b = m.fb
+    m.fb[1] = 6
+    b[1] == 0 && m.fb[1] == 6
 }

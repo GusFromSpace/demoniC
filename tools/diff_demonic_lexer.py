@@ -141,7 +141,6 @@ KIND_MAP: dict[str, str] = {
     "dotstar": "DotMul",
     "dotslash": "DotDiv",
     "dotcaret": "DotPow",
-    "dotstarstar": "DotPow2",
 
     # ── elementwise comparison ──
     "dotgt": "DotGt",
@@ -163,6 +162,8 @@ KIND_MAP: dict[str, str] = {
 
     # ── pipes / streams ──
     "pipe": "Pipe",          # both `|>` and the canonical `\|>`
+    # `>>` — the right shift since #530. It was the pipe until #501 ruling S1a
+    # and a lex error in between, which is why this row went away and is back.
     "rshift": "RShift",
     "stream": "StreamArrow",  # `<-` (distinct from the `stream` keyword above)
 
@@ -263,7 +264,6 @@ PROBES: dict[str, str] = {
         "    a ^= b\n"
         "    x := 1\n"
         "    a .>= b\n"
-        "    a .** b\n"
         "    a?\n"
         "    a >> b\n"
         "    a << b\n"
@@ -285,6 +285,16 @@ PROBES: dict[str, str] = {
         "    let q: trit = 0\n"
         "    let r: fp8_e4m3 = 0\n"
         "    let s: fp8_e5m2 = 0\n"
+        "    nil\n"
+        "}\n"
+    ),
+    # #501: `.**` is no longer an operator — the reference hard-errors on it.
+    # The self-hosted lexer must reject too, not tokenize `.*` `*`: rejection
+    # means an empty stream on BOTH sides, so a self-hosted stream with tokens
+    # here is a LEN divergence. Guards against the second spelling creeping back.
+    "dotstarstar_rejected": (
+        "fn probe() -> nil {\n"
+        "    a .** b\n"
         "    nil\n"
         "}\n"
     ),

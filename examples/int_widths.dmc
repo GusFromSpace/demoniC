@@ -1,0 +1,98 @@
+# Fixed-width integer arithmetic — the spec's "Scalar types" section.
+#
+# An `i32` is 32 bits wide at run time, not "an i64 that happens to be small".
+# Every arithmetic result is taken mod 2^32 and reinterpreted as signed, so a
+# sum that leaves the range comes back at the other end. The two backends used
+# to disagree about this — `dmc run` never narrowed, `dmc jit` always did — so
+# these tests exist to keep them one language.
+#
+# `as i64` on the way out is not a formality: it is what proves the value being
+# printed really is the wrapped one, rather than a print path that narrows.
+
+# 2147483647 + 1 leaves the top of the range and re-enters at the bottom.
+fn test_i32_add_wraps_to_min() -> bool {
+    let max: i32 = 2147483647
+    let one: i32 = 1
+    (max + one) as i64 == -2147483648
+}
+
+# The mirror case: below the bottom, back to the top.
+fn test_i32_sub_wraps_to_max() -> bool {
+    let min: i32 = -2147483648
+    let one: i32 = 1
+    (min - one) as i64 == 2147483647
+}
+
+# 10^10 does not fit in 32 bits; what survives is 10^10 mod 2^32.
+fn test_i32_mul_wraps() -> bool {
+    let big: i32 = 100000
+    (big * big) as i64 == 1410065408
+}
+
+# Negation is `0 - n`, so it wraps like any other subtraction: the most
+# negative i32 has no positive counterpart and negating it is a no-op.
+fn test_i32_negate_min_is_min() -> bool {
+    let min:  i32 = -2147483648
+    let zero: i32 = 0
+    (zero - min) as i64 == -2147483648
+}
+
+# The width outlives the expression that produced it, so the comparison is
+# against the WRAPPED value, not the mathematical one.
+fn test_i32_overflow_compares_as_negative() -> bool {
+    let max:  i32 = 2147483647
+    let one:  i32 = 1
+    let zero: i32 = 0
+    (max + one) < zero
+}
+
+# A bare literal has no width of its own; it adopts the one the other operand
+# brought (§3.1). So this is i32 arithmetic even though nothing annotates the 1.
+fn test_untyped_literal_adopts_i32() -> bool {
+    let max: i32 = 2147483647
+    (max + 1) as i64 == -2147483648
+}
+
+# `<<` runs at the width too — shifting a 1 into the sign bit is how you land on
+# the most negative i32, not on 2^31.
+fn test_i32_shift_lands_in_the_sign_bit() -> bool {
+    let one: i32 = 1
+    (one << 31) as i64 == -2147483648
+}
+
+# Division by zero is total at every width: it answers 0 rather than trapping,
+# so a guard is the caller's business, not a hardware fault.
+fn test_i32_division_by_zero_is_zero() -> bool {
+    let max: i32 = 2147483647
+    let z:   i32 = 0
+    ((max / z) + (max % z)) as i64 == 0
+}
+
+# An explicit `as i32` narrows exactly as it always has — this half of the
+# language never diverged, and the rule above does not change it.
+fn test_as_i32_cast_narrows() -> bool {
+    let wide: i64 = 5000000000
+    (wide as i32) as i64 == 705032704
+}
+
+# The rule is about the DECLARED width, not about the magnitude 2^31: the same
+# sum at i64 has room for its answer and does not wrap.
+fn test_i64_has_room_for_the_same_sum() -> bool {
+    let max: i64 = 2147483647
+    let one: i64 = 1
+    max + one == 2147483648
+}
+
+fn main() -> nil {
+    print(test_i32_add_wraps_to_min())
+    print(test_i32_sub_wraps_to_max())
+    print(test_i32_mul_wraps())
+    print(test_i32_negate_min_is_min())
+    print(test_i32_overflow_compares_as_negative())
+    print(test_untyped_literal_adopts_i32())
+    print(test_i32_shift_lands_in_the_sign_bit())
+    print(test_i32_division_by_zero_is_zero())
+    print(test_as_i32_cast_narrows())
+    print(test_i64_has_room_for_the_same_sum())
+    nil
+}

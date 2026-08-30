@@ -160,7 +160,7 @@
     "pass": 2
   },
   "examples/fused_attn.dmc": {
-    "jit_ran": 0,
+    "jit_ran": 4,
     "pass": 4
   },
   "examples/games/battleship.dmc": {
@@ -186,6 +186,14 @@
   "examples/games/tictactoe.dmc": {
     "jit_ran": 10,
     "pass": 10
+  },
+  "examples/generic_shape_values.dmc": {
+    "jit_ran": 12,
+    "pass": 12
+  },
+  "examples/generic_slice_bounds.dmc": {
+    "jit_ran": 13,
+    "pass": 13
   },
   "examples/grad_control_flow.dmc": {
     "jit_ran": 0,
@@ -287,9 +295,13 @@
     "jit_ran": 0,
     "pass": 6
   },
-  "examples/port_python.dmc": {
+  "examples/port_payloads.dmc": {
     "jit_ran": 0,
-    "pass": 7
+    "pass": 9
+  },
+  "examples/port_python.dmc": {
+    "jit_ran": 11,
+    "pass": 11
   },
   "examples/reel_to_reel.dmc": {
     "jit_ran": 0,
@@ -357,7 +369,7 @@
   },
   "examples/slice.dmc": {
     "jit_ran": 0,
-    "pass": 5
+    "pass": 6
   },
   "examples/softmax_grad_jit.dmc": {
     "jit_ran": 3,

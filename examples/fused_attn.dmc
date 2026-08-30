@@ -15,18 +15,19 @@ fn attn_block[B, H, S, D](
     attn(q, k, v, mask)
 }
 
-# `@fuse` extends the same single-kernel guarantee to user code.
-# Use it when you want stdlib-grade fusion for a hand-written variant
-# the JIT's heuristic wouldn't otherwise collapse.
+# `@fuse` extends the same single-kernel guarantee to user code — and the
+# guarantee is enforced: a block the JIT cannot collapse into one pass is
+# refused at compile time as `fuse-infeasible`. Today's fusable set is a
+# single elementwise chain over f32 tensors, so a hand-written attention
+# (matmul + softmax + matmul) does not fuse — `attn` above IS the fused
+# kernel for that shape. The hand-written variant runs unfused.
 
 fn manual_attn[B, H, S, D](
     q: Tensor[f32, [B, H, S, D]],
     k: Tensor[f32, [B, H, S, D]],
     v: Tensor[f32, [B, H, S, D]],
 ) -> Tensor[f32, [B, H, S, D]] {
-    @fuse {
-        softmax((q @ k') .* (1.0 / sqrt(D as f32)), -1) @ v
-    }
+    softmax((q @ k') .* (1.0 / sqrt(D as f32)), -1) @ v
 }
 
 # Autoregressive decode: KV operands carry the streaming axis `~`,
@@ -55,7 +56,10 @@ fn test_manual_attn_zeros_v() -> bool {
     let k = forge.zeros[f32, [1, 1, 2, 4]]
     let v = forge.zeros[f32, [1, 1, 2, 4]]
     let out = manual_attn(q, k, v)
-    sum(out .* out) < 0.0001f32
+    # One elementwise op over an f32 tensor is inside the enforced fusable
+    # set — this `@fuse` compiles because its contract can be honored.
+    let sq = @fuse { out .* out }
+    sum(sq) < 0.0001f32
 }
 
 # Invariant: when S=1 the softmax over a single key is [1.0],

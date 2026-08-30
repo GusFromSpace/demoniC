@@ -143,9 +143,17 @@ mod tests {
     }
 
     #[test]
-    fn dot_pow_variants() {
-        let toks = lex_kinds_noeol(".^ .**");
-        assert_eq!(toks, vec![TokenKind::DotPow, TokenKind::DotPow2]);
+    fn dot_pow_lexes() {
+        let toks = lex_kinds_noeol(".^");
+        assert_eq!(toks, vec![TokenKind::DotPow]);
+    }
+
+    #[test]
+    fn dot_star_star_is_a_lex_error() {
+        // `.**` was a second spelling of `.^`; removed pre-0.1.0 (#501).
+        let err = Lexer::new("a .** b").tokenize().unwrap_err();
+        assert!(err.msg.contains("`.**` is not an operator"), "got: {}", err.msg);
+        assert!(err.msg.contains("`.^`"), "diagnostic must name the replacement, got: {}", err.msg);
     }
 
     #[test]
@@ -554,8 +562,38 @@ mod tests {
 
     #[test]
     fn bitwise_shift_operators() {
+        // Both spellings lex since #530; `>>` was a lex error between #501
+        // ruling S1a and that change.
         let toks = lex_kinds_noeol("<< >>");
         assert_eq!(toks, vec![TokenKind::LtLt, TokenKind::RShift]);
+    }
+
+    /// #530. `>>` is one token, greedily: it must not fall back to two `Gt`.
+    /// It reached this spelling by way of #501 ruling S1a, which took the
+    /// token off the pipe and reserved it, and #188, which is the record of
+    /// people writing `x >> 2` meaning a shift.
+    #[test]
+    fn rshift_is_one_token() {
+        let toks = lex_kinds_noeol("5 >> 2");
+        assert_eq!(toks, vec![
+            TokenKind::IntLit(5, None), TokenKind::RShift, TokenKind::IntLit(2, None),
+        ]);
+    }
+
+    /// The greedy `>>` must not swallow the neighbouring `>` spellings.
+    #[test]
+    fn rshift_leaves_gt_and_gteq_alone() {
+        let toks = lex_kinds_noeol("a > b >= c");
+        assert!(toks.contains(&TokenKind::Gt) && toks.contains(&TokenKind::GtEq));
+        assert!(!toks.contains(&TokenKind::RShift));
+        // A space between them is two separate `>` tokens, not the shift.
+        let toks = lex_kinds_noeol("a > > b");
+        assert_eq!(toks.iter().filter(|t| **t == TokenKind::Gt).count(), 2);
+        assert!(!toks.contains(&TokenKind::RShift));
+        // `>>=` is not a token: `>>` then `=`, which is a parse error, not a
+        // compound assignment (OPERATORS §14 — there is no `<<=` either).
+        let toks = lex_kinds_noeol("a >>= b");
+        assert_eq!(toks[1..3], [TokenKind::RShift, TokenKind::Eq]);
     }
 
     #[test]

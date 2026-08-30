@@ -46,7 +46,7 @@ section being exercised. Example:
 | Spec § | Probes |
 |---|---|
 | §2 (lexical, literals, comments, idents, strings) | p01, p02, p03, p04, p38, p39 |
-| §3 (types: aliases, models, tuples, dynamic shape, Rng, Mesh) | p12, p23, p23b, p24, p25, p29, p32, p34 |
+| §3 (types: aliases, models, tuples, dynamic shape, Rng, Mesh, integer width) | p12, p23, p23b, p24, p25, p29, p32, p34, p57 |
 | §4 (expressions: slicing, transpose, broadcast, ReLU, pipe, power, control flow, match, range, cast, tensor literals) | p05, p06, p07, p08, p09, p11, p13, p14, p15, p16, p26, p27, p28, p36, p40, p40b, p43 |
 | §5–6 (statements, items, arenas, shape arithmetic) | p10, p17, p35, p45 |
 | §7 (JIT model, directives) | p18, p19, p20, p21, p22, p33, p37, p42, p44 |

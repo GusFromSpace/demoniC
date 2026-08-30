@@ -607,8 +607,14 @@ impl Printer {
                     UnOp::Neg => format!("-{}", inner),
                     UnOp::Not => format!("!{}", inner),
                     UnOp::Deref => format!("*{}", inner),
-                    UnOp::ReLU => format!("relu({})", inner),
-                    UnOp::GeLU => format!("gelu({})", inner),
+                    // #501: `\>` / `\<` ARE the canonical spellings (TOKENIZER
+                    // §2–§3); `relu(x)` / `gelu(x)` are the alternates the
+                    // formatter is supposed to rewrite *into* them. Emitting the
+                    // call form inverted the rule and rewrote all 30 canonical
+                    // corpus uses the wrong way. The operand is an `as_expr`
+                    // (GRAMMAR `unary`), so it needs no parens to re-parse.
+                    UnOp::ReLU => format!("\\>{}", inner),
+                    UnOp::GeLU => format!("\\<{}", inner),
                     UnOp::BitNot => format!("~{}", inner),
                 }
             }
@@ -781,16 +787,22 @@ impl Printer {
                     match elem {
                         IndexElem::FullSlice(_) => s.push_str(".."),
                         IndexElem::Expr(e) => s.push_str(&self.expr_to_string(e)),
+                        // The colon form is a distinct surface from `..`
+                        // (OPERATORS §9), not a spelling of it. Printing it
+                        // with `..` dropped the step separator and re-parsed
+                        // as the invalid mixed form — `a[0:100:2]` came back
+                        // out as `a[0..100::2]`, a range in the start bound.
+                        // Print colons so `fmt` round-trips.
                         IndexElem::Slice { start, end, step, .. } => {
                             if let Some(st) = start {
                                 s.push_str(&self.expr_to_string(st));
                             }
-                            s.push_str("..");
+                            s.push(':');
                             if let Some(en) = end {
                                 s.push_str(&self.expr_to_string(en));
                             }
                             if let Some(st) = step {
-                                s.push_str("::");
+                                s.push(':');
                                 s.push_str(&self.expr_to_string(st));
                             }
                         }
@@ -919,14 +931,17 @@ impl Printer {
 
     fn shape_spec_to_string(&mut self, ss: &ShapeSpec) -> String {
         let parts: Vec<String> = ss.elems.iter()
-            .map(|e| self.shape_elem_to_string(e))
+            .map(|e| self.shape_elem_to_string(e, false))
             .collect();
         format!("[{}]", parts.join(", "))
     }
 
-    fn shape_elem_to_string(&mut self, elem: &ShapeElem) -> String {
+    /// `in_pattern` selects the wildcard's spelling. Both positions parse to the
+    /// same `ShapeElem::Wildcard`, but a type's shape only admits `?` — `_` there
+    /// is a parse error since #501 — while a shape pattern spells it `_`.
+    fn shape_elem_to_string(&mut self, elem: &ShapeElem, in_pattern: bool) -> String {
         match elem {
-            ShapeElem::Wildcard(_) => "_".to_string(),
+            ShapeElem::Wildcard(_) => if in_pattern { "_" } else { "?" }.to_string(),
             ShapeElem::Spread(_) => "..".to_string(),
             ShapeElem::Streaming(_) => "~".to_string(),
             ShapeElem::Expr(e) => self.expr_to_string(e),
@@ -949,7 +964,7 @@ impl Printer {
             }
             Pattern::Shape(elems, _) => {
                 let parts: Vec<String> = elems.iter()
-                    .map(|e| self.shape_elem_to_string(e))
+                    .map(|e| self.shape_elem_to_string(e, true))
                     .collect();
                 format!("[{}]", parts.join(", "))
             }
@@ -1047,7 +1062,10 @@ fn lit_to_string(lit: &Literal) -> String {
     }
 }
 
-fn scalar_type_str(s: &ScalarType) -> &'static str {
+/// The *source* spelling of a scalar type (`i64`, not the `I64` a derived
+/// `Debug` would print). Shared with `check.rs`, whose #550 cast diagnostic has
+/// to read exactly like the JIT's.
+pub(crate) fn scalar_type_str(s: &ScalarType) -> &'static str {
     match s {
         ScalarType::I8    => "i8",
         ScalarType::I16   => "i16",
@@ -1073,21 +1091,62 @@ fn scalar_type_str(s: &ScalarType) -> &'static str {
     }
 }
 
-fn binop_str(op: &BinOp) -> &'static str {
+// #501 S16: markers for the reserved `BinOp` variants no parser path
+// constructs. `$` is not a demoniC token (lexer.rs bottoms out at "unexpected
+// character"), so a marker cannot re-lex, let alone re-parse as some other
+// operator. Before this, fmt spelled `Pow` as `^` — which parses as `BitXor` —
+// and `RShift`/`BitShr` as `>>`, which at the time parsed as `BinOp::Pipe`
+// (S1a of the same ruling since reserved that token). Neither spelling ever
+// denoted the variant it was printed for. Nothing surfaced those variants, so
+// the wrong code was never emitted; the point of the markers is that if
+// something ever does surface them, it fails loudly instead of silently
+// changing the program.
+//
+// `BitShr` has since left this set: #530 made `>>` the right shift, so the
+// parser constructs it and `>>` is now its true spelling. `RShift` — the
+// pipe-era node for the same token — did not: it stays unconstructible and
+// keeps its marker, because printing *it* as `>>` would emit a shift for a
+// pipe.
+pub(crate) const RESERVED_POW: &str = "$reserved-binop-pow$";
+pub(crate) const RESERVED_RSHIFT: &str = "$reserved-binop-rshift$";
+
+/// Render a reserved `BinOp` variant. `fmt` is infallible end to end — every
+/// `*_to_string` returns a plain `String` and the module has no panics and no
+/// `Result` — so plumbing a `Result` out for a case no caller can reach would
+/// cost the whole module its shape. A `debug_assert!` catches the surfacing in
+/// the test suite and in `cargo run`; the marker catches it in a release `dmc
+/// fmt`, at the next lex of the formatted file.
+///
+/// `binop_str` has a second caller: check.rs spells the operator into the
+/// fuse-infeasible diagnostics (#521). The assert guards that path too, which
+/// is intended — a reserved variant reaching a *diagnostic* is the same bug,
+/// and a diagnostic naming `$reserved-binop-pow$` is the loud outcome we want
+/// over one naming an operator the program never wrote.
+#[inline]
+fn reserved_binop(op: &BinOp, marker: &'static str) -> &'static str {
+    debug_assert!(
+        false,
+        "fmt: reserved BinOp::{:?} reached the formatter; it has no source \
+         spelling, so give it one before any pass constructs it",
+        op
+    );
+    marker
+}
+
+pub(crate) fn binop_str(op: &BinOp) -> &'static str {
     match op {
         BinOp::Add     => "+",
         BinOp::Sub     => "-",
         BinOp::Mul     => "*",
         BinOp::Div     => "/",
         BinOp::Mod     => "%",
-        BinOp::Pow     => "^",
+        BinOp::Pow     => reserved_binop(op, RESERVED_POW),
         BinOp::StarStar => "**",
         BinOp::DotAdd  => ".+",
         BinOp::DotSub  => ".-",
         BinOp::DotMul  => ".*",
         BinOp::DotDiv  => "./",
         BinOp::DotPow  => ".^",
-        BinOp::DotPow2 => ".**",
         BinOp::DotGt   => ".>",
         BinOp::DotLt   => ".<",
         BinOp::DotGe   => ".>=",
@@ -1101,12 +1160,18 @@ fn binop_str(op: &BinOp) -> &'static str {
         BinOp::Gt      => ">",
         BinOp::LtEq    => "<=",
         BinOp::GtEq    => ">=",
-        BinOp::Pipe    => "|>",
-        BinOp::RShift  => ">>",
+        // #501: `\|>` is the canonical pipe (TOKENIZER §2); §3 says the
+        // formatter normalizes the bare `|>` onto it. It emitted the bare form.
+        BinOp::Pipe    => "\\|>",
+        BinOp::RShift  => reserved_binop(op, RESERVED_RSHIFT),
         BinOp::BitAnd  => "&",
         BinOp::BitOr   => "|",
-        BinOp::BitXor  => "^^",
+        // #501: XOR is `^` (OPERATORS §8a). `^^` is not a demoniC operator at
+        // all — the formatter was emitting source the lexer rejects.
+        BinOp::BitXor  => "^",
         BinOp::BitShl  => "<<",
+        // #530: `>>` is this variant's real spelling now — it re-parses to
+        // `BitShr`, so it replaces the marker rather than needing one.
         BinOp::BitShr  => ">>",
     }
 }
@@ -1125,7 +1190,7 @@ fn binop_precedence(op: &BinOp) -> u8 {
         BinOp::Add | BinOp::Sub | BinOp::DotAdd | BinOp::DotSub => 9,
         BinOp::Mul | BinOp::Div | BinOp::Mod
         | BinOp::DotMul | BinOp::DotDiv => 10,
-        BinOp::Pow | BinOp::StarStar | BinOp::DotPow | BinOp::DotPow2 => 11,
+        BinOp::Pow | BinOp::StarStar | BinOp::DotPow => 11,
         BinOp::Matmul => 12,
         BinOp::Pipe => 0,
     }

@@ -1,10 +1,13 @@
 // Module-wide dead-code allowance — deliberate, and scoped to this data model
 // only. The AST is a *complete, consistent* representation: every node carries a
 // `span` for diagnostics even though not every downstream pass reads it, and a
-// few variants are reserved or superseded (e.g. `BinOp::RShift`, now parsed as
-// `Pipe`) yet kept wired into the backends' exhaustive matches. These are not
-// stale helpers — deleting them would make the model inconsistent. Real dead
-// code (unused helpers/methods) is NOT suppressed anywhere else in the crate.
+// few variants are reserved or superseded (e.g. `BinOp::RShift`, the pipe-era
+// node for `>>`; #501 ruling S1a freed that spelling and #530 gave it to
+// `BinOp::BitShr`, so `RShift` itself is unconstructible and ruling S16 keeps
+// it reserved) yet kept wired into the backends' exhaustive matches. These are
+// not stale helpers — deleting them would make the model inconsistent. Real
+// dead code (unused helpers/methods) is NOT suppressed anywhere else in the
+// crate.
 #![allow(dead_code)]
 /// demoniC AST — spec 0.0.4-draft
 ///
@@ -23,6 +26,10 @@ use std::collections::HashSet;
 pub struct Program {
     pub items: Vec<Item>,
     pub span: Span,
+    /// #463: line count of the source this program was parsed from, measured
+    /// at the EOF token. Feeds the safe-mode file-size lint in `check.rs`;
+    /// carried on the AST so the checker needs no path or re-read of source.
+    pub source_lines: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -352,7 +359,7 @@ pub enum CallArg {
 pub enum BinOp {
     Add, Sub, Mul, Div, Mod,
     Pow, StarStar,
-    DotAdd, DotSub, DotMul, DotDiv, DotPow, DotPow2,
+    DotAdd, DotSub, DotMul, DotDiv, DotPow,
     DotGt, DotLt, DotGe, DotLe,
     Matmul,
     And, Or,
@@ -540,6 +547,9 @@ fn collect_pattern_names(pat: &Pattern, names: &mut HashSet<String>) {
 /// a callable). Does not descend into closures (`FnLit`) — they carry their own
 /// pipe scope. Block-like stages (block/if/match) are not treated as fusion
 /// stages and report `false`.
+///
+/// The parser reuses it for a second question with the same shape: whether a
+/// shape element in a *type* hides a `_`, which is not a dimension (#501, S3).
 pub(crate) fn expr_contains_underscore(e: &Expr) -> bool {
     match e {
         Expr::Underscore(_) => true,

@@ -18,17 +18,19 @@ no user-defined directives. Adding one requires a spec revision.
 | `@host`            | `match`            | comptime hardware dispatch                             | `docs/SPEC.md §7.2` (Hardware dispatch (`@host`))    | Interpreter only; JIT lowering pending |
 | `@deterministic`   | block               | bit-exact reproducibility contract                     | `docs/SPEC.md §7.3` (Determinism contract (`@deterministic`))    | Fully implemented |
 | `@recompute(...)`  | block               | activation-budget checkpointing                        | `docs/AUTODIFF.md §3`  | Parse-accepted no-op; not implemented |
-| `@inplace`         | stmt                | fail if a write would CoW                              | —  | Parse-accepted; no enforcement |
+| `@inplace`         | assignment stmt     | fail if a write would CoW                              | —  | Attachment enforced (§3 — assignment statements only); the CoW diagnostic itself is not implemented |
 | `@shard(...)`      | `let` / expr       | marks a tensor for sharding along a named axis (parsed only) | `docs/SPEC.md §2.6` (Directives) | Parsed and type-checked; does not alter code generation in this version |
 | `@tp(...)`         | `let` / expr       | marks a tensor-parallel weight or op (parsed only)     | `docs/SPEC.md §2.6` (Directives) | Parsed and type-checked; does not alter code generation in this version |
 | `@pp(...)`         | `fn`                | pipeline-parallel function with `stage K:` body        | `docs/SPEC.md §2.6` (Directives) | Body-validated; the interpreter executes stages sequentially, threading `_` between them; JIT lowering pending |
-| `@fuse`            | block / expr       | force single-kernel emission                           | `docs/SPEC.md §7.4` (Forced fusion (`@fuse`))    | Fully implemented |
+| `@fuse`            | block / expr       | force single-kernel emission                           | `docs/SPEC.md §7.4` (Forced fusion (`@fuse`))    | Fully implemented; the `fuse-infeasible` analysis is enforced at check time |
 | `@comptime`        | block / `fn`        | evaluates contents; does not yet force comptime folding | `docs/SPEC.md §7.5` (Comptime evaluation (`@comptime`))    | Block form runs as an ordinary block (no folding enforced); `@comptime fn` is inert; the compiler warns on both forms |
 
 **Note:** `@inplace` and `@recompute` are **parse-accepted no-ops** —
 the compiler does nothing with them today, and the type checker emits
 a warning (`directive @X is not implemented — it is parsed but has no
-effect`) so they aren't silent. `@comptime`'s block form evaluates its
+effect`) so they aren't silent. `@inplace` is the partial exception:
+where it may be written is enforced (§3), only what it promises is not.
+`@comptime`'s block form evaluates its
 contents like an ordinary block without yet enforcing compile-time
 folding; a `@comptime fn` declaration is inert and warns the same way.
 `@host` is functional in the interpreter: `@host match { .feature =>
@@ -65,7 +67,7 @@ one closest to the wrapped construct:
 
 ```
 @deterministic @cast(bf16) @fuse {
-    q @ k'
+    x .* g .+ b
 }
 ```
 
@@ -81,15 +83,26 @@ Stacking is meaningful in this order:
 form (`docs/SPEC.md §6.2` (`@grad` — autodiff), `docs/AUTODIFF.md §7`). Stacking a third `@grad` is
 not implemented.
 
-Illegal stacks (specified as compile-time errors; **not yet
-enforced** — the checker currently accepts them):
+Illegal stacks are compile-time errors:
 
-- `@cast(t1) @cast(t2)` directly nested — inner wins, but explicit nesting is rejected to avoid confusion.
-- `@inplace` on anything other than an assignment statement.
-- `@shard` on a value whose type cannot accept the sharding annotation.
-- `@fuse @fuse` — idempotent, redundant.
-- `@fuse` wrapping an expression whose ops cannot be collapsed on the host — fails as `fuse-infeasible`, not a stacking error per se but reported at the same compile stage.
-- `@comptime` wrapping an expression containing any non-comptime operand — fails as `comptime-non-static`.
+- `@cast(t1) @cast(t2)` directly nested — inner wins, but explicit nesting is rejected to avoid confusion. **Enforced.** The brace form `@cast(t1) { @cast(t2) { … } }` is the same stack written long-hand and is rejected the same way, including when another directive level sits between the two casts: `@cast(f32) { @fuse { @cast(bf16) { … } } }` is read across the intervening `@fuse` exactly as `@cast(f32) @fuse @cast(bf16) { … }` is.
+- `@inplace` on anything other than an assignment statement. **Enforced** — a `fn`, a `let`, a block, or a bare expression holds no write that could copy-on-write (`docs/MEMORY.md §4.3`).
+- `@shard` on a value whose type cannot accept the sharding annotation. **Enforced** on both attachments the catalog lists — the `let` form and the expression/block form are checked identically.
+- `@fuse @fuse` — idempotent, redundant. **Enforced.**
+- `@fuse` on a `fn` declaration or on a bare statement (`@fuse let x = …`) — the catalog's attachment is block / expr, and neither form honors the promise: a declaration's `@fuse` is ignored by both backends, and a statement-attached directive is refused by the JIT before any fuse analysis runs, feasible body or not. **Enforced:** refused like `@inplace`'s attachment rule, with a hint to the supported spelling — `@fuse { … }` in the body, `let x = @fuse { … }` for the statement.
+- `@fuse` wrapping an expression whose ops cannot be collapsed on the host — fails as `fuse-infeasible`, not a stacking error per se but reported at the same compile stage. **Enforced.** The collapsible set is what the JIT's fused kernel lowers: a single elementwise expression (`.+ .- .* ./ .^ .** .< .> .<= .>=`, `\>` ReLU) over f32 tensor operands whose shapes are provably equal, with float-scalar broadcasts — tensors do not broadcast against each other inside the block, and a symbolic dim pair the checker cannot prove equal (`N` against `M` across fn params) is refused, because the fused kernel refuses it at monomorphization when they differ. A `let` inside the block materializes an intermediate and is refused; the diagnostic names the offending op.
+- `@comptime` wrapping an expression containing any non-comptime operand — fails as `comptime-non-static`. **Not yet:** waits on comptime folding.
+
+The two *stacking* rejections name both directives, so
+`@cast(f32) @cast(bf16)` reports which dtype won and `@fuse @fuse`
+points at the redundant one. The two *attachment* rejections have only
+one directive to name, so they name it and what it was attached to:
+`@inplace` names the construct that holds no write to guard, `@shard`
+names the type that cannot accept the sharding annotation.
+
+A port call inside `@fuse` or `@deterministic` is rejected at the same
+stage, as `port-forbidden` rather than as a stacking error — the stack
+is legal, the call in it is not (`docs/PORTS.md §5`).
 
 ---
 

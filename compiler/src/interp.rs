@@ -132,6 +132,114 @@ fn float_width(v: &Value) -> FW {
     match v { Value::Float(_, w) => *w, _ => FW::F64 }
 }
 
+/// Width of a scalar integer (#540) — the integer twin of `FW`.
+///
+/// SPEC §3.1: arithmetic on a fixed-width integer type wraps at that width.
+/// The interpreter is dynamically typed, so the only way an add can wrap at 32
+/// bits is for the value to carry the width the annotation gave it — exactly
+/// how #473 made an `f32` annotation real at run time. Without it `let c: i32 =
+/// a + b` stores an i64 while the JIT wraps its `cl::I32`, and the backends
+/// part company on every `i32` expression that leaves the 32-bit range.
+///
+/// #544 widened this from `{I64, I32}` to every fixed-width integer kind the
+/// language has. Each variant is a WIDTH plus a SIGNEDNESS; the backing
+/// storage is an i64 in all cases, holding the wrapped value sign-extended
+/// (signed kinds) or zero-extended (unsigned kinds). Zero-extension is what
+/// makes `0u32 - 1u32` the unsigned 4294967295 rather than -1, and it also
+/// keeps `/ % >> < >` correct without a separate unsigned instruction set:
+/// a zero-extended `u8`/`u16`/`u32` is a non-negative i64, so the signed
+/// operation IS the unsigned one.
+///
+/// `u64` is the exception and stays `I64`: an i64-backed value cannot hold
+/// 2^63..2^64-1, so a `u64` carries the 64-bit two's-complement PATTERN.
+/// Wrapping at 64 bits — which is all #544 asks of it — is bit-identical
+/// between `i64` and `u64`, so nothing about the wrap rule is lost; what is
+/// not modelled is unsigned division/comparison/rendering above 2^63.
+/// `int8` is a signed 8-bit type (SPEC §3.1) and shares `I8`; `int4` is `I4`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IW { I64, I32, I16, I8, I4, U32, U16, U8 }
+
+impl IW {
+    /// Width of an integer binary op's result. Unlike `FW::join`, the *narrow*
+    /// width wins: `check.rs` types `i32 OP i32` as `i32` and forbids an `i32`
+    /// meeting a real `i64` (§3.1, no mutual assignability), so the only value
+    /// that reaches a narrow operand tagged `I64` is an untyped integer
+    /// literal — which §3.1 says adopts "the type of its context … or other
+    /// operand at its use site". That is the same rule the JIT applies in
+    /// `adopt_int_literal_kind` (#541), resolved here against the operand's
+    /// runtime tag instead of its lowered kind. Two genuinely different narrow
+    /// kinds never meet (the checker refuses `u8 + i16`), so the fall-through
+    /// only has to be total, not clever: take the narrower.
+    #[inline]
+    fn join(a: IW, b: IW) -> IW {
+        if a == b { return a; }
+        if a == IW::I64 { return b; }
+        if b == IW::I64 { return a; }
+        if a.bits() <= b.bits() { a } else { b }
+    }
+    /// Wrap a value into this width, two's-complement (#300: overflow wraps).
+    /// Unsigned kinds land in `0..2^w`, signed kinds in `-2^(w-1)..2^(w-1)`.
+    #[inline]
+    fn wrap(self, x: i64) -> i64 {
+        match self {
+            IW::I64 => x,
+            IW::I32 => x as i32 as i64,
+            IW::I16 => x as i16 as i64,
+            IW::I8  => x as i8  as i64,
+            // No Rust primitive is 4 bits: mask, then sign-extend bit 3.
+            IW::I4  => ((x & 0xf) ^ 0x8) - 0x8,
+            IW::U32 => x as u32 as i64,
+            IW::U16 => x as u16 as i64,
+            IW::U8  => x as u8  as i64,
+        }
+    }
+    /// Bit width, for the `/` overflow and `<<` range diagnostics, which name
+    /// the range actually violated (`0..=31` for an i32 shift).
+    #[inline]
+    fn bits(self) -> u32 {
+        match self {
+            IW::I64 => 64,
+            IW::I32 | IW::U32 => 32,
+            IW::I16 | IW::U16 => 16,
+            IW::I8  | IW::U8  => 8,
+            IW::I4 => 4,
+        }
+    }
+    /// Whether the width is signed. Only a signed width has a `MIN / -1`.
+    #[inline]
+    fn is_signed(self) -> bool {
+        matches!(self, IW::I64 | IW::I32 | IW::I16 | IW::I8 | IW::I4)
+    }
+    /// The most negative value at this width — the `MIN / -1` overflow case.
+    /// `0` at an unsigned width, which `is_signed` keeps out of that guard.
+    #[inline]
+    fn min(self) -> i64 {
+        if !self.is_signed() { return 0; }
+        match self {
+            IW::I64 => i64::MIN,
+            _ => -(1i64 << (self.bits() - 1)),
+        }
+    }
+    /// How the width names itself in a diagnostic (`exceeds the i32 range`).
+    #[inline]
+    fn name(self) -> &'static str {
+        match self {
+            IW::I64 => "i64", IW::I32 => "i32", IW::I16 => "i16",
+            // `i4`, not `int4`: the diagnostic names the WIDTH that overflowed,
+            // and the JIT's `__dmc_div_overflow_trap` spells it `i{bits}`.
+            IW::I8 => "i8", IW::I4 => "i4",
+            IW::U32 => "u32", IW::U16 => "u16", IW::U8 => "u8",
+        }
+    }
+}
+
+/// The width a value contributes to an integer arithmetic result. Non-ints
+/// count as `I64`, so they never drag a result narrow (#540).
+#[inline]
+fn int_width(v: &Value) -> IW {
+    match v { Value::Int(_, w) => *w, _ => IW::I64 }
+}
+
 /// The f32-family scalar types. `f16`/`bf16`/`tf32`/`fp8_*` are f32-backed in
 /// both backends by the #179 convention — computed in f32 and retagged, never
 /// rounded to their own narrower precision.
@@ -149,6 +257,51 @@ fn scalar_is_f32_family(t: &ScalarType) -> bool {
 /// semantics. Without this, `let a: f32 = 0.1` keeps the f64 0.1 while the JIT
 /// lowers the f32 one, and the two backends part company on the next operation.
 /// Only floats are touched; every other value passes through untouched.
+/// `Port[L]`: the annotation names a runtime, so a handle entering the
+/// position has to be one (SPEC §3.11).
+///
+/// Applied at the same places `coerce_scalar_width` is — a typed parameter, a
+/// typed `let`, a declared return — because those are exactly where an
+/// annotation becomes semantics, and they are the positions the JIT's
+/// `coerce_to` covers. Checking only parameters would have left `let q:
+/// Port[lua] = p` and `fn give() -> Port[lua]` refused by the JIT and accepted
+/// here, which is the divergence this whole check exists to remove.
+///
+/// A null/nil handle is not a lang error: whatever reads it next reports it as
+/// the missing handle it is.
+fn check_port_lang(v: &Value, ty: Option<&Type>, sp: &Span) -> EvalResult<()> {
+    let (Some(ty), Value::Opaque(h)) = (ty, v) else { return Ok(()) };
+    let Some(want) = crate::ports::port_type_lang(ty) else { return Ok(()) };
+    match crate::ports::lang_mismatch(&want, h) {
+        Some(msg) => Err(RuntimeError::at(msg, sp.clone())),
+        None => Ok(()),
+    }
+}
+
+/// The integer WIDTH a declared scalar type carries at run time (#540, widened
+/// to every fixed-width kind by #544).
+///
+/// `u64` maps to `I64` because an i64-backed value has no room for the top half
+/// of the u64 range; the 64-bit wrap is identical either way (see `IW`).
+/// `int8`/`int4` are the packed signed 8-/4-bit types of SPEC §3.1.
+/// The JIT's `narrow_scalar_kind` is the mirror of this table — the two must
+/// stay in lockstep or the backends wrap at different widths.
+#[inline]
+fn scalar_int_width(t: &ScalarType) -> Option<IW> {
+    use ScalarType::*;
+    match t {
+        I32 => Some(IW::I32),
+        I16 => Some(IW::I16),
+        I8 | Int8 => Some(IW::I8),
+        Int4 => Some(IW::I4),
+        U32 => Some(IW::U32),
+        U16 => Some(IW::U16),
+        U8 => Some(IW::U8),
+        I64 | U64 => Some(IW::I64),
+        _ => None,
+    }
+}
+
 fn coerce_scalar_width(v: Value, ty: Option<&Type>) -> Value {
     let Some(Type::Scalar(st, _)) = ty else { return v };
     match v {
@@ -156,6 +309,14 @@ fn coerce_scalar_width(v: Value, ty: Option<&Type>) -> Value {
             Value::Float(quantize_f32(x), FW::F32)
         }
         Value::Float(x, _) if matches!(st, ScalarType::F64) => Value::Float(x, FW::F64),
+        // #540: an integer annotation is a width, not documentation. This is
+        // the same set of sites #473 uses for floats — a typed `let`, a typed
+        // parameter, a declared return, a declared model field — because those
+        // are where an annotation becomes semantics on both backends.
+        Value::Int(n, w0) => match scalar_int_width(st) {
+            Some(w) => Value::Int(w.wrap(n), w),
+            None => Value::Int(n, w0),
+        },
         other => other,
     }
 }
@@ -250,7 +411,11 @@ impl fmt::Display for TensorVal {
 /// coarse `DType` tag so integer element reads round-trip as integers.
 #[derive(Clone)]
 pub enum Value {
-    Int(i64),
+    /// #540: a scalar integer carries its declared WIDTH, the way `Float`
+    /// carries `FW`. Without it an `i32` annotation is inert at run time: the
+    /// interpreter computes every integer in i64 while the JIT wraps its
+    /// `cl::I32`, so the two backends disagree on `i32` overflow.
+    Int(i64, IW),
     /// #473: a scalar float carries its declared WIDTH, the way `TensorVal`
     /// carries `DType`. Without it an `f32` annotation is inert at runtime: the
     /// interpreter computes every float in f64 while the JIT computes true
@@ -324,7 +489,7 @@ pub enum Value {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Int(n)   => write!(f, "{}", n),
+            Value::Int(n, _)   => write!(f, "{}", n),
             // #473: an f32 renders as the f64 expansion of its f32-rounded
             // value ("12.368000030517578"), NOT the shortest f32 form
             // ("12.368"). That is #368's rule, it is what f32 *tensors* have
@@ -423,17 +588,17 @@ impl Value {
     /// Construct a list value from an owned `Vec` (wraps it in the COW buffer).
     pub fn list(items: Vec<Value>) -> Value { Value::List(Rc::new(items)) }
     fn as_int(&self) -> Option<i64> {
-        match self { Value::Int(n) => Some(*n), _ => None }
+        match self { Value::Int(n, _) => Some(*n), _ => None }
     }
     fn as_float(&self) -> Option<f64> {
-        match self { Value::Int(n) => Some(*n as f64), Value::Float(x, _) => Some(*x), _ => None }
+        match self { Value::Int(n, _) => Some(*n as f64), Value::Float(x, _) => Some(*x), _ => None }
     }
     fn as_bool(&self) -> Option<bool> {
         match self { Value::Bool(b) => Some(*b), _ => None }
     }
     fn type_name(&self) -> &'static str {
         match self {
-            Value::Int(_)     => "int",
+            Value::Int(_, _)     => "int",
             Value::Float(_, _)   => "float",
             Value::Bool(_)    => "bool",
             Value::Str(_)     => "str",
@@ -509,18 +674,29 @@ impl Drop for CallDepthGuard {
     }
 }
 
-/// #402: an open process port (PORTS.md §7.1) — a child runtime speaking
-/// line-oriented JSON over its own stdin/stdout. The demoniC side holds the
-/// pipes; the Value side carries only an opaque `port#<id>:<lang>` handle.
-struct PortProc {
-    child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+/// The outcome of trying to read a postfix bracket as a shape-bracketed method
+/// call (#474). Either it was one and has been called, or it was not — and the
+/// receiver, which had to be evaluated to find that out, comes back so the
+/// ordinary postfix path can reuse it rather than evaluate it a second time.
+enum BracketedCall {
+    Dispatched(Value),
+    NotAMethod(Value),
 }
 
 pub struct Interpreter {
     /// Lexical scope stack: each scope a name→value map.
     scopes: Vec<HashMap<String, Value>>,
+    /// #517: parallel to `scopes` — the subset of each frame's names that
+    /// were bound as SHAPE PARAMETERS (`fn f[S](...)`, inferred from an arg's
+    /// tensor shape, or a model's `__shape_P__` field forwarded into a
+    /// method call) rather than an ordinary `let`/`for`/param binding. A
+    /// plain `HashMap<String, Value>` can't tell the two apart after the
+    /// fact — `bind_shape_param` tags the name here at the moment it's
+    /// bound. Used only to match the JIT's `shape_env` (jit.rs): a shape
+    /// param resolves to a compile-time constant there, so a slice bound
+    /// built from one must be classified the same way here (`affine_form`),
+    /// not treated as a runtime term the way an ordinary variable is.
+    shape_param_scopes: Vec<std::collections::HashSet<String>>,
     /// Lexical scope stack for declared streaming axes on KV-like bindings.
     stream_axes: Vec<HashMap<String, usize>>,
     /// Declared capacity (max streaming-axis length) for each KV binding.
@@ -543,6 +719,28 @@ pub struct Interpreter {
     /// #336: top-level enum declarations — name → ordered variant names. A
     /// variant's value is its index here (the i64 ordinal).
     enums: HashMap<String, Vec<String>>,
+    /// Module-level mutable bindings (`let !w = …` / `let mut w = …`), in
+    /// declaration order. A `@grad fn` that reads one of these captures it, and
+    /// AUTODIFF.md §2 makes that capture a differentiable input: `call_grad`
+    /// tapes it and returns its adjoint in `Grads` under this name (#398).
+    /// Order is the source order of the `let`s, which fixes the order the
+    /// capture fields follow the `!` params in `Grads`.
+    ///
+    /// Each entry is tagged with the **module** that declared it. One
+    /// `Interpreter` loads every file in the dependency graph through repeated
+    /// `load_program`, so a single flat name list let one module's `let !alpha`
+    /// make an unrelated module's *immutable* `alpha` differentiable — a
+    /// `Grads` field for a binding no checker rule ever admitted. The checker
+    /// never had that hole: an imported `pub let !` is not even in scope as a
+    /// bare name, so a `@grad fn` can only ever capture its **own** module's
+    /// mut bindings. The tag is what lets the tape agree with that.
+    mut_globals: Vec<(usize, String)>,
+    /// Which module each registered fn came from, keyed exactly as `fns` is, so
+    /// `grad_capture_names` can ask "which mut globals were in scope where this
+    /// fn was written?" rather than "what mut global exists anywhere?".
+    fn_module: HashMap<String, usize>,
+    /// The module `load_program` is currently ingesting; bumped once per file.
+    module_epoch: usize,
     /// xorshift64 RNG state, advanced by every `rng.normal[...]` /
     /// `rng.uniform[...]`. Seeded from `Rng.seed(N)` at the call site; this
     /// global is the fallback so programs that never call seed still get a
@@ -552,10 +750,10 @@ pub struct Interpreter {
     start_time: std::time::Instant,
     /// Command-line arguments passed to the program (for `argv()`).
     argv: Vec<String>,
-    /// #402: open ports by handle id. Ids are never reused, so a call on a
-    /// closed handle reports `port-closed` instead of reaching a stranger.
-    ports: HashMap<i64, PortProc>,
-    next_port_id: i64,
+    /// #402: the open process ports of this run. The registry — child process,
+    /// wire framing, and PORTS.md §6 tags — lives in `crate::ports`, shared with
+    /// the JIT so the two backends cannot drift on the protocol.
+    ports: crate::ports::PortRegistry,
     /// Optional op-count profile; Some only when --profile is active.
     pub profile: Option<OpProfile>,
     pub interp_modules: HashMap<std::path::PathBuf, InterpModuleEnv>,
@@ -569,6 +767,23 @@ pub struct Interpreter {
     /// The call site reads this immediately after the call and writes the values
     /// back to the corresponding caller-side identifier (if the arg was a bare ident).
     pending_writebacks: Vec<(usize, Value)>,
+    /// #474: the receiver of a shape-bracketed postfix call, evaluated once.
+    ///
+    /// `recv.name[…](args)` cannot be told apart from `recv.field[i](args)`
+    /// without knowing what `recv` *is*, so the dispatch has to evaluate it
+    /// before it can decide. When the answer is "not a method after all", the
+    /// ordinary postfix path takes over — and used to walk the very same
+    /// receiver expression a second time. That is not a slower route to the
+    /// same answer: `get(h).subs[0](5)` called `get` twice, printing twice and
+    /// allocating a second receiver in the arena.
+    ///
+    /// So the value is parked here instead, keyed by the identity of the AST
+    /// node it came from, and the one `Field` evaluation that follows takes it.
+    /// Node addresses are stable and unique for the program's lifetime, and the
+    /// only way to reach that `Field` is through the call expression that parks
+    /// the value — which re-parks a fresh one on every evaluation — so a parked
+    /// value can never be read by a later run of the same expression.
+    parked_receiver: Option<(*const Expr, Value)>,
     /// Current recursive-call depth, bumped via `CallDepthGuard` on every user-fn /
     /// lambda entry. Trips `MAX_CALL_DEPTH` with a catchable error before the native
     /// stack is exhausted. `Rc<Cell<…>>` so the guard can decrement on drop without
@@ -583,6 +798,30 @@ pub struct Interpreter {
     /// uniquely owned and lets the write land in place instead of copying.
     /// See `release_move_target`.
     move_hint: Option<String>,
+    /// #478 type-directed literal evaluation: the width an *unsuffixed* float
+    /// literal should adopt in the value position about to be evaluated
+    /// (SPEC.md §"Untyped numeric literals" — a bare literal takes the type of
+    /// its context, including "the other operand at its use site"). Armed by
+    /// `eval_if_flow` / `eval_match` from a sibling branch's static type and
+    /// `take()`n at the top of `eval_expr` / `eval_block`, so it reaches
+    /// exactly the position it was armed for. Mirrors `jit::Translator`'s
+    /// `float_lit_hint` rule by rule: without it `dmc run` and `dmc jit`
+    /// disagree on `if c { x_f32 } else { 0.1 }` whenever the else arm is the
+    /// one taken — the checker calls that literal an f32, and only the JIT
+    /// used to be told.
+    float_lit_hint: Option<FW>,
+    /// #400: per-arena byte budgets from `--vault=` / `--forge=` (`MEMORY.md
+    /// §1.1`). `None` on an arena means unbounded.
+    arena_limits: crate::arena::ArenaLimits,
+    /// Bytes charged against each sized arena so far. The interpreter has no
+    /// bump pointer — it hands every tensor to Rust's allocator — so these
+    /// counters *are* the arena watermarks: they meter the explicit `vault.*`
+    /// and `forge.*` constructors at an f64 per element. Both counters are
+    /// monotonic: nothing here reclaims memory, so nothing here returns
+    /// budget. In particular a `forge { … }` block does not rewind
+    /// `forge_used` on exit — see `Expr::ArenaBlock` (#400).
+    vault_used: u64,
+    forge_used: u64,
 }
 
 struct AxisSelection {
@@ -602,8 +841,14 @@ struct AxisSelection {
 enum IndexVal {
     /// `..` — full axis
     FullSlice,
-    /// a range expression in index position: `a..b` / `a..=b`
-    Range { start: Option<i64>, end: Option<i64>, inclusive: bool },
+    /// a range expression in index position: `a..b` / `a..=b`. `dyn_extent`
+    /// is `Some(n)` when `start`/`end` share the same runtime idents with
+    /// matching coefficients (`i..i+1`), so the WIDTH `n` is fixed by
+    /// construction even though `start` is only known at runtime (#517;
+    /// mirrors `jit::classify_index`'s `DynRange` split). When set, the
+    /// window `[start, start+n)` is bounds-checked and traps on OOB rather
+    /// than being independently clamped — see `resolve_index_values`.
+    Range { start: Option<i64>, end: Option<i64>, inclusive: bool, dyn_extent: Option<i64> },
     /// slice syntax with an optional step
     Slice { start: Option<i64>, end: Option<i64>, step: i64 },
     /// a scalar index (may be negative — normalized against the axis length)
@@ -616,6 +861,7 @@ impl IndexVal {
         !matches!(self, IndexVal::Index(_))
     }
 }
+
 
 /// Coerce an evaluated index sub-expression to an integer, naming the position
 /// (`"tensor index"`, `"slice step"`, …) in the error.
@@ -671,6 +917,99 @@ fn assign_scalar_to_selection(arr: &mut ArrayD<f64>, selections: &[AxisSelection
 }
 
 impl Interpreter {
+    /// #517: the affine form `const + Σ coeff·ident` of a range-bound
+    /// expression — used only to tell whether a `Range`'s `start` and `end`
+    /// differ by a fixed constant (`i..i+1`: both are `1*i + k`), i.e.
+    /// whether the slice's WIDTH is fixed by construction independent of
+    /// any runtime value. Mirrors `jit::affine_index_expr`, INCLUDING its
+    /// shape-env lookup: an identifier currently bound as a SHAPE PARAMETER
+    /// (`is_shape_param`) resolves to its concrete value as a constant here
+    /// too — exactly like the JIT's `shape_env` — rather than becoming a
+    /// term. Without this, `fn f[S](x: Tensor[f32,[S]]) { x[S..S+1] }`
+    /// classified as dynamic here but static in the JIT (which folds `S` to
+    /// a literal at monomorphization), so the two backends picked different
+    /// arms of `resolve_index_values` for the very same range. An ordinary
+    /// `let`/`for`-bound identifier that merely holds an int right now is
+    /// NOT a shape param and still becomes a term (coefficient 1) — that's
+    /// what makes `i..i+1` with a loop var `i` dynamic. Conservative: `None`
+    /// whenever the expression isn't affine in its idents.
+    fn affine_form(&self, e: &Expr) -> Option<(i64, HashMap<String, i64>)> {
+        match e {
+            Expr::Literal(Literal::Int(n, _), _) => Some((*n, HashMap::new())),
+            Expr::Ident(name, _) => {
+                if self.is_shape_param(name) {
+                    let v = self.lookup(name)?.as_int()?;
+                    Some((v, HashMap::new()))
+                } else {
+                    Some((0, HashMap::from([(name.clone(), 1i64)])))
+                }
+            }
+            // `(e)` — the parser builds a 1-tuple for grouping.
+            Expr::Tuple(es, _) if es.len() == 1 => self.affine_form(&es[0]),
+            Expr::UnOp { op: UnOp::Neg, operand, .. } => {
+                let (c, mut t) = self.affine_form(operand)?;
+                for v in t.values_mut() { *v = -*v; }
+                Some((-c, t))
+            }
+            Expr::BinOp { op, lhs, rhs, .. } => {
+                let (lc, lt) = self.affine_form(lhs)?;
+                let (rc, rt) = self.affine_form(rhs)?;
+                match op {
+                    BinOp::Add | BinOp::Sub => {
+                        let sign = if matches!(op, BinOp::Add) { 1 } else { -1 };
+                        let mut t = lt;
+                        for (k, v) in rt { *t.entry(k).or_insert(0) += sign * v; }
+                        t.retain(|_, v| *v != 0);
+                        Some((lc + sign * rc, t))
+                    }
+                    BinOp::Mul if rt.is_empty() => {
+                        let mut t = lt;
+                        for v in t.values_mut() { *v *= rc; }
+                        t.retain(|_, v| *v != 0);
+                        Some((lc * rc, t))
+                    }
+                    BinOp::Mul if lt.is_empty() => {
+                        let mut t = rt;
+                        for v in t.values_mut() { *v *= lc; }
+                        t.retain(|_, v| *v != 0);
+                        Some((lc * rc, t))
+                    }
+                    BinOp::Div if rt.is_empty() && lt.is_empty() && rc != 0 => {
+                        Some((lc / rc, HashMap::new()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// #517: does `start..end` (`end` required, `start` optional — an
+    /// omitted start is the literal `0`) have a WIDTH fixed by construction
+    /// even though `start` may be a runtime expression? `Some(extent)` iff
+    /// the two bounds' affine forms share identical ident terms (so
+    /// subtracting them cancels every runtime ident, leaving a constant)
+    /// AND that shared term set is non-empty (i.e. this isn't just two
+    /// literals-or-shape-params — that case keeps the existing
+    /// independent-clamp behavior, #291.4's JIT counterpart). Returns the
+    /// extent with the `..=` bump already applied, floored at 0.
+    fn dyn_range_extent(&self, start: Option<&Expr>, end: Option<&Expr>, inclusive: bool) -> Option<i64> {
+        let end = end?;
+        let sa = match start {
+            Some(e) => self.affine_form(e),
+            None => Some((0, HashMap::new())),
+        };
+        let ea = self.affine_form(end);
+        match (sa, ea) {
+            (Some((sc, st)), Some((ec, et))) if st == et && !st.is_empty() => {
+                let mut extent = ec - sc;
+                if inclusive { extent += 1; }
+                Some(extent.max(0))
+            }
+            _ => None,
+        }
+    }
+
     /// Evaluate every expression inside an index into an integer, leaving a
     /// form `resolve_index_values` can consume without the interpreter. This
     /// is the only half that can re-enter `eval_expr`, so a caller that is
@@ -681,6 +1020,9 @@ impl Interpreter {
         for elem in elems {
             out.push(match elem {
                 IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => {
+                    // #517: classify BEFORE evaluating — the affine check is
+                    // purely syntactic (over the un-evaluated bound exprs).
+                    let dyn_extent = self.dyn_range_extent(start.as_deref(), end.as_deref(), *inclusive);
                     let start = match start {
                         Some(e) => Some(index_int(&self.eval_expr(e)?, "range start", span)?),
                         None => None,
@@ -689,7 +1031,7 @@ impl Interpreter {
                         Some(e) => Some(index_int(&self.eval_expr(e)?, "range end", span)?),
                         None => None,
                     };
-                    IndexVal::Range { start, end, inclusive: *inclusive }
+                    IndexVal::Range { start, end, inclusive: *inclusive, dyn_extent }
                 }
                 IndexElem::Expr(e) => {
                     IndexVal::Index(index_int(&self.eval_expr(e)?, "tensor index", span)?)
@@ -742,7 +1084,36 @@ impl Interpreter {
         for (axis, elem) in padded_elems.iter().enumerate() {
             let dim = arr_shape[axis];
             match elem {
-                IndexVal::Range { start, end, inclusive } => {
+                IndexVal::Range { start, end: _, inclusive: _, dyn_extent: Some(extent) } => {
+                    // #517: a dynamic start whose WIDTH is fixed by
+                    // construction (`i..i+1`) is dynamic OOB per SPEC §4.3
+                    // when the window `[start, start+extent)` doesn't fit
+                    // the axis — a NEGATIVE start included; it does NOT
+                    // resolve from the end the way a static bound does (no
+                    // resolution preserves both the fixed extent and the
+                    // value actually seen — see
+                    // `jit::bounds_check_slice_start`'s doc comment for why
+                    // the JIT makes the same call). The independent
+                    // per-bound clamp below is for STATIC bounds only
+                    // (#291.4) and does not run for this arm. Message
+                    // matches `__dmc_slice_oob_trap` verbatim (jit.rs
+                    // `dmc_slice_oob_trap`) so both backends emit the same
+                    // diagnostic and exit(1).
+                    let start_val = start.expect("dyn_extent implies a non-omitted start (#517)");
+                    let extent = *extent;
+                    if start_val < 0 || start_val + extent > dim as i64 {
+                        return Err(RuntimeError::msg(format!(
+                            "slice start {} with extent {} out of bounds for axis of size {}",
+                            start_val, extent, dim
+                        )));
+                    }
+                    let indices: Vec<usize> = (start_val..start_val + extent).map(|v| v as usize).collect();
+                    selections.push(AxisSelection {
+                        indices,
+                        reduce_rank: false,
+                    });
+                }
+                IndexVal::Range { start, end, inclusive, dyn_extent: None } => {
                     let start_val = *start;
                     let end_val = *end;
 
@@ -978,7 +1349,7 @@ impl Interpreter {
                     }
                 }
             }
-            Value::Int(n) => {
+            Value::Int(n, _) => {
                 assign_scalar_to_selection(arr, &selections, n as f64);
             }
             Value::Float(val, _) => {
@@ -998,6 +1369,7 @@ impl Interpreter {
     pub fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            shape_param_scopes: vec![std::collections::HashSet::new()],
             stream_axes: vec![HashMap::new()],
             kv_capacities: HashMap::new(),
             model_shape_params: HashMap::new(),
@@ -1006,20 +1378,34 @@ impl Interpreter {
             model_methods: HashMap::new(),
             model_fields: HashMap::new(),
             enums: HashMap::new(),
+            mut_globals: Vec::new(),
+            fn_module: HashMap::new(),
+            module_epoch: 0,
             rng_state: 0x9E3779B97F4A7C15,  // SplitMix64 golden-ratio seed
             start_time: std::time::Instant::now(),
             argv: Vec::new(),
-            ports: HashMap::new(),
-            next_port_id: 1,
+            ports: crate::ports::PortRegistry::new(),
             profile: None,
             interp_modules: HashMap::new(),
             public_items: std::collections::HashSet::new(),
             host_features: detect_host_features(),
             extern_fns: std::collections::HashSet::new(),
             pending_writebacks: Vec::new(),
+            parked_receiver: None,
             call_depth: Rc::new(Cell::new(0)),
             move_hint: None,
+            float_lit_hint: None,
+            arena_limits: crate::arena::ArenaLimits::default(),
+            vault_used: 0,
+            forge_used: 0,
         }
+    }
+
+    /// #400: install the `--vault=` / `--forge=` byte budgets (`MEMORY.md §1.1`).
+    /// Absent flags leave the corresponding arena unbounded, which is what every
+    /// program got before the flags were accepted.
+    pub fn set_arena_limits(&mut self, limits: crate::arena::ArenaLimits) {
+        self.arena_limits = limits;
     }
 
     /// Enter a user-function call frame: bump the recursion counter and hand back a
@@ -1073,6 +1459,49 @@ impl Interpreter {
         }
     }
 
+    /// #400: charge `nbytes` against a sized arena, or report exhaustion.
+    ///
+    /// `arena` is `None` for allocations that land somewhere the sizing flags
+    /// do not reach — the Stream arena (`forge.kv` / `stream.kv`, which carries
+    /// its own `capacity`) and implicit intermediates. Those are never charged.
+    fn charge_arena(
+        &mut self,
+        arena: Option<crate::arena::Arena>,
+        nbytes: u64,
+        span: Option<&Span>,
+    ) -> EvalResult<()> {
+        use crate::arena::{fmt_bytes, Arena};
+        let Some(arena) = arena else { return Ok(()) };
+        let (limit, used) = match arena {
+            Arena::Vault => (self.arena_limits.vault, &mut self.vault_used),
+            Arena::Forge => (self.arena_limits.forge, &mut self.forge_used),
+        };
+        let Some(limit) = limit else {
+            // Unbounded: still track the watermark so a later `--vault`/`--forge`
+            // run reports the same numbers, but never fail.
+            *used = used.saturating_add(nbytes);
+            return Ok(());
+        };
+        let after = used.saturating_add(nbytes);
+        if after > limit {
+            let msg = format!(
+                "{} arena exhausted: this allocation needs {}, but only {} of the \
+                 {} {} budget is free",
+                arena.name(),
+                fmt_bytes(nbytes),
+                fmt_bytes(limit.saturating_sub(*used)),
+                fmt_bytes(limit),
+                arena.flag(),
+            );
+            return Err(match span {
+                Some(sp) => RuntimeError::at(msg, sp.clone()),
+                None => RuntimeError::msg(msg),
+            });
+        }
+        *used = after;
+        Ok(())
+    }
+
     /// Set command-line arguments for `argv()` builtin.
     pub fn set_argv(&mut self, args: Vec<String>) {
         self.argv = args;
@@ -1116,6 +1545,11 @@ impl Interpreter {
     pub fn load_program(&mut self, program: &Program, path: Option<&std::path::Path>) -> EvalResult<()> {
         self.public_items = crate::ast::collect_public_items(program);
         self.process_imports(program, path)?;
+        // One epoch per file (#398). Imports are merged above under the
+        // *importing* module's epoch-independent name table; only the items
+        // declared in THIS file are stamped with this epoch, which is what
+        // scopes a `@grad fn`'s captures to the module it was written in.
+        self.module_epoch += 1;
         // Pass 1: collect fn and model decls (forward references)
         for item in &program.items {
             self.collect_item(item);
@@ -1241,7 +1675,10 @@ impl Interpreter {
 
     fn collect_item(&mut self, item: &Item) {
         match item {
-            Item::Fn(f)       => { self.fns.insert(f.name.clone(), f.clone()); }
+            Item::Fn(f)       => {
+                self.fns.insert(f.name.clone(), f.clone());
+                self.fn_module.insert(f.name.clone(), self.module_epoch);
+            }
             Item::ExternFn(e) => { self.extern_fns.insert(e.name.clone()); }
             Item::Model(m) => {
                 self.models.insert(m.name.clone());
@@ -1263,6 +1700,20 @@ impl Interpreter {
                 let variants: Vec<String> = e.variants.iter().map(|v| v.name.clone()).collect();
                 self.enums.insert(e.name.clone(), variants);
             }
+            // A module-level mutable binding is what a `@grad fn` can capture
+            // (#398). Record the name (and the module's declaration order,
+            // which orders the capture fields in `Grads`). Collection runs over
+            // every item before any body does; the checker separately requires
+            // the binding to be declared *above* the fn that reads it, so this
+            // list is only ever consulted for names already in scope.
+            Item::Let(l) if l.mutating || l.is_mut => {
+                if let Pattern::Ident(name, _) = &l.pattern {
+                    let entry = (self.module_epoch, name.clone());
+                    if !self.mut_globals.contains(&entry) {
+                        self.mut_globals.push(entry);
+                    }
+                }
+            }
             Item::Directive { inner, .. } => self.collect_item(inner),
             Item::Pub(inner) => self.collect_item(inner),
             _ => {}
@@ -1273,6 +1724,7 @@ impl Interpreter {
         match item {
             Item::Let(l) => {
                 let v = self.eval_expr(&l.value)?;
+                check_port_lang(&v, l.ty.as_ref(), &l.span)?;
                 let v = coerce_scalar_width(v, l.ty.as_ref());
                 self.bind_pattern(&l.pattern, v);
                 if let Some(axis) = l.ty.as_ref().and_then(streaming_axis_from_type) {
@@ -1358,10 +1810,12 @@ impl Interpreter {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.shape_param_scopes.push(std::collections::HashSet::new());
         self.stream_axes.push(HashMap::new());
     }
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.shape_param_scopes.pop();
         self.stream_axes.pop();
     }
 
@@ -1369,6 +1823,35 @@ impl Interpreter {
         if let Some(scope) = self.scopes.last_mut() {
             scope.insert(name.into(), v);
         }
+    }
+
+    /// #517: like `bind`, but also tags `name` as a SHAPE PARAMETER in the
+    /// current frame (`shape_param_scopes`) — a value inferred from an arg's
+    /// tensor shape or supplied via `f[N]`/`f[S=4]`, matching what the JIT's
+    /// `shape_env` holds for the same call. Every shape-param binding site
+    /// (`call_fn_with_shapes`, `@grad`'s own shape-param setup) uses this
+    /// instead of `bind` so `affine_form` can tell a shape param apart from
+    /// an ordinary `let`/`for`/plain-param binding that merely happens to
+    /// hold an int right now.
+    fn bind_shape_param(&mut self, name: impl Into<String>, v: Value) {
+        let name = name.into();
+        if let Some(scope) = self.shape_param_scopes.last_mut() {
+            scope.insert(name.clone());
+        }
+        self.bind(name, v);
+    }
+
+    /// #517: is `name`, as `lookup` would currently resolve it (innermost
+    /// scope first), a SHAPE PARAMETER rather than an ordinary binding? Must
+    /// mirror `lookup`'s own scan order: an inner `let x = ...` shadowing an
+    /// outer shape param `x` is correctly NOT a shape param, and vice versa.
+    fn is_shape_param(&self, name: &str) -> bool {
+        for (scope, shape_names) in self.scopes.iter().rev().zip(self.shape_param_scopes.iter().rev()) {
+            if scope.contains_key(name) {
+                return shape_names.contains(name);
+            }
+        }
+        false
     }
 
     fn bind_stream_axis(&mut self, name: impl Into<String>, axis: usize) {
@@ -1604,7 +2087,7 @@ impl Interpreter {
         for sp_decl in &f.shape_params { referenced.insert(sp_decl.name.clone()); }
         for name in &referenced {
             match inferred.get(name) {
-                Some(&dim) => self.bind(name, Value::Int(dim)),
+                Some(&dim) => self.bind_shape_param(name, Value::Int(dim, IW::I64)),
                 None => {
                     self.pop_scope();
                     return Err(RuntimeError::at(format!(
@@ -1619,21 +2102,87 @@ impl Interpreter {
 
         // Bind params: tensor params become Input nodes; the `mutating` flag
         // tells the backward pass which ones to return gradients for.
+        // A **scalar `!` parameter** is an Input node too (#420 item 2), so
+        // `@grad fn f(!a: f32) -> f32 { a*a*a }` differentiates without having
+        // to route the value through a one-element tensor. Only `!` float
+        // scalars join the tape: an immutable scalar has no gradient to
+        // return, and an integer parameter isn't differentiable.
         for (i, (p, v)) in f.params.iter().zip(&args).enumerate() {
-            self.bind(&p.name, coerce_scalar_width(v.clone(), p.ty.as_ref()));
-            if let Value::Tensor(_) = v {
+            let bound = coerce_scalar_width(v.clone(), p.ty.as_ref());
+            self.bind(&p.name, bound.clone());
+            let traced = matches!(bound, Value::Tensor(_))
+                || (p.mutating && matches!(bound, Value::Float(_, _)));
+            if traced {
                 let node_id = tape.push(TapeNode {
                     op: TapeOp::Input { param_idx: i, mutating: p.mutating },
                     inputs: Vec::new(),
-                    value: v.clone(),
+                    value: bound,
                 });
                 var_node.insert(p.name.clone(), node_id);
             }
         }
 
+        // AUTODIFF.md §2 / #398: a captured `mut` binding is a differentiable
+        // input too. Seed one tape input per captured binding, holding its value
+        // at call time, so reads of it in the body are traced and its adjoint
+        // comes back in `Grads` under the binding's own name. The node ids are
+        // kept here rather than read back out of `var_node` at the end: a body
+        // that reassigns the capture (`b = b .+ 1`) repoints `var_node`, and the
+        // gradient we owe is the one w.r.t. the value the call started from.
+        //
+        // A capture resolves to the **module binding**, never to whatever
+        // `lookup` finds on the way out through the caller's frames. The
+        // interpreter shares one scope stack across calls, so `go()` holding a
+        // local of the same name used to have that local taped under the
+        // capture's name — same `@grad fn`, same module state, a different
+        // gradient depending on who called it. Any such intervening binding is
+        // lifted out for the duration of the call and put back below, which
+        // leaves scope 0 (the module scope) as the only `cap` in sight: reads
+        // in the body and the value on the tape are then the same thing by
+        // construction, and a reassignment in the body still writes through to
+        // the module binding as AUTODIFF §2.1 says it does.
+        let capture_names = self.grad_capture_names(&f);
+        // Scope 0 is the module scope (what we want) and the last scope is this
+        // call's own frame, already holding the params and shape params — a
+        // binding there shadows legitimately. Only the CALLER frames in between
+        // are masked.
+        let mut masked: Vec<(usize, String, Value)> = Vec::new();
+        let caller_frames = self.scopes.len().saturating_sub(1);
+        for name in &capture_names {
+            for i in 1..caller_frames {
+                if let Some(v) = self.scopes[i].get(name) {
+                    masked.push((i, name.clone(), v.clone()));
+                }
+            }
+        }
+        for (i, name, _) in &masked {
+            self.scopes[*i].remove(name);
+        }
+        let mut capture_nodes: Vec<(String, usize)> = Vec::new();
+        for name in capture_names {
+            let Some(v) = self.scopes.first().and_then(|g| g.get(&name)).cloned() else { continue };
+            if !value_is_differentiable(&v) { continue; }
+            let node_id = tape.push(TapeNode {
+                op: TapeOp::Captured { name: name.clone() },
+                inputs: Vec::new(),
+                value: v.clone(),
+            });
+            var_node.insert(name.clone(), node_id);
+            capture_nodes.push((name, node_id));
+        }
+
         // Forward pass: evaluate the body, recording tensor ops to the tape.
         let result = self.eval_block_with_tape(&f.body, &mut tape, &mut var_node, &span);
         self.pop_scope();
+        // Put back whatever the capture masking lifted out, before any `?`
+        // below can leave through an error path. The backward pass reads
+        // captures off `capture_nodes`, not the scope stack, so restoring here
+        // is early enough to be unconditional and late enough to be correct.
+        for (i, name, v) in masked {
+            if let Some(scope) = self.scopes.get_mut(i) {
+                scope.insert(name, v);
+            }
+        }
         let (loss_value, loss_node) = result?;
 
         // The function's tail must produce a scalar (real-valued loss). The
@@ -1642,10 +2191,14 @@ impl Interpreter {
         // tracked tensor node (the one whose `Sum`/`ScalarDiv` produced the
         // scalar); the tape's `loss_node` field holds it.
         let loss_node = loss_node.ok_or_else(|| RuntimeError::at(format!(
-            "@grad `{}`: function body must produce a scalar derived from a tensor computation \
-            (got a value that doesn't participate in the gradient graph).\n\
-            hint: indexed reads `x[i]` exit the graph — reduce with a traced reduction:\n\
-            \t`sum(x)` or `mean(x)` (e.g. `sum(x .* x)`).\n\
+            "@grad `{}`: function body must produce a scalar derived from a \
+            differentiable input (got a value that doesn't participate in the \
+            gradient graph).\n\
+            hint: gradients flow from `!` parameters — tensors, and (#420) f32 \
+            scalars. A partial index `x[i]` on a rank > 1 tensor yields a \
+            sub-tensor and exits the graph; reduce with a traced reduction \
+            (`sum(x)` / `mean(x)`, e.g. `sum(x .* x)`) or read a single element \
+            with a full index.\n\
             `argmax`/`argmin` and fused `embed` don't trace yet.\n\
             See examples/autograd.dmc for working patterns.", f.name),
             span.clone()))?;
@@ -1659,15 +2212,25 @@ impl Interpreter {
         let mut grads: Vec<Option<Value>>;
         if method == "fwd_bwd_bwd" {
             let adj = tape.backward_symbolic(loss_node)?;
-            let p0_node = f.params.iter()
+            let p0 = f.params.iter()
                 .find(|p| p.mutating)
-                .and_then(|p| var_node.get(&p.name).copied())
-                .ok_or_else(|| RuntimeError::at(format!(
-                    "@grad `{}`: fwd_bwd_bwd needs a `!` tensor parameter",
-                    f.name), span.clone()))?;
+                .and_then(|p| var_node.get(&p.name).copied().map(|id|
+                    (format!("`!` param `{}`", p.name), id)))
+                // No `!` param: a captured `mut` binding is the differentiable
+                // input the second-order pass reduces over instead (#398).
+                .or_else(|| capture_nodes.first().map(|(name, id)|
+                    (format!("captured `mut` binding `{}`", name), *id)));
+            let (p0_label, p0_node) = p0.ok_or_else(|| RuntimeError::at(format!(
+                "@grad `{}`: fwd_bwd_bwd needs a `!` tensor parameter or a \
+                 captured `mut` binding",
+                f.name), span.clone()))?;
             let g1 = adj[p0_node].ok_or_else(|| RuntimeError::at(format!(
-                "@grad `{}`: first `!` param has no gradient \
-                 (loss independent of it?)", f.name), span.clone()))?;
+                "@grad `{}`: the second-order pass found no first-order gradient \
+                 for {} to differentiate again — either the loss does not depend \
+                 on it, or its only path to the loss is one the second-order \
+                 replay does not cover (the scalar `*` multiplier operand is the \
+                 known gap; first order is unaffected)",
+                f.name, p0_label), span.clone()))?;
             let loss2 = match &tape.nodes[g1].value {
                 Value::Tensor(t) => {
                     let total: f64 = t.iter().sum();
@@ -1685,29 +2248,104 @@ impl Interpreter {
         }
         tape.backward(&mut grads)?;
 
-        // Collect gradients for each `!`-marked tensor parameter.
+        // Collect gradients for each `!`-marked parameter (tensor, or — since
+        // #420 item 2 — f32 scalar).
         let mut grad_struct: Vec<(String, Value)> = Vec::new();
-        for (i, p) in f.params.iter().enumerate() {
+        for p in f.params.iter() {
             if !p.mutating { continue; }
             let Some(node_id) = var_node.get(&p.name) else { continue; };
             let g = grads[*node_id].clone().unwrap_or_else(|| {
                 // No gradient flowed back — this parameter doesn't affect
                 // the loss. Surface it as zeros of the param shape, since
                 // that IS the mathematically correct answer (∂L/∂x=0 when
-                // L doesn't depend on x), not a placeholder.
-                match &args[i] {
+                // L doesn't depend on x), not a placeholder. Shaped from the
+                // tape's own input value, which is the *coerced* parameter —
+                // handing back the parameter itself would read as a gradient.
+                match &tape.nodes[*node_id].value {
                     Value::Tensor(t) => Value::tensor(ArrayD::zeros(t.raw_dim())),
+                    Value::Float(_, w) => Value::Float(0.0, *w),
                     other => other.clone(),
                 }
             });
             grad_struct.push((p.name.clone(), g));
         }
+        // Captured `mut` bindings follow the `!` params, in the order the
+        // module declares them (AUTODIFF.md §2). Same zero-gradient rule as a
+        // parameter: a capture the loss doesn't depend on gets zeros of its own
+        // shape, which is the correct ∂L/∂x = 0, not a placeholder.
+        for (name, node_id) in &capture_nodes {
+            let g = grads[*node_id].clone().unwrap_or_else(|| {
+                match &tape.nodes[*node_id].value {
+                    Value::Tensor(t) => Value::tensor(ArrayD::zeros(t.raw_dim())),
+                    _ => Value::Float(0.0, FW::F64),
+                }
+            });
+            grad_struct.push((name.clone(), g));
+        }
         let grad_value = Value::Struct(Rc::new(RefCell::new(grad_struct)));
+        // #473's rule reaches the loss too. An ordinary call already narrows
+        // its result to the declared return type (`call_fn`, same helper); the
+        // `@grad` entry handed back the raw tape value, so one `@grad fn f(..)
+        // -> f32 { sum(w) + 0.1 }` produced TWO different numbers depending on
+        // how it was called — `f(w)` gave the f32, `f.fwd_bwd(w)` the f64 — and
+        // the JIT, whose tape is f32 throughout, matched only the first. That
+        // is an AUTODIFF §6.1 divergence in the loss (the gradients were always
+        // f32 and always agreed), and it is why #422 wall 2's neighbourhood
+        // still disagreed after the malformed IR was fixed.
+        let loss_value = coerce_scalar_width(loss_value, f.ret_type.as_ref());
         match method {
             "grad" => Ok(grad_value),
             "fwd_bwd" | "fwd_bwd_bwd" => Ok(Value::Tuple(vec![loss_value, grad_value])),
             _ => unreachable!(),
         }
+    }
+
+    /// The captured `mut` bindings a `@grad fn` differentiates (AUTODIFF.md §2,
+    /// #398): the module-level mutable bindings its body reads *directly*,
+    /// minus its own parameter names (a param shadows the binding, so a read
+    /// there is not a capture).
+    ///
+    /// Reads that occur only inside a closure literal are excluded: the tape
+    /// never enters a closure body, so such a capture has no adjoint. The
+    /// checker rejects that program outright (`check_fn`'s #398 rule) and both
+    /// sides use the same scan, so what the interpreter tapes is exactly what
+    /// the checker admitted. The related case — a capture read by a fn the body
+    /// *calls*, whose gradient path the tape also cannot see — is enforced by
+    /// the checker alone (it owns the call graph); the interpreter would
+    /// otherwise hand back that capture's body-only half.
+    ///
+    /// Candidates are drawn from the fn's **own module** only. A `@grad fn` can
+    /// capture nothing else: the checker does not put an imported `pub let !`
+    /// in scope under its bare name, so a cross-module name match was never a
+    /// capture the checker admitted — only one the flat name list invented.
+    ///
+    /// Result order is the module's declaration order, which fixes the order
+    /// the capture fields take in `Grads`.
+    fn grad_capture_names(&self, f: &FnDecl) -> Vec<String> {
+        if self.mut_globals.is_empty() {
+            return Vec::new();
+        }
+        // The fn's home module. An unregistered fn (a model method, say) falls
+        // back to the last-loaded module — the root file being run, which is
+        // where such a fn most likely lives; it is a narrowing either way,
+        // never the old cross-module free-for-all.
+        let home = self.fn_module.get(&f.name).copied().unwrap_or(self.module_epoch);
+        let params: std::collections::HashSet<&str> =
+            f.params.iter().map(|p| p.name.as_str()).collect();
+        let refs = crate::check::collect_body_idents(&f.body);
+        self.mut_globals.iter()
+            .filter(|(module, n)| {
+                *module == home
+                    && !params.contains(n.as_str())
+                    // `reads_free` excludes names the body BINDS itself: a
+                    // body-local `let cap` shadows the module binding, so there
+                    // is no capture to tape and no `g.cap` to hand back.
+                    && refs.reads_free(n)
+                    && refs.direct.contains(n)
+                    && !refs.in_closure.contains(n)
+            })
+            .map(|(_, n)| n.clone())
+            .collect()
     }
 
     /// Evaluate a block while recording tensor ops to a tape. Returns the
@@ -1869,6 +2507,17 @@ impl Interpreter {
         Ok(())
     }
 
+    /// True for the comparison operators — dotted (tensor mask) and scalar
+    /// alike. Their output is a 0/1 indicator that is constant almost
+    /// everywhere in its operands, so inside `@grad` they are stop-gradient
+    /// (AUTODIFF.md §5) rather than an unsupported-op error (#434).
+    fn is_comparison(op: &BinOp) -> bool {
+        matches!(op,
+            BinOp::DotGt | BinOp::DotLt | BinOp::DotGe | BinOp::DotLe
+            | BinOp::Gt | BinOp::Lt | BinOp::GtEq | BinOp::LtEq
+            | BinOp::Eq | BinOp::NotEq)
+    }
+
     /// Push a binary-op node onto the tape, reusing one op→VJP mapping for both
     /// the `BinOp` expression arm and compound reassignment. Returns the forward
     /// value and its node id (None when neither operand is tracked).
@@ -1882,6 +2531,16 @@ impl Interpreter {
     ) -> EvalResult<(Value, Option<usize>)> {
         let out = apply_binop(op.clone(), lv, rv)?;
         if ln.is_none() && rn.is_none() {
+            return Ok((out, None));
+        }
+        // Comparisons are stop-gradient (AUTODIFF.md §5): the 0/1 result is
+        // locally constant in its operands, so it leaves the tape as a value
+        // rather than erroring (#434). That is what makes comparison-masked
+        // select — `(a .< b) .* a .+ (a .>= b) .* b` — differentiable: the
+        // mask multiplies in as a constant and `DotMul`'s product rule routes
+        // the whole cotangent to whichever branch the mask selected, exactly
+        // the treatment `\>`'s ReLU mask already gets.
+        if Self::is_comparison(op) {
             return Ok((out, None));
         }
         let tape_op = match op {
@@ -1906,6 +2565,77 @@ impl Interpreter {
                 "@grad: BinOp `{:?}` not supported inside differentiated body \
                 (no VJP rule yet).", op), span.clone())),
         }
+    }
+
+    /// Trace a fully-qualified element read `base[i, j, ...]` onto the tape
+    /// (#420 item 3). The gradient of an element read scatters: the adjoint
+    /// lands on element `[i, j, ...]` of a zero tensor shaped like `base`,
+    /// which is what lets vector component math (`w[0]*w[0] + w[1]*w[1]`, the
+    /// natural spelling of an SDF) differentiate without the outer-product
+    /// broadcast workaround.
+    ///
+    /// Returns `None` — leaving the caller's untracked path in charge — when
+    /// this isn't an element read of a traced float tensor: a bracket form
+    /// that isn't indexing at all (arena constructors, `.split`, `.reshape`),
+    /// a non-constant or non-integer subscript, a partial index (which yields
+    /// a sub-tensor, not an element), or an int/bool tensor. Indices
+    /// themselves are always concrete — they select *which* element, they are
+    /// not differentiable.
+    ///
+    /// Bailing out after the base has been traced re-evaluates it in the
+    /// caller and leaves an unreferenced node on the tape. Both are inert: the
+    /// admitted base forms (ident / arithmetic, never a call) are pure, and a
+    /// node no adjoint reaches contributes nothing to the backward pass.
+    fn tape_index_read(
+        &mut self,
+        base: &Expr,
+        elems: &[IndexElem],
+        tape: &mut Tape,
+        var_node: &mut std::collections::HashMap<String, usize>,
+        span: &Span,
+    ) -> EvalResult<Option<(Value, Option<usize>)>> {
+        // Only bracket forms that are genuinely subscripts. A `Field`/`Postfix`
+        // base is `vault.zeros[...]`, `t.split[n]`, `t.reshape[[..]]` and
+        // friends — tracing those bases would re-evaluate a constructor.
+        if !matches!(base, Expr::Ident(_, _) | Expr::BinOp { .. } | Expr::UnOp { .. } | Expr::Tuple(_, _)) {
+            return Ok(None);
+        }
+        if elems.is_empty() {
+            return Ok(None);
+        }
+        let mut raw_idx: Vec<i64> = Vec::with_capacity(elems.len());
+        for elem in elems {
+            let IndexElem::Expr(ie) = elem else { return Ok(None) };
+            match self.eval_expr(ie)? {
+                Value::Int(n, _) => raw_idx.push(n),
+                _ => return Ok(None),
+            }
+        }
+        let (bv, bn) = self.eval_expr_with_tape(base, tape, var_node, span)?;
+        let Value::Tensor(arr) = &bv else { return Ok(None) };
+        if arr.dtype != DType::F32 && arr.dtype != DType::F64 {
+            return Ok(None);
+        }
+        if raw_idx.len() != arr.ndim() {
+            return Ok(None);      // partial index → sub-tensor; not wired
+        }
+        let mut idx: Vec<usize> = Vec::with_capacity(raw_idx.len());
+        for (axis, &n) in raw_idx.iter().enumerate() {
+            let dim = arr.shape()[axis] as i64;
+            let resolved = if n < 0 { dim + n } else { n };
+            if resolved < 0 || resolved >= dim {
+                return Err(RuntimeError::at(
+                    format!("index {} out of bounds for axis {} of size {}", n, axis, dim),
+                    span.clone()));
+            }
+            idx.push(resolved as usize);
+        }
+        let out = Value::Float(arr[IxDyn(&idx)], arr.float_width());
+        let Some(nid) = bn else { return Ok(Some((out, None))) };
+        let id = tape.push(TapeNode {
+            op: TapeOp::IndexRead(idx), inputs: vec![nid], value: out.clone(),
+        });
+        Ok(Some((out, Some(id))))
     }
 
     /// Evaluate an expression while building the tape. Returns (value,
@@ -2005,19 +2735,27 @@ impl Interpreter {
                             }
                         }
                     }
-                    // sum_along / mean_along (axis dropped) differentiate through
-                    // the tape (#307): the adjoint broadcasts back along the axis.
+                    // The axis reductions (axis dropped) differentiate through
+                    // the tape: sum_along / mean_along broadcast the adjoint
+                    // back along the axis (#307); max_along / min_along route
+                    // it to each lane's extreme element (#434).
                     if let Expr::Ident(fname, _) = expr.as_ref() {
-                        if (fname == "sum_along" || fname == "mean_along") && args.len() == 2 {
+                        let along: Option<fn(usize) -> TapeOp> = match fname.as_str() {
+                            "sum_along"  => Some(TapeOp::SumAlong),
+                            "mean_along" => Some(TapeOp::MeanAlong),
+                            "max_along"  => Some(TapeOp::MaxAlong),
+                            "min_along"  => Some(TapeOp::MinAlong),
+                            _ => None,
+                        };
+                        if let (Some(mk), 2) = (along, args.len()) {
                             if let (CallArg::Positional(xe), CallArg::Positional(ae)) = (&args[0], &args[1]) {
                                 let (v, n) = self.eval_expr_with_tape(xe, tape, var_node, span)?;
                                 let axis_lit = self.eval_expr(ae)?.as_int().unwrap_or(0);
-                                let out = self.call_builtin(fname, vec![v.clone(), Value::Int(axis_lit)], psp.clone())?;
+                                let out = self.call_builtin(fname, vec![v.clone(), Value::Int(axis_lit, IW::I64)], psp.clone())?;
                                 if let Some(nid) = n {
                                     let ndim = as_tensor(&v)?.ndim();
                                     let axis = normalize_axis(axis_lit, ndim, span)?;
-                                    let top = if fname == "sum_along" { TapeOp::SumAlong(axis) } else { TapeOp::MeanAlong(axis) };
-                                    let id = tape.push(TapeNode { op: top, inputs: vec![nid], value: out.clone() });
+                                    let id = tape.push(TapeNode { op: mk(axis), inputs: vec![nid], value: out.clone() });
                                     return Ok((out, Some(id)));
                                 }
                                 return Ok((out, None));
@@ -2037,7 +2775,7 @@ impl Interpreter {
                                         _ => -1,
                                     }
                                 } else { -1 };
-                                let out = self.call_builtin(fname, vec![v.clone(), Value::Int(axis_lit)], psp.clone())?;
+                                let out = self.call_builtin(fname, vec![v.clone(), Value::Int(axis_lit, IW::I64)], psp.clone())?;
                                 if let Some(nid) = n {
                                     let ndim = as_tensor(&v)?.ndim();
                                     let axis = normalize_axis(axis_lit, ndim, span)?;
@@ -2241,7 +2979,7 @@ impl Interpreter {
                     let v = self.eval_expr(e)?;
                     Ok((v, None))
                 }
-                PostfixOp::Index(_elems) => {
+                PostfixOp::Index(elems) => {
                     // `x.reshape[[..]]` parses as Index over a `.reshape` Field.
                     // Trace it so the adjoint reshapes back to x's shape (#307).
                     if let Postfix { expr: recv, op: PostfixOp::Field(method), .. } = expr.as_ref() {
@@ -2254,6 +2992,11 @@ impl Interpreter {
                             }
                             return Ok((out, None));
                         }
+                    }
+                    // `w[i]` / `w[i, j]` on a traced tensor stays on the tape
+                    // (#420 item 3): the adjoint scatters back to element `i`.
+                    if let Some(hit) = self.tape_index_read(expr, elems, tape, var_node, span)? {
+                        return Ok(hit);
                     }
                     Ok((self.eval_expr(e)?, None))
                 }
@@ -2362,13 +3105,13 @@ impl Interpreter {
             Pattern::Literal(lit, _) => {
                 let lv = lit_value(lit);
                 match (&lv, val) {
-                    (Value::Int(a),   Value::Int(b))   => a == b,
+                    (Value::Int(a, _),   Value::Int(b, _))   => a == b,
                     (Value::Float(a, _), Value::Float(b, _)) => a == b,
                     // Cross-match Int/Float like `==` (scalar_compare) and
                     // `list_contains` already do (#291.2): a `0` literal pattern
                     // matches a `0.0` scrutinee, so match agrees with equality.
-                    (Value::Int(a),   Value::Float(b, _)) => (*a as f64) == *b,
-                    (Value::Float(a, _), Value::Int(b))   => *a == (*b as f64),
+                    (Value::Int(a, _),   Value::Float(b, _)) => (*a as f64) == *b,
+                    (Value::Float(a, _), Value::Int(b, _))   => *a == (*b as f64),
                     (Value::Bool(a),  Value::Bool(b))  => a == b,
                     (Value::Str(a),   Value::Str(b))   => a == b,
                     (Value::Nil,      Value::Nil)       => true,
@@ -2410,9 +3153,21 @@ impl Interpreter {
             .map(|p| p as i64)
     }
 
+    /// #478's `if_branch_hint` for a `match`: what an unsuffixed float literal
+    /// in arm `taken` adopts, read off the other arms.
+    fn match_arm_hint(&self, me: &MatchExpr, taken: usize, inherited: Option<FW>) -> Option<FW> {
+        if !has_untyped_float_lit(&me.arms[taken].body) { return None; }
+        let other = me.arms.iter().enumerate()
+            .filter(|(i, _)| *i != taken)
+            .find_map(|(_, a)| self.static_float_width(&a.body));
+        if other == Some(FW::F32) { Some(FW::F32) } else { inherited.filter(|w| *w == FW::F32) }
+    }
+
     fn eval_match(&mut self, me: &MatchExpr) -> EvalResult<Value> {
+        // #478: the hint belongs to the arm body, never to the scrutinee.
+        let inherited = self.float_lit_hint.take();
         let scrutinee = self.eval_expr(&me.scrutinee)?;
-        for arm in &me.arms {
+        for (idx, arm) in me.arms.iter().enumerate() {
             if self.pattern_matches(&arm.pattern, &scrutinee) {
                 self.push_scope();
                 self.bind_pattern(&arm.pattern, scrutinee.clone());
@@ -2422,6 +3177,7 @@ impl Interpreter {
                     true
                 };
                 if guard_ok {
+                    self.float_lit_hint = self.match_arm_hint(me, idx, inherited);
                     let val = self.eval_expr(&arm.body)?;
                     self.pop_scope();
                     return Ok(val);
@@ -2442,6 +3198,185 @@ impl Interpreter {
         self.call_fn_with_shapes(f, args, &[], sp)
     }
 
+    /// Bind a shape-argument bracket — `f[N]`, `f[S=4]`, `b.blit![H, W]` —
+    /// against a declaration's shape parameters. Positional args bind in
+    /// declaration order, named args by name. Every failure is an error here
+    /// rather than a fallthrough: an opaque stand-in silently poisons the
+    /// trailing call (the `<opaque bracket(...)>` mode, and #474's ghost
+    /// method). Free functions and methods share it so both report alike.
+    fn bind_shape_bracket(
+        &mut self,
+        owner: &str,
+        shape_params: &[ShapeParam],
+        bracket: &[(Option<&str>, &Expr, Span)],
+        span: &Span,
+    ) -> EvalResult<Vec<(String, i64)>> {
+        let mut bindings: Vec<(String, i64)> = Vec::new();
+        let mut pos_idx = 0usize;
+        for (arg_name, value_expr, aspan) in bracket {
+            let sp_name = match arg_name {
+                None => {
+                    let Some(sp) = shape_params.get(pos_idx) else {
+                        return Err(RuntimeError::at(format!(
+                            "`{}` declares {} shape parameter(s), got more bracket args",
+                            owner, shape_params.len()), span.clone()));
+                    };
+                    pos_idx += 1;
+                    sp.name.clone()
+                }
+                Some(n) => {
+                    if !shape_params.iter().any(|sp| sp.name == *n) {
+                        return Err(RuntimeError::at(format!(
+                            "`{}` is not a shape parameter of `{}` (declared: {})",
+                            n, owner,
+                            shape_params.iter().map(|sp| sp.name.as_str())
+                                .collect::<Vec<_>>().join(", ")), aspan.clone()));
+                    }
+                    (*n).to_string()
+                }
+            };
+            if bindings.iter().any(|(b, _)| *b == sp_name) {
+                return Err(RuntimeError::at(format!(
+                    "shape parameter `{}` of `{}` bound twice", sp_name, owner), aspan.clone()));
+            }
+            let v = self.eval_expr(value_expr)?;
+            let Some(n) = v.as_int() else {
+                return Err(RuntimeError::at(format!(
+                    "shape argument `{}` of `{}` must be an integer, got {}",
+                    sp_name, owner, v.type_name()), aspan.clone()));
+            };
+            bindings.push((sp_name, n));
+        }
+        Ok(bindings)
+    }
+
+    /// #474: dispatch `recv.method![shape args](args)`.
+    ///
+    /// Deciding whether this *is* a method call needs the receiver's value, so
+    /// the receiver is evaluated here — exactly once, on every path. When the
+    /// answer turns out to be no (the receiver is not a model instance, or the
+    /// name is one of its *fields* being indexed, `b.handlers[i](x)`), the
+    /// value comes back out with `NotAMethod` so the caller can hand it to the
+    /// ordinary postfix path instead of running the expression again. When the
+    /// receiver is a model instance and the name is neither a method nor a
+    /// field, this is #441's undefined method reached through a bracket, and it
+    /// errors here instead of evaluating to a silent opaque.
+    fn call_bracketed_method(
+        &mut self,
+        recv_expr: &Expr,
+        method: &str,
+        bracket: &[(Option<&str>, &Expr, Span)],
+        arg_vals: &[Value],
+        span: &Span,
+    ) -> EvalResult<BracketedCall> {
+        let recv = self.eval_expr(recv_expr)?;
+        let Value::Struct(ref fields) = recv else { return Ok(BracketedCall::NotAMethod(recv)) };
+        let Some(mname) = struct_model_name(fields) else {
+            return Ok(BracketedCall::NotAMethod(recv));
+        };
+        let Some(f) = self.model_methods.get(&mname)
+            .and_then(|ms| ms.get(method)).cloned()
+        else {
+            // A field of that name may hold an indexable value; leave it to
+            // the ordinary path. Otherwise there is nothing to call (#441).
+            if fields.borrow().iter().any(|(k, _)| k == method) {
+                return Ok(BracketedCall::NotAMethod(recv));
+            }
+            return Err(RuntimeError::at(format!(
+                "no method `{}` on model `{}`", method, mname), span.clone()));
+        };
+        let owner = format!("{}.{}", mname, method);
+        let explicit = self.bind_shape_bracket(&owner, &f.shape_params, bracket, span)?;
+        // The model's own shape args, then the method's. A method that reuses
+        // one of the model's shape-param names shadows it with what the call
+        // site wrote, which is the only reading that makes the bracket mean
+        // anything.
+        let mut shape_bindings = model_shape_bindings(fields);
+        shape_bindings.retain(|(n, _)| !explicit.iter().any(|(e, _)| e == n));
+        shape_bindings.extend(explicit);
+        let mut call_args = vec![recv.clone()];
+        call_args.extend(arg_vals.iter().cloned());
+        Ok(BracketedCall::Dispatched(
+            self.call_fn_with_shapes(&f, call_args, &shape_bindings, span.clone())?))
+    }
+
+    /// Park an already-evaluated receiver for the `Field` evaluation that the
+    /// ordinary postfix path is about to perform on the same node.
+    fn park_receiver(&mut self, recv_expr: &Expr, recv: Value) {
+        self.parked_receiver = Some((recv_expr as *const Expr, recv));
+    }
+
+    /// Take the parked receiver for `expr`, if this is the node it was parked
+    /// for. A value parked for some other node belongs to an outer call still
+    /// on its way down and is left alone.
+    fn take_parked_receiver(&mut self, expr: &Expr) -> Option<Value> {
+        let key = expr as *const Expr;
+        match &self.parked_receiver {
+            Some((parked, _)) if *parked == key =>
+                self.parked_receiver.take().map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    /// Harvest shape-param bindings from one argument against its declared
+    /// parameter type. Three sources, all landing in the same `inferred` map
+    /// through `bind_shape_name`, so two arguments that disagree report the
+    /// same way whichever pair of sources they came from:
+    ///
+    ///   - a tensor / view / kv argument's shape against a `ShapeSpec` — the
+    ///     original rule, and for a long time the only one;
+    ///   - a model array's length against `[T; N]` (#459). The array knows how
+    ///     many slots it has, so `N` is every bit as inferable as a tensor dim;
+    ///     without this `fn build[N](!ns: [Node; N], …)` type-checked and then
+    ///     died at the call site.
+    ///   - a model argument's own bound shape args against a parameterized
+    ///     model parameter type (#474, parameter position). An instance carries
+    ///     its shape args as hidden `__shape_P__` fields, so `!b: Box[H, W]`
+    ///     can bind H and W instead of making every call site spell out
+    ///     `f![2, 2](b, …)`.
+    fn harvest_shape_params(
+        &self,
+        ty: &Type,
+        v: &Value,
+        inferred: &mut std::collections::HashMap<String, i64>,
+        fn_name: &str,
+        sp: &Span,
+    ) -> EvalResult<()> {
+        match ty {
+            Type::Tensor(_, spec, _) | Type::View(_, spec, _) | Type::KV(_, spec, _) => {
+                if let Value::Tensor(t) = v {
+                    infer_shape_from_arg(spec, t.shape(), inferred, fn_name, sp)?;
+                }
+            }
+            // A model array is a List of slots at runtime (see the
+            // `forge.uninit[Model, [N]]` path); its length is the `N`.
+            Type::Array(_, size, _) => {
+                if let Value::List(items) = v {
+                    bind_shape_ident_expr(size, items.len() as i64, inferred, fn_name, sp)?;
+                }
+            }
+            Type::Named { name, args, .. } if !args.is_empty() => {
+                let Value::Struct(fields) = v else { return Ok(()); };
+                let Some(model) = struct_model_name(fields) else { return Ok(()); };
+                if &model != name { return Ok(()); }
+                let Some(decl) = self.model_shape_params.get(&model) else { return Ok(()); };
+                // The instance tags its dims under the model's *declaration*
+                // names; the parameter type names them positionally.
+                for (decl_name, arg) in decl.iter().zip(args) {
+                    let Some(target) = type_arg_shape_var(arg) else { continue; };
+                    let key = format!("__shape_{}__", decl_name);
+                    let actual = fields.borrow().iter()
+                        .find(|(k, _)| *k == key)
+                        .and_then(|(_, v)| v.as_int());
+                    let Some(dim) = actual else { continue; };
+                    bind_shape_name(target, dim, inferred, fn_name, sp)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn call_fn_with_shapes(&mut self, f: &FnDecl, args: Vec<Value>, explicit_shapes: &[(String, i64)], sp: Span) -> EvalResult<Value> {
         if args.len() != f.params.len() {
             return Err(RuntimeError::at(
@@ -2452,39 +3387,57 @@ impl Interpreter {
         let _depth = self.enter_call(&sp)?;
         self.prof_fn_call();
         self.push_scope();
-        // Shape params: bind from explicit args first, then infer from tensor shapes.
-        // Bind all explicit shape params upfront so they are visible in the method body
-        // even when not referenced in any parameter type annotation (e.g. model shape params
-        // that only appear in the body as bare identifiers like `D`).
+        // Shape params: bind from explicit args first, then infer from the
+        // arguments themselves. Bind all explicit shape params upfront so they
+        // are visible in the method body even when not referenced in any
+        // parameter type annotation (e.g. model shape params that only appear
+        // in the body as bare identifiers like `D`).
         for (name, dim) in explicit_shapes {
-            self.bind(name, Value::Int(*dim));
+            self.bind_shape_param(name, Value::Int(*dim, IW::I64));
         }
         let mut inferred: std::collections::HashMap<String, i64> =
             explicit_shapes.iter().cloned().collect();
         let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (p, v) in f.params.iter().zip(&args) {
             let Some(ty) = &p.ty else { continue; };
-            let Some(spec) = type_shape_spec(ty) else { continue; };
-            collect_idents_in_spec(spec, &mut referenced);
-            let Value::Tensor(t) = v else { continue; };
-            infer_shape_from_arg(spec, t.shape(), &mut inferred, &f.name, &sp)?;
+            if let Some(spec) = type_shape_spec(ty) {
+                collect_idents_in_spec(spec, &mut referenced);
+            }
+            self.harvest_shape_params(ty, v, &mut inferred, &f.name, &sp)?;
         }
         for sp_decl in &f.shape_params {
             referenced.insert(sp_decl.name.clone());
         }
         for name in &referenced {
             match inferred.get(name) {
-                Some(&dim) => self.bind(name, Value::Int(dim)),
+                Some(&dim) => self.bind_shape_param(name, Value::Int(dim, IW::I64)),
                 None => {
                     self.pop_scope();
                     return Err(RuntimeError::at(format!(
-                        "fn `{}`: shape param `{}` cannot be inferred from any tensor argument's shape. \
-                        Either pass a tensor whose declared type uses `{}`, or make the value explicit in the program.",
+                        "fn `{}`: shape param `{}` cannot be inferred from any argument. \
+                        Either pass a tensor, model array or model whose declared type uses `{}`, \
+                        or make the value explicit in the program.",
                         f.name, name, name), sp));
                 }
             }
         }
+        // A dim harvested from a source no annotation named (#459/#474: a model
+        // array's length, a model argument's own shape args) still belongs in
+        // scope — the body may reference it even where `referenced` did not.
+        for (name, dim) in &inferred {
+            if !referenced.contains(name) {
+                self.bind_shape_param(name, Value::Int(*dim, IW::I64));
+            }
+        }
         for (p, v) in f.params.iter().zip(args) {
+            // `Port[L]`: the annotation names a runtime, so the handle has to
+            // be one. `L` was decoration before this — a `Port[lua]` parameter
+            // took a python handle without complaint in either backend, so the
+            // signature implied a check that did not exist.
+            if let Err(e) = check_port_lang(&v, p.ty.as_ref(), &sp) {
+                self.pop_scope();
+                return Err(e);
+            }
             self.bind(&p.name, coerce_scalar_width(v, p.ty.as_ref()));
             if let Some(axis) = p.ty.as_ref().and_then(streaming_axis_from_type) {
                 self.bind_stream_axis(&p.name, axis);
@@ -2526,6 +3479,7 @@ impl Interpreter {
             // next operation. A `?` propagation returns a (T, Err) tuple, not a
             // T, so it is deliberately left alone.
             Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => {
+                check_port_lang(&v, f.ret_type.as_ref(), &sp)?;
                 Ok(coerce_scalar_width(v, f.ret_type.as_ref()))
             }
             Ok(Flow::Break) | Ok(Flow::Continue) => Err(RuntimeError::msg("break/continue outside loop")),
@@ -2537,6 +3491,9 @@ impl Interpreter {
     // ── Block ─────────────────────────────────────────────────────────────
 
     fn eval_block(&mut self, block: &Block) -> EvalResult<Flow> {
+        // #478: a block is value-transparent through its tail, but its
+        // statements are not — take the hint now, re-arm it on the tail below.
+        let want = self.float_lit_hint.take();
         self.push_scope();
         let result = (|| -> EvalResult<Flow> {
             // Defer the last stmt if it's a yielding form AND no explicit tail.
@@ -2555,6 +3512,7 @@ impl Interpreter {
                 }
             }
             if let Some(tail) = &block.tail_expr {
+                self.float_lit_hint = want;
                 Ok(Flow::Normal(self.eval_expr(tail)?))
             } else if deferred_last {
                 match &block.stmts[n - 1] {
@@ -2566,6 +3524,7 @@ impl Interpreter {
                             }
                         }
                         let raw = if let Some(t) = &body.tail_expr {
+                            self.float_lit_hint = want;
                             self.eval_expr(t)?
                         } else { Value::Nil };
                         // Apply @cast directive if present (same logic as Expr::DirectiveBlock).
@@ -2582,12 +3541,16 @@ impl Interpreter {
                         } else { raw };
                         Ok(Flow::Normal(v))
                     }
-                    Stmt::If(ie) => self.eval_if_flow(ie),
+                    Stmt::If(ie) => { self.float_lit_hint = want; self.eval_if_flow(ie) }
                     Stmt::Expr { lhs, assign: None, .. } => {
+                        self.float_lit_hint = want;
                         Ok(Flow::Normal(self.eval_expr(lhs)?))
                     }
                     Stmt::Stage { body, .. } => Ok(Flow::Normal(self.eval_expr(body)?)),
-                    Stmt::Match(me) => Ok(Flow::Normal(self.eval_match(me)?)),
+                    Stmt::Match(me) => {
+                        self.float_lit_hint = want;
+                        Ok(Flow::Normal(self.eval_match(me)?))
+                    }
                     _ => unreachable!(),
                 }
             } else {
@@ -2646,6 +3609,7 @@ impl Interpreter {
                     }
                 }
                 let v = self.eval_expr(&l.value)?;
+                check_port_lang(&v, l.ty.as_ref(), &l.span)?;
                 let v = coerce_scalar_width(v, l.ty.as_ref());
                 self.bind_pattern(&l.pattern, v);
                 // #399: resolve the streaming axis and declared capacity from the
@@ -2927,6 +3891,11 @@ impl Interpreter {
                                             if let Value::Tensor(ref mut arr) = slot {
                                                 let dt = arr.dtype;
                                                 Self::assign_to_tensor_resolved(arr, dt, &idx_vals, rval, span.clone())?;
+                                            } else if matches!(slot, Value::List(_)) {
+                                                // #476: same model-array store as the
+                                                // `m.field[i] =` path below, for the
+                                                // aliased-field spelling.
+                                                assign_into_model_array(slot, &idx_vals, rval, &span)?;
                                             } else {
                                                 return Err(RuntimeError::at(
                                                     format!("indexed assignment requires a tensor, got {}", slot.type_name()),
@@ -2954,6 +3923,17 @@ impl Interpreter {
                                         if let Value::Tensor(ref mut arr) = slot {
                                             let dt = arr.dtype;
                                             Self::assign_to_tensor_resolved(arr, dt, &idx_vals, rval, span.clone())?;
+                                        } else if matches!(slot, Value::List(_)) {
+                                            // #476 spelling 3: `h.cells[i] = Cell { .. }`
+                                            // — a model-array field. The local form
+                                            // (`cs[i] = ..`) has always worked; through a
+                                            // field it hit the tensor-only path and failed
+                                            // with a message about tensors and lists,
+                                            // neither of which the author wrote. Writing
+                                            // the slot here goes through the struct's own
+                                            // `Rc<RefCell<..>>`, so unlike the
+                                            // copy-out-and-fill spelling it really lands.
+                                            assign_into_model_array(slot, &idx_vals, rval, &span)?;
                                         } else {
                                             return Err(RuntimeError::at(
                                                 format!("indexed assignment requires a tensor, got {}", slot.type_name()),
@@ -3063,14 +4043,115 @@ impl Interpreter {
     /// inside an if-body propagate out via the returned Flow. Callers that
     /// only want a Value should unwrap (or treat non-Normal as an error in
     /// expression context).
+    /// #478: the float width this expression will evaluate to, answered
+    /// **without evaluating it** — so no side effects, and no commitment to a
+    /// branch that will not be taken. The mirror of
+    /// `jit::Translator::static_float_kind`; deliberately partial, and a
+    /// `None` answer changes nothing (the literal keeps #209's f64 default).
+    fn static_float_width(&self, e: &Expr) -> Option<FW> {
+        match e {
+            // A suffix is the width, full stop (#473). An *unsuffixed* literal
+            // is the thing being decided, so it answers nothing.
+            Expr::Literal(Literal::Float(_, Some(t)), _) =>
+                Some(if scalar_is_f32_family(t) { FW::F32 } else { FW::F64 }),
+            Expr::Ident(name, _) => match self.lookup_ref(name)? {
+                Value::Float(_, fw) => Some(*fw),
+                _ => None,
+            },
+            Expr::Cast { ty: Type::Scalar(s, _), .. } => match s {
+                _ if scalar_is_f32_family(s) => Some(FW::F32),
+                ScalarType::F64 => Some(FW::F64),
+                _ => None,
+            },
+            Expr::UnOp { op: UnOp::Neg, operand, .. } => self.static_float_width(operand),
+            Expr::Tuple(els, _) if els.len() == 1 => self.static_float_width(&els[0]),
+            Expr::Block(b) => self.static_float_width_of_block(b),
+            Expr::If(ie) => self.static_float_width_of_if(ie),
+            Expr::Match(me) => me.arms.iter().find_map(|a| self.static_float_width(&a.body)),
+            Expr::BinOp { op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod,
+                          lhs, rhs, .. } => {
+                match (self.static_float_width(lhs), self.static_float_width(rhs)) {
+                    (Some(a), Some(b)) if a != b => None,
+                    (a, b) => a.or(b),
+                }
+            }
+            // A fully-subscripted read of a tensor binding is an element of
+            // that tensor, and carries the tensor's width (#473).
+            Expr::Postfix { expr, op: PostfixOp::Index(elems), .. } => {
+                let Expr::Ident(name, _) = &**expr else { return None };
+                let Value::Tensor(t) = self.lookup_ref(name)? else { return None };
+                let all_points = elems.iter().all(|ie| matches!(ie, IndexElem::Expr(_)));
+                if !all_points || elems.len() != t.shape().len() { return None; }
+                Some(t.float_width())
+            }
+            _ => None,
+        }
+    }
+
+    fn static_float_width_of_block(&self, b: &Block) -> Option<FW> {
+        if let Some(tail) = &b.tail_expr { return self.static_float_width(tail); }
+        // #421: a trailing block-form `if`/`match` parses as a statement.
+        match b.stmts.last() {
+            Some(Stmt::If(ie)) => self.static_float_width_of_if(ie),
+            Some(Stmt::Match(me)) => me.arms.iter().find_map(|a| self.static_float_width(&a.body)),
+            _ => None,
+        }
+    }
+
+    fn static_float_width_of_if(&self, ie: &IfExpr) -> Option<FW> {
+        self.static_float_width_of_block(&ie.then_branch).or_else(|| match &ie.else_branch {
+            Some(ElseBranch::Block(b)) => self.static_float_width_of_block(b),
+            Some(ElseBranch::If(nested)) => self.static_float_width_of_if(nested),
+            None => None,
+        })
+    }
+
+    /// Non-cloning scope lookup, for the peek above only — `lookup` clones the
+    /// whole `Value`, which for a tensor binding would make an `if` inside a
+    /// hot loop copy its data just to ask what width it is.
+    fn lookup_ref(&self, name: &str) -> Option<&Value> {
+        self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+
+    /// #478: the width an unsuffixed float literal in the *taken* branch of
+    /// `ie` should adopt — read off the branch NOT taken, falling back to an
+    /// enclosing join's answer. Gated on the taken branch actually containing
+    /// such a literal, so the common `if` pays one shallow AST walk and no
+    /// scope lookups at all.
+    fn if_branch_hint(&self, ie: &IfExpr, then_taken: bool, inherited: Option<FW>) -> Option<FW> {
+        let taken_has_lit = if then_taken {
+            block_has_untyped_float_lit(&ie.then_branch)
+        } else {
+            else_has_untyped_float_lit(&ie.else_branch)
+        };
+        if !taken_has_lit { return None; }
+        let other = if then_taken {
+            match &ie.else_branch {
+                Some(ElseBranch::Block(b)) => self.static_float_width_of_block(b),
+                Some(ElseBranch::If(nested)) => self.static_float_width_of_if(nested),
+                None => None,
+            }
+        } else {
+            self.static_float_width_of_block(&ie.then_branch)
+        };
+        if other == Some(FW::F32) { Some(FW::F32) } else { inherited.filter(|w| *w == FW::F32) }
+    }
+
     fn eval_if_flow(&mut self, ie: &IfExpr) -> EvalResult<Flow> {
+        // #478: the hint belongs to the branch value, never to the condition.
+        let inherited = self.float_lit_hint.take();
         let c = self.eval_expr(&ie.cond)?;
         if c.as_bool().unwrap_or(false) {
+            self.float_lit_hint = self.if_branch_hint(ie, true, inherited);
             self.eval_block(&ie.then_branch)
         } else {
+            let hint = self.if_branch_hint(ie, false, inherited);
             match &ie.else_branch {
-                Some(ElseBranch::Block(b)) => self.eval_block(b),
-                Some(ElseBranch::If(nested)) => self.eval_if_flow(nested),
+                Some(ElseBranch::Block(b)) => { self.float_lit_hint = hint; self.eval_block(b) }
+                Some(ElseBranch::If(nested)) => {
+                    self.float_lit_hint = hint;
+                    self.eval_if_flow(nested)
+                }
                 None => Ok(Flow::Normal(Value::Nil)),
             }
         }
@@ -3089,8 +4170,14 @@ impl Interpreter {
     // ── Expr ──────────────────────────────────────────────────────────────
 
     fn eval_expr(&mut self, expr: &Expr) -> EvalResult<Value> {
+        // #478: consume the type-direction hint here, once. Forms that are
+        // *value-transparent* — they yield one of their sub-expressions
+        // unchanged — re-arm it before recursing; everything else drops it, so
+        // it can only ever reach a literal that really is the value of the
+        // branch position it was armed for. Mirrors `jit::Translator::lower_expr`.
+        let want = self.float_lit_hint.take();
         match expr {
-            Expr::Literal(lit, _) => Ok(lit_value(lit)),
+            Expr::Literal(lit, _) => Ok(lit_value_hinted(lit, want)),
             Expr::Nil(_)          => Ok(Value::Nil),
             Expr::Underscore(_)   => {
                 // In @pp stage bodies `_` refers to the previous stage's output.
@@ -3100,7 +4187,10 @@ impl Interpreter {
             Expr::Spread(_)       => Ok(Value::Nil),
             Expr::Ident(name, span) => self.eval_ident(name, span.clone()),
             Expr::Tuple(elems, _) => {
-                if elems.len() == 1 { return self.eval_expr(&elems[0]); }
+                if elems.len() == 1 {
+                    self.float_lit_hint = want;
+                    return self.eval_expr(&elems[0]);
+                }
                 let vs: Result<Vec<_>, _> = elems.iter().map(|e| self.eval_expr(e)).collect();
                 Ok(Value::Tuple(vs?))
             }
@@ -3150,7 +4240,7 @@ impl Interpreter {
                         // Nested literal inherits its rows' dtype.
                         Ok(Value::tensor_dt(arr, row_dtype))
                     }
-                    Value::Int(f0) => {
+                    Value::Int(f0, _) => {
                         let mut data = vec![f0 as f64];
                         for e in elems.iter().skip(1) {
                             let v = self.eval_expr(e)?;
@@ -3182,16 +4272,34 @@ impl Interpreter {
                 if result.is_ok() { self.prof_alloc(); }
                 result
             }
-            Expr::Block(b) => match self.eval_block(b)? {
-                Flow::Normal(v) | Flow::Return(v) => Ok(v),
-                _ => Ok(Value::Nil),
-            },
-            Expr::ArenaBlock(ab) => match self.eval_block(&ab.body)? {
-                Flow::Normal(v) | Flow::Return(v) => Ok(v),
-                _ => Ok(Value::Nil),
-            },
-            Expr::If(ie) => self.eval_if(ie),
-            Expr::Match(me) => self.eval_match(me),
+            Expr::Block(b) => {
+                self.float_lit_hint = want;
+                match self.eval_block(b)? {
+                    Flow::Normal(v) | Flow::Return(v) => Ok(v),
+                    _ => Ok(Value::Nil),
+                }
+            }
+            Expr::ArenaBlock(ab) => {
+                self.float_lit_hint = want;
+                // #400: the meter does **not** rewind at the end of a
+                // `forge { … }` block. The interpreter has no bump pointer to
+                // reset — every tensor is an ordinary Rust allocation kept
+                // alive by whatever binding holds it, and the block's value
+                // escapes as the block's result. Rewinding `forge_used` here
+                // made `forge { … }` a one-token bypass of `--forge`: wrapping
+                // each allocation in a block let a recursive fn hold 80 MiB of
+                // live tensors under `--forge=4M`, while the same program
+                // unwrapped was correctly refused. The JIT takes the same line
+                // — `ForgeArena::restore` rewinds the cursor but never returns
+                // committed bytes to the budget — so metering is monotonic on
+                // both backends and the flag means what it says.
+                match self.eval_block(&ab.body)? {
+                    Flow::Normal(v) | Flow::Return(v) => Ok(v),
+                    _ => Ok(Value::Nil),
+                }
+            }
+            Expr::If(ie) => { self.float_lit_hint = want; self.eval_if(ie) }
+            Expr::Match(me) => { self.float_lit_hint = want; self.eval_match(me) }
             Expr::FnLit(lit) => {
                 // Snapshot all locals visible at this point (outer → inner so
                 // inner bindings win on duplicate names, matching lookup order).
@@ -3235,6 +4343,7 @@ impl Interpreter {
                 Ok(Value::Struct(Rc::new(RefCell::new(field_vals))))
             }
             Expr::DirectiveBlock { directives, body, .. } => {
+                self.float_lit_hint = want;
                 let v = match self.eval_block(body)? {
                     Flow::Normal(v) | Flow::Return(v) => v,
                     _ => Value::Nil,
@@ -3293,7 +4402,7 @@ impl Interpreter {
                 // Profile: count tensor ops vs scalar ops.
                 match op {
                     BinOp::Matmul | BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
-                    | BinOp::DotPow | BinOp::DotPow2 | BinOp::DotGt | BinOp::DotLt
+                    | BinOp::DotPow | BinOp::DotGt | BinOp::DotLt
                     | BinOp::DotGe | BinOp::DotLe => {
                         let elems = match &result {
                             Value::Tensor(t) => t.len() as u64,
@@ -3311,8 +4420,8 @@ impl Interpreter {
                                 };
                                 self.prof_tensor_op(elems);
                             }
-                            (Value::Int(_), _) | (Value::Float(_, _), _)
-                            | (_, Value::Int(_)) | (_, Value::Float(_, _)) => {
+                            (Value::Int(_, _), _) | (Value::Float(_, _), _)
+                            | (_, Value::Int(_, _)) | (_, Value::Float(_, _)) => {
                                 self.prof_scalar_op();
                             }
                             _ => {}
@@ -3323,6 +4432,8 @@ impl Interpreter {
                 Ok(result)
             }
             Expr::UnOp { op, operand, .. } => {
+                // `-0.1` is a negated literal, so the hint passes through the sign.
+                if matches!(op, UnOp::Neg) { self.float_lit_hint = want; }
                 let v = self.eval_expr(operand)?;
                 apply_unop(op.clone(), &v)
             }
@@ -3334,7 +4445,7 @@ impl Interpreter {
                 // then let the generic cast widen/narrow it.
                 if let Value::EnumVal { enum_name, variant, .. } = &v {
                     let ord = self.enum_variant_ordinal(enum_name, variant).unwrap_or(0);
-                    return Ok(apply_cast(&Value::Int(ord), ty));
+                    return Ok(apply_cast(&Value::Int(ord, IW::I64), ty));
                 }
                 Ok(apply_cast(&v, ty))
             }
@@ -3444,12 +4555,74 @@ impl Interpreter {
                         }
                     }
                 }
+                // #474 — the ghost method. `b.blit![2, 2](src)` parses as
+                // Call(Index(Field(b, "blit!"), [2, 2]), [src]): the shape
+                // bracket sits between the method name and the call, so the
+                // Field-shaped dispatch just below never sees a method. The
+                // callee fell through to `Value::Opaque("index")`, and calling
+                // an opaque yields another opaque — a defined, `--check`-clean
+                // method that did nothing whatsoever, no error and no effect.
+                // That is #441's ghost-method mode surviving in the shape-
+                // parameterized case, and a test asserting the call did
+                // nothing could not tell the difference.
+                //
+                // Dispatch it here. Both halves of the body's shape scope are
+                // reachable: the receiver carries the *model's* shape args as
+                // hidden `__shape_P__` fields, and the bracket names the
+                // method's *own*.
+                if let Expr::Postfix { expr: bracketed, op: bracket_op, .. } = expr {
+                    if let Some(bracket) = shape_bracket_args(bracket_op, &span) {
+                        if let Expr::Postfix { expr: recv_expr, op: PostfixOp::Field(method), .. } =
+                            bracketed.as_ref()
+                        {
+                            match self.call_bracketed_method(
+                                recv_expr, method, &bracket, &arg_vals, &span)?
+                            {
+                                BracketedCall::Dispatched(v) => return Ok(v),
+                                // Not a method after all. The receiver is
+                                // already evaluated; hand it to the ordinary
+                                // path below instead of running it again.
+                                BracketedCall::NotAMethod(recv) =>
+                                    self.park_receiver(recv_expr, recv),
+                            }
+                        }
+                    }
+                }
                 // String method calls: s.split(","), s.trim(), s.upper(), etc.
                 // Also handles model instance method calls: m.method(args).
                 if let Expr::Postfix { expr: inner_expr, op: PostfixOp::Field(method), .. } = expr {
                     let recv = self.eval_expr(inner_expr)?;
                     if let Value::Str(s) = &recv {
                         return call_str_method(s, method, arg_vals, span);
+                    }
+                    // `nil` has no methods. This used to fall through to the
+                    // forward-compat "unknown receiver" path and hand back
+                    // `Value::Opaque(".starts_with(...)")`, which is falsy — so
+                    // the PORTS.md §6 idiom written without its nil guard,
+                    // `e.starts_with("port-open")` on a no-error `Err`, quietly
+                    // answered "no" instead of saying the receiver was nil. The
+                    // JIT raises here (a null str pointer is `nil`); raise the
+                    // same error, with the same wording, rather than diverge.
+                    if matches!(recv, Value::Nil) {
+                        return Err(RuntimeError::at(
+                            format!("cannot call method `{}` on nil", method), span));
+                    }
+                    // A `Port` handle has no methods either. PORTS.md §7.1: a
+                    // handle "compares only against `nil`, … and is otherwise
+                    // inert: it has no length, no elements, and no equality".
+                    // Without this it took the same forward-compat path and
+                    // `p.starts_with("port#")` on a *live* handle answered with
+                    // a falsy `Opaque`, rc 0 — the handle-forging check the
+                    // opacity exists to make impossible, quietly reported as
+                    // "no". The JIT refuses this at compile time; `run` cannot
+                    // (the receiver's type is not known until it is evaluated),
+                    // so it raises here, located, rather than answering.
+                    if let Value::Opaque(ref o) = recv {
+                        if crate::ports::handle_id(o).is_some() {
+                            return Err(RuntimeError::at(format!(
+                                "cannot call method `{}` on a Port handle — a handle is \
+                                 opaque and has no methods (PORTS §7.1)", method), span));
+                        }
                     }
                     // Model instance method dispatch: m.other_method(args).
                     // The forward-desugar path (m() → m.forward()) is handled later via
@@ -3478,7 +4651,13 @@ impl Interpreter {
                                 };
                                 let mut call_args = vec![recv.clone()];
                                 call_args.extend(arg_vals);
-                                return self.call_fn_with_shapes(&f, call_args, &shape_bindings, span);
+                                let result = self.call_fn_with_shapes(&f, call_args, &shape_bindings, span)?;
+                                // #475: `!` params on a method alias exactly as
+                                // they do on a free function. `self` occupies
+                                // callee param 0 and has no call-arg slot, hence
+                                // the offset of 1.
+                                apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args, 1);
+                                return Ok(result);
                             }
                             // #394: model serialization `instance.save(...)` /
                             // `.load(...)` is specified (SPEC §3.10) but not
@@ -3586,7 +4765,7 @@ impl Interpreter {
                             RuntimeError::at(format!("undefined fn `{}`", name), span.clone())
                         })?;
                         let result = self.call_fn(&f, arg_vals, span)?;
-                        apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args);
+                        apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args, 0);
                         Ok(result)
                     }
                     Value::BoundFn { ref name, ref shape_bindings } => {
@@ -3595,7 +4774,7 @@ impl Interpreter {
                         })?;
                         let bindings = shape_bindings.clone();
                         let result = self.call_fn_with_shapes(&f, arg_vals, &bindings, span)?;
-                        apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args);
+                        apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args, 0);
                         Ok(result)
                     }
                     Value::Lambda { lit, captured_env } => self.call_lambda(&lit.clone(), captured_env, arg_vals, span),
@@ -3636,7 +4815,12 @@ impl Interpreter {
                                 };
                                 let mut call_args = vec![callee.clone()];
                                 call_args.extend(arg_vals);
-                                return self.call_fn_with_shapes(&f, call_args, &shape_bindings, span);
+                                let result = self.call_fn_with_shapes(&f, call_args, &shape_bindings, span)?;
+                                // #475: same as the named-method path — the
+                                // forward-desugar `m(x)` ≡ `m.forward(x)` puts
+                                // the receiver in param 0 with no call-arg slot.
+                                apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args, 1);
+                                return Ok(result);
                             }
                         }
                         Err(RuntimeError::at(
@@ -3656,7 +4840,13 @@ impl Interpreter {
                         return Ok(Value::EnumVal { enum_name: base.clone(), variant: name.clone(), payload: Vec::new() });
                     }
                 }
-                let recv = self.eval_expr(expr)?;
+                // #474: a shape-bracketed call that turned out not to be a
+                // method already evaluated this very node. Reuse that value —
+                // evaluating it again would repeat every side effect.
+                let recv = match self.take_parked_receiver(expr) {
+                    Some(v) => v,
+                    None => self.eval_expr(expr)?,
+                };
                 match (&recv, name.as_str()) {
                     (Value::Module { alias, .. }, _) => {
                         let qual_name = format!("{}.{}", alias, name);
@@ -3673,12 +4863,12 @@ impl Interpreter {
                     }
                     (Value::Tensor(t), "shape") => {
                         let dims: Vec<Value> = t.shape().iter()
-                            .map(|&d| Value::Int(d as i64)).collect();
+                            .map(|&d| Value::Int(d as i64, IW::I64)).collect();
                         Ok(Value::Tuple(dims))
                     }
                     (Value::Tensor(_), "rank" | "ndim") => Ok(Value::Int(
                         if let Value::Tensor(t) = &recv { t.ndim() as i64 } else { 0 }
-                    )),
+                    , IW::I64)),
                     (Value::Struct(fields), _) => {
                         for (k, v) in fields.borrow().iter() {
                             if k == name { return Ok(v.clone()); }
@@ -3696,6 +4886,20 @@ impl Interpreter {
                             "`{}.{}` is not supported by the interpreter \
                              (`dmc run`); run this program under `dmc jit`", arena, name), span))
                     }
+                    // #476: an unwritten model-array slot is `nil` (that is how
+                    // `forge.uninit[Cell, [N]]` fills its list), so a field read
+                    // off one used to yield a silent `Opaque`. The program then
+                    // failed at whatever line first *used* the value, with a
+                    // complaint about "opaque" — a word that appears nowhere in
+                    // the program or the spec — naming neither the field, nor
+                    // the array, nor initialization. Name the real cause here,
+                    // at the read.
+                    (Value::Nil, _) => Err(RuntimeError::at(format!(
+                        "read of uninitialized model-array element: field `.{}` was \
+                         read from an empty slot. `forge.uninit`/`vault.uninit` leaves \
+                         every element unwritten — assign a whole model literal to the \
+                         slot (`arr[i] = M {{ .. }}`) before reading it (MEMORY §2)",
+                        name), span)),
                     _ => Ok(Value::Opaque(format!(".{}", name))),
                 }
             }
@@ -3758,43 +4962,18 @@ impl Interpreter {
                 if let Expr::Ident(fn_name, _) = expr {
                     if let Some(f) = self.fns.get(fn_name).cloned() {
                         if !f.shape_params.is_empty() {
-                            let mut shape_bindings: Vec<(String, i64)> = Vec::new();
-                            let mut pos_idx = 0usize;
-                            for a in args {
-                                let (sp_name, value_expr, aspan) = match a {
-                                    CallArg::Positional(e) => {
-                                        let Some(sp) = f.shape_params.get(pos_idx) else {
-                                            return Err(RuntimeError::at(format!(
-                                                "`{}` declares {} shape parameter(s), got more bracket args",
-                                                fn_name, f.shape_params.len()), span));
-                                        };
-                                        pos_idx += 1;
-                                        (sp.name.clone(), e, span.clone())
-                                    }
-                                    CallArg::Named { name, value, span: nspan } => {
-                                        if !f.shape_params.iter().any(|sp| sp.name == *name) {
-                                            return Err(RuntimeError::at(format!(
-                                                "`{}` is not a shape parameter of `{}` (declared: {})",
-                                                name, fn_name,
-                                                f.shape_params.iter().map(|sp| sp.name.as_str())
-                                                    .collect::<Vec<_>>().join(", ")), nspan.clone()));
-                                        }
-                                        (name.clone(), value, nspan.clone())
-                                    }
-                                    CallArg::Spread(_) => continue,
-                                };
-                                if shape_bindings.iter().any(|(n, _)| *n == sp_name) {
-                                    return Err(RuntimeError::at(format!(
-                                        "shape parameter `{}` of `{}` bound twice", sp_name, fn_name), aspan));
-                                }
-                                let v = self.eval_expr(value_expr)?;
-                                let Some(n) = v.as_int() else {
-                                    return Err(RuntimeError::at(format!(
-                                        "shape argument `{}` of `{}` must be an integer, got {}",
-                                        sp_name, fn_name, v.type_name()), aspan));
-                                };
-                                shape_bindings.push((sp_name, n));
-                            }
+                            // A spread is not a shape argument; the pre-#474
+                            // loop skipped it and this keeps that.
+                            let bracket: Vec<(Option<&str>, &Expr, Span)> = args.iter()
+                                .filter_map(|a| match a {
+                                    CallArg::Positional(e) => Some((None, e, span.clone())),
+                                    CallArg::Named { name, value, span: nspan } =>
+                                        Some((Some(name.as_str()), value, nspan.clone())),
+                                    CallArg::Spread(_) => None,
+                                })
+                                .collect();
+                            let shape_bindings =
+                                self.bind_shape_bracket(fn_name, &f.shape_params, &bracket, &span)?;
                             if !shape_bindings.is_empty() {
                                 return Ok(Value::BoundFn { name: fn_name.clone(), shape_bindings });
                             }
@@ -3856,7 +5035,7 @@ impl Interpreter {
                                     .collect(),
                                 // [2, 3, 4] in demoniC evaluates as a Tensor literal
                                 Value::Tensor(t) => t.iter().map(|&x| x as usize).collect(),
-                                Value::Int(n) => vec![n as usize],
+                                Value::Int(n, _) => vec![n as usize],
                                 _ => return Err(RuntimeError::at(
                                     "reshape: shape must be a list of integers", span)),
                             };
@@ -3877,7 +5056,7 @@ impl Interpreter {
                     match elem {
                         IndexElem::Expr(e) => {
                             match self.eval_expr(e)? {
-                                Value::Int(n)   => raw_idx.push(n),
+                                Value::Int(n, _)   => raw_idx.push(n),
                                 Value::Float(x, _) => raw_idx.push(x as i64),
                                 _ => { all_scalar = false; break; }
                             }
@@ -3911,7 +5090,7 @@ impl Interpreter {
                             // keep integer semantics (#125).
                             let x = arr[IxDyn(&idx)];
                             match arr.dtype {
-                                DType::Int  => Ok(Value::Int(x as i64)),
+                                DType::Int  => Ok(Value::Int(x as i64, IW::I64)),
                                 DType::Bool => Ok(Value::Bool(x != 0.0)),
                                 _ => Ok(Value::Float(x, arr.float_width())),
                             }
@@ -3968,7 +5147,7 @@ impl Interpreter {
                         let n = raw_idx[0];
                         let i = if n < 0 { (len + n) as usize } else { n as usize };
                         match s.as_bytes().get(i) {
-                            Some(&b) => Ok(Value::Int(b as i64)),
+                            Some(&b) => Ok(Value::Int(b as i64, IW::I64)),
                             None => Err(RuntimeError::at(
                                 format!("string index {} out of range (len {})", i, s.len()),
                                 span,
@@ -3988,6 +5167,18 @@ impl Interpreter {
                         }
                         Ok(Value::Opaque("index".into()))
                     }
+                    // Indexing `nil` is not an index. It used to fall through
+                    // to the forward-compat `Opaque("index")` below, so `e[0]`
+                    // on a nil `Err` printed `<opaque index>` and exited 0 —
+                    // silent, and the JIT had raised on the same program. Say
+                    // it, at the span, in the JIT's words.
+                    Value::Nil => Err(RuntimeError::at("cannot index nil", span)),
+                    // A `Port` handle has no elements (PORTS.md §7.1), so
+                    // indexing one is an error rather than an opaque.
+                    Value::Opaque(ref o) if crate::ports::handle_id(o).is_some() =>
+                        Err(RuntimeError::at(
+                            "cannot index a Port handle — a handle is opaque and has \
+                             no elements (PORTS §7.1)", span)),
                     _ => Ok(Value::Opaque("index".into())),
                 }
             }
@@ -3999,7 +5190,7 @@ impl Interpreter {
     /// unbound shape params), so we always get a concrete shape.
     fn eval_dim(&mut self, e: &Expr) -> usize {
         match self.eval_expr(e) {
-            Ok(Value::Int(n))   if n >= 0 => n as usize,
+            Ok(Value::Int(n, _))   if n >= 0 => n as usize,
             Ok(Value::Float(x, _)) if x >= 0.0 => x as usize,
             _ => 4,
         }
@@ -4058,7 +5249,7 @@ impl Interpreter {
                     let sz = self.type_byte_size(fty)?;
                     let slice = read_overlay_bytes(&bytes, offset, sz, model_name, fname)?;
                     offset += sz;
-                    Value::Int(be_bytes_to_i64(slice))
+                    Value::Int(be_bytes_to_i64(slice), IW::I64)
                 }
                 Type::Tensor(elem, shape, _) => {
                     let elem_sz = self.type_byte_size(elem)?;
@@ -4222,6 +5413,19 @@ impl Interpreter {
         }
         if !is_tensor_ctor && !is_rng_ctor { return Ok(None); }
 
+        // #400: which sized arena this constructor charges against. `vault.*`
+        // is Vault, `forge.*` is Forge; `.kv` on either lands in the Stream
+        // arena (`MEMORY.md §9`), which has no sizing flag, and an `rng.*` draw
+        // has no arena base at all. See `charge_arena`.
+        let charge_to = match inner.as_ref() {
+            Expr::Ident(base, _) if method != "kv" => match base.as_str() {
+                "vault" => Some(crate::arena::Arena::Vault),
+                "forge" => Some(crate::arena::Arena::Forge),
+                _ => None,
+            },
+            _ => None,
+        };
+
         // Collect args once so we can read both the element type (for the
         // dtype tag) and the shape literal. The element type is the leading
         // bracket arg, e.g. the `u64` in `forge.zeros[u64, [128]]`.
@@ -4266,6 +5470,11 @@ impl Interpreter {
                     "identity: size {} is too large — the {}×{} element count overflows the address space",
                     n, n, n)));
             }
+            self.charge_arena(
+                charge_to,
+                (n as u64).saturating_mul(n as u64).saturating_mul(8),
+                Some(&expr.span_of()),
+            )?;
             let mut a = ArrayD::<f64>::zeros(IxDyn(&[n, n]));
             for i in 0..n { a[[i, i]] = 1.0; }
             self.prof_alloc();
@@ -4279,6 +5488,11 @@ impl Interpreter {
                 Expr::Literal(Literal::Int(k, _), _) if *k >= 0 => Some(*k as usize),
                 _ => None,
             }).collect();
+            let trit_elems = checked_shape_elems(&trit_dims).ok_or_else(|| RuntimeError::msg(
+                format!("trit: shape {:?} is too large — its element count overflows the address space",
+                        trit_dims)))?;
+            self.charge_arena(
+                charge_to, (trit_elems as u64).saturating_mul(8), Some(&expr.span_of()))?;
             let arr = ArrayD::from_elem(IxDyn(&trit_dims), 0.0_f64);
             self.prof_alloc();
             return Ok(Some(Value::tensor_dt(arr, DType::Trit)));
@@ -4324,6 +5538,10 @@ impl Interpreter {
         // OOM-kill; the `try_reserve` below is the remaining backstop.
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
         let nbytes = (nelems as u64).saturating_mul(8);
+        // #400: the declared arena budget is checked before the machine's, so a
+        // program run under `--forge=2G` hears about its own limit rather than
+        // about the host's RAM.
+        self.charge_arena(charge_to, nbytes, shape_span.as_ref())?;
         if let Some(total) = total_system_memory_bytes() {
             if nbytes > total {
                 return Err(located(format!(
@@ -4443,17 +5661,79 @@ fn is_trit_type_name(name: &str) -> bool {
 // ─── Literal → Value ─────────────────────────────────────────────────────────
 
 fn lit_value(lit: &Literal) -> Value {
+    lit_value_hinted(lit, None)
+}
+
+/// #478: does this value position hold an *unsuffixed* float literal — the
+/// only thing the type-direction hint can change? Follows exactly the
+/// value-transparent forms that `eval_expr` re-arms the hint through, so a
+/// `false` answer means the hint provably cannot matter and the sibling-branch
+/// type peek can be skipped outright.
+fn has_untyped_float_lit(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Literal::Float(_, None), _) => true,
+        Expr::UnOp { op: UnOp::Neg, operand, .. } => has_untyped_float_lit(operand),
+        Expr::Tuple(els, _) if els.len() == 1 => has_untyped_float_lit(&els[0]),
+        Expr::Block(b) => block_has_untyped_float_lit(b),
+        Expr::DirectiveBlock { body, .. } => block_has_untyped_float_lit(body),
+        Expr::ArenaBlock(ab) => block_has_untyped_float_lit(&ab.body),
+        Expr::If(ie) => if_has_untyped_float_lit(ie),
+        Expr::Match(me) => me.arms.iter().any(|a| has_untyped_float_lit(&a.body)),
+        _ => false,
+    }
+}
+
+fn block_has_untyped_float_lit(b: &Block) -> bool {
+    if let Some(tail) = &b.tail_expr { return has_untyped_float_lit(tail); }
+    match b.stmts.last() {
+        Some(Stmt::If(ie)) => if_has_untyped_float_lit(ie),
+        Some(Stmt::Match(me)) => me.arms.iter().any(|a| has_untyped_float_lit(&a.body)),
+        Some(Stmt::Expr { lhs, assign: None, .. }) => has_untyped_float_lit(lhs),
+        _ => false,
+    }
+}
+
+fn if_has_untyped_float_lit(ie: &IfExpr) -> bool {
+    block_has_untyped_float_lit(&ie.then_branch) || else_has_untyped_float_lit(&ie.else_branch)
+}
+
+fn else_has_untyped_float_lit(e: &Option<ElseBranch>) -> bool {
+    match e {
+        Some(ElseBranch::Block(b)) => block_has_untyped_float_lit(b),
+        Some(ElseBranch::If(nested)) => if_has_untyped_float_lit(nested),
+        None => false,
+    }
+}
+
+/// `lit_value`, plus the #478 context hint an *unsuffixed* float literal
+/// adopts. `want` is `None` everywhere except a branch-join value position
+/// (see `Interpreter::float_lit_hint`), and a suffix always outranks it.
+fn lit_value_hinted(lit: &Literal, want: Option<FW>) -> Value {
     match lit {
-        Literal::Int(n, _) => Value::Int(*n),
+        // #545: an integer literal's SUFFIX is a width origin, exactly as §3.1
+        // says ("an explicit type suffix … types the literal concretely"), so
+        // `2147483647i32 + 1i32` wraps. `jit.rs`'s `lower_literal` was fixed in
+        // the same change to lower the suffix at its own kind, which is what
+        // makes honoring it here safe: #540 backed this line out only because
+        // the JIT dropped the suffix and the two backends would have parted
+        // company on it. An UNSUFFIXED literal is untyped and stays `I64`: it
+        // adopts a narrow operand's width at the operator (`IW::join`), which
+        // is what the JIT's `adopt_int_literal_kind` does.
+        Literal::Int(n, sfx) => match sfx.as_ref().and_then(scalar_int_width) {
+            Some(w) => Value::Int(w.wrap(*n), w),
+            None => Value::Int(*n, IW::I64),
+        },
         // #473: an f32-family suffix produces a true f32 value. Rounding here
         // matters on its own: `0.1f32` is 0.100000001490116119384765625, not
         // the f64 0.1, and the JIT has always lowered it that way.
         Literal::Float(x, sfx) => match sfx {
             Some(t) if scalar_is_f32_family(t) => Value::Float(quantize_f32(*x), FW::F32),
+            // #478: no suffix — the literal is untyped and adopts its context.
+            None if want == Some(FW::F32) => Value::Float(quantize_f32(*x), FW::F32),
             _ => Value::Float(*x, FW::F64),
         },
         Literal::Str(s)   => Value::Str(s.clone()),
-        Literal::Char(c)  => Value::Int(*c as i64),
+        Literal::Char(c)  => Value::Int(*c as i64, IW::I64),
         Literal::Bool(b)  => Value::Bool(*b),
         Literal::Nil      => Value::Nil,
     }
@@ -4490,7 +5770,7 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     }
     match op {
         Add | Sub | Mul | Div | Mod | Pow | StarStar => scalar_arith(op, l, r),
-        DotAdd | DotSub | DotMul | DotDiv | DotPow | DotPow2 => {
+        DotAdd | DotSub | DotMul | DotDiv | DotPow => {
             // #275: a dotted arithmetic op on two scalars is the scalar op — the
             // checker types `5.0 ./ 2.0` as a scalar f32, and the JIT computes it
             // as such; don't promote to a rank-0 tensor here. Only when an operand
@@ -4498,9 +5778,13 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
             let scalar_pair = !matches!(l, Value::Tensor(_)) && !matches!(r, Value::Tensor(_))
                 && l.as_float().is_some() && r.as_float().is_some();
             if scalar_pair {
+                // #501 S16: `Pow` here is a transient dispatch tag handed
+                // straight to `scalar_arith` — it is never stored in an AST
+                // node and must never reach `fmt`, which has no source
+                // spelling for it (see `fmt::reserved_binop`).
                 let base = match op {
                     DotAdd => Add, DotSub => Sub, DotMul => Mul, DotDiv => Div,
-                    _ => Pow, // DotPow | DotPow2
+                    _ => Pow, // DotPow
                 };
                 return scalar_arith(base, l, r);
             }
@@ -4512,43 +5796,61 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
         And => Ok(Value::Bool(l.as_bool().unwrap_or(false) && r.as_bool().unwrap_or(false))),
         Or  => Ok(Value::Bool(l.as_bool().unwrap_or(false) || r.as_bool().unwrap_or(false))),
         // Pipe is handled in eval_expr (needs call_value); shouldn't reach apply_binop.
-        // RShift now parses as Pipe so it also never reaches here.
+        // RShift is the pipe-era variant for `>>`; that spelling parses to
+        // `BitShr` since #530, so nothing constructs `RShift` at all.
         Pipe | RShift => Ok(r.clone()),
+        // #540: the result carries the operands' width. `& | ^` on two values
+        // already inside the width cannot leave it, so the wrap is a no-op on
+        // the value — but the TAG has to propagate, or the next `+` widens.
         BitAnd => {
             let a = l.as_int().ok_or_else(|| RuntimeError::msg(format!("& requires int, got {}", l.type_name())))?;
             let b = r.as_int().ok_or_else(|| RuntimeError::msg(format!("& requires int, got {}", r.type_name())))?;
-            Ok(Value::Int(a & b))
+            let w = IW::join(int_width(l), int_width(r));
+            Ok(Value::Int(w.wrap(a & b), w))
         }
         BitOr => {
             let a = l.as_int().ok_or_else(|| RuntimeError::msg(format!("| requires int, got {}", l.type_name())))?;
             let b = r.as_int().ok_or_else(|| RuntimeError::msg(format!("| requires int, got {}", r.type_name())))?;
-            Ok(Value::Int(a | b))
+            let w = IW::join(int_width(l), int_width(r));
+            Ok(Value::Int(w.wrap(a | b), w))
         }
         BitXor => {
             let a = l.as_int().ok_or_else(|| RuntimeError::msg(format!("^ requires int, got {}", l.type_name())))?;
             let b = r.as_int().ok_or_else(|| RuntimeError::msg(format!("^ requires int, got {}", r.type_name())))?;
-            Ok(Value::Int(a ^ b))
+            let w = IW::join(int_width(l), int_width(r));
+            Ok(Value::Int(w.wrap(a ^ b), w))
         }
         BitShl => {
             let a = l.as_int().ok_or_else(|| RuntimeError::msg(format!("<< requires int, got {}", l.type_name())))?;
             let b = r.as_int().ok_or_else(|| RuntimeError::msg(format!("<< requires int, got {}", r.type_name())))?;
             // #215: the shift amount was cast `as u32`, so a negative or >=64 RHS
             // silently wrapped/masked (and panicked in debug builds). Validate it.
-            if !(0..64).contains(&b) {
-                Err(RuntimeError::msg(format!("<< shift amount {} out of range (expected 0..=63)", b)))
+            // #540: the legal range is the SHIFTED VALUE's width — an i32 shift
+            // tops out at 31 — and the result wraps at that width. Both match
+            // the JIT's `shift_range_check`, which sizes its guard the same way.
+            let w = IW::join(int_width(l), int_width(r));
+            if !(0..w.bits() as i64).contains(&b) {
+                Err(RuntimeError::msg(format!(
+                    "<< shift amount {} out of range (expected 0..={})", b, w.bits() - 1)))
             } else {
-                Ok(Value::Int(a << b))
+                Ok(Value::Int(w.wrap(a.wrapping_shl(b as u32)), w))
             }
         }
         BitShr => {
             let a = l.as_int().ok_or_else(|| RuntimeError::msg(format!(">> requires int, got {}", l.type_name())))?;
             let b = r.as_int().ok_or_else(|| RuntimeError::msg(format!(">> requires int, got {}", r.type_name())))?;
-            // (`>>` parses as the pipe operator, so this arm is currently dead, but
-            // guard the shift amount too for consistency — #215.)
-            if !(0..64).contains(&b) {
-                Err(RuntimeError::msg(format!(">> shift amount {} out of range (expected 0..=63)", b)))
+            // Arithmetic (sign-propagating) shift, matching the JIT's `sshr`:
+            // `-8 >> 1` is -4 and `-1 >> 63` is -1, not 0. #215: the shift
+            // amount is range-guarded exactly as `<<` is — Rust's `>>` panics
+            // in debug and masks mod-width in release outside the range. #540
+            // made that range the operands' joined width, so an i32 shift is
+            // judged against 0..=31.
+            let w = IW::join(int_width(l), int_width(r));
+            if !(0..w.bits() as i64).contains(&b) {
+                Err(RuntimeError::msg(format!(
+                    ">> shift amount {} out of range (expected 0..={})", b, w.bits() - 1)))
             } else {
-                Ok(Value::Int(a >> b))
+                Ok(Value::Int(w.wrap(w.wrap(a) >> b), w))
             }
         }
     }
@@ -4558,6 +5860,17 @@ fn scalar_arith(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     use BinOp::*;
     // int + int = int; otherwise float-promote
     if let (Some(a), Some(b)) = (l.as_int(), r.as_int()) {
+        // #540: the result's width is the operands' — SPEC §3.1, arithmetic on
+        // a fixed-width integer type wraps at that width. Everything below
+        // computes in i64 and wraps once at the end. For `+ - * **` that is
+        // exactly arithmetic at the narrow width, because reduction mod 2^w is
+        // a ring homomorphism, so wrapping late equals wrapping early — as long
+        // as the i64 computation itself does not overflow, which `**` still
+        // reports rather than wrapping (the JIT does not lower integer `**` at
+        // all, so nothing diverges). `/` and `%` cannot leave the range their
+        // operands are already in, except `MIN / -1`, guarded at the width.
+        let w = IW::join(int_width(l), int_width(r));
+        let (a, b) = (w.wrap(a), w.wrap(b));
         // Integer power needs fallible handling (#215): the exponent was cast via
         // `as u32`, silently truncating exponents > u32::MAX and wrapping on
         // i64 overflow. Validate the exponent range and use checked_pow.
@@ -4567,7 +5880,7 @@ fn scalar_arith(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
                     "integer exponent {} out of range (expected 0..={})", b, u32::MAX)));
             }
             return match a.checked_pow(b as u32) {
-                Some(v) => Ok(Value::Int(v)),
+                Some(v) => Ok(Value::Int(w.wrap(v), w)),
                 None => Err(RuntimeError::msg(format!(
                     "integer overflow: {} ** {} exceeds the i64 range", a, b))),
             };
@@ -4580,23 +5893,29 @@ fn scalar_arith(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
             Add => a.wrapping_add(b),
             Sub => a.wrapping_sub(b),
             Mul => a.wrapping_mul(b),
+            // #544: `MIN / -1` is a SIGNED-only overflow. At an unsigned width
+            // both operands are zero-extended and non-negative, so `-1` can
+            // never be the divisor and the signed `wrapping_div` on two
+            // non-negative i64s IS the unsigned division.
             Div => {
                 if b == 0 { 0 }
-                else {
-                    a.checked_div(b).ok_or_else(|| RuntimeError::msg(
-                        format!("integer overflow: {} / {} exceeds the i64 range", a, b)))?
+                else if w.is_signed() && a == w.min() && b == -1 {
+                    return Err(RuntimeError::msg(format!(
+                        "integer overflow: {} / {} exceeds the {} range", a, b, w.name())));
                 }
+                else { a.wrapping_div(b) }
             },
             Mod => {
                 if b == 0 { 0 }
-                else {
-                    a.checked_rem(b).ok_or_else(|| RuntimeError::msg(
-                        format!("integer overflow: {} % {} exceeds the i64 range", a, b)))?
+                else if w.is_signed() && a == w.min() && b == -1 {
+                    return Err(RuntimeError::msg(format!(
+                        "integer overflow: {} % {} exceeds the {} range", a, b, w.name())));
                 }
+                else { a.wrapping_rem(b) }
             },
             _ => unreachable!(),
         };
-        return Ok(Value::Int(v));
+        return Ok(Value::Int(w.wrap(v), w));
     }
     if let (Some(a), Some(b)) = (l.as_float(), r.as_float()) {
         let v = match op {
@@ -4623,7 +5942,7 @@ fn scalar_compare(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     // below) loses precision above 2^53 and disagrees with the JIT's integer
     // compare (#296): e.g. 9007199254740993 == 9007199254740992 wrongly
     // returned true. Mixed int/float still falls through to the f64 path.
-    if let (Value::Int(a), Value::Int(b)) = (l, r) {
+    if let (Value::Int(a, _), Value::Int(b, _)) = (l, r) {
         return Ok(Value::Bool(match op {
             Eq    => a == b, NotEq => a != b,
             Lt    => a < b,  Gt    => a > b,
@@ -4735,7 +6054,7 @@ fn scalar_rhs(op: BinOp, a: &ArrayD<f64>, s: f64) -> ArrayD<f64> {
         DotSub => a.mapv(|x| x - s),
         DotMul => a.mapv(|x| x * s),
         DotDiv => a.mapv(|x| x / s),
-        DotPow | DotPow2 => pow_by_scalar(a, s),
+        DotPow => pow_by_scalar(a, s),
         DotGt => a.mapv(|x| (x >  s) as i64 as f64),
         DotLt => a.mapv(|x| (x <  s) as i64 as f64),
         DotGe => a.mapv(|x| (x >= s) as i64 as f64),
@@ -4753,7 +6072,7 @@ fn scalar_lhs(op: BinOp, s: f64, b: &ArrayD<f64>) -> ArrayD<f64> {
         DotSub => b.mapv(|x| s - x),
         DotMul => b.mapv(|x| s * x),
         DotDiv => b.mapv(|x| s / x),
-        DotPow | DotPow2 => b.mapv(|x| s.powf(x)),
+        DotPow => b.mapv(|x| s.powf(x)),
         DotGt => b.mapv(|x| (s >  x) as i64 as f64),
         DotLt => b.mapv(|x| (s <  x) as i64 as f64),
         DotGe => b.mapv(|x| (s >= x) as i64 as f64),
@@ -4808,7 +6127,7 @@ fn tensor_elementwise(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
         DotSub => &a - &b,
         DotMul => &a * &b,
         DotDiv => &a / &b,
-        DotPow | DotPow2 => {
+        DotPow => {
             let mut out = a.clone();
             for (o, e) in out.iter_mut().zip(b.iter()) { *o = o.powf(*e); }
             out
@@ -4995,19 +6314,69 @@ fn broadcast_source_index(out_idx: &[usize], out_shape: &[usize], source_shape: 
     flat
 }
 
+/// #476: store `rval` into slot `i` of a model array (`Value::List`) held in a
+/// struct field, given an already-resolved index vector. Mirrors the local
+/// `arr[i] = instance` path — single scalar index, negatives wrap from the end.
+///
+/// The caller holds a `borrow_mut()` on the owning struct, so the write lands
+/// in the field itself rather than in a copy: this is what separates the
+/// working `h.cells[i] = ..` spelling from `let !cs = h.cells` (a model-array
+/// field binds by value, so a fill through the alias never reaches the field).
+fn assign_into_model_array(
+    slot: &mut Value,
+    idx_vals: &[IndexVal],
+    rval: Value,
+    span: &Span,
+) -> EvalResult<()> {
+    let Value::List(buf) = slot else {
+        return Err(RuntimeError::at(
+            format!("indexed assignment requires a tensor, got {}", slot.type_name()),
+            span.clone(),
+        ));
+    };
+    let raw = match idx_vals {
+        [IndexVal::Index(i)] => *i,
+        _ => return Err(RuntimeError::at(
+            "model-array assignment requires a single scalar index", span.clone())),
+    };
+    let len = buf.len() as i64;
+    let i = if raw < 0 { len + raw } else { raw };
+    if i < 0 || i >= len {
+        return Err(RuntimeError::at(
+            format!("index {} out of bounds for axis 0 of size {}", raw, len), span.clone()));
+    }
+    Rc::make_mut(buf)[i as usize] = rval;
+    Ok(())
+}
+
 /// Write back the final values of `!`-prefixed parameters to the caller's scope.
 ///
 /// `pending` holds `(param_index, final_value)` pairs populated by
 /// `call_fn_with_shapes` before it pops the callee's scope. For each entry,
 /// if the corresponding call argument was a bare identifier, the identifier is
 /// updated in the caller's current scope stack.
+///
+/// `self_params` is the number of leading callee parameters that have no
+/// counterpart in `call_args`. It is 0 for a free function and 1 for a model
+/// method, where the receiver is prepended to the argument vector but written
+/// at the call site as `recv.m(args)` — so callee param `i` is call arg
+/// `i - self_params`. The receiver itself never needs a writeback: a
+/// `Value::Struct` is an `Rc<RefCell<..>>` the callee already shares.
+///
+/// #475: methods used to skip this step entirely. Tensors are value-copies in
+/// the interpreter (see `Value::Tensor`), so a `!` tensor parameter only
+/// aliases by virtue of this writeback. Without it a method's writes through
+/// an out-parameter were silently dropped while the same body as a free
+/// function worked — no error, correct return value, lost mutation.
 fn apply_writebacks(
     scopes: &mut Vec<HashMap<String, Value>>,
     pending: &mut Vec<(usize, Value)>,
     call_args: &[CallArg],
+    self_params: usize,
 ) {
     for (idx, val) in pending.drain(..) {
-        if let Some(CallArg::Positional(Expr::Ident(name, _))) = call_args.get(idx) {
+        let Some(arg_idx) = idx.checked_sub(self_params) else { continue };
+        if let Some(CallArg::Positional(Expr::Ident(name, _))) = call_args.get(arg_idx) {
             for scope in scopes.iter_mut().rev() {
                 if scope.contains_key(name.as_str()) {
                     scope.insert(name.clone(), val);
@@ -5159,26 +6528,110 @@ fn bind_shape_elem(
     sp: &Span,
 ) -> EvalResult<()> {
     let ShapeElem::Expr(e) = elem else { return Ok(()); };
-    let Expr::Ident(name, _) = e.as_ref() else { return Ok(()); };
+    bind_shape_ident_expr(e, dim, inferred, fn_name, sp)
+}
+
+/// Bind `dim` to `e` when `e` is a bare shape variable. Anything else (a
+/// literal, an arithmetic expression) is not a binding site — the checker owns
+/// verifying those.
+fn bind_shape_ident_expr(
+    e: &Expr,
+    dim: i64,
+    inferred: &mut std::collections::HashMap<String, i64>,
+    fn_name: &str,
+    sp: &Span,
+) -> EvalResult<()> {
+    let Expr::Ident(name, _) = e else { return Ok(()); };
+    bind_shape_name(name, dim, inferred, fn_name, sp)
+}
+
+/// The one place a harvested dim meets an already-harvested one. Every source
+/// — tensor shape, model-array length, a model argument's own shape args —
+/// goes through here, so a disagreement reads the same whichever two
+/// arguments produced it.
+fn bind_shape_name(
+    name: &str,
+    dim: i64,
+    inferred: &mut std::collections::HashMap<String, i64>,
+    fn_name: &str,
+    sp: &Span,
+) -> EvalResult<()> {
     // Only bind shape-variable-like names (uppercase-first).
     if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) { return Ok(()); }
     if let Some(&prev) = inferred.get(name) {
         if prev != dim {
             return Err(RuntimeError::at(format!(
                 "fn `{}`: shape param `{}` would need to be both {} and {} \
-                (inconsistent tensor shapes across arguments)",
+                (inconsistent argument shapes)",
                 fn_name, name, prev, dim), sp.clone()));
         }
     } else {
-        inferred.insert(name.clone(), dim);
+        inferred.insert(name.to_string(), dim);
     }
     Ok(())
+}
+
+/// A postfix bracket read as shape arguments: one `(name?, value, span)` per
+/// argument. `Index` is the all-positional spelling (`f[2, 2]`), `BracketArgs`
+/// the one with names (`f[SH=2]`); either may in fact be ordinary indexing, so
+/// anything that cannot be a shape argument — a slice, `..`, a spread —
+/// returns `None` and leaves the expression to the indexing path.
+fn shape_bracket_args<'a>(
+    op: &'a PostfixOp,
+    span: &Span,
+) -> Option<Vec<(Option<&'a str>, &'a Expr, Span)>> {
+    match op {
+        PostfixOp::Index(elems) => elems.iter().map(|e| match e {
+            IndexElem::Expr(e) => Some((None, e, span.clone())),
+            _ => None,
+        }).collect(),
+        PostfixOp::BracketArgs(args) => args.iter().map(|a| match a {
+            CallArg::Positional(e) => Some((None, e, span.clone())),
+            CallArg::Named { name, value, span: nspan } =>
+                Some((Some(name.as_str()), value, nspan.clone())),
+            CallArg::Spread(_) => None,
+        }).collect(),
+        _ => None,
+    }
+}
+
+/// A model type argument written as a bare shape variable. `Box[H, W]` parses
+/// `H` as a *type* (an ident can start one) while `Box[2, W]` parses `2` as an
+/// expression, so both spellings have to be recognised here.
+fn type_arg_shape_var(arg: &TypeArg) -> Option<&str> {
+    match arg {
+        TypeArg::Type(Type::Named { name, args, .. }) if args.is_empty() => Some(name),
+        TypeArg::Expr(e) => match e.as_ref() {
+            Expr::Ident(name, _) => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `__model__` tag on a struct value, if it carries one.
+fn struct_model_name(fields: &Rc<RefCell<Vec<(String, Value)>>>) -> Option<String> {
+    fields.borrow().iter()
+        .find(|(k, _)| k == "__model__")
+        .and_then(|(_, v)| match v { Value::Str(s) => Some(s.clone()), _ => None })
+}
+
+/// The shape args an instance was constructed with, recovered from the hidden
+/// `__shape_P__` fields a model literal writes.
+fn model_shape_bindings(fields: &Rc<RefCell<Vec<(String, Value)>>>) -> Vec<(String, i64)> {
+    fields.borrow().iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("__shape_")
+                .and_then(|s| s.strip_suffix("__"))
+                .and_then(|pname| v.as_int().map(|n| (pname.to_string(), n)))
+        })
+        .collect()
 }
 
 fn as_tensor(v: &Value) -> EvalResult<ArrayD<f64>> {
     match v {
         Value::Tensor(t) => Ok(t.data.clone()),
-        Value::Int(n)   => Ok(ArrayD::from_elem(IxDyn(&[]), *n as f64)),
+        Value::Int(n, _)   => Ok(ArrayD::from_elem(IxDyn(&[]), *n as f64)),
         Value::Float(x, _) => Ok(ArrayD::from_elem(IxDyn(&[]), *x)),
         _ => Err(RuntimeError::msg(format!("expected tensor or numeric scalar, got {}", v.type_name()))),
     }
@@ -5250,7 +6703,9 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
     use UnOp::*;
     match op {
         Neg => match v {
-            Value::Int(n)    => Ok(Value::Int(-n)),
+            // #540: negation is `0 - n`, so it wraps at the operand's width —
+            // `-i32::MIN` is `i32::MIN`, the same value the JIT's `ineg` gives.
+            Value::Int(n, w)    => Ok(Value::Int(w.wrap(n.wrapping_neg()), *w)),
             Value::Float(x, w)  => Ok(Value::Float(w.round(-x), *w)),
             // Result width follows the operand (#241): an Int/F64 tensor must
             // not be rounded through f32 by the default-F32 construction.
@@ -5262,7 +6717,7 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
         ReLU => match v {
             Value::Tensor(t) => Ok(Value::tensor_dt(t.map(|x| x.max(0.0)), float_result_dtype(&[v]))),
             Value::Float(x, w)  => Ok(Value::Float(w.round(x.max(0.0)), *w)),
-            Value::Int(n)    => Ok(Value::Int((*n).max(0))),
+            Value::Int(n, w)    => Ok(Value::Int((*n).max(0), *w)),
             _ => Err(RuntimeError::msg(format!("\\> requires numeric/tensor, got {}", v.type_name()))),
         }
         GeLU => match v {
@@ -5272,7 +6727,8 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
             _ => Err(RuntimeError::msg(format!("\\< requires numeric/tensor, got {}", v.type_name()))),
         }
         BitNot => match v {
-            Value::Int(n) => Ok(Value::Int(!n)),
+            // #540: `~` complements the operand's width, not always 64 bits.
+            Value::Int(n, w) => Ok(Value::Int(w.wrap(!w.wrap(*n)), *w)),
             _ => Err(RuntimeError::msg(format!("~ (bitwise NOT) requires int, got {}", v.type_name()))),
         }
     }
@@ -5342,31 +6798,41 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
                 let arr = ndarray::Array1::from_vec(bytes).into_dyn();
                 return Value::tensor_dt(arr, DType::Int);
             }
-            if let Some(n) = v.as_int()   { return Value::Int((n as u8)  as i64); }
-            if let Some(n) = v.as_float() { return Value::Int(n as u8 as i64); }
+            if let Some(n) = v.as_int()   { return Value::Int((n as u8)  as i64, IW::U8); }
+            if let Some(n) = v.as_float() { return Value::Int(n as u8 as i64, IW::U8); }
         }
-        "i8"  => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as i8)  as i64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as i64); } }
-        "i16" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as i16) as i64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as i64); } }
-        "i32" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as i32) as i64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as i64); } }
-        "i64" | "int4" | "int8" => {
-            if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-            if let Some(n) = v.as_float() { return Value::Int(n as i64); }
+        // #544: the narrow targets carry their width the way `i32` has since
+        // #540, and the float source is narrowed through that width for the
+        // same reason — a value tagged `I8` has to be inside the i8 range.
+        "i8" | "int8" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I8); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as i8)  as i64, IW::I8); }
+                   if let Some(n) = v.as_float() { return Value::Int(n as i8 as i64, IW::I8); } }
+        "i16" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I16); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as i16) as i64, IW::I16); }
+                   if let Some(n) = v.as_float() { return Value::Int(n as i16 as i64, IW::I16); } }
+        "int4" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I4); }
+                   if let Some(n) = v.as_int() { return Value::Int(IW::I4.wrap(n), IW::I4); }
+                   if let Some(n) = v.as_float() { return Value::Int(IW::I4.wrap(n as i64), IW::I4); } }
+        // #540: an i32 target carries the width, exactly as in `apply_cast`.
+        "i32" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I32); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as i32) as i64, IW::I32); }
+                   // Narrow the float source too: a value tagged `I32` must be
+                   // inside the i32 range, and this is what `x as i32` on the
+                   // same float already produced (`apply_cast`).
+                   if let Some(n) = v.as_float() { return Value::Int(n as i32 as i64, IW::I32); } }
+        "i64" => {
+            if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
+            if let Some(n) = v.as_float() { return Value::Int(n as i64, IW::I64); }
         }
-        "u16" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as u16) as i64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as u16 as i64); } }
-        "u32" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as u32) as i64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as u32 as i64); } }
-        "u64" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64); } }
+        "u16" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U16); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as u16) as i64, IW::U16); }
+                   if let Some(n) = v.as_float() { return Value::Int(n as u16 as i64, IW::U16); } }
+        "u32" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U32); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as u32) as i64, IW::U32); }
+                   if let Some(n) = v.as_float() { return Value::Int(n as u32 as i64, IW::U32); } }
+        "u64" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64, IW::I64); }
+                   if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64, IW::I64); } }
         "f64" => {
             if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F64); }
             if let Some(n) = v.as_float() { return Value::Float(n, FW::F64); }
@@ -5423,31 +6889,42 @@ fn apply_cast(v: &Value, ty: &Type) -> Value {
             // Float→signed-narrow wraps through the target width to match the
             // int→signed-narrow path above and the unsigned-float path below
             // (#291.1): `300.0 as i8` == `300 as i8` == 44, not 300.
-            I8  => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as i8)  as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as i8 as i64); } }
-            I16 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as i16) as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as i16 as i64); } }
-            I32 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as i32) as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as i32 as i64); } }
-            I64 | Int4 | Int8 | Trit => {
-                if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                if let Some(n) = v.as_float() { return Value::Int(n as i64); }
+            // #544: every narrow target carries its width, exactly as `i32` has
+            // since #540. The narrowing of the VALUE is unchanged — `300 as i8`
+            // was 44 before and still is; what is new is that the result stays
+            // an `i8`, so the arithmetic that follows wraps at 8 bits.
+            I8 | Int8 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I8); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as i8)  as i64, IW::I8); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as i8 as i64, IW::I8); } }
+            I16 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I16); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as i16) as i64, IW::I16); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as i16 as i64, IW::I16); } }
+            Int4 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I4); }
+                     if let Some(n) = v.as_int() { return Value::Int(IW::I4.wrap(n), IW::I4); }
+                     if let Some(n) = v.as_float() { return Value::Int(IW::I4.wrap(n as i64), IW::I4); } }
+            // #540: `as i32` already narrowed the VALUE; it now also carries the
+            // width, so the arithmetic that follows wraps like the JIT's
+            // `cl::I32`. The narrowing itself is unchanged — `5000000000 as i32`
+            // was 705032704 on both backends before this and still is.
+            I32 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I32); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as i32) as i64, IW::I32); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as i32 as i64, IW::I32); } }
+            I64 | Trit => {
+                if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
+                if let Some(n) = v.as_float() { return Value::Int(n as i64, IW::I64); }
             }
-            U8  => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as u8)  as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as u8 as i64); } }
-            U16 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as u16) as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as u16 as i64); } }
-            U32 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as u32) as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as u32 as i64); } }
-            U64 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64); } }
+            U8  => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U8); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as u8)  as i64, IW::U8); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as u8 as i64, IW::U8); } }
+            U16 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U16); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as u16) as i64, IW::U16); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as u16 as i64, IW::U16); } }
+            U32 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U32); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as u32) as i64, IW::U32); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as u32 as i64, IW::U32); } }
+            U64 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64, IW::I64); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64, IW::I64); } }
             F64 => {
                 if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F64); }
                 if let Some(n) = v.as_float() { return Value::Float(n, FW::F64); }
@@ -5507,7 +6984,7 @@ fn expand_iter(v: &Value) -> EvalResult<Vec<Value>> {
     match v {
         Value::Range { start, end, inclusive } => {
             let end = if *inclusive { *end + 1 } else { *end };
-            Ok((*start..end).map(Value::Int).collect())
+            Ok((*start..end).map(|n| Value::Int(n, IW::I64)).collect())
         }
         Value::Tuple(vs) => Ok(vs.clone()),
         Value::List(vs) => Ok((**vs).clone()),
@@ -5517,7 +6994,7 @@ fn expand_iter(v: &Value) -> EvalResult<Vec<Value>> {
             // (and a bool tensor yields Bools).
             let dtype = t.dtype;
             let scalar = move |x: f64| match dtype {
-                DType::Int  => Value::Int(x as i64),
+                DType::Int  => Value::Int(x as i64, IW::I64),
                 DType::Bool => Value::Bool(x != 0.0),
                 _ => Value::Float(x, FW::F64),
             };
@@ -5593,14 +7070,14 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
                 _ => return Err(RuntimeError::at("str.find: needs str arg", sp)),
             };
             let idx = s.find(needle.as_str()).map(|i| i as i64).unwrap_or(-1);
-            Ok(Value::Int(idx))
+            Ok(Value::Int(idx, IW::I64))
         }
         "index" => {
             let needle = match args.first() {
                 Some(Value::Str(n)) => n.clone(),
                 _ => return Err(RuntimeError::at("str.index: needs str arg", sp)),
             };
-            s.find(needle.as_str()).map(|i| Value::Int(i as i64))
+            s.find(needle.as_str()).map(|i| Value::Int(i as i64, IW::I64))
                 .ok_or_else(|| RuntimeError::at(
                     format!("str.index: {:?} not found in {:?}", needle, s), sp))
         }
@@ -5610,10 +7087,10 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
                 _ => return Err(RuntimeError::at("str.count: needs str arg", sp)),
             };
             if needle.is_empty() {
-                return Ok(Value::Int(s.chars().count() as i64 + 1));
+                return Ok(Value::Int(s.chars().count() as i64 + 1, IW::I64));
             }
             let count = s.matches(needle.as_str()).count();
-            Ok(Value::Int(count as i64))
+            Ok(Value::Int(count as i64, IW::I64))
         }
         "lines" | "split_lines" => {
             let parts: Vec<Value> = s.lines()
@@ -5621,7 +7098,7 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
                 .collect();
             Ok(Value::list(parts))
         }
-        "len" => Ok(Value::Int(s.len() as i64)),
+        "len" => Ok(Value::Int(s.len() as i64, IW::I64)),
         _ => {
             // Unknown method — fall through to opaque (don't error, for forward compat)
             Ok(Value::Opaque(format!("str.{}", method)))
@@ -5631,73 +7108,32 @@ fn call_str_method(s: &str, method: &str, args: Vec<Value>, sp: Span) -> EvalRes
 
 // ─── Builtins ────────────────────────────────────────────────────────────────
 
-/// #402: the python process-port harness (PORTS.md §7.1), passed to
-/// `python3 -c`. Request per line: `{"name": str, "payload": str}` where
-/// `name` is a dotted import path (`math.sqrt`, `json.dumps`, or a bare
-/// builtin like `len`) and `payload` is JSON for the function's single
-/// argument — `null` or empty calls with no arguments. Response per line:
-/// `{"ok": result}` or `{"err": message}`.
-const PY_PORT_HARNESS: &str = r#"
-import sys, json, importlib, builtins
-class _ABI(Exception):
-    pass  # signals a malformed payload -> port-protocol, not port-call
-def _resolve(name):
-    parts = name.split('.')
-    if len(parts) == 1 and hasattr(builtins, parts[0]):
-        return getattr(builtins, parts[0])
-    obj = importlib.import_module(parts[0])
-    for p in parts[1:]:
-        obj = getattr(obj, p)
-    return obj
-def _unpack(payload):
-    # (args, kwargs) from the JSON payload per PORTS.md §2. null/empty -> no
-    # args; array -> positional; object -> {args, kwargs} envelope; a bare
-    # scalar is not an argument vector and is an ABI error.
-    if payload in (None, ''):
-        return (), {}
-    try:
-        p = json.loads(payload)
-    except Exception as e:
-        raise _ABI('payload is not valid JSON: %s' % e)
-    if isinstance(p, list):
-        return tuple(p), {}
-    if isinstance(p, dict):
-        extra = set(p) - {'args', 'kwargs'}
-        if extra:
-            raise _ABI('payload object must contain only "args"/"kwargs", got %s'
-                       % ', '.join(sorted(extra)))
-        a = p.get('args', [])
-        k = p.get('kwargs', {})
-        if not isinstance(a, list):
-            raise _ABI('"args" must be a JSON array')
-        if not isinstance(k, dict):
-            raise _ABI('"kwargs" must be a JSON object')
-        return tuple(a), k
-    raise _ABI('payload must be a JSON array, an {args, kwargs} object, or null')
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        req = json.loads(line)
-        args, kwargs = _unpack(req.get('payload'))
-        fn = _resolve(req['name'])
-        out = json.dumps({'ok': fn(*args, **kwargs)})
-    except _ABI as e:
-        out = json.dumps({'perr': str(e)})
-    except Exception as e:
-        out = json.dumps({'err': str(e)})
-    sys.stdout.write(out + '\n')
-    sys.stdout.flush()
-"#;
-
-/// #402: recover the registry id from an opaque `port#<id>:<lang>` handle.
+/// #402: recover the registry id from a `Port` handle value. The Value side
+/// carries only the opaque `port#<id>:<lang>` text minted by `crate::ports`.
 fn port_handle_id(v: Option<&Value>) -> Option<i64> {
     if let Some(Value::Opaque(s)) = v {
-        s.strip_prefix("port#")?.split(':').next()?.parse().ok()
+        crate::ports::handle_id(s)
     } else {
         None
     }
+}
+
+/// The `PORTS.md §3.2` wire dtype an interpreter tensor crosses as.
+///
+/// The interpreter has one integer tensor dtype and the JIT has two, so the
+/// mapping deliberately lands every integer tensor on `i64` — see
+/// `ports::wire_dtype_for`. `Trit` has no wire dtype at all: a packed ternary
+/// weight is a demoniC storage format, not a portable element type, so it is
+/// refused rather than silently widened to bytes no foreign runtime can read.
+fn wire_dtype_of(dt: DType) -> Option<crate::ports::WireDType> {
+    use crate::ports::WireDType as W;
+    Some(match dt {
+        DType::Int => W::I64,
+        DType::F32 => W::F32,
+        DType::F64 => W::F64,
+        DType::Bool => W::Bool,
+        DType::Trit => return None,
+    })
 }
 
 pub(crate) fn is_builtin(name: &str) -> bool {
@@ -5743,6 +7179,9 @@ pub(crate) fn is_builtin(name: &str) -> bool {
         "rand_float" | "rand_int" | "rand_normal" | "rand_seed" | "rand_choice" |
         // JSON
         "json_encode" | "json_decode" |
+        // Typed decode — one primitive per demoniC type (PORTS.md §6)
+        "json_decode_i64" | "json_decode_f64" | "json_decode_str" |
+        "json_decode_bool" | "json_decode_list" |
         // List functional combinators
         "list_map" | "list_filter" | "list_reduce" | "list_sort" | "list_sort_by" |
         "list_zip" | "list_enumerate" | "list_flatten" | "list_uniq" |
@@ -5762,8 +7201,9 @@ pub(crate) fn is_builtin(name: &str) -> bool {
         "path_exists" | "path_is_dir" | "path_is_file" |
         // Process execution
         "exec_cmd" |
-        // Ports (#402, PORTS.md §2)
+        // Ports (#402, PORTS.md §2) + tensor copy mode (PORTS.md §3.2)
         "port_open" | "port_call" | "port_close" |
+        "port_tensor_encode" | "port_tensor_decode" |
         // CLI argument parsing
         "cli_arg" | "cli_flag" | "cli_positional" | "cli_positional_count" |
         // Regex
@@ -5922,7 +7362,7 @@ impl Interpreter {
             .ok_or_else(|| RuntimeError::msg("log: numeric"))?
             .ln(), FW::F64)),
         "abs" => match args.first() {
-            Some(Value::Int(n)) => Ok(Value::Int(n.abs())),
+            Some(Value::Int(n, _)) => Ok(Value::Int(n.abs(), IW::I64)),
             Some(v) => Ok(Value::Float(v.as_float().unwrap_or(0.0).abs(), FW::F64)),
             None => Err(RuntimeError::msg("abs: needs arg")),
         }
@@ -5969,7 +7409,7 @@ impl Interpreter {
             let mut b = args.get(1).and_then(|v| v.as_int())
                 .ok_or_else(|| RuntimeError::msg("gcd: integer args required"))?.abs();
             while b != 0 { let t = b; b = a % t; a = t; }
-            Ok(Value::Int(a))
+            Ok(Value::Int(a, IW::I64))
         }
         "log2" => Ok(Value::Float(args.first().and_then(|v| v.as_float())
             .ok_or_else(|| RuntimeError::msg("log2: numeric arg required"))?
@@ -6009,7 +7449,7 @@ impl Interpreter {
         }
         "sign" => {
             match args.first() {
-                Some(Value::Int(n))   => Ok(Value::Int(n.signum())),
+                Some(Value::Int(n, _))   => Ok(Value::Int(n.signum(), IW::I64)),
                 Some(Value::Float(f, w)) => Ok(Value::Float(f.signum(), *w)),
                 _ => Err(RuntimeError::msg("sign: numeric arg required")),
             }
@@ -6032,12 +7472,12 @@ impl Interpreter {
         "ord" => {
             let s = match args.first() {
                 Some(Value::Str(s)) => s.clone(),
-                Some(Value::Int(n)) => return Ok(Value::Int(*n)), // already a codepoint
+                Some(Value::Int(n, _)) => return Ok(Value::Int(*n, IW::I64)), // already a codepoint
                 _ => return Err(RuntimeError::at("ord: str arg required", sp)),
             };
             let ch = s.chars().next()
                 .ok_or_else(|| RuntimeError::at("ord: empty string", sp.clone()))?;
-            Ok(Value::Int(ch as i64))
+            Ok(Value::Int(ch as i64, IW::I64))
         }
         "to_str" | "to_string" => {
             let v = args.into_iter().next().unwrap_or(Value::Nil);
@@ -6048,7 +7488,7 @@ impl Interpreter {
             Some(v) => Ok(Value::Str(v.type_name().to_string())),
             None => Err(RuntimeError::at("typeof: requires 1 argument", sp)),
         },
-        "is_int" => Ok(Value::Bool(matches!(args.first(), Some(Value::Int(_))))),
+        "is_int" => Ok(Value::Bool(matches!(args.first(), Some(Value::Int(_, _))))),
         "is_float" => Ok(Value::Bool(matches!(args.first(), Some(Value::Float(_, _))))),
         "is_str" => Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_))))),
         "is_bool" => Ok(Value::Bool(matches!(args.first(), Some(Value::Bool(_))))),
@@ -6068,27 +7508,27 @@ impl Interpreter {
                 Ok(Value::Bool(t.parse::<i64>().is_ok() || t.parse::<f64>().is_ok()))
             }
             // Numbers are trivially numeric; everything else is not.
-            Some(Value::Int(_)) | Some(Value::Float(_, _)) => Ok(Value::Bool(true)),
+            Some(Value::Int(_, _)) | Some(Value::Float(_, _)) => Ok(Value::Bool(true)),
             _ => Ok(Value::Bool(false)),
         },
         // `try_to_int(s)` / `try_to_float(s)` — return (value, Err) per Spec §3.9:
         // Err is nil on success, a str message on failure. Never aborts.
         "try_to_int" => {
             let (v, err) = match args.first() {
-                Some(Value::Int(n))   => (Value::Int(*n), Value::Nil),
-                Some(Value::Float(f, _)) => (Value::Int(*f as i64), Value::Nil),
-                Some(Value::Bool(b))  => (Value::Int(*b as i64), Value::Nil),
+                Some(Value::Int(n, _))   => (Value::Int(*n, IW::I64), Value::Nil),
+                Some(Value::Float(f, _)) => (Value::Int(*f as i64, IW::I64), Value::Nil),
+                Some(Value::Bool(b))  => (Value::Int(*b as i64, IW::I64), Value::Nil),
                 Some(Value::Str(s)) => {
                     let t = s.trim();
                     if let Ok(n) = t.parse::<i64>() {
-                        (Value::Int(n), Value::Nil)
+                        (Value::Int(n, IW::I64), Value::Nil)
                     } else if let Ok(f) = t.parse::<f64>() {
-                        (Value::Int(f as i64), Value::Nil)
+                        (Value::Int(f as i64, IW::I64), Value::Nil)
                     } else {
-                        (Value::Int(0), Value::Str(format!("try_to_int: not a number: {:?}", s)))
+                        (Value::Int(0, IW::I64), Value::Str(format!("try_to_int: not a number: {:?}", s)))
                     }
                 }
-                other => (Value::Int(0), Value::Str(format!(
+                other => (Value::Int(0, IW::I64), Value::Str(format!(
                     "try_to_int: cannot convert {}",
                     other.map(|v| v.type_name()).unwrap_or("nil")))),
             };
@@ -6097,7 +7537,7 @@ impl Interpreter {
         "try_to_float" => {
             let (v, err) = match args.first() {
                 Some(Value::Float(f, w)) => (Value::Float(*f, *w), Value::Nil),
-                Some(Value::Int(n))   => (Value::Float(*n as f64, FW::F64), Value::Nil),
+                Some(Value::Int(n, _))   => (Value::Float(*n as f64, FW::F64), Value::Nil),
                 Some(Value::Bool(b))  => (Value::Float(*b as i64 as f64, FW::F64), Value::Nil),
                 Some(Value::Str(s)) => match s.trim().parse::<f64>() {
                     Ok(f) => (Value::Float(f, FW::F64), Value::Nil),
@@ -6112,15 +7552,15 @@ impl Interpreter {
 
         "to_int" => {
             match args.first() {
-                Some(Value::Int(n))   => Ok(Value::Int(*n)),
-                Some(Value::Float(f, _)) => Ok(Value::Int(*f as i64)),
-                Some(Value::Bool(b))  => Ok(Value::Int(*b as i64)),
+                Some(Value::Int(n, _))   => Ok(Value::Int(*n, IW::I64)),
+                Some(Value::Float(f, _)) => Ok(Value::Int(*f as i64, IW::I64)),
+                Some(Value::Bool(b))  => Ok(Value::Int(*b as i64, IW::I64)),
                 Some(Value::Str(s))   => {
                     let trimmed = s.trim();
                     if let Ok(n) = trimmed.parse::<i64>() {
-                        Ok(Value::Int(n))
+                        Ok(Value::Int(n, IW::I64))
                     } else if let Ok(f) = trimmed.parse::<f64>() {
-                        Ok(Value::Int(f as i64))
+                        Ok(Value::Int(f as i64, IW::I64))
                     } else {
                         Err(RuntimeError::at(format!("to_int: cannot convert {:?} to int", s), sp))
                     }
@@ -6133,7 +7573,7 @@ impl Interpreter {
         "to_float" => {
             match args.first() {
                 Some(Value::Float(f, w)) => Ok(Value::Float(*f, *w)),
-                Some(Value::Int(n))   => Ok(Value::Float(*n as f64, FW::F64)),
+                Some(Value::Int(n, _))   => Ok(Value::Float(*n as f64, FW::F64)),
                 Some(Value::Bool(b))  => Ok(Value::Float(*b as i64 as f64, FW::F64)),
                 Some(Value::Str(s))   => {
                     s.trim().parse::<f64>().map(|v| Value::Float(v, FW::F64))
@@ -6151,7 +7591,7 @@ impl Interpreter {
             let f = args.first().and_then(|v| v.as_float()).ok_or_else(|| {
                 RuntimeError::at("f32_to_bits: numeric argument required".to_string(), sp.clone())
             })?;
-            Ok(Value::Int((f as f32).to_bits() as i64))
+            Ok(Value::Int((f as f32).to_bits() as i64, IW::I64))
         }
         "f32_from_bits" => {
             let n = args.first().and_then(|v| v.as_int()).ok_or_else(|| {
@@ -6191,25 +7631,29 @@ impl Interpreter {
                 }
             }
             match (&args[0], &args[1], &args[2]) {
-                (Value::Int(x), Value::Int(lo), Value::Int(hi))     => Ok(Value::Int((*x).clamp(*lo, *hi))),
+                (Value::Int(x, _), Value::Int(lo, _), Value::Int(hi, _))     => Ok(Value::Int((*x).clamp(*lo, *hi), IW::I64)),
                 (Value::Float(x, _), Value::Float(lo, _), Value::Float(hi, _)) => Ok(Value::Float(x.clamp(*lo, *hi), FW::F64)),
-                (Value::Int(x), Value::Float(lo, _), Value::Float(hi, _))  => Ok(Value::Float((*x as f64).clamp(*lo, *hi), FW::F64)),
-                (Value::Float(x, _), Value::Int(lo), Value::Int(hi))    => Ok(Value::Float(x.clamp(*lo as f64, *hi as f64), FW::F64)),
+                (Value::Int(x, _), Value::Float(lo, _), Value::Float(hi, _))  => Ok(Value::Float((*x as f64).clamp(*lo, *hi), FW::F64)),
+                (Value::Float(x, _), Value::Int(lo, _), Value::Int(hi, _))    => Ok(Value::Float(x.clamp(*lo as f64, *hi as f64), FW::F64)),
                 _ => Err(RuntimeError::at("clamp: numeric args required", sp)),
             }
         }
         "len" => {
             match args.first() {
-                Some(Value::Tensor(t)) => Ok(Value::Int(t.shape().first().copied().unwrap_or(0) as i64)),
-                Some(Value::Tuple(vs)) => Ok(Value::Int(vs.len() as i64)),
-                Some(Value::Str(s))    => Ok(Value::Int(s.len() as i64)),
-                Some(Value::List(vs))  => Ok(Value::Int(vs.len() as i64)),
-                Some(Value::Map(m))    => Ok(Value::Int(m.borrow().len() as i64)),
+                Some(Value::Tensor(t)) => Ok(Value::Int(t.shape().first().copied().unwrap_or(0) as i64, IW::I64)),
+                Some(Value::Tuple(vs)) => Ok(Value::Int(vs.len() as i64, IW::I64)),
+                Some(Value::Str(s))    => Ok(Value::Int(s.len() as i64, IW::I64)),
+                Some(Value::List(vs))  => Ok(Value::Int(vs.len() as i64, IW::I64)),
+                Some(Value::Map(m))    => Ok(Value::Int(m.borrow().len() as i64, IW::I64)),
                 Some(Value::Range { start, end, inclusive }) => {
                     let e = if *inclusive { *end + 1 } else { *end };
-                    Ok(Value::Int((e - *start).max(0)))
+                    Ok(Value::Int((e - *start).max(0), IW::I64))
                 }
-                _ => Err(RuntimeError::msg("len: requires tensor, tuple, str, list, or map")),
+                // Located, like every other runtime error the two backends
+                // are compared on: the JIT's `dmc_str_len` names the span, and
+                // an unlocated twin here is a presentation divergence on the
+                // same program.
+                _ => Err(RuntimeError::at("len: requires tensor, tuple, str, list, or map", sp)),
             }
         }
         "sum" => {
@@ -6550,7 +7994,7 @@ impl Interpreter {
         }
         "list_len" => {
             match args.first() {
-                Some(Value::List(vs)) => Ok(Value::Int(vs.len() as i64)),
+                Some(Value::List(vs)) => Ok(Value::Int(vs.len() as i64, IW::I64)),
                 Some(other) => Err(RuntimeError::at(
                     format!("list_len: arg must be list, got {}", other.type_name()), sp)),
                 None => Err(RuntimeError::at("list_len: requires list arg", sp)),
@@ -6601,10 +8045,10 @@ impl Interpreter {
             let item = args.get(1).ok_or_else(||
                 RuntimeError::at("list_contains: requires item arg", sp.clone()))?;
             let found = lst.iter().any(|v| match (v, item) {
-                (Value::Int(a), Value::Int(b)) => a == b,
+                (Value::Int(a, _), Value::Int(b, _)) => a == b,
                 (Value::Float(a, _), Value::Float(b, _)) => a == b,
-                (Value::Int(a), Value::Float(b, _)) => (*a as f64) == *b,
-                (Value::Float(a, _), Value::Int(b)) => *a == (*b as f64),
+                (Value::Int(a, _), Value::Float(b, _)) => (*a as f64) == *b,
+                (Value::Float(a, _), Value::Int(b, _)) => *a == (*b as f64),
                 (Value::Str(a), Value::Str(b)) => a == b,
                 (Value::Bool(a), Value::Bool(b)) => a == b,
                 (Value::Nil, Value::Nil) => true,
@@ -6658,7 +8102,14 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("map_get: requires key arg", sp)),
             };
             let result = m.borrow().get(&key).cloned().unwrap_or(Value::Nil);
-            Ok(result)
+            // #540: a map is `str → any` (§3.1) and the JIT backs it with a raw
+            // i64 store, so an integer LOSES its declared width by going
+            // through one — `map_get(m, k)` is typed i64 on that side. Drop the
+            // width here too: keeping it would make `map_get(m,"k") + 1` wrap
+            // under `dmc run` and not under `dmc jit`, which is the divergence
+            // this whole change removes. Crossing `any` forgoes static
+            // guarantees, and the width is one of them.
+            Ok(match result { Value::Int(n, _) => Value::Int(n, IW::I64), other => other })
         }
         "map_has" | "map_contains" => {
             let builtin_name = name;
@@ -6715,7 +8166,7 @@ impl Interpreter {
         }
         "map_len" => {
             match args.first() {
-                Some(Value::Map(m)) => Ok(Value::Int(m.borrow().len() as i64)),
+                Some(Value::Map(m)) => Ok(Value::Int(m.borrow().len() as i64, IW::I64)),
                 Some(other) => Err(RuntimeError::at(
                     format!("map_len: arg must be map, got {}", other.type_name()), sp)),
                 None => Err(RuntimeError::at("map_len: requires map arg", sp)),
@@ -6766,7 +8217,7 @@ impl Interpreter {
         "set_raw_mode" => {
             let enable = args.first().and_then(|v| match v {
                 Value::Bool(b) => Some(*b),
-                Value::Int(n) => Some(*n != 0),
+                Value::Int(n, _) => Some(*n != 0),
                 _ => None,
             }).unwrap_or(false);
             // Silently ignore "not a tty" errors — game degrades gracefully
@@ -6861,7 +8312,7 @@ impl Interpreter {
             }
             let range = (hi - lo) as u64;
             let n = self.rand_u64() % range;
-            Ok(Value::Int(lo + n as i64))
+            Ok(Value::Int(lo + n as i64, IW::I64))
         }
         "rand_normal" => {
             let mean = args.first().and_then(|v| v.as_float()).unwrap_or(0.0);
@@ -6898,10 +8349,29 @@ impl Interpreter {
                     format!("json_decode: arg must be str, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("json_decode: requires str arg", sp)),
             };
-            match json_decode_str(&s) {
+            match json_parse(&s) {
                 Ok(v) => Ok(Value::Tuple(vec![v, Value::Nil])),
                 Err(e) => Ok(Value::Tuple(vec![Value::Nil, Value::Str(format!("parse error: {}", e))])),
             }
+        }
+
+        // ── Typed JSON decode (PORTS.md §6, ASSIMILATE.md §5.1) ───────────────
+        // `json_decode` hands back a dynamic value, so anything built on it is
+        // untyped all the way out. The typed family commits to one demoniC type
+        // per primitive and returns `(T, Err)`: the decoded value, or T's zero
+        // and a `decode-*` tag. A value of the wrong JSON type is an error, not
+        // a coercion — that is the whole point (an assimilated wrapper's
+        // declared return type is only a contract if the boundary enforces it).
+        "json_decode_i64" | "json_decode_f64" | "json_decode_str"
+        | "json_decode_bool" | "json_decode_list" => {
+            let s = match args.first() {
+                Some(Value::Str(s)) => s.clone(),
+                Some(other) => return Err(RuntimeError::at(
+                    format!("{}: arg must be str, got {}", name, other.type_name()), sp)),
+                None => return Err(RuntimeError::at(
+                    format!("{}: requires str arg", name), sp)),
+            };
+            Ok(json_decode_typed(&name["json_decode_".len()..], &s))
         }
 
         // ── List functional combinators ───────────────────────────────────────
@@ -6936,7 +8406,7 @@ impl Interpreter {
             for item in into_list_vec(lst) {
                 let out = self.call_value(fn_val.clone(), vec![item.clone()], sp.clone())?;
                 if out.as_bool().unwrap_or(match &out {
-                    Value::Int(n) => *n != 0,
+                    Value::Int(n, _) => *n != 0,
                     Value::Float(x, _) => *x != 0.0,
                     Value::Nil => false,
                     _ => true,
@@ -7023,7 +8493,7 @@ impl Interpreter {
             };
             args[0] = Value::Nil;
             let pairs: Vec<Value> = into_list_vec(lst).into_iter().enumerate()
-                .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v]))
+                .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64, IW::I64), v]))
                 .collect();
             Ok(Value::list(pairs))
         }
@@ -7067,9 +8537,9 @@ impl Interpreter {
                 None => return Err(RuntimeError::at("list_sum: requires list arg", sp)),
             };
             // Preserve integer type if all elements are integers
-            if lst.iter().all(|v| matches!(v, Value::Int(_))) {
+            if lst.iter().all(|v| matches!(v, Value::Int(_, _))) {
                 let total: i64 = lst.iter().filter_map(|v| v.as_int()).sum();
-                Ok(Value::Int(total))
+                Ok(Value::Int(total, IW::I64))
             } else {
                 let total: f64 = lst.iter().filter_map(|v| v.as_float()).sum();
                 Ok(Value::Float(total, FW::F64))
@@ -7207,7 +8677,7 @@ impl Interpreter {
             let needle = args.get(1).cloned()
                 .ok_or_else(|| RuntimeError::at("list_find: requires item arg", sp.clone()))?;
             let idx = lst.iter().position(|v| values_equal(v, &needle));
-            Ok(Value::Int(idx.map(|i| i as i64).unwrap_or(-1)))
+            Ok(Value::Int(idx.map(|i| i as i64).unwrap_or(-1), IW::I64))
         }
         "list_count" => {
             let lst = match args.first() {
@@ -7219,7 +8689,7 @@ impl Interpreter {
             let needle = args.get(1).cloned()
                 .ok_or_else(|| RuntimeError::at("list_count: requires item arg", sp.clone()))?;
             let count = lst.iter().filter(|v| values_equal(v, &needle)).count();
-            Ok(Value::Int(count as i64))
+            Ok(Value::Int(count as i64, IW::I64))
         }
         "list_any" => {
             let lst = match args.first() {
@@ -7313,7 +8783,7 @@ impl Interpreter {
                     format!("hash_fnv: arg must be str, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("hash_fnv: requires str arg", sp)),
             };
-            Ok(Value::Int(fnv1a_64(&s)))
+            Ok(Value::Int(fnv1a_64(&s), IW::I64))
         }
         "hash_crc32" => {
             let s = match args.first() {
@@ -7322,7 +8792,7 @@ impl Interpreter {
                     format!("hash_crc32: arg must be str, got {}", other.type_name()), sp)),
                 None => return Err(RuntimeError::at("hash_crc32: requires str arg", sp)),
             };
-            Ok(Value::Int(crc32_ieee(&s)))
+            Ok(Value::Int(crc32_ieee(&s), IW::I64))
         }
 
         // ── Filesystem operations ─────────────────────────────────────────────
@@ -7407,8 +8877,8 @@ impl Interpreter {
                 _ => return Err(RuntimeError::at("file_size: path must be str", sp)),
             };
             match std::fs::metadata(&path) {
-                Ok(meta) => Ok(Value::Tuple(vec![Value::Int(meta.len() as i64), Value::Nil])),
-                Err(e) => Ok(Value::Tuple(vec![Value::Int(0), Value::Str(format!("error: {}", e))])),
+                Ok(meta) => Ok(Value::Tuple(vec![Value::Int(meta.len() as i64, IW::I64), Value::Nil])),
+                Err(e) => Ok(Value::Tuple(vec![Value::Int(0, IW::I64), Value::Str(format!("error: {}", e))])),
             }
         }
         "path_join" => {
@@ -7484,12 +8954,12 @@ impl Interpreter {
                     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
                     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
                     let code = out.status.code().unwrap_or(-1) as i64;
-                    Ok(Value::Tuple(vec![Value::Str(stdout), Value::Str(stderr), Value::Int(code)]))
+                    Ok(Value::Tuple(vec![Value::Str(stdout), Value::Str(stderr), Value::Int(code, IW::I64)]))
                 }
                 Err(e) => Ok(Value::Tuple(vec![
                     Value::Str(String::new()),
                     Value::Str(format!("failed to spawn: {}", e)),
-                    Value::Int(-1),
+                    Value::Int(-1, IW::I64),
                 ])),
             }
         }
@@ -7498,45 +8968,19 @@ impl Interpreter {
         // Process-port floor: a child runtime speaking line-oriented JSON
         // over stdin/stdout. All three builtins return `(_, Err)` where Err
         // is nil or a str beginning with a PORTS.md §6 tag; code must match
-        // only the tag prefix.
+        // only the tag prefix. The protocol itself lives in `crate::ports`,
+        // shared with the JIT; these arms only shape the result into Values.
         "port_open" => {
             let lang = match args.first() {
                 Some(Value::Str(s)) => s.clone(),
                 _ => return Err(RuntimeError::at("port_open: lang must be str", sp)),
             };
-            // Only the python runtime is wired up so far; others report
-            // `port-open` (PORTS.md: "runtime could not be started") rather
-            // than pretending.
-            if lang != "python" {
-                return Ok(Value::Tuple(vec![Value::Nil, Value::Str(format!(
-                    "port-open: unsupported runtime `{}` — the process-port floor implements `python`", lang))]));
-            }
-            match std::process::Command::new("python3")
-                .args(["-u", "-c", PY_PORT_HARNESS])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let stdin = child.stdin.take().expect("piped stdin");
-                    let stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
-                    let id = self.next_port_id;
-                    self.next_port_id += 1;
-                    self.ports.insert(id, PortProc { child, stdin, stdout });
-                    Ok(Value::Tuple(vec![
-                        Value::Opaque(format!("port#{}:{}", id, lang)),
-                        Value::Nil,
-                    ]))
-                }
-                Err(e) => Ok(Value::Tuple(vec![Value::Nil, Value::Str(
-                    format!("port-open: failed to start python3: {}", e))])),
-            }
+            Ok(match self.ports.open(&lang) {
+                Ok(handle) => Value::Tuple(vec![Value::Opaque(handle), Value::Nil]),
+                Err(tag) => Value::Tuple(vec![Value::Nil, Value::Str(tag)]),
+            })
         }
         "port_call" => {
-            use std::io::{BufRead, Write};
-            let call_err = |msg: String| Ok(Value::Tuple(vec![
-                Value::Str(String::new()), Value::Str(msg)]));
             let id = match port_handle_id(args.first()) {
                 Some(id) => id,
                 None => return Err(RuntimeError::at(
@@ -7551,51 +8995,10 @@ impl Interpreter {
                 Some(Value::Nil) | None => String::new(),
                 _ => return Err(RuntimeError::at("port_call: payload must be a JSON str", sp)),
             };
-            let port = match self.ports.get_mut(&id) {
-                Some(p) => p,
-                None => return call_err("port-closed: handle was already closed".to_string()),
-            };
-            let req = format!("{{\"name\":{},\"payload\":{}}}",
-                json_encode_str(&name), json_encode_str(&payload));
-            if let Err(e) = writeln!(port.stdin, "{}", req).and_then(|_| port.stdin.flush()) {
-                return call_err(format!("port-protocol: write failed: {}", e));
-            }
-            let mut line = String::new();
-            match port.stdout.read_line(&mut line) {
-                Ok(0) => return call_err("port-protocol: runtime closed the pipe".to_string()),
-                Ok(_) => {}
-                Err(e) => return call_err(format!("port-protocol: read failed: {}", e)),
-            }
-            match json_decode_str(line.trim()) {
-                Ok(Value::Map(m)) => {
-                    let m = m.borrow();
-                    let tagged = |tag: &str, v: &Value| {
-                        let msg = match v {
-                            Value::Str(s) => s.clone(),
-                            other => json_encode_value(other),
-                        };
-                        format!("{}: {}", tag, msg)
-                    };
-                    // `perr` is a malformed-payload signal from the harness
-                    // (PORTS.md §6 port-protocol); `err` is a foreign-runtime
-                    // failure (port-call). Distinguished so code can match tags.
-                    if let Some(perr) = m.get("perr") {
-                        call_err(tagged("port-protocol", perr))
-                    } else if let Some(err) = m.get("err") {
-                        call_err(tagged("port-call", err))
-                    } else if let Some(ok) = m.get("ok") {
-                        // Re-encode through the crate's canonical JSON writer,
-                        // so the result str is canonical regardless of the
-                        // foreign runtime's formatting.
-                        Ok(Value::Tuple(vec![
-                            Value::Str(json_encode_value(ok)), Value::Nil]))
-                    } else {
-                        call_err("port-protocol: response has neither `ok` nor `err`".to_string())
-                    }
-                }
-                Ok(_) => call_err("port-protocol: response is not a JSON object".to_string()),
-                Err(e) => call_err(format!("port-protocol: {}", e)),
-            }
+            Ok(match self.ports.call(id, &name, &payload) {
+                Ok(out) => Value::Tuple(vec![Value::Str(out), Value::Nil]),
+                Err(tag) => Value::Tuple(vec![Value::Str(String::new()), Value::Str(tag)]),
+            })
         }
         "port_close" => {
             let id = match port_handle_id(args.first()) {
@@ -7603,16 +9006,69 @@ impl Interpreter {
                 None => return Err(RuntimeError::at(
                     "port_close: arg must be a Port handle from port_open", sp)),
             };
-            match self.ports.remove(&id) {
-                Some(port) => {
-                    let PortProc { stdin, mut child, .. } = port;
-                    drop(stdin);               // EOF ends the harness loop
-                    let _ = child.wait();      // reap; exit status is not an error surface
-                    Ok(Value::Tuple(vec![Value::Nil, Value::Nil]))
-                }
-                None => Ok(Value::Tuple(vec![Value::Nil, Value::Str(
-                    "port-closed: handle was already closed".to_string())])),
+            Ok(match self.ports.close(id) {
+                Ok(()) => Value::Tuple(vec![Value::Nil, Value::Nil]),
+                Err(tag) => Value::Tuple(vec![Value::Nil, Value::Str(tag)]),
+            })
+        }
+
+        // ── Tensor copy mode (PORTS.md §3.2) ─────────────────────────────────
+        // A tensor crosses the port boundary as one canonical-JSON envelope
+        // carrying `{dtype, shape, layout}` plus a base64 payload buffer.
+        // `crate::ports` owns every byte of that text; these arms only read
+        // the interpreter's f64-backed storage into it and back out.
+        "port_tensor_encode" => {
+            let t = match args.first() {
+                Some(Value::Tensor(t)) => t,
+                Some(other) => return Err(RuntimeError::at(format!(
+                    "port_tensor_encode: arg must be a tensor, got {}", other.type_name()), sp)),
+                None => return Err(RuntimeError::at(
+                    "port_tensor_encode: arg must be a tensor", sp)),
+            };
+            let store = wire_dtype_of(t.dtype).ok_or_else(|| RuntimeError::at(
+                "port_tensor_encode: a `trit` tensor has no copy-mode wire dtype \
+                 (PORTS.md §3.2)", sp.clone()))?;
+            let shape: Vec<i64> = t.shape().iter().map(|&d| d as i64).collect();
+            let vals: Vec<f64> = t.iter().copied().collect();
+            match crate::ports::pack_from_f64(store, &shape, &vals) {
+                Ok(text) => Ok(Value::Str(text)),
+                Err(msg) => Err(RuntimeError::at(format!("port_tensor_encode: {}", msg), sp)),
             }
+        }
+        "port_tensor_decode" => {
+            let text = match args.first() {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err(RuntimeError::at(
+                    "port_tensor_decode: first arg must be the envelope str", sp)),
+            };
+            let like = match args.get(1) {
+                Some(Value::Tensor(t)) => t,
+                _ => return Err(RuntimeError::at(
+                    "port_tensor_decode: second arg must be a tensor declaring the \
+                     expected dtype and shape", sp)),
+            };
+            let want = wire_dtype_of(like.dtype).ok_or_else(|| RuntimeError::at(
+                "port_tensor_decode: a `trit` tensor has no copy-mode wire dtype \
+                 (PORTS.md §3.2)", sp.clone()))?;
+            let dims: Vec<usize> = like.shape().to_vec();
+            let shape: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+            let (dtype, numel) = (like.dtype, dims.iter().product::<usize>());
+            Ok(match crate::ports::unpack_raw(&text, want, &shape) {
+                Ok(bytes) => {
+                    let vals = crate::ports::raw_to_f64(want, &bytes);
+                    let arr = ArrayD::from_shape_vec(IxDyn(&dims), vals)
+                        .map_err(|e| RuntimeError::at(
+                            format!("port_tensor_decode: {}", e), sp.clone()))?;
+                    Value::Tuple(vec![Value::tensor_dt(arr, dtype), Value::Nil])
+                }
+                // The value half is the declared tensor's zero, the §3.1
+                // discipline: `(T, Err)` stays well-typed on the failure path.
+                Err(tag) => Value::Tuple(vec![
+                    Value::tensor_dt(ArrayD::from_shape_vec(
+                        IxDyn(&dims), vec![0.0; numel]).unwrap(), dtype),
+                    Value::Str(tag),
+                ]),
+            })
         }
 
         // ── CLI argument builtins ─────────────────────────────────────────────
@@ -7650,7 +9106,7 @@ impl Interpreter {
         }
         "cli_positional" => {
             let n = match args.first() {
-                Some(Value::Int(n)) => *n,
+                Some(Value::Int(n, _)) => *n,
                 _ => return Err(RuntimeError::at("cli_positional: first arg must be i64", sp)),
             };
             // Skip over values that follow --flag entries
@@ -7692,7 +9148,7 @@ impl Interpreter {
                     i += 1;
                 }
             }
-            Ok(Value::Int(count as i64))
+            Ok(Value::Int(count as i64, IW::I64))
         }
 
         // ── Regex ─────────────────────────────────────────────────────────────
@@ -7725,11 +9181,11 @@ impl Interpreter {
                     match re.find(&text) {
                         Some(m) => Ok(Value::Tuple(vec![
                             Value::Str(m.as_str().to_string()),
-                            Value::Int(m.start() as i64),
+                            Value::Int(m.start() as i64, IW::I64),
                         ])),
                         None => Ok(Value::Tuple(vec![
                             Value::Str(String::new()),
-                            Value::Int(-1),
+                            Value::Int(-1, IW::I64),
                         ])),
                     }
                 }
@@ -7993,14 +9449,14 @@ impl Interpreter {
 
         // ── Date/time ─────────────────────────────────────────────────────────
         "date_now_ms" => {
-            Ok(Value::Int(chrono::Utc::now().timestamp_millis()))
+            Ok(Value::Int(chrono::Utc::now().timestamp_millis(), IW::I64))
         }
         "date_now_s" => {
-            Ok(Value::Int(chrono::Utc::now().timestamp()))
+            Ok(Value::Int(chrono::Utc::now().timestamp(), IW::I64))
         }
         "date_format" => {
             let timestamp_ms = match args.first() {
-                Some(Value::Int(n)) => *n,
+                Some(Value::Int(n, _)) => *n,
                 Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_format: timestamp_ms must be integer", sp)),
             };
@@ -8025,7 +9481,7 @@ impl Interpreter {
             match chrono::NaiveDateTime::parse_from_str(&date_str, &format_str) {
                 Ok(dt) => {
                     let ts_ms = dt.and_utc().timestamp_millis();
-                    Ok(Value::Tuple(vec![Value::Int(ts_ms), Value::Nil]))
+                    Ok(Value::Tuple(vec![Value::Int(ts_ms, IW::I64), Value::Nil]))
                 }
                 Err(_) => {
                     // Try parsing as a date only (NaiveDate)
@@ -8033,10 +9489,10 @@ impl Interpreter {
                         Ok(d) => {
                             let dt = d.and_hms_opt(0, 0, 0).unwrap();
                             let ts_ms = dt.and_utc().timestamp_millis();
-                            Ok(Value::Tuple(vec![Value::Int(ts_ms), Value::Nil]))
+                            Ok(Value::Tuple(vec![Value::Int(ts_ms, IW::I64), Value::Nil]))
                         }
                         Err(e) => Ok(Value::Tuple(vec![
-                            Value::Int(0),
+                            Value::Int(0, IW::I64),
                             Value::Str(format!("parse error: {}", e)),
                         ])),
                     }
@@ -8045,29 +9501,29 @@ impl Interpreter {
         }
         "date_add_ms" => {
             let timestamp_ms = match args.first() {
-                Some(Value::Int(n)) => *n,
+                Some(Value::Int(n, _)) => *n,
                 Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_add_ms: timestamp_ms must be integer", sp)),
             };
             let delta_ms = match args.get(1) {
-                Some(Value::Int(n)) => *n,
+                Some(Value::Int(n, _)) => *n,
                 Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_add_ms: delta_ms must be integer", sp)),
             };
-            Ok(Value::Int(timestamp_ms + delta_ms))
+            Ok(Value::Int(timestamp_ms + delta_ms, IW::I64))
         }
         "date_diff_ms" => {
             let ts_a = match args.first() {
-                Some(Value::Int(n)) => *n,
+                Some(Value::Int(n, _)) => *n,
                 Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_diff_ms: ts_a must be integer", sp)),
             };
             let ts_b = match args.get(1) {
-                Some(Value::Int(n)) => *n,
+                Some(Value::Int(n, _)) => *n,
                 Some(Value::Float(x, _)) => *x as i64,
                 _ => return Err(RuntimeError::at("date_diff_ms: ts_b must be integer", sp)),
             };
-            Ok(Value::Int(ts_a - ts_b))
+            Ok(Value::Int(ts_a - ts_b, IW::I64))
         }
 
         // ── Trit tensor operations ────────────────────────────────────────
@@ -8612,7 +10068,7 @@ fn builtin_arg_reduce(args: &[Value], sp: Span, want_max: bool) -> EvalResult<Va
             let pick = if want_max { v > best_v } else { v < best_v };
             if pick { best_v = v; best_i = i; }
         }
-        return Ok(Value::Int(best_i as i64));
+        return Ok(Value::Int(best_i as i64, IW::I64));
     }
     let mut out = ArrayD::<f64>::zeros(IxDyn(&out_shape));
     // For each output index, scan along `axis` and pick argmax/argmin.
@@ -8798,7 +10254,7 @@ fn builtin_attn(args: &[Value], sp: Span) -> EvalResult<Value> {
             if mask[IxDyn(&[i, j])] == 0.0 { *slot = f64::NEG_INFINITY; }
         }
     }
-    let weights = builtin_softmax(&[Value::tensor(scaled), Value::Int(-1)], sp.clone())?;
+    let weights = builtin_softmax(&[Value::tensor(scaled), Value::Int(-1, IW::I64)], sp.clone())?;
     let weights_t = match weights { Value::Tensor(t) => t, _ => unreachable!() };
     // weights @ v
     tensor_matmul(&Value::Tensor(weights_t), &Value::tensor(v.clone()))
@@ -8879,7 +10335,7 @@ fn builtin_attn_gqa(args: &[Value], sp: Span) -> EvalResult<Value> {
 
             // softmax along last axis (rows of S)
             let weights_v = builtin_softmax(
-                &[Value::tensor(scaled), Value::Int(-1)], sp.clone())?;
+                &[Value::tensor(scaled), Value::Int(-1, IW::I64)], sp.clone())?;
             let weights = match weights_v { Value::Tensor(t) => t, _ => unreachable!() };
 
             // head_out = weights @ v_head  [S, D]
@@ -8916,6 +10372,14 @@ enum TapeOp {
     Input {
         #[allow(dead_code)] param_idx: usize,
         #[allow(dead_code)] mutating: bool,
+    },
+    /// A captured `mut` binding read by the differentiated body (AUTODIFF.md
+    /// §2, #398). Differentiated exactly like a `!` parameter: it seeds the
+    /// tape with the binding's value at call time and its adjoint comes back in
+    /// `Grads` under `name` — which is also the binding's name, so
+    /// `g.<name>` reads it.
+    Captured {
+        #[allow(dead_code)] name: String,
     },
     /// A constant value that didn't come from the gradient graph — its
     /// gradient is discarded.
@@ -8964,6 +10428,16 @@ enum TapeOp {
     /// `mean_along(x, axis)` — like SumAlong but the adjoint is divided by the
     /// reduced axis length (#307).
     MeanAlong(usize),
+    /// `max_along(x, axis)` / `min_along(x, axis)` (axis dropped) — the
+    /// per-lane counterpart of `MaxReduce`/`MinReduce`. Each lane's adjoint
+    /// goes to that lane's single extreme element (first occurrence on a tie,
+    /// matching `argmax`/`argmin`), 0 elsewhere (#434).
+    MaxAlong(usize),
+    MinAlong(usize),
+    /// `x[i, j, ...]` — a fully-qualified element read of a traced tensor. The
+    /// index is fixed at trace time, so the VJP scatters the scalar adjoint
+    /// into that one slot of a zero tensor shaped like `x` (#420).
+    IndexRead(Vec<usize>),
     /// `x.reshape[[..]]` — VJP reshapes the adjoint back to the input's shape (#307).
     Reshape,
     /// `variance(x)` — population variance over all elements. VJP
@@ -9064,8 +10538,9 @@ impl Tape {
             let n = &self.nodes[i];
             let Some(g_out) = grads[i].clone() else { continue; };
             match &n.op {
-                TapeOp::Input { .. } | TapeOp::Const => {
-                    // No upstream to propagate to.
+                TapeOp::Input { .. } | TapeOp::Captured { .. } | TapeOp::Const => {
+                    // Leaves of the graph: no upstream to propagate to. Their
+                    // accumulated adjoint *is* the answer `Grads` hands back.
                 }
                 TapeOp::Matmul => {
                     // c = a @ b. Each is a tensor.
@@ -9352,7 +10827,7 @@ impl Tape {
                                 }
                             }
                             let p = match builtin_softmax(
-                                &[Value::tensor(scaled), Value::Int(-1)],
+                                &[Value::tensor(scaled), Value::Int(-1, IW::I64)],
                                 Span { start: 0, end: 0, line: 0, col: 0 })? {
                                 Value::Tensor(t) => t,
                                 _ => unreachable!(),
@@ -9399,6 +10874,48 @@ impl Tape {
                     if matches!(n.op, TapeOp::MeanAlong(_)) {
                         dx.mapv_inplace(|v| v / dlen);
                     }
+                    accumulate(grads, n.inputs[0], Value::tensor(dx));
+                }
+                TapeOp::MaxAlong(axis) | TapeOp::MinAlong(axis) => {
+                    // y = max/min over `axis` (axis dropped). Subgradient: each
+                    // lane's adjoint goes to that lane's extreme element, 0
+                    // elsewhere — the per-axis form of MaxReduce/MinReduce
+                    // (#434). Ties break toward the first occurrence, matching
+                    // argmax/argmin and the whole-tensor rule.
+                    let x = as_tensor(&self.nodes[n.inputs[0]].value)?;
+                    let g = as_tensor(&g_out)?;
+                    let want_max = matches!(n.op, TapeOp::MaxAlong(_));
+                    let mut best = ArrayD::from_elem(
+                        g.raw_dim(),
+                        if want_max { f64::NEG_INFINITY } else { f64::INFINITY });
+                    let mut arg = ArrayD::<usize>::zeros(g.raw_dim());
+                    for (ido, &xv) in x.indexed_iter() {
+                        let full: Vec<usize> = ido.as_array_view().iter().copied().collect();
+                        let k = full[*axis];
+                        let mut red = full;
+                        red.remove(*axis);
+                        let ri = IxDyn(&red);
+                        let better = if want_max { xv > best[ri.clone()] } else { xv < best[ri.clone()] };
+                        if better {
+                            best[ri.clone()] = xv;
+                            arg[ri] = k;
+                        }
+                    }
+                    let mut dx = ArrayD::<f64>::zeros(x.raw_dim());
+                    for (ido, &gv) in g.indexed_iter() {
+                        let red: Vec<usize> = ido.as_array_view().iter().copied().collect();
+                        let mut full = red.clone();
+                        full.insert(*axis, arg[IxDyn(&red)]);
+                        dx[IxDyn(&full)] = gv;
+                    }
+                    accumulate(grads, n.inputs[0], Value::tensor(dx));
+                }
+                TapeOp::IndexRead(idx) => {
+                    // y = x[i, j, ...] → dx is zero everywhere but that slot,
+                    // which receives the whole scalar adjoint (#420).
+                    let x = as_tensor(&self.nodes[n.inputs[0]].value)?;
+                    let mut dx = ArrayD::<f64>::zeros(x.raw_dim());
+                    dx[IxDyn(idx)] = g_out.as_float().unwrap_or(0.0);
                     accumulate(grads, n.inputs[0], Value::tensor(dx));
                 }
                 TapeOp::Reshape => {
@@ -9545,7 +11062,7 @@ impl Tape {
             let inputs = self.nodes[i].inputs.clone();
             let g_val = self.nodes[g].value.clone();
             match op {
-                TapeOp::Input { .. } | TapeOp::Const => {}
+                TapeOp::Input { .. } | TapeOp::Captured { .. } | TapeOp::Const => {}
                 TapeOp::Matmul => {
                     // da = g @ b';  db = a' @ g
                     let b_val = self.nodes[inputs[1]].value.clone();
@@ -9680,6 +11197,16 @@ impl Tape {
                         "@grad @grad: second-order gradient through `variance`/`max`/`min` \
                          is not supported yet (first-order works)".to_string()));
                 }
+                TapeOp::MaxAlong(_) | TapeOp::MinAlong(_) => {
+                    return Err(RuntimeError::msg(
+                        "@grad @grad: second-order gradient through `max_along`/`min_along` \
+                         is not supported yet (first-order works)".to_string()));
+                }
+                TapeOp::IndexRead(_) => {
+                    return Err(RuntimeError::msg(
+                        "@grad @grad: second-order gradient through an indexed read `x[i]` \
+                         is not supported yet (first-order works)".to_string()));
+                }
                 TapeOp::ScalarMath(kind) => {
                     return Err(RuntimeError::msg(format!(
                         "@grad @grad: second-order gradient through scalar `{}` is not \
@@ -9725,6 +11252,19 @@ impl Tape {
             }
         }
         Ok(adj)
+    }
+}
+
+/// Can this runtime value carry a gradient (AUTODIFF.md §2)? Float tensors and
+/// float scalars can; integer/bool/trit tensors, integers, strings, structs and
+/// the rest cannot — taping them would hand back a meaningless adjoint. Used to
+/// decide which captured `mut` bindings become tape inputs (#398); the checker's
+/// `capture_type_is_differentiable` is the static counterpart.
+fn value_is_differentiable(v: &Value) -> bool {
+    match v {
+        Value::Tensor(t) => matches!(t.dtype, DType::F32 | DType::F64),
+        Value::Float(..) => true,
+        _ => false,
     }
 }
 
@@ -9834,7 +11374,7 @@ fn negate_value(v: &Value) -> EvalResult<Value> {
     match v {
         Value::Tensor(t) => Ok(Value::tensor(t.mapv(|x| -x))),
         Value::Float(x, w)  => Ok(Value::Float(w.round(-x), *w)),
-        Value::Int(n)    => Ok(Value::Int(-n)),
+        Value::Int(n, _)    => Ok(Value::Int(-n, IW::I64)),
         other => Err(RuntimeError::msg(format!("cannot negate {}", other.type_name()))),
     }
 }
@@ -9843,7 +11383,7 @@ fn scale_value(v: &Value, s: f64) -> EvalResult<Value> {
     match v {
         Value::Tensor(t) => Ok(Value::tensor(t.mapv(|x| x * s))),
         Value::Float(x, _)  => Ok(Value::Float(x * s, FW::F64)),
-        Value::Int(n)    => Ok(Value::Float(*n as f64 * s, FW::F64)),
+        Value::Int(n, _)    => Ok(Value::Float(*n as f64 * s, FW::F64)),
         other => Err(RuntimeError::msg(format!("cannot scale {}", other.type_name()))),
     }
 }
@@ -9858,11 +11398,11 @@ fn transpose_last_two(t: ArrayD<f64>) -> ArrayD<f64> {
 
 // ─── JSON encode/decode ───────────────────────────────────────────────────────
 
-fn json_encode_value(v: &Value) -> String {
+pub(crate) fn json_encode_value(v: &Value) -> String {
     match v {
         Value::Nil       => "null".to_string(),
         Value::Bool(b)   => if *b { "true".to_string() } else { "false".to_string() },
-        Value::Int(n)    => n.to_string(),
+        Value::Int(n, _)    => n.to_string(),
         Value::Float(x, _)  => {
             // Produce a compact representation; avoid trailing .0 for whole numbers
             // that the JSON spec allows, but be explicit enough to round-trip.
@@ -9901,7 +11441,7 @@ fn json_encode_value(v: &Value) -> String {
     }
 }
 
-fn json_encode_str(s: &str) -> String {
+pub(crate) fn json_encode_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -9937,8 +11477,19 @@ struct JsonParser<'a> {
 /// defaults to 128) yet far below the native-stack overflow threshold.
 const MAX_JSON_DEPTH: usize = 512;
 
+/// How a diagnostic names a byte it found in the input.
+///
+/// An ASCII byte prints as itself, which is what every existing parser message
+/// says. A byte at or above 0x80 does not: on its own it is a fragment of a
+/// UTF-8 sequence, not a character, and `b as char` printed it as the latin-1
+/// letter it is not — the same misreading as #509, one layer up in the
+/// diagnostics. Show the byte.
+fn json_byte_desc(b: u8) -> String {
+    if b < 0x80 { format!("'{}'", b as char) } else { format!("0x{:02X}", b) }
+}
+
 impl<'a> JsonParser<'a> {
-    fn new(s: &'a str) -> Self { Self { src: s.as_bytes(), pos: 0, depth: 0 } }
+    fn new(src: &'a [u8]) -> Self { Self { src, pos: 0, depth: 0 } }
 
     fn skip_ws(&mut self) {
         while self.pos < self.src.len() && matches!(self.src[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
@@ -9957,7 +11508,7 @@ impl<'a> JsonParser<'a> {
     fn expect(&mut self, b: u8) -> Result<(), String> {
         match self.consume() {
             Some(got) if got == b => Ok(()),
-            Some(got) => Err(format!("expected '{}', got '{}'", b as char, got as char)),
+            Some(got) => Err(format!("expected '{}', got {}", b as char, json_byte_desc(got))),
             None => Err(format!("expected '{}', got EOF", b as char)),
         }
     }
@@ -9986,7 +11537,8 @@ impl<'a> JsonParser<'a> {
             Some(b'f')  => { self.consume_literal(b"false")?; Ok(Value::Bool(false)) }
             Some(b'n')  => { self.consume_literal(b"null")?;  Ok(Value::Nil) }
             Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
-            Some(c) => Err(format!("unexpected byte '{}' at position {}", c as char, self.pos)),
+            Some(c) => Err(format!("unexpected byte {} at position {}",
+                json_byte_desc(c), self.pos)),
             None => Err("unexpected end of input".to_string()),
         }
     }
@@ -9995,7 +11547,8 @@ impl<'a> JsonParser<'a> {
         for &b in expected {
             match self.consume() {
                 Some(got) if got == b => {}
-                Some(got) => return Err(format!("expected '{}', got '{}'", b as char, got as char)),
+                Some(got) => return Err(format!("expected '{}', got {}",
+                    b as char, json_byte_desc(got))),
                 None => return Err("unexpected EOF in literal".to_string()),
             }
         }
@@ -10019,29 +11572,84 @@ impl<'a> JsonParser<'a> {
                         Some(b'b')  => s.push('\x08'),
                         Some(b'f')  => s.push('\x0C'),
                         Some(b'u')  => {
-                            // 4 hex digits
-                            let mut hex = String::new();
-                            for _ in 0..4 {
-                                match self.consume() {
-                                    Some(b) => hex.push(b as char),
-                                    None => return Err("truncated \\uXXXX".to_string()),
-                                }
-                            }
-                            let cp = u32::from_str_radix(&hex, 16)
-                                .map_err(|_| format!("invalid \\u{}", hex))?;
-                            let c = char::from_u32(cp)
-                                .ok_or_else(|| format!("invalid codepoint U+{:04X}", cp))?;
-                            s.push(c);
+                            let cp = self.read_hex4()?;
+                            s.push(self.escaped_scalar(cp)?);
                         }
-                        Some(c) => return Err(format!("unknown escape \\{}", c as char)),
+                        Some(c) if c < 0x80 =>
+                            return Err(format!("unknown escape \\{}", c as char)),
+                        Some(c) => return Err(format!("unknown escape \\{}", json_byte_desc(c))),
                         None => return Err("truncated escape".to_string()),
                     }
                 }
-                Some(b) => s.push(b as char),
+                Some(b) if b < 0x80 => s.push(b as char),
+                // A raw byte at or above 0x80 opens a multi-byte sequence:
+                // JSON text is UTF-8 by definition, so decode the sequence
+                // instead of pushing the byte as a char. Pushing it read the
+                // text as latin-1 and turned every unescaped non-ASCII scalar
+                // into mojibake — an em dash arrived as `â\u{80}\u{94}` (#509).
+                // Same shape as the lexer's string-literal path.
+                Some(b) => {
+                    let mut buf = vec![b];
+                    while let Some(next) = self.peek() {
+                        if next & 0xC0 == 0x80 { buf.push(next); self.pos += 1; } else { break; }
+                    }
+                    match std::str::from_utf8(&buf) {
+                        Ok(text) => s.push_str(text),
+                        Err(_) => return Err("invalid UTF-8 in string".to_string()),
+                    }
+                }
                 None => return Err("unterminated string".to_string()),
             }
         }
         Ok(s)
+    }
+
+    /// The four hex digits of a `\uXXXX` escape, `\u` already consumed. Shared
+    /// by a lone escape and by each half of a surrogate pair.
+    fn read_hex4(&mut self) -> Result<u32, String> {
+        let mut hex = String::new();
+        for _ in 0..4 {
+            match self.consume() {
+                Some(b) if b < 0x80 => hex.push(b as char),
+                // Not a hex digit, and not a character either — naming it as
+                // one would echo the same latin-1 misreading back at the user.
+                Some(b) => return Err(format!(
+                    "invalid \\u escape: {} is not a hex digit", json_byte_desc(b))),
+                None => return Err("truncated \\uXXXX".to_string()),
+            }
+        }
+        u32::from_str_radix(&hex, 16).map_err(|_| format!("invalid \\u{}", hex))
+    }
+
+    /// The scalar value a `\uXXXX` escape denotes, joining a surrogate pair
+    /// when it opens one.
+    ///
+    /// A code point past the BMP has no four-digit escape; JSON spells it as a
+    /// UTF-16 surrogate pair, and that is what every ASCII-only writer emits —
+    /// including python's `json.dumps`, the producer on the other side of the
+    /// process port. Reading the halves separately rejects valid JSON, since
+    /// neither half is a Unicode scalar value on its own. A surrogate that is
+    /// not part of a pair stays an error for the same reason (#509).
+    fn escaped_scalar(&mut self, cp: u32) -> Result<char, String> {
+        let scalar = match cp {
+            0xD800..=0xDBFF => {
+                if self.peek() != Some(b'\\')
+                    || self.src.get(self.pos + 1).copied() != Some(b'u')
+                {
+                    return Err(format!("unpaired high surrogate U+{:04X}", cp));
+                }
+                self.pos += 2;
+                let lo = self.read_hex4()?;
+                if !(0xDC00..=0xDFFF).contains(&lo) {
+                    return Err(format!(
+                        "expected low surrogate after U+{:04X}, got U+{:04X}", cp, lo));
+                }
+                0x1_0000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+            }
+            0xDC00..=0xDFFF => return Err(format!("unpaired low surrogate U+{:04X}", cp)),
+            _ => cp,
+        };
+        char::from_u32(scalar).ok_or_else(|| format!("invalid codepoint U+{:04X}", scalar))
     }
 
     fn parse_number(&mut self) -> Result<Value, String> {
@@ -10070,8 +11678,23 @@ impl<'a> JsonParser<'a> {
             let x: f64 = s.parse().map_err(|_| format!("invalid float: {}", s))?;
             Ok(Value::Float(x, FW::F64))
         } else {
-            let n: i64 = s.parse().map_err(|_| format!("invalid integer: {}", s))?;
-            Ok(Value::Int(n))
+            // A fraction-less token is a JSON integer, so it lands in `i64`
+            // whenever it fits. When it does not, it is still a well-formed
+            // JSON number and must not become a parse error — the canonical
+            // writer prints a whole float without its fraction (PORTS.md §2),
+            // so every whole-valued float past 2^63 arrives here looking like
+            // a very long integer. Widen those to f64: `json_decode_f64` then
+            // succeeds, and `json_decode_i64` reports an honest `decode-type:
+            // expected i64, got f64` instead of claiming valid JSON is not
+            // JSON (PORTS.md §3.1, §6).
+            match s.parse::<i64>() {
+                Ok(n) => Ok(Value::Int(n, IW::I64)),
+                Err(_) => {
+                    let x: f64 = s.parse()
+                        .map_err(|_| format!("invalid integer: {}", s))?;
+                    Ok(Value::Float(x, FW::F64))
+                }
+            }
         }
     }
 
@@ -10086,7 +11709,7 @@ impl<'a> JsonParser<'a> {
             match self.consume() {
                 Some(b']') => break,
                 Some(b',') => {}
-                Some(c) => return Err(format!("expected ',' or ']', got '{}'", c as char)),
+                Some(c) => return Err(format!("expected ',' or ']', got {}", json_byte_desc(c))),
                 None => return Err("unterminated array".to_string()),
             }
         }
@@ -10109,7 +11732,7 @@ impl<'a> JsonParser<'a> {
             match self.consume() {
                 Some(b'}') => break,
                 Some(b',') => {}
-                Some(c) => return Err(format!("expected ',' or '}}', got '{}'", c as char)),
+                Some(c) => return Err(format!("expected ',' or '}}', got {}", json_byte_desc(c))),
                 None => return Err("unterminated object".to_string()),
             }
         }
@@ -10117,14 +11740,98 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-pub(crate) fn json_decode_str(s: &str) -> Result<Value, String> {
-    let mut parser = JsonParser::new(s);
+pub(crate) fn json_parse(s: &str) -> Result<Value, String> {
+    json_parse_bytes(s.as_bytes())
+}
+
+/// The parser's real entry point: JSON is a byte format, and `parse_string`
+/// decodes UTF-8 sequences out of these bytes itself.
+///
+/// Every caller in the language reaches it through `json_parse`, whose `&str`
+/// is already valid UTF-8 by construction — a demoniC `str` cannot hold an
+/// ill-formed sequence, and the process port's `read_line` rejects one before
+/// the text gets here. So the invalid-UTF-8 branch is unreachable from the
+/// language surface and is a guard, not a live path; this entry point is what
+/// lets a test aim at it directly.
+pub(crate) fn json_parse_bytes(src: &[u8]) -> Result<Value, String> {
+    let mut parser = JsonParser::new(src);
     let v = parser.parse_value()?;
     parser.skip_ws();
     if parser.pos < parser.src.len() {
         return Err(format!("trailing content at position {}", parser.pos));
     }
     Ok(v)
+}
+
+// ─── Typed JSON decode ────────────────────────────────────────────────────────
+
+/// The demoniC types the typed-decode family targets. Kept next to the
+/// primitives so `assimilate` and the interpreter cannot drift on the set:
+/// `assimilate` reads it to decide whether a descriptor's `ret` is decodable.
+pub(crate) const DECODE_TYPES: &[&str] = &["i64", "f64", "str", "bool", "list"];
+
+/// The decode-target name for a decoded JSON value, so a `decode-type` tag
+/// speaks one vocabulary on both sides of "expected X, got Y".
+pub(crate) fn decode_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Int(_, _)      => "i64",
+        Value::Float(_, _) => "f64",
+        Value::Str(_)      => "str",
+        Value::Bool(_)     => "bool",
+        Value::List(_)     => "list",
+        Value::Map(_)      => "map",
+        Value::Nil         => "nil",
+        other              => other.type_name(),
+    }
+}
+
+/// `T`'s zero, returned beside a non-nil Err so `(T, Err)` stays well-typed on
+/// the failure path — the same discipline a hand-written wrapper follows.
+fn decode_zero(want: &str) -> Value {
+    match want {
+        "i64"  => Value::Int(0, IW::I64),
+        "f64"  => Value::Float(0.0, FW::F64),
+        "bool" => Value::Bool(false),
+        "list" => Value::List(Rc::new(Vec::new())),
+        _      => Value::Str(String::new()),
+    }
+}
+
+/// Decode `src` as JSON and require it to be `want`. Returns the `(T, Err)`
+/// tuple the `json_decode_<T>` builtins hand back.
+///
+/// Two tags, both documented in PORTS.md §6 and distinct from the `port-*`
+/// family so a descriptor that lies about a type is never confused with a
+/// runtime that failed:
+///
+/// - `decode-parse` — the text is not JSON at all.
+/// - `decode-type`  — the text is JSON of another kind. Never coerced.
+///
+/// Numbers are the one place the check cannot be exact, and the reason is
+/// JSON's: it has a single number type, and the canonical writer prints a
+/// whole float without its fraction (`2.0` → `2`, PORTS.md §2). A whole-valued
+/// float and an integer are the same bytes here, so the widening runs both ways
+/// *for whole values* — an integer always satisfies `f64` (refusing it would
+/// fail on every whole float that crosses a port), and a whole float always
+/// satisfies `i64` because the difference was erased upstream of this function.
+/// What the `i64` direction does catch is every token that stayed distinct: a
+/// str, a bool, a null, a list, a map, and every non-whole number. `2.5` into
+/// `i64` is a `decode-type` — truncation is exactly the silent coercion this
+/// family exists to prevent. PORTS.md §3.1 documents the gap in full.
+pub(crate) fn json_decode_typed(want: &str, src: &str) -> Value {
+    let parsed = match json_parse(src) {
+        Ok(v) => v,
+        Err(e) => return Value::Tuple(vec![
+            decode_zero(want), Value::Str(format!("decode-parse: {}", e))]),
+    };
+    let got = decode_kind(&parsed);
+    let value = match (want, parsed) {
+        ("f64", Value::Int(n, _)) => Value::Float(n as f64, FW::F64),
+        (w, v) if w == got => v,
+        _ => return Value::Tuple(vec![decode_zero(want), Value::Str(
+            format!("decode-type: expected {}, got {}", want, got))]),
+    };
+    Value::Tuple(vec![value, Value::Nil])
 }
 
 // ─── List combinator helpers ──────────────────────────────────────────────────
@@ -10143,7 +11850,7 @@ fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
     fn type_rank(v: &Value) -> u8 {
         match v {
             Value::Bool(_)  => 0,
-            Value::Int(_)   => 1,
+            Value::Int(_, _)   => 1,
             Value::Float(_, _) => 2,
             Value::Str(_)   => 3,
             _               => 4,
@@ -10156,7 +11863,7 @@ fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
     match (a, b) {
         (Value::Bool(x),  Value::Bool(y))  => x.cmp(y),
-        (Value::Int(x),   Value::Int(y))   => x.cmp(y),
+        (Value::Int(x, _),   Value::Int(y, _))   => x.cmp(y),
         (Value::Float(x, _), Value::Float(y, _)) => x.total_cmp(y),
         (Value::Str(x),   Value::Str(y))   => x.cmp(y),
         _                                  => Ordering::Equal,
@@ -10166,10 +11873,10 @@ fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
 /// Compare two Values for equality (for list_uniq).
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Int(x, _), Value::Int(y, _)) => x == y,
         (Value::Float(x, _), Value::Float(y, _)) => x == y,
-        (Value::Int(x), Value::Float(y, _)) => (*x as f64) == *y,
-        (Value::Float(x, _), Value::Int(y)) => *x == (*y as f64),
+        (Value::Int(x, _), Value::Float(y, _)) => (*x as f64) == *y,
+        (Value::Float(x, _), Value::Int(y, _)) => *x == (*y as f64),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nil, Value::Nil) => true,

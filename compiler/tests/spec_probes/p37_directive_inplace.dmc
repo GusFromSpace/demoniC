@@ -1,9 +1,12 @@
-# Probe 37 — Spec §2.6 / DIRECTIVES: @inplace directive on a function
-@inplace fn zero_out(!x: Tensor[i64, [4]]) -> nil {
-    x[0] = 0
-    x[1] = 0
-    x[2] = 0
-    x[3] = 0
+# Probe 37 — Spec §2.6 / DIRECTIVES §3: @inplace on an assignment statement
+# `@inplace` guards a write that would copy-on-write (MEMORY.md §4.3), so it
+# attaches to the assignment itself. On anything else — a `fn`, a `let`, a
+# block — it is an illegal stack and the checker rejects it.
+fn zero_out(!x: Tensor[i64, [4]]) -> nil {
+    @inplace x[0] = 0
+    @inplace x[1] = 0
+    @inplace x[2] = 0
+    @inplace x[3] = 0
     nil
 }
 

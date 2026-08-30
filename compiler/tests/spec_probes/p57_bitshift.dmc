@@ -1,0 +1,15 @@
+# Probe 57 — Spec §2.5 / OPERATORS §8a: the shift operators `<<` and `>>`
+# `>>` is the arithmetic (sign-propagating) right shift (#530), so a negative
+# left operand floors rather than truncating toward zero: `-7 >> 1` is -4,
+# while `-7 / 2` is -3. That difference is the whole point of the probe.
+fn main() -> nil {
+    let a = 1 << 10
+    let b = 4096 >> 6
+    let c = -7 >> 1
+    let d = -7 / 2
+    print(a); print(" ")
+    print(b); print(" ")
+    print(c); print(" ")
+    print(d); print("\n")
+    nil
+}

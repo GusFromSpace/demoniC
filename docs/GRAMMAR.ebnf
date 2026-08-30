@@ -106,7 +106,12 @@ pattern       = "_"
               | pattern "@" pattern ;       (* bind — parsed, not yet matched *)
 
 shape_pattern = "[" [ shape_elem { "," shape_elem } ] "]" ;
-shape_elem    = "_" | ".." | int_lit | ident | "~" ;
+shape_elem    = "_" | "?"        (* dynamic dim (SPEC.md §3.2 (Tensors)) — two spellings,
+                                    one meaning; both lex to the same wildcard *)
+              | ".."             (* spread *)
+              | "~"              (* streaming axis; KV only *)
+              | comptime_expr ;  (* int_lit, a symbolic dim ident, or arithmetic
+                                    over them (e.g. `[D * 2, 3]`) *)
 
 (* ---------- expressions ---------- *)
 (* Precedence encoded in the layered productions.                         *)
@@ -114,7 +119,11 @@ shape_elem    = "_" | ".." | int_lit | ident | "~" ;
 
 expr          = pipe_expr ;
 
-pipe_expr     = logic_or { ( "|>" | ">>" ) logic_or } ;
+pipe_expr     = logic_or { ( "\\|>" | "|>" | ">>" ) logic_or } ;
+                              (* one operator, three spellings. `\|>` is        *)
+                              (* canonical (TOKENIZER.md §2); the lexer folds   *)
+                              (* the bare `|>` onto the same token and the      *)
+                              (* parser folds `>>` onto the same node.          *)
 logic_or      = logic_and { "||" logic_and } ;
 logic_and     = compare   { "&&" compare } ;
 compare       = equality    { ("<"|"<="|">"|">="|".<"|".<="|".>"|".>=") equality } ;
@@ -152,6 +161,7 @@ primary       = literal
               | if_stmt
               | match_stmt
               | fn_lit
+              | arena_block                         (* `forge { ... }` is also an expression *)
               | directive_block ;                   (* @cast(bf16) { ... } as expr *)
 
 struct_lit    = ident [ "[" type_args "]" ] "{" field_init { "," field_init } [ "," ] "}" ;

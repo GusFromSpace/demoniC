@@ -70,3 +70,29 @@ jobs:
         # External source of truth: tensor ops checked against an independent
         # NumPy reimplementation (catches bugs shared by both backends).
         run: python3 tools/numpy_oracle.py --meta-test
+
+  standalone-crate:
+    name: Standalone crate (compiler/ alone)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The property: a bare copy of compiler/ alone — no examples/, no
+      # docs/, no siblings — must build and test clean. It regresses
+      # silently the next time a test reaches for a fixture by a ../ path;
+      # this job makes that a red X instead.
+      - name: Copy compiler/ alone to a temp dir
+        run: |
+          tmp="$(mktemp -d)"
+          echo "STANDALONE_DIR=$tmp" >> "$GITHUB_ENV"
+          git archive HEAD compiler | tar -x -C "$tmp"
+      - name: cargo build + cargo test in the copy
+        # An out-of-crate include_str! dies at compile time, a runtime
+        # fixture read dies in its test; either way the error names the
+        # escaping path.
+        run: |
+          cd "$STANDALONE_DIR/compiler"
+          cargo build --release
+          cargo test --all

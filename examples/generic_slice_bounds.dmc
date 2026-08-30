@@ -1,0 +1,230 @@
+# generic_slice_bounds.dmc — slab bounds built from a SHAPE PARAMETER.
+#
+# Every slice in the corpus before this file had literal bounds: `M[0:2]`,
+# `x[0::2]`, `k[.., .., 0..2, ..]`. `slice.dmc`'s `demo[B, S]` does write
+# `x[.., S - 1::-1, ..]`, but nothing calls `demo`, so the shape-parameter
+# form was compile-only — never executed, never diffed across backends.
+#
+# That is a gate hole, not a cosmetic one. A slab whose bounds mention `S`
+# cannot be resolved until the generic is monomorphized, so the interpreter
+# and the JIT reach the bound by two different routes: the interpreter
+# substitutes the binding at call time, the JIT bakes a constant into the
+# emitted body per instantiation. Either side can drift — bake the wrong
+# instantiation's `S`, compute the slab LENGTH at the wrong width, or lose
+# the `S/2` rounding — and no example in the corpus would have noticed.
+#
+# So the tests below are written to make a baked-in constant visible: each
+# generic is called at TWO different shapes, chosen so the slab's own length
+# changes between them. A backend that reused the first instantiation's `S`
+# returns a defensible-looking number that is arithmetically wrong.
+#
+# Run:
+#   dmc test examples/generic_slice_bounds.dmc
+#   dmc test --jit examples/generic_slice_bounds.dmc
+
+# ─── 1-D slabs ───────────────────────────────────────────────────────────────
+
+# Fixed-length window anchored at the END of the tensor. The start moves with
+# the instantiation; the length does not.
+fn tail2[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S - 2 .. S]) }
+
+# Length varies with the instantiation, and `S/2` is integer division — the
+# odd case truncates, which is the part a re-derived bound gets wrong.
+fn head_half[S](x: Tensor[f32, [S]]) -> f32 { sum(x[0 .. S / 2]) }
+
+# Both ends derived: drop the first and last element.
+fn interior[S](x: Tensor[f32, [S]]) -> f32 { sum(x[1 .. S - 1]) }
+
+# Degenerate ends: one element, and the whole tensor spelled through `S`.
+fn last_one[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S - 1 .. S]) }
+fn whole[S](x: Tensor[f32, [S]]) -> f32 { sum(x[0 .. S]) }
+
+# Two slabs of the same derived length, combined elementwise. The shapes agree
+# only because both are `S/2` long — a length computed twice, and required to
+# come out equal both times.
+fn halves_diff[S](x: Tensor[f32, [S]]) -> f32 { sum(x[0 .. S / 2] .- x[S / 2 .. S]) }
+
+# ─── 2-D slabs ───────────────────────────────────────────────────────────────
+
+fn last_row[R, C](m: Tensor[f32, [R, C]]) -> f32 { sum(m[R - 1 .. R, ..]) }
+fn right_half[R, C](m: Tensor[f32, [R, C]]) -> f32 { sum(m[.., C / 2 .. C]) }
+fn corner[R, C](m: Tensor[f32, [R, C]]) -> f32 { sum(m[R - 2 .. R, C - 2 .. C]) }
+
+# A shape-parameter slab used as an OPERAND, not just as a reduction argument:
+# the view has to carry its derived extent into matmul, into a per-axis
+# reduction, and through a transpose.
+fn slab_matmul[R, C](m: Tensor[f32, [R, C]], w: Tensor[f32, [C, C]]) -> f32 {
+    sum(m[0 .. R / 2, ..] @ w)
+}
+
+fn slab_sum_along[R, C](m: Tensor[f32, [R, C]]) -> f32 {
+    sum(sum_along(m[0 .. R - 1, ..], 0))
+}
+
+fn slab_transposed[R, C](m: Tensor[f32, [R, C]]) -> f32 {
+    let s = m[0 .. R - 1, ..]
+    sum(s')
+}
+
+# ─── Fixtures ────────────────────────────────────────────────────────────────
+
+# ramp6[i] = i+1, so sums over any window are consecutive-integer sums.
+fn ramp6() -> Tensor[f32, [6]] {
+    let !x = forge.zeros[f32, [6]]
+    for i in 0..6 { x[i] = (i + 1) as f32 }
+    x
+}
+
+fn ramp5() -> Tensor[f32, [5]] {
+    let !x = forge.zeros[f32, [5]]
+    for i in 0..5 { x[i] = (i + 1) as f32 }
+    x
+}
+
+fn ramp3() -> Tensor[f32, [3]] {
+    let !x = forge.zeros[f32, [3]]
+    for i in 0..3 { x[i] = (i + 10) as f32 }
+    x
+}
+
+# grid43[i,j] = i*3 + j on a [4, 3] tensor: every element distinct, so a slab
+# that picks the wrong rows or columns cannot sum to the right answer.
+fn grid43() -> Tensor[f32, [4, 3]] {
+    let !m = forge.zeros[f32, [4, 3]]
+    for i in 0..4 { for j in 0..3 { m[i, j] = (i * 3 + j) as f32 } }
+    m
+}
+
+fn eye3() -> Tensor[f32, [3, 3]] {
+    let !w = forge.zeros[f32, [3, 3]]
+    for i in 0..3 { w[i, i] = 1.0 }
+    w
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+# `diff_backends.py` only compares a file whose `dmc run` exits 0, so a
+# test-only file is invisible to it. This `main` puts every shape above on
+# stdout, which is the byte-for-byte half of the parity gate — the `dmc test
+# --jit` comparison is the numeric half.
+fn main() -> i64 {
+    let a = ramp6()
+    let b = ramp3()
+    let c = ramp5()
+    print_i64(tail2(a) as i64)
+    print_i64(tail2(b) as i64)
+    print_i64(head_half(a) as i64)
+    print_i64(head_half(b) as i64)
+    print_i64(head_half(c) as i64)
+    print_i64(interior(a) as i64)
+    print_i64(last_one(a) as i64)
+    print_i64(whole(a) as i64)
+    print_i64(halves_diff(a) as i64)
+
+    let m = grid43()
+    print_i64(last_row(m) as i64)
+    print_i64(right_half(m) as i64)
+    print_i64(corner(m) as i64)
+    print_i64(slab_matmul(m, eye3()) as i64)
+    print_i64(slab_sum_along(m) as i64)
+    print_i64(slab_transposed(m) as i64)
+    0
+}
+
+# ─── Tests ───────────────────────────────────────────────────────────────────
+
+# `x[S-2 .. S]` on [6] is the last two of 1..6 → 5+6 = 11; on [3] it is the
+# last two of 10..12 → 11+12 = 23. Same generic, two instantiations, and the
+# two answers differ — a baked-in `S` cannot produce both.
+fn test_tail_window_tracks_the_instantiation() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(tail2(a) - 11.0) < 1e-4 && abs(tail2(b) - 23.0) < 1e-4
+}
+
+# The slab LENGTH itself moves: `S/2` is 3 on [6] (1+2+3 = 6) and 1 on [3]
+# (just 10). Integer division truncates on the odd shape.
+fn test_slab_length_tracks_the_instantiation() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(head_half(a) - 6.0) < 1e-4 && abs(head_half(b) - 10.0) < 1e-4
+}
+
+# `S/2` on an ODD shape: [5] halves to 2, so the slab is 1+2 = 3, NOT 1+2+3.
+# This is the case that separates truncating division from rounding.
+fn test_odd_shape_half_truncates() -> bool {
+    let c = ramp5()
+    abs(head_half(c) - 3.0) < 1e-4
+}
+
+# Both bounds derived: [6] drops 1 and 6, leaving 2+3+4+5 = 14; [3] drops 10
+# and 12, leaving 11.
+fn test_interior_drops_both_ends() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(interior(a) - 14.0) < 1e-4 && abs(interior(b) - 11.0) < 1e-4
+}
+
+# A length-1 slab is still a slab, not a scalar index: `x[S-1 .. S]` on [6] is
+# the one-element view [6.0].
+fn test_single_element_slab() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(last_one(a) - 6.0) < 1e-4 && abs(last_one(b) - 12.0) < 1e-4
+}
+
+# `x[0 .. S]` must be the whole tensor at every instantiation — an off-by-one
+# in the derived END shows up here and nowhere else.
+fn test_full_range_slab_is_the_whole_tensor() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(whole(a) - 21.0) < 1e-4 && abs(whole(b) - 33.0) < 1e-4
+}
+
+# Two derived slabs, elementwise: (1+2+3) - (4+5+6) = -9 on [6].
+fn test_two_derived_slabs_combine_elementwise() -> bool {
+    let a = ramp6()
+    abs(halves_diff(a) + 9.0) < 1e-4
+}
+
+# Row slab on a [4,3] grid: row 3 is 9+10+11 = 30.
+fn test_row_slab_from_shape_param() -> bool {
+    let m = grid43()
+    abs(last_row(m) - 30.0) < 1e-4
+}
+
+# Column slab: columns 1 and 2 of every row.
+# rows contribute (1+2) + (4+5) + (7+8) + (10+11) = 3+9+15+21 = 48.
+fn test_column_slab_from_shape_param() -> bool {
+    let m = grid43()
+    abs(right_half(m) - 48.0) < 1e-4
+}
+
+# Both axes derived at once: rows 2..4 x columns 1..3 → 7+8+10+11 = 36.
+fn test_corner_slab_derives_both_axes() -> bool {
+    let m = grid43()
+    abs(corner(m) - 36.0) < 1e-4
+}
+
+# The slab is an operand of `@`: rows 0..2 through the identity is rows 0..2,
+# so the sum is 0+1+...+5 = 15. A slab that carried the wrong extent into
+# matmul would either trap on a shape mismatch or contract the wrong rows.
+fn test_slab_feeds_matmul() -> bool {
+    let m = grid43()
+    let w = eye3()
+    abs(slab_matmul(m, w) - 15.0) < 1e-4
+}
+
+# The slab is the argument of a per-axis reduction: rows 0..3 of the grid are
+# 0..8, and summing the per-column sums gives 36.
+fn test_slab_feeds_axis_reduction() -> bool {
+    let m = grid43()
+    abs(slab_sum_along(m) - 36.0) < 1e-4
+}
+
+# Transpose is stride surgery on a view that already has derived strides —
+# the total is invariant, so 0..8 sums to 36 either way round.
+fn test_slab_transposes() -> bool {
+    let m = grid43()
+    abs(slab_transposed(m) - 36.0) < 1e-4
+}

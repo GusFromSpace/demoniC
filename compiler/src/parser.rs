@@ -11,7 +11,8 @@
 ///   - call and bracket arg lists allow named args (`dp=8`, `axis=-1`)
 ///   - `[T; N]` array type (Rust-style fixed-size array)
 ///   - `...` spread in call arg lists (lex: DotDot then Dot)
-///   - `start::step` indexing shorthand (lex: ColonColon)
+///   - `start::step` and `::step` indexing shorthand (lex: ColonColon; #529
+///     added the start-omitted form so `a[::-1]` parses)
 ///   - `expr as type` postfix cast (used heavily in examples)
 ///
 /// Pre-alpha goal: parse all 12 files in `examples/*.dmc` cleanly.
@@ -53,6 +54,20 @@ pub struct Parser {
 /// below the native-stack overflow threshold — so deeply nested input gets a
 /// clean parse error instead of a SIGABRT.
 const MAX_EXPR_DEPTH: usize = 1024;
+
+/// Which construct a shape-element list belongs to. The two share every element
+/// spelling but `_`: in a shape *pattern* it is the wildcard pattern, in a
+/// tensor *type* it is not a dimension at all — the dynamic dim is `?` (#501).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeCtx {
+    /// `Tensor[f32, [ … ]]` and friends — the shape of a type.
+    Type,
+    /// `[ … ]` in pattern position, e.g. a `match` arm over `x.shape`.
+    Pattern,
+}
+
+/// One wording for the S3 break, wherever `_` surfaces in a type's shape.
+const UNDERSCORE_NOT_A_DIM: &str = "`_` is not a dimension; a dynamic dim is `?`";
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
@@ -107,6 +122,12 @@ impl Parser {
         ParseError { msg: msg.into(), line: sp.line, col: sp.col }
     }
 
+    /// `err`, but pointing at a span already consumed — for a construct that is
+    /// only known to be wrong after it has been parsed.
+    fn err_at(&self, sp: &Span, msg: impl Into<String>) -> ParseError {
+        ParseError { msg: msg.into(), line: sp.line, col: sp.col }
+    }
+
     fn span_from(&self, start: &Span) -> Span {
         let end = self.tokens.get(self.pos.saturating_sub(1))
             .map(|t| t.span.end).unwrap_or(start.end);
@@ -147,7 +168,13 @@ impl Parser {
             items.push(self.parse_item()?);
             self.skip_newlines();
         }
-        let mut program = Program { items, span: self.span_from(&start) };
+        // #463: the EOF token records where the source ends. A trailing
+        // newline parks EOF at column 1 of the line past the last real one —
+        // don't count that phantom line.
+        let eof = self.peek_span();
+        let source_lines =
+            if eof.col == 1 && eof.line > 1 { eof.line - 1 } else { eof.line };
+        let mut program = Program { items, span: self.span_from(&start), source_lines };
         // #333: UFCS — rewrite `x.f(args)` → `f(x, args)` once, post-parse, so
         // check/interp/jit all inherit the desugared AST.
         crate::desugar::desugar_ufcs(&mut program);
@@ -851,7 +878,7 @@ impl Parser {
             }
             TokenKind::LBracket => {
                 self.advance();
-                let elems = self.parse_shape_elems(TokenKind::RBracket)?;
+                let elems = self.parse_shape_elems(TokenKind::RBracket, ShapeCtx::Pattern)?;
                 self.expect(&TokenKind::RBracket, "after shape pattern")?;
                 Ok(Pattern::Shape(elems, self.span_from(&start)))
             }
@@ -885,17 +912,35 @@ impl Parser {
         }
     }
 
-    fn parse_shape_elems(&mut self, terminator: TokenKind) -> ParseResult<Vec<ShapeElem>> {
+    fn parse_shape_elems(&mut self, terminator: TokenKind, ctx: ShapeCtx) -> ParseResult<Vec<ShapeElem>> {
         let mut out = Vec::new();
         while std::mem::discriminant(self.peek()) != std::mem::discriminant(&terminator) {
             let start = self.peek_span();
             let elem = match self.peek() {
-                TokenKind::Ident(s) if s == "_" => { self.advance(); ShapeElem::Wildcard(self.span_from(&start)) }
+                // `_` is the wildcard *pattern*, legal only in a shape pattern. As a
+                // dimension inside a type it was a second spelling of `?`; removed in
+                // the pre-0.1.0 redundancy sweep (#501, ruling S3).
+                TokenKind::Ident(s) if s == "_" => match ctx {
+                    ShapeCtx::Pattern => { self.advance(); ShapeElem::Wildcard(self.span_from(&start)) }
+                    ShapeCtx::Type    => return Err(self.err(UNDERSCORE_NOT_A_DIM)),
+                },
                 TokenKind::DotDot               => { self.advance(); ShapeElem::Spread(self.span_from(&start)) }
                 TokenKind::Tilde                => { self.advance(); ShapeElem::Streaming(self.span_from(&start)) }
                 // `?` inside a shape literal is the dynamic-dimension escape hatch (Spec §3.2)
                 TokenKind::Query                => { self.advance(); ShapeElem::Wildcard(self.span_from(&start)) }
-                _ => ShapeElem::Expr(Box::new(self.parse_expr()?)),
+                _ => {
+                    let e = self.parse_expr()?;
+                    // A leading `_` is caught above; this catches every other
+                    // position it can hide in — `(_)`, `1 + _`, `-_`, `_ as i64`
+                    // — so the break is total rather than a first-token check.
+                    // Such an element used to parse and then reject every
+                    // argument shape as `SymDim::Unknown`; the refusal belongs
+                    // at the spelling, not three phases later.
+                    if ctx == ShapeCtx::Type && crate::ast::expr_contains_underscore(&e) {
+                        return Err(self.err_at(&start, UNDERSCORE_NOT_A_DIM));
+                    }
+                    ShapeElem::Expr(Box::new(e))
+                }
             };
             out.push(elem);
             if !self.eat(&TokenKind::Comma) { break; }
@@ -966,7 +1011,7 @@ impl Parser {
                         self.expect(&TokenKind::Comma, "in tensor-like type args")?;
                         self.expect(&TokenKind::LBracket, "before shape spec")?;
                         let elems_start = self.peek_span();
-                        let elems = self.parse_shape_elems(TokenKind::RBracket)?;
+                        let elems = self.parse_shape_elems(TokenKind::RBracket, ShapeCtx::Type)?;
                         self.expect(&TokenKind::RBracket, "after shape spec")?;
                         self.expect(&TokenKind::RBracket, "after tensor-like type")?;
                         let shape = ShapeSpec { elems, span: self.span_from(&elems_start) };
@@ -1117,10 +1162,11 @@ impl Parser {
             let saved = self.pos;
             self.skip_newlines();
             let op = match self.peek() {
+                // `\|>` and the bare `|>` share TokenKind::Pipe (TOKENIZER §2–§3).
+                // `>>` was a third spelling until #501 ruling S1a; it is the
+                // right-shift operator since #530 and binds at the bitshift
+                // level, so TokenKind::RShift never reaches the pipe level.
                 TokenKind::Pipe    => BinOp::Pipe,
-                // `>>` is compose-pipe (same semantics as `|>`), NOT bitwise right-shift.
-                // Per SPEC.md §4.6 and OPERATORS.md §1, `>>` pipelines the LHS into the RHS fn.
-                TokenKind::RShift  => BinOp::Pipe,
                 _ => { self.pos = saved; break; }
             };
             self.advance();
@@ -1281,7 +1327,11 @@ impl Parser {
             self.skip_newlines();
             let op = match self.peek() {
                 TokenKind::LtLt => BinOp::BitShl,
-                // `>>` (RShift) is handled at the pipe level as BinOp::Pipe — not here.
+                // #530: `>>` is the arithmetic right shift, the mirror of `<<`
+                // and at the same precedence level (OPERATORS §1, row 12).
+                // `BinOp::BitShr` — not the pipe-era `BinOp::RShift`, which
+                // ruling S16 keeps reserved and which nothing constructs.
+                TokenKind::RShift => BinOp::BitShr,
                 _ => { self.pos = saved; break; }
             };
             self.advance();
@@ -1388,7 +1438,7 @@ impl Parser {
     fn parse_power(&mut self) -> ParseResult<Expr> {
         let start = self.peek_span();
         let lhs = self.parse_unary()?;
-        // #278: `**`, `.^`, `.**` are right-associative (OPERATORS.md §1
+        // #278: `**` and `.^` are right-associative (OPERATORS.md §1
         // row 16, §2.4): `a ** b ** c` is `a ** (b ** c)`. Recurse into
         // parse_power for the rhs instead of left-folding over parse_unary.
         let saved = self.pos;
@@ -1396,7 +1446,6 @@ impl Parser {
         let op = match self.peek() {
             TokenKind::StarStar => BinOp::StarStar,
             TokenKind::DotPow   => BinOp::DotPow,
-            TokenKind::DotPow2  => BinOp::DotPow2,
             _ => { self.pos = saved; return Ok(lhs); }
         };
         self.advance();
@@ -1614,7 +1663,7 @@ impl Parser {
             self.advance();
             return Ok(IndexOrArg::Idx(IndexElem::FullSlice(self.span_from(&start))));
         }
-        // bare `:` or `:end` or `:end:step` or `::step` slice forms where start is omitted
+        // bare `:` or `:end` or `:end:step` slice forms where start is omitted
         if matches!(self.peek(), TokenKind::Colon) {
             self.advance();
             let end = if !matches!(self.peek(), TokenKind::Colon | TokenKind::Comma | TokenKind::RBracket) {
@@ -1625,10 +1674,28 @@ impl Parser {
                     Some(Box::new(self.parse_expr()?))
                 } else { None }
             } else { None };
+            reject_range_bound(&start, [end.as_deref(), step.as_deref()])?;
             return Ok(IndexOrArg::Idx(IndexElem::Slice {
                 start: None,
                 end,
                 step,
+                span: self.span_from(&start),
+            }));
+        }
+        // `::step` — start AND stop omitted, step present (lex: ColonColon).
+        // `::` is one token, so `a[::-1]` never reaches the `Colon` branch
+        // above; without this arm it falls through to `parse_expr` and dies
+        // on "expected expression, found ColonColon" (#529). Mirrors the
+        // `expr "::" expr` arm below: the step is mandatory here too, so
+        // `a[::]` (no step at all) is still a parse error, same as `a[0::]`.
+        if matches!(self.peek(), TokenKind::ColonColon) {
+            self.advance();
+            let step = self.parse_expr()?;
+            reject_range_bound(&start, [Some(&step)])?;
+            return Ok(IndexOrArg::Idx(IndexElem::Slice {
+                start: None,
+                end: None,
+                step: Some(Box::new(step)),
                 span: self.span_from(&start),
             }));
         }
@@ -1648,6 +1715,7 @@ impl Parser {
         if matches!(self.peek(), TokenKind::ColonColon) {
             self.advance();
             let step = self.parse_expr()?;
+            reject_range_bound(&start, [Some(&first), Some(&step)])?;
             return Ok(IndexOrArg::Idx(IndexElem::Slice {
                 start: Some(Box::new(first)),
                 end: None,
@@ -1666,6 +1734,7 @@ impl Parser {
                     Some(Box::new(self.parse_expr()?))
                 } else { None }
             } else { None };
+            reject_range_bound(&start, [Some(&first), end.as_deref(), step.as_deref()])?;
             return Ok(IndexOrArg::Idx(IndexElem::Slice {
                 start: Some(Box::new(first)),
                 end, step,
@@ -1856,6 +1925,27 @@ impl Parser {
         self.advance();
         Ok(s)
     }
+}
+
+/// The two slicing surfaces never mix (OPERATORS §9, SPEC §4.3): `..`/`..=`
+/// is the unstepped range form, `:` is the stepped/full form. `a[0..100:2]`
+/// otherwise parses as a *range expression sitting in the start bound* of a
+/// `:` slice — type-clean at check time, and fatal only much later ("slice
+/// start must be integer, got range" under `dmc run`, "slice start must be a
+/// literal int in slice 4" under `dmc jit`). Reject it at the seam, where the
+/// confusion is, and name the spelling the author meant.
+fn reject_range_bound<const N: usize>(at: &Span, bounds: [Option<&Expr>; N]) -> ParseResult<()> {
+    for b in bounds.into_iter().flatten() {
+        if matches!(b, Expr::Range { .. }) {
+            return Err(ParseError {
+                msg: "`..` range used as a `:` slice bound; write the whole slice \
+                      with colons (`a[0:100:2]`, not `a[0..100:2]`)".into(),
+                line: at.line,
+                col: at.col,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// #445: map an integer literal's explicit type suffix. Mirrors

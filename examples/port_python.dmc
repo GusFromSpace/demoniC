@@ -1,8 +1,9 @@
 # port_python.dmc -- the process-port floor (PORTS.md §7.1) end to end.
 # Demonstrates: open a python runtime, call stdlib functions across every
-# argument mode of the JSON ABI, read the canonical-JSON results back, handle
-# the error tags, and close. No new syntax -- port_open/port_call/port_close
-# are ordinary fallible builtins (SPEC.md §4.11).
+# argument mode of the JSON ABI, read the canonical-JSON results back (as text
+# or through a typed decode), handle the error tags, and close. No new syntax
+# -- port_open/port_call/port_close are ordinary fallible builtins
+# (SPEC.md §4.11).
 #
 # The argument ABI (PORTS.md §2). The `payload` str decodes to:
 #   - null / empty  -> the function is called with no arguments.
@@ -14,14 +15,17 @@
 # always the envelope, so an object *argument* nests inside the array and is
 # never mistaken for it.
 #
+# Payloads below are written as the JSON text that actually crosses the pipe,
+# so what you read here is what the runtime receives. Building one from
+# demoniC values instead -- `map()` / `list()` / `json_encode` -- is what
+# port_bridge.dmc shows.
+#
 # Run: dmc run examples/port_python.dmc   (python3 is a dev prerequisite)
+#      dmc jit examples/port_python.dmc   (both backends drive the same port)
 
 # Encode a two-element positional argument vector [a, b] as canonical JSON.
 fn pos2(a: i64, b: i64) -> str {
-    let xs = list()
-    let xs = list_push(xs, a)
-    let xs = list_push(xs, b)
-    json_encode(xs)
+    "[" + to_str(a) + "," + to_str(b) + "]"
 }
 
 fn main() -> str {
@@ -43,18 +47,8 @@ fn main() -> str {
 
     # A keyword argument through the envelope: sorted([3, 1, 2], reverse=true).
     # The list is one positional arg, so it nests one level inside `args`.
-    let inner = list()
-    let inner = list_push(inner, 3)
-    let inner = list_push(inner, 1)
-    let inner = list_push(inner, 2)
-    let args = list()
-    let args = list_push(args, inner)
-    let kwargs = map()
-    let kwargs = map_set(kwargs, "reverse", true)
-    let env = map()
-    let env = map_set(env, "args", args)
-    let env = map_set(env, "kwargs", kwargs)
-    let (s, e3) = port_call(p, "sorted", json_encode(env))
+    let (s, e3) = port_call(p, "sorted",
+        "{\"args\": [[3, 1, 2]], \"kwargs\": {\"reverse\": true}}")
     if e3 != nil {
         print("sort failed: " + e3)
         let (_, _) = port_close(p)
@@ -85,14 +79,8 @@ fn test_no_args_calls_niladic() -> bool {
 # One positional argument is a one-element array: sum([1, 2, 3]) == 6.
 # The list is the single argument, so it nests inside the payload array.
 fn test_single_arg_nests_in_array() -> bool {
-    let one = list()
-    let one = list_push(one, 1)
-    let one = list_push(one, 2)
-    let one = list_push(one, 3)
-    let payload = list()
-    let payload = list_push(payload, one)     # [[1,2,3]]
     let (p, _) = port_open("python")
-    let (out, err) = port_call(p, "sum", json_encode(payload))
+    let (out, err) = port_call(p, "sum", "[[1, 2, 3]]")
     let (_, _) = port_close(p)
     err == nil && out == "6"
 }
@@ -109,15 +97,9 @@ fn test_multi_arg_spreads() -> bool {
 # Keyword arguments through the {args, kwargs} envelope:
 # round(3.14159, ndigits=2) == 3.14.
 fn test_kwargs_envelope() -> bool {
-    let args = list()
-    let args = list_push(args, 3.14159)
-    let kwargs = map()
-    let kwargs = map_set(kwargs, "ndigits", 2)
-    let env = map()
-    let env = map_set(env, "args", args)
-    let env = map_set(env, "kwargs", kwargs)
     let (p, _) = port_open("python")
-    let (out, err) = port_call(p, "round", json_encode(env))
+    let (out, err) = port_call(p, "round",
+        "{\"args\": [3.14159], \"kwargs\": {\"ndigits\": 2}}")
     let (_, _) = port_close(p)
     err == nil && out == "3.14"
 }
@@ -125,12 +107,12 @@ fn test_kwargs_envelope() -> bool {
 # A foreign exception (sqrt of a string) surfaces as a `port-call` tag and
 # leaves the port alive -- code matches only the tag prefix (PORTS.md §6).
 fn test_foreign_exception_tags_port_call() -> bool {
-    let bad = list()
-    let bad = list_push(bad, "sixteen")
     let (p, _) = port_open("python")
-    let (out, err) = port_call(p, "math.sqrt", json_encode(bad))  # ["sixteen"]
+    let (out, err) = port_call(p, "math.sqrt", "[\"sixteen\"]")
+    # The port survives the foreign exception: the next call still answers.
+    let (again, err2) = port_call(p, "math.gcd", pos2(462, 1071))
     let (_, _) = port_close(p)
-    err != nil && err.starts_with("port-call")
+    err != nil && err.starts_with("port-call") && out == "" && again == "21" && err2 == nil
 }
 
 # A bare scalar payload is not an argument vector: the ABI rejects it with
@@ -139,11 +121,197 @@ fn test_bare_scalar_tags_port_protocol() -> bool {
     let (p, _) = port_open("python")
     let (out, err) = port_call(p, "math.sqrt", "16")   # scalar, not [16]
     let (_, _) = port_close(p)
-    err != nil && err.starts_with("port-protocol")
+    err != nil && err.starts_with("port-protocol") && out == ""
 }
 
 # An unsupported runtime is reported, not faked: only `python` is wired up.
+# The handle half of the pair is nil, so nothing downstream can use it.
 fn test_unsupported_runtime_tags_port_open() -> bool {
     let (p, err) = port_open("lua")
-    err != nil && err.starts_with("port-open")
+    p == nil && err != nil && err.starts_with("port-open")
 }
+
+# Closing twice is `port-closed`, not a crash and not silence: handle ids are
+# never reused, so a stale handle can never reach a later port.
+fn test_double_close_tags_port_closed() -> bool {
+    let (p, _) = port_open("python")
+    let (_, first) = port_close(p)
+    let (_, second) = port_close(p)
+    first == nil && second != nil && second.starts_with("port-closed")
+}
+
+# A call on a closed handle is `port-closed` too, and it does not reach the
+# port opened after it.
+fn test_call_after_close_tags_port_closed() -> bool {
+    let (p, _) = port_open("python")
+    let (_, _) = port_close(p)
+    let (q, _) = port_open("python")
+    let (out, err) = port_call(p, "len", "[[1, 2, 3]]")
+    let (fresh, ferr) = port_call(q, "len", "[[1, 2, 3]]")
+    let (_, _) = port_close(q)
+    err != nil && err.starts_with("port-closed") && out == ""
+        && fresh == "3" && ferr == nil
+}
+
+# A handle may be passed and returned (SPEC.md 3.11), so `Port[python]` is
+# writable in a signature: the port can be opened in one function and called
+# from another, and it is the same live port on the other side. The handle
+# itself stays opaque -- it compares only against nil, and a plain str is not
+# one, so nothing can forge a handle it never opened.
+fn ask_len(q: Port[python], payload: str) -> str {
+    let (out, _) = port_call(q, "len", payload)
+    out
+}
+
+fn test_handle_crosses_a_function_boundary() -> bool {
+    let (p, e) = port_open("python")
+    let a = ask_len(p, "[[1, 2, 3]]")
+    let b = ask_len(p, "[\"abcd\"]")
+    let (_, _) = port_close(p)
+    e == nil && p != nil && a == "3" && b == "4"
+}
+
+# Escaping is the port's job, not the caller's: a payload string carrying a
+# quote and a newline crosses intact, so python counts the 12 characters of
+# `he said "hi"` plus the newline -- 13, not a mangled frame.
+fn test_quoted_payload_survives_the_frame() -> bool {
+    let (p, _) = port_open("python")
+    let (out, err) = port_call(p, "len", "[\"he said \\\"hi\\\"\\n\"]")
+    # The frame stayed in sync: the very next call still answers correctly.
+    let (after, aerr) = port_call(p, "len", "[[1, 2, 3]]")
+    let (_, _) = port_close(p)
+    err == nil && out == "13" && after == "3" && aerr == nil
+}
+
+# --- tensor copy mode (PORTS.md 3.2) ---
+# A tensor does NOT implicitly become a JSON array: that would hide the
+# allocation and erase the shape. It crosses as one canonical-JSON object --
+# the tensor envelope -- carrying `{dtype, shape, layout}` plus the payload
+# buffer as base64:
+#
+#   {"data":"<base64>","dmc_tensor":1,"dtype":"i64",
+#    "layout":"row_major","shape":[2,3]}
+#
+# `port_tensor_encode(t)` writes one; `port_tensor_decode(s, like)` reads one,
+# with `like` declaring the dtype and shape that were expected. The envelope is
+# ordinary JSON text, so it composes with the payload rules above: a tensor
+# argument is one element of the argument vector, `[ <envelope> ]`.
+#
+# Where numpy is installed, the port harness rehydrates the envelope into an
+# ndarray, so real numpy is one call away and needs nothing at the call site:
+#
+#   let (out, e) = port_call(p, "numpy.transpose", "[" + port_tensor_encode(g) + "]")
+#   let (t, e2)  = port_tensor_decode(out, forge.zeros[i64, [3, 2]])
+#
+# The tests below deliberately do not use numpy: they gate the format itself,
+# and the format is demoniC's, not numpy's.
+
+# The envelope is the ABI, so this pins its exact bytes -- key order included.
+# Keys are in the canonical writer's order, which is why an envelope demoniC
+# wrote and one that comes back through `port_call` are the same text.
+fn test_tensor_encode_is_the_wire_format() -> bool {
+    let !g = forge.zeros[i64, [2, 3]]
+    g[0, 0] = 1
+    g[0, 1] = 2
+    g[0, 2] = 3
+    g[1, 0] = -4
+    g[1, 1] = 5
+    g[1, 2] = 6
+    let want = "{\"data\":\"AQAAAAAAAAACAAAAAAAAAAMAAAAAAAAA"
+        + "/P////////8FAAAAAAAAAAYAAAAAAAAA\","
+        + "\"dmc_tensor\":1,\"dtype\":\"i64\","
+        + "\"layout\":\"row_major\",\"shape\":[2,3]}"
+    port_tensor_encode(g) == want
+}
+
+# The `dtype` on the wire always states the width of the bytes actually in
+# `data`. A bool tensor is 1 byte per element, so three bools are three bytes
+# ("AQAB"), not a widened stand-in. A `dtype` naming a type wider than its
+# payload is how a 2-byte source ends up read into a 4-byte buffer, with every
+# consumer striding it 2x and running off the end -- a real weight-loading
+# failure mode, refused here at the port boundary.
+fn test_tensor_dtype_states_the_payload_width() -> bool {
+    let !b = forge.uninit[bool, [3]]
+    b[0] = true
+    b[1] = false
+    b[2] = true
+    let want = "{\"data\":\"AQAB\",\"dmc_tensor\":1,\"dtype\":\"bool\","
+        + "\"layout\":\"row_major\",\"shape\":[3]}"
+    port_tensor_encode(b) == want
+}
+
+# Values, shape and dtype all survive a round trip through the envelope.
+fn test_tensor_round_trips_through_the_envelope() -> bool {
+    let !g = forge.zeros[i64, [2, 2]]
+    g[0, 0] = 10
+    g[0, 1] = -20
+    g[1, 0] = 30
+    g[1, 1] = -40
+    let (back, err) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2, 2]])
+    err == nil && back[0, 1] == -20 && back[1, 0] == 30 && back[1, 1] == -40
+}
+
+# A decode is typed, so it never coerces: a shape the caller did not declare
+# and a float envelope read as an integer tensor are both `decode-type`. The
+# tags are the 3.1 decode family, not the `port-` family -- decoding happens
+# after the call returned, so a bad envelope is a contract failure, not a port
+# that failed. The value half is the declared tensor's zero.
+fn test_tensor_decode_refuses_what_it_did_not_declare() -> bool {
+    let !g = forge.zeros[i64, [4]]
+    let (short, e1) = port_tensor_decode(port_tensor_encode(g), forge.zeros[i64, [2]])
+    let !f = forge.zeros[f32, [2]]
+    let (wrong, e2) = port_tensor_decode(port_tensor_encode(f), forge.zeros[i64, [2]])
+    let (junk, e3) = port_tensor_decode("{oops", forge.zeros[i64, [2]])
+    e1 == "decode-type: expected tensor shape [2], got [4]"
+        && e2 == "decode-type: expected a `i64` tensor, got `f32`"
+        && e3.starts_with("decode-parse")
+        && short[0] == 0 && junk[0] == 0
+}
+
+# The whole loop through a live port: encode, send the envelope as the single
+# positional argument, let python hand it back, decode it. The `dmc.*` names
+# are served by the port harness itself, so a copy-mode round trip needs no
+# third-party runtime; `dmc.shape` answers from the *rehydrated* tensor, which
+# is how this proves the far side parsed the envelope rather than echoing text.
+fn test_tensor_crosses_the_port_by_copy() -> bool {
+    let (p, e1) = port_open("python")
+    let !g = forge.zeros[i64, [2, 2]]
+    g[0, 0] = 1
+    g[0, 1] = 2
+    g[1, 0] = 3
+    g[1, 1] = 4
+    let (out, e2) = port_call(p, "dmc.echo", "[" + port_tensor_encode(g) + "]")
+    let (dims, e3) = port_call(p, "dmc.shape", "[" + port_tensor_encode(g) + "]")
+    let (_, e4) = port_close(p)
+    let (back, e5) = port_tensor_decode(out, forge.zeros[i64, [2, 2]])
+    e1 == nil && e2 == nil && e3 == nil && e5 == nil
+        && dims == "[2,2]"
+        && back[0, 0] + back[0, 1] + back[1, 0] + back[1, 1] == 10
+}
+
+# The envelope is manifest-strict on its fields, not descriptor-additive: the
+# five PORTS.md 3.2 defines are all of them. A key nobody defined is a document
+# written to a format this reader does not know, and reading the rest of it
+# anyway would be reading someone else's numbers. Both readers refuse it, and
+# the tags differ by *where*: locally it is a `decode-type` (a caller contract),
+# but an envelope sent to a runtime dies inside the ABI before any foreign code
+# runs, which is `port-protocol`.
+fn test_an_unknown_envelope_field_is_refused_on_both_sides() -> bool {
+    let bad = "{\"data\":\"AQAAAAAAAAACAAAAAAAAAA==\",\"dmc_tensor\":1,"
+        + "\"dtype\":\"i64\",\"evil\":1,\"layout\":\"row_major\",\"shape\":[2]}"
+    let (here, e1) = port_tensor_decode(bad, forge.zeros[i64, [2]])
+    let (p, e2) = port_open("python")
+    let (_, e3) = port_call(p, "dmc.echo", "[" + bad + "]")
+    let (_, e4) = port_close(p)
+    e1 == "decode-type: tensor envelope has unknown field(s) `evil`"
+        && e3 == "port-protocol: tensor envelope has unknown field(s) 'evil'"
+        && here[0] == 0
+}
+
+# Payloads built out of demoniC values -- `list()` / `list_push` / `map()` /
+# `map_set` / `json_encode` -- and the typed decode of a result back into one
+# live in port_payloads.dmc. They are the other half of this boundary and are
+# covered, just not here: those builtins are outside the JIT's lowered subset,
+# so a file using them is refused by `dmc jit` whole. Splitting them keeps this
+# file a real `dmc test --jit` gate on the port lowering instead of averaging a
+# gate with a refusal into one number.
