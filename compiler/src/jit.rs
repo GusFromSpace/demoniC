@@ -28335,23 +28335,32 @@ fn main() -> i64 { 0 }
     #[test]
     fn jit_extern_abi_admits_the_widths_that_match() {
         // The other side of the rule: everything whose machine width equals
-        // its declared one goes through. `dmc_test_add_f32` is `no_mangle`, so
-        // the pre-flight resolves it against this test binary's own image.
+        // its declared one goes through. The symbols are libm's, which every
+        // host has loaded, so the pre-flight resolves them on macOS and Linux
+        // alike. The test binary's own `no_mangle` helpers are NOT usable
+        // here: Linux does not export an executable's symbols to the dynamic
+        // table without `-rdynamic`, so `dlsym` cannot see them there, and
+        // the public CI (x86_64 Linux) failed on exactly that.
         jit_compile_only(r#"
-            extern fn dmc_test_add_f32(a: f32, b: f32) -> f32
+            extern fn fmaxf(a: f32, b: f32) -> f32
             fn main() -> i64 { 0 }
         "#).expect("f32 should compile");
         jit_compile_only(r#"
-            extern fn dmc_test_scale_ptr(p: *f32, n: i64, s: f32) -> f32
+            extern fn modff(x: f32, iptr: *f32) -> f32
             fn main() -> i64 { 0 }
-        "#).expect("*f32 + i64 should compile");
+        "#).expect("*f32 should compile");
+        jit_compile_only(r#"
+            extern fn labs(x: i64) -> i64
+            fn main() -> i64 { 0 }
+        "#).expect("i64 should compile");
     }
 
     #[test]
     fn jit_extern_fn_rawptr_type_parses_and_compiles() {
-        // *f32 and i64 param types are accepted without error.
+        // A raw-pointer parameter type is accepted without error. libm's
+        // `modff` takes a `float*`; see the note on symbol resolution above.
         jit_compile_only(r#"
-            extern fn dmc_test_scale_ptr(ptr: *f32, n: i64, scale: f32) -> f32
+            extern fn modff(x: f32, iptr: *f32) -> f32
             fn main() -> i64 { 0 }
         "#).expect("should compile");
     }
