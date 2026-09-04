@@ -991,6 +991,23 @@ fn main() -> nil {{ nil }}
         assert_eq!(generate(&d).unwrap_err(), "descriptor: `schema` must be an integer");
     }
 
+    /// #518 (post-merge nit from #513): `generate`'s own comment says the
+    /// schema is checked "before reading anything else", but nothing pinned
+    /// that ordering — every prior test's descriptor also had a `runtime`
+    /// field, so a schema check that ran *after* field validation would have
+    /// passed them too. A bare `{"schema": 2}` descriptor is missing both a
+    /// known schema and a `runtime` field; the error must be the schema one,
+    /// not "`runtime` (str) is required" — which is what a reader that
+    /// validated fields before checking `schema` would report instead.
+    #[test]
+    fn schema_error_wins_over_missing_runtime_513() {
+        let e = generate(r#"{"schema": 2}"#).unwrap_err();
+        assert_eq!(e,
+            "descriptor: schema 2 is unknown — this dmc reads schema 1; regenerate \
+             the descriptor or upgrade dmc",
+            "the schema check must run before `runtime` is even read, got: {}", e);
+    }
+
     #[test]
     fn unknown_fields_within_a_known_schema_are_ignored() {
         // Additive evolution stays cheap (§4): a schema-1 reader ignores fields

@@ -91,6 +91,10 @@
     "jit_ran": 0,
     "pass": 5
   },
+  "examples/comptime_fold.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
   "examples/console/asm.dmc": {
     "jit_ran": 0,
     "pass": 8
@@ -143,6 +147,10 @@
     "jit_ran": 0,
     "pass": 1
   },
+  "examples/embed_index_type.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
   "examples/enum_shape.dmc": {
     "jit_ran": 8,
     "pass": 8
@@ -192,8 +200,8 @@
     "pass": 12
   },
   "examples/generic_slice_bounds.dmc": {
-    "jit_ran": 13,
-    "pass": 13
+    "jit_ran": 21,
+    "pass": 21
   },
   "examples/grad_control_flow.dmc": {
     "jit_ran": 0,
@@ -222,6 +230,14 @@
   "examples/impossible_attention.dmc": {
     "jit_ran": 3,
     "pass": 3
+  },
+  "examples/int_tensor_dotted_widths.dmc": {
+    "jit_ran": 0,
+    "pass": 7
+  },
+  "examples/int_tensor_widths.dmc": {
+    "jit_ran": 10,
+    "pass": 10
   },
   "examples/int_widths.dmc": {
     "jit_ran": 10,
@@ -354,6 +370,10 @@
   "examples/rule30.dmc": {
     "jit_ran": 4,
     "pass": 4
+  },
+  "examples/shift_ops.dmc": {
+    "jit_ran": 19,
+    "pass": 19
   },
   "examples/sieve.dmc": {
     "jit_ran": 2,

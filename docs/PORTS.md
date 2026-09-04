@@ -161,6 +161,14 @@ that is what `port_call` returned.
 `f32` has no typed decode. JSON numbers carry no width, so the family
 lands them in `f64`; narrow with `as f32` where you want it, explicitly.
 
+**Ratified 2026-09-02.** The whole-value int/float wire decision above —
+the canonical writer emits `2.0` as `2`, the ambiguity is permanent by
+design, and a caller needing the distinction carries it in the payload —
+was reviewed and confirmed as a ratification rather than an open
+question. It stands unchanged. `docs/STABILITY.md §2` lists this ABI as
+a stable surface and §3 of that document is the procedure that now
+governs changing it.
+
 ### 3.2 Tensors
 
 Tensor values do not implicitly become JSON arrays. That would hide
@@ -207,19 +215,25 @@ sees, the files it reads, and the argument vector it launches with.
 `@deterministic` refuses any other port at compile time — the refusal
 rule in §5.2.
 
-Three of the four restrictions are enforced: the checker rejects a port
-call inside a `@grad fn`, a `@fuse` block, or a `@deterministic` block —
+All four restrictions are enforced. The checker rejects a port call
+inside a `@grad fn`, a `@fuse` block, or a `@deterministic` block —
 closures they enclose included — with a `port-forbidden` diagnostic. The
 scope is lexical, like every other directive scope (`docs/DIRECTIVES.md`
 §4): a port call in a function that one of those constructs *calls* is
 not caught.
 
+`@comptime` is the exception to that last caveat, and it is stricter
+rather than weaker. Its body admits **no call of any kind**
+(`docs/SPEC.md §7.5` (Comptime evaluation (`@comptime`))), so a port
+call is refused as `port-forbidden` and the transitive case cannot
+arise: there is no call through which a port could be reached.
+Compile-time evaluation therefore performs no effect by construction,
+not by analysis.
+
 `@deterministic` still rejects every port today: the manifest format
 below is *specified, not yet implemented*, so no port can present one.
 When resolution lands, the rule narrows from all ports to un-manifested
-ones, at the same checker gate that rejects them now. The `@comptime`
-restriction binds once that directive is implemented; today it parses
-but does not gate.
+ones, at the same checker gate that rejects them now.
 
 ### 5.1 The deterministic-port manifest
 

@@ -64,6 +64,22 @@ impl RuntimeError {
 
 pub type EvalResult<T> = Result<T, RuntimeError>;
 
+/// #505: why a `@comptime` fold did not produce a value (`SPEC.md §7.8`).
+///
+/// Kept apart from `RuntimeError` because the two become different
+/// diagnostics: `Budget` is `comptime-budget` (the operands were static, the
+/// evaluation just did not finish) while `Failed` is `comptime-non-static`
+/// (the body did something a compile-time evaluation cannot do). A caller
+/// that collapsed them would have to re-derive the distinction from prose.
+#[derive(Debug)]
+pub enum ComptimeStop {
+    /// The step budget ran out — the block may not terminate.
+    Budget,
+    /// The body raised an ordinary evaluation error (overflow, division by
+    /// zero, a value the fold set has no representation for).
+    Failed(RuntimeError),
+}
+
 // ─── Value ───────────────────────────────────────────────────────────────────
 
 /// Coarse runtime dtype tag for tensors. The interpreter stores all tensor
@@ -72,8 +88,15 @@ pub type EvalResult<T> = Result<T, RuntimeError>;
 /// than `Value::Float`. Without this, integer division, `%`, bitwise ops and
 /// range/loop bounds sourced from a tensor element silently misbehave (#125).
 ///
-/// `Int` covers the whole signed/unsigned integer family — that's all the
-/// element read needs, since `Value::Int` is `i64`.
+/// `Int` carries the element's WIDTH (#571), the way the float side splits
+/// `F32`/`F64`: a tensor element's width is part of its type, so an element
+/// read out of a `Tensor[i32, …]` is an `i32` and `a .+ b` over two of them
+/// wraps at 32 bits. Before this the tag was width-less, the elementwise path
+/// computed in f64, and `2147483647 .+ 1` answered 2147483648 — a value that
+/// does not fit the element type the checker assigned it. The width comes from
+/// the constructor or cast that named the element type; a source that names no
+/// width (a bare integer tensor literal, `read_bytes`, `uniform_int`) is `I64`,
+/// which wraps at 64 bits and so is the identity on everything below it.
 ///
 /// #241: floats track their *width*, because the two widths have different
 /// JIT-parity semantics. `F32` covers f32 and the narrower float-likes
@@ -87,7 +110,7 @@ pub type EvalResult<T> = Result<T, RuntimeError>;
 /// yield `Value::Bool` and element writes accept one — matching the JIT,
 /// where a bool tensor is a 1-byte 0/1 lane and `m[i,j]` is a real bool.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DType { Int, F32, F64, Trit, Bool }
+pub enum DType { Int(IW), F32, F64, Trit, Bool }
 
 /// Width of a scalar float (#473) — the scalar counterpart of `DType`'s
 /// `F32`/`F64` split for tensors.
@@ -299,6 +322,54 @@ fn scalar_int_width(t: &ScalarType) -> Option<IW> {
         U8 => Some(IW::U8),
         I64 | U64 => Some(IW::I64),
         _ => None,
+    }
+}
+
+/// The integer WIDTH a tensor element type carries at run time (#571), keyed by
+/// the spelling a constructor or cast names it with (`forge.zeros[i32, …]`,
+/// `t as u8`). The name-keyed twin of `scalar_int_width`, and the reason
+/// `is_int_type_name` and this table can never disagree about which names are
+/// integers: the predicate is defined in terms of this function.
+#[inline]
+fn int_type_name_width(name: &str) -> Option<IW> {
+    Some(match name {
+        // `int8` is the packed signed 8-bit type and `int4` the packed signed
+        // 4-bit one (SPEC §3.1); they share `I8`/`I4` with the scalar table.
+        "i8" | "int8" => IW::I8,
+        "i16" => IW::I16,
+        "i32" => IW::I32,
+        "int4" => IW::I4,
+        "u8"  => IW::U8,
+        "u16" => IW::U16,
+        "u32" => IW::U32,
+        // `u64` shares `I64` for the reason `scalar_int_width` gives.
+        "i64" | "u64" => IW::I64,
+        _ => return None,
+    })
+}
+
+/// Narrow every element of a tensor into an integer element width, for a cast
+/// that names an integer element type (#571).
+///
+/// This is the table `apply_cast` has used for the `as` spelling since #298:
+/// Rust's `as` out of the f64 lane, which SATURATES a float source at the
+/// range end (`4294967298.0 as i32` is 2147483647) — the documented
+/// counterpart to the wrapping integer cast. `I4` has no Rust primitive, so it
+/// goes through `i8` and then `IW::wrap`, the one wrap rule.
+///
+/// `I64` truncates only: the f64 lane cannot represent the whole 64-bit range,
+/// so pushing it through `as i64` would saturate values that survive today.
+/// That is the pre-existing representational limit #544 names, not this fix.
+fn cast_tensor_to_int_width(data: &ArrayD<f64>, w: IW) -> ArrayD<f64> {
+    match w {
+        IW::I64 => data.mapv(|x| x.trunc()),
+        IW::I8  => data.mapv(|x| x as i8  as f64),
+        IW::I16 => data.mapv(|x| x as i16 as f64),
+        IW::I32 => data.mapv(|x| x as i32 as f64),
+        IW::U8  => data.mapv(|x| x as u8  as f64),
+        IW::U16 => data.mapv(|x| x as u16 as f64),
+        IW::U32 => data.mapv(|x| x as u32 as f64),
+        IW::I4  => data.mapv(|x| IW::I4.wrap(x as i8 as i64) as f64),
     }
 }
 
@@ -822,6 +893,11 @@ pub struct Interpreter {
     /// `forge_used` on exit — see `Expr::ArenaBlock` (#400).
     vault_used: u64,
     forge_used: u64,
+    /// #505: remaining `@comptime` step budget, or `None` when this
+    /// interpreter is executing a program rather than folding a block
+    /// (`COMPTIME_V1.md §6`). Armed by `eval_comptime` and cleared by it, so
+    /// no ordinary run is ever metered. One step is one `eval_expr` entry.
+    comptime_fuel: Option<u64>,
 }
 
 struct AxisSelection {
@@ -1299,13 +1375,31 @@ impl Interpreter {
         // #226/#241: element writes mutate the backing array directly
         // (bypassing TensorVal::new), so round the written value through f32
         // here when the target is an F32 tensor. F64/Int/Trit pass through.
-        let rval = if matches!(dtype, DType::F32) {
-            match rval {
+        let rval = match dtype {
+            DType::F32 => match rval {
                 Value::Float(x, _) => Value::Float(quantize_f32(x), FW::F64),
                 Value::Tensor(mut t) => { quantize_f32_arr(&mut t.data); Value::Tensor(t) }
                 other => other,
-            }
-        } else { rval };
+            },
+            // #571: the same rule one width down. A narrow integer element is
+            // as wide as its type says, so what lands in the buffer is the
+            // wrapped value — the JIT stores into a 4-byte `i32` lane and
+            // truncates, and an unwrapped store here would read back a number
+            // that does not fit the element type.
+            // `I64` is left alone rather than wrapped-as-identity: at 64 bits
+            // the wrap changes no integer, and routing through `x as i64` would
+            // truncate a float written into a width-less integer tensor, which
+            // is a different (pre-existing) question than this one.
+            DType::Int(w) if w != IW::I64 => match rval {
+                Value::Int(n, _) => Value::Int(w.wrap(n), w),
+                Value::Tensor(mut t) => {
+                    t.data.mapv_inplace(|x| w.wrap(x as i64) as f64);
+                    Value::Tensor(t)
+                }
+                other => other,
+            },
+            _ => rval,
+        };
         let selections = Self::resolve_index_values(arr.shape(), idx_vals, &span)?;
 
         let mut target_shape = Vec::new();
@@ -1398,6 +1492,41 @@ impl Interpreter {
             arena_limits: crate::arena::ArenaLimits::default(),
             vault_used: 0,
             forge_used: 0,
+            comptime_fuel: None,
+        }
+    }
+
+    /// #505: evaluate a `@comptime` body at compile time (`SPEC.md §7.8`).
+    ///
+    /// This is the whole of "the reference interpreter is the comptime
+    /// evaluator": the arithmetic a folded block sees is the arithmetic every
+    /// other demoniC expression sees, so a fold cannot disagree with a run on
+    /// truncating division, `%` sign, or per-width integer wrapping (#540).
+    /// A hand-written const-folder beside the reference implementation is
+    /// exactly the drift `COMPTIME_V1.md §8` is avoiding.
+    ///
+    /// What keeps compile-time evaluation out of runtime state is not this
+    /// entry point but `comptime.rs`'s static gate, which admits no call of
+    /// any kind — so a legal body cannot name the port registry, the RNG,
+    /// `argv`, the clock, the arenas, or the filesystem, and the caller can
+    /// throw the whole `Interpreter` away after the block.
+    ///
+    /// `budget` bounds termination: the body may loop, so a non-terminating
+    /// one must fail the compile rather than hang it.
+    pub fn eval_comptime(&mut self, block: &Block, budget: u64)
+        -> Result<Value, ComptimeStop>
+    {
+        self.comptime_fuel = Some(budget);
+        self.push_scope();
+        let r = self.eval_block(block);
+        self.pop_scope();
+        let exhausted = self.comptime_fuel == Some(0);
+        self.comptime_fuel = None;
+        match r {
+            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => Ok(v),
+            Ok(_) => Ok(Value::Nil),
+            Err(e) if exhausted => { let _ = e; Err(ComptimeStop::Budget) }
+            Err(e) => Err(ComptimeStop::Failed(e)),
         }
     }
 
@@ -1744,7 +1873,7 @@ impl Interpreter {
         match callee {
             Value::Fn(name) => {
                 if self.extern_fns.contains(&name) {
-                    return Err(RuntimeError::at(format!("extern fn `{}` cannot be called without a JIT backend", name), sp));
+                    return Err(RuntimeError::at(format!("extern fn `{}` cannot be called by the interpreter — a foreign call crosses an unchecked machine boundary this backend has no pointer representation for, so the spec confines `extern fn` calls to the JIT; run it with `dmc jit`", name), sp));
                 }
                 let f = self.fns.get(&name).cloned().ok_or_else(|| {
                     RuntimeError::at(format!("undefined fn `{}`", name), sp.clone())
@@ -3491,74 +3620,80 @@ impl Interpreter {
     // ── Block ─────────────────────────────────────────────────────────────
 
     fn eval_block(&mut self, block: &Block) -> EvalResult<Flow> {
+        self.push_scope();
+        let result = self.eval_block_body(block);
+        self.pop_scope();
+        result
+    }
+
+    /// The statements and value of `block`, evaluated in the CURRENT scope.
+    /// `eval_block` wraps this in a scope of its own; the trailing
+    /// directive-block arm below calls it directly so the inner `let`s stay
+    /// visible to the enclosing block, and so a body that ends in an `if` /
+    /// `match` STATEMENT (keyword-led, so parsed as a stmt rather than a tail
+    /// expr) yields that statement's value exactly as a plain block does —
+    /// which is what the checker types it as.
+    fn eval_block_body(&mut self, block: &Block) -> EvalResult<Flow> {
         // #478: a block is value-transparent through its tail, but its
         // statements are not — take the hint now, re-arm it on the tail below.
         let want = self.float_lit_hint.take();
-        self.push_scope();
-        let result = (|| -> EvalResult<Flow> {
-            // Defer the last stmt if it's a yielding form AND no explicit tail.
-            let n = block.stmts.len();
-            let deferred_last = if block.tail_expr.is_none() && n > 0 {
-                matches!(&block.stmts[n - 1],
-                    Stmt::DirectiveBlock { .. } | Stmt::Expr { assign: None, .. }
-                    | Stmt::Stage { .. } | Stmt::If(_) | Stmt::Match(_))
-            } else { false };
+        // Defer the last stmt if it's a yielding form AND no explicit tail.
+        let n = block.stmts.len();
+        let deferred_last = if block.tail_expr.is_none() && n > 0 {
+            matches!(&block.stmts[n - 1],
+                Stmt::DirectiveBlock { .. } | Stmt::Expr { assign: None, .. }
+                | Stmt::Stage { .. } | Stmt::If(_) | Stmt::Match(_))
+        } else { false };
 
-            let stop = if deferred_last { n - 1 } else { n };
-            for stmt in &block.stmts[..stop] {
-                match self.eval_stmt(stmt)? {
-                    Flow::Normal(_) => {}
-                    other => return Ok(other),
-                }
+        let stop = if deferred_last { n - 1 } else { n };
+        for stmt in &block.stmts[..stop] {
+            match self.eval_stmt(stmt)? {
+                Flow::Normal(_) => {}
+                other => return Ok(other),
             }
-            if let Some(tail) = &block.tail_expr {
-                self.float_lit_hint = want;
-                Ok(Flow::Normal(self.eval_expr(tail)?))
-            } else if deferred_last {
-                match &block.stmts[n - 1] {
-                    Stmt::DirectiveBlock { directives, body, .. } => {
-                        for s in &body.stmts {
-                            match self.eval_stmt(s)? {
-                                Flow::Normal(_) => {}
-                                other => return Ok(other),
-                            }
-                        }
-                        let raw = if let Some(t) = &body.tail_expr {
-                            self.float_lit_hint = want;
-                            self.eval_expr(t)?
-                        } else { Value::Nil };
-                        // Apply @cast directive if present (same logic as Expr::DirectiveBlock).
-                        let v = if let Some(cast_dir) = directives.iter().find(|d| d.name == "cast") {
-                            if let Some(crate::ast::DArg::Positional(type_expr)) = cast_dir.args.first() {
-                                if let Expr::Ident(ty_name, _) = type_expr {
-                                    if self.model_fields.contains_key(ty_name) {
-                                        self.cast_to_struct(&raw, ty_name)?
-                                    } else {
-                                        apply_cast_by_name(&raw, ty_name)
-                                    }
-                                } else { raw }
+        }
+        if let Some(tail) = &block.tail_expr {
+            self.float_lit_hint = want;
+            Ok(Flow::Normal(self.eval_expr(tail)?))
+        } else if deferred_last {
+            match &block.stmts[n - 1] {
+                Stmt::DirectiveBlock { directives, body, .. } => {
+                    // Walk the body in the outer scope, taking its value the
+                    // way any block does; the hint is re-armed on its tail.
+                    self.float_lit_hint = want;
+                    let raw = match self.eval_block_body(body)? {
+                        Flow::Normal(v) => v,
+                        other => return Ok(other),
+                    };
+                    // Apply @cast directive if present (same logic as Expr::DirectiveBlock).
+                    let v = if let Some(cast_dir) = directives.iter().find(|d| d.name == "cast") {
+                        if let Some(crate::ast::DArg::Positional(type_expr)) = cast_dir.args.first() {
+                            if let Expr::Ident(ty_name, _) = type_expr {
+                                if self.model_fields.contains_key(ty_name) {
+                                    self.cast_to_struct(&raw, ty_name)?
+                                } else {
+                                    apply_cast_by_name(&raw, ty_name)
+                                }
                             } else { raw }
-                        } else { raw };
-                        Ok(Flow::Normal(v))
-                    }
-                    Stmt::If(ie) => { self.float_lit_hint = want; self.eval_if_flow(ie) }
-                    Stmt::Expr { lhs, assign: None, .. } => {
-                        self.float_lit_hint = want;
-                        Ok(Flow::Normal(self.eval_expr(lhs)?))
-                    }
-                    Stmt::Stage { body, .. } => Ok(Flow::Normal(self.eval_expr(body)?)),
-                    Stmt::Match(me) => {
-                        self.float_lit_hint = want;
-                        Ok(Flow::Normal(self.eval_match(me)?))
-                    }
-                    _ => unreachable!(),
+                        } else { raw }
+                    } else { raw };
+                    Ok(Flow::Normal(v))
                 }
-            } else {
-                Ok(Flow::Normal(Value::Nil))
+                Stmt::If(ie) => { self.float_lit_hint = want; self.eval_if_flow(ie) }
+                Stmt::Expr { lhs, assign: None, .. } => {
+                    self.float_lit_hint = want;
+                    Ok(Flow::Normal(self.eval_expr(lhs)?))
+                }
+                Stmt::Stage { body, .. } => Ok(Flow::Normal(self.eval_expr(body)?)),
+                Stmt::Match(me) => {
+                    self.float_lit_hint = want;
+                    Ok(Flow::Normal(self.eval_match(me)?))
+                }
+                _ => unreachable!(),
             }
-        })();
-        self.pop_scope();
-        result
+        } else {
+            Ok(Flow::Normal(Value::Nil))
+        }
     }
 
     // ── Stmt ──────────────────────────────────────────────────────────────
@@ -3754,10 +3889,17 @@ impl Interpreter {
                                             existing.ndim()
                                         )));
                                     }
+                                    // SPEC §4.8 also spells the appendee with the streaming
+                                    // axis dropped; bring it up to rank first so the capacity
+                                    // check below counts frames and not feature width (p31).
+                                    let new_arr = promote_stream_appendee(
+                                        &existing.data, &new_data.data, axis,
+                                    ).map_err(|e| RuntimeError::msg(
+                                        format!("<- stream append failed: {}", e)))?;
                                     // Enforce declared capacity (Spec §3.6: panics on overflow).
                                     if let Some(&cap) = self.kv_capacities.get(name.as_str()) {
                                         let current_len = existing.shape()[axis];
-                                        let append_len = new_data.shape()[axis];
+                                        let append_len = new_arr.shape()[axis];
                                         if current_len + append_len > cap {
                                             return Err(RuntimeError::msg(format!(
                                                 "stream `<-` append exceeded declared capacity {} \
@@ -3768,7 +3910,7 @@ impl Interpreter {
                                     }
                                     let cat = ndarray::concatenate(
                                         Axis(axis),
-                                        &[existing.view(), new_data.view()],
+                                        &[existing.view(), new_arr.view()],
                                     ).map_err(|e| RuntimeError::msg(
                                         format!("<- stream append failed: {}", e)
                                     ))?;
@@ -3791,7 +3933,9 @@ impl Interpreter {
                                         return Err(RuntimeError::msg(format!(
                                             "<- stream append axis {} out of bounds for {}-d tensor", axis, ndim)));
                                     }
-                                    let cat = ndarray::concatenate(Axis(axis), &[ex_data.view(), new_data.data.view()])
+                                    let new_arr = promote_stream_appendee(&ex_data, &new_data.data, axis)
+                                        .map_err(|e| RuntimeError::msg(format!("<- stream append failed: {}", e)))?;
+                                    let cat = ndarray::concatenate(Axis(axis), &[ex_data.view(), new_arr.view()])
                                         .map_err(|e| RuntimeError::msg(format!("<- stream append failed: {}", e)))?;
                                     *slot = Value::tensor_dt(cat, dtype);
                                 }
@@ -3888,7 +4032,7 @@ impl Interpreter {
                                         let idx_vals = self.eval_index_elems(idx_elems, &span)?;
                                         let mut borrowed = rc.borrow_mut();
                                         if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == &field) {
-                                            if let Value::Tensor(ref mut arr) = slot {
+                                            if let Value::Tensor(arr) = slot {
                                                 let dt = arr.dtype;
                                                 Self::assign_to_tensor_resolved(arr, dt, &idx_vals, rval, span.clone())?;
                                             } else if matches!(slot, Value::List(_)) {
@@ -3920,7 +4064,7 @@ impl Interpreter {
                                     let idx_vals = self.eval_index_elems(idx_elems, &span)?;
                                     let mut borrowed = fields.borrow_mut();
                                     if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == field_name) {
-                                        if let Value::Tensor(ref mut arr) = slot {
+                                        if let Value::Tensor(arr) = slot {
                                             let dt = arr.dtype;
                                             Self::assign_to_tensor_resolved(arr, dt, &idx_vals, rval, span.clone())?;
                                         } else if matches!(slot, Value::List(_)) {
@@ -4170,6 +4314,18 @@ impl Interpreter {
     // ── Expr ──────────────────────────────────────────────────────────────
 
     fn eval_expr(&mut self, expr: &Expr) -> EvalResult<Value> {
+        // #505: the `@comptime` step budget. Armed only by `eval_comptime`, so
+        // `dmc run` pays one predictable branch on a `None` field and nothing
+        // else. A `@comptime` body may loop (`COMPTIME_V1.md §5`), so this is
+        // what turns a non-terminating fold into a failed compile instead of a
+        // hung one. The message never reaches a user: `eval_comptime` sees the
+        // exhausted counter and reports `comptime-budget` against the block.
+        if let Some(fuel) = self.comptime_fuel.as_mut() {
+            if *fuel == 0 {
+                return Err(RuntimeError::msg("comptime step budget exhausted"));
+            }
+            *fuel -= 1;
+        }
         // #478: consume the type-direction hint here, once. Forms that are
         // *value-transparent* — they yield one of their sub-expressions
         // unchanged — re-arm it before recursing; everything else drops it, so
@@ -4251,7 +4407,9 @@ impl Interpreter {
                         let arr = ArrayD::from_shape_vec(IxDyn(&[data.len()]), data)
                             .map_err(|e| RuntimeError::msg(format!("tensor literal: {}", e)))?;
                         // An all-integer literal is an integer tensor (#125).
-                        Ok(Value::tensor_dt(arr, DType::Int))
+                        // The literal names no width, so its elements are the
+                        // 64-bit default of the integer family (§3.1, #571).
+                        Ok(Value::tensor_dt(arr, DType::Int(IW::I64)))
                     }
                     Value::Float(f0, _) => {
                         let mut data = vec![f0];
@@ -4759,7 +4917,7 @@ impl Interpreter {
                 match callee {
                     Value::Fn(name) => {
                         if self.extern_fns.contains(&name) {
-                            return Err(RuntimeError::at(format!("extern fn `{}` cannot be called without a JIT backend", name), span));
+                            return Err(RuntimeError::at(format!("extern fn `{}` cannot be called by the interpreter — a foreign call crosses an unchecked machine boundary this backend has no pointer representation for, so the spec confines `extern fn` calls to the JIT; run it with `dmc jit`", name), span));
                         }
                         let f = self.fns.get(&name).cloned().ok_or_else(|| {
                             RuntimeError::at(format!("undefined fn `{}`", name), span.clone())
@@ -5090,7 +5248,11 @@ impl Interpreter {
                             // keep integer semantics (#125).
                             let x = arr[IxDyn(&idx)];
                             match arr.dtype {
-                                DType::Int  => Ok(Value::Int(x as i64, IW::I64)),
+                                // #571: the element's width comes with it. The
+                                // JIT loads an `i32` lane as an `I32`, so a
+                                // width-less load here made `t[i] + 1` wrap on
+                                // one backend and not the other.
+                                DType::Int(w) => Ok(Value::Int(w.wrap(x as i64), w)),
                                 DType::Bool => Ok(Value::Bool(x != 0.0)),
                                 _ => Ok(Value::Float(x, arr.float_width())),
                             }
@@ -5263,7 +5425,11 @@ impl Interpreter {
                     }
                     let arr = ArrayD::from_shape_vec(IxDyn(&dims), data)
                         .map_err(|e| RuntimeError::msg(format!("@cast({}): {}", model_name, e)))?;
-                    Value::tensor_dt(arr, DType::Int)
+                    // I64 like the scalar field twin above: the overlay
+                    // assembles each element from its bytes big-endian, and
+                    // narrowing that here would be a different question than
+                    // #571's (it would re-sign values, not just wrap them).
+                    Value::tensor_dt(arr, DType::Int(IW::I64))
                 }
                 other => return Err(RuntimeError::msg(format!(
                     "@cast({}): field `{}` has unsupported type {:?}", model_name, fname, other))),
@@ -5386,7 +5552,8 @@ impl Interpreter {
             .map_err(|e| RuntimeError::at(format!("uniform_int: {}", e), span.clone()))?;
         self.prof_alloc();
         let rng_state = self.eval_expr(rng_expr)?;
-        Ok(Value::Tuple(vec![rng_state, Value::tensor_dt(arr, DType::Int)]))
+        // `uniform_int` names no element type, so its elements are i64-wide.
+        Ok(Value::Tuple(vec![rng_state, Value::tensor_dt(arr, DType::Int(IW::I64))]))
     }
 
     fn try_arena_constructor<'a>(
@@ -5638,20 +5805,16 @@ fn model_ctor_base_name(e: &Expr) -> Option<&str> {
 fn arena_ctor_dtype(pos: &[&Expr]) -> DType {
     for e in pos {
         if let Expr::Ident(name, _) = e {
-            if is_int_type_name(name)  { return DType::Int; }
+            // #571: the constructor names the element type, so it names the
+            // element WIDTH — `forge.zeros[i32, [N]]` is 32 bits wide at every
+            // element read, write and elementwise op over it.
+            if let Some(w) = int_type_name_width(name) { return DType::Int(w); }
             if is_trit_type_name(name) { return DType::Trit; }
             if name == "f64"           { return DType::F64; }
             if name == "bool"          { return DType::Bool; }
         }
     }
     DType::F32
-}
-
-fn is_int_type_name(name: &str) -> bool {
-    matches!(name,
-        "i8" | "i16" | "i32" | "i64" |
-        "u8" | "u16" | "u32" | "u64" |
-        "int4" | "int8")
 }
 
 fn is_trit_type_name(name: &str) -> bool {
@@ -5856,66 +6019,76 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     }
 }
 
+/// `a OP b` at integer width `w`, for `+ - * / % **` — the one implementation
+/// of SPEC §3.1's fixed-width integer arithmetic.
+///
+/// #540 wrote it for scalars; #571 made the elementwise path call the same
+/// function, because a tensor element's width is part of its type exactly as a
+/// local's is, and two wrap implementations would drift. Everything computes in
+/// i64 and wraps once at the end. For `+ - * **` that is exactly arithmetic at
+/// the narrow width, because reduction mod 2^w is a ring homomorphism, so
+/// wrapping late equals wrapping early — as long as the i64 computation itself
+/// does not overflow, which `**` reports rather than wrapping (the JIT does not
+/// lower integer `**` at all, so nothing diverges). `/` and `%` cannot leave the
+/// range their operands are already in, except `MIN / -1`, guarded at the width.
+fn int_arith(op: BinOp, a: i64, b: i64, w: IW) -> EvalResult<i64> {
+    use BinOp::*;
+    let (a, b) = (w.wrap(a), w.wrap(b));
+    // Integer power needs fallible handling (#215): the exponent was cast via
+    // `as u32`, silently truncating exponents > u32::MAX and wrapping on
+    // i64 overflow. Validate the exponent range and use checked_pow.
+    if matches!(op, Pow | StarStar) {
+        if b < 0 || b > u32::MAX as i64 {
+            return Err(RuntimeError::msg(format!(
+                "integer exponent {} out of range (expected 0..={})", b, u32::MAX)));
+        }
+        return match a.checked_pow(b as u32) {
+            Some(v) => Ok(w.wrap(v)),
+            None => Err(RuntimeError::msg(format!(
+                "integer overflow: {} ** {} exceeds the i64 range", a, b))),
+        };
+    }
+    let v = match op {
+        // 2's-complement wrap, matching the JIT's iadd/isub/imul (#300 ruling:
+        // overflow wraps everywhere — systems-language norm, no per-op cost).
+        // div-by-zero stays 0 (#208) and INT_MIN/-1 stays a trap (below), the
+        // two cases that have no defined wrapped value.
+        Add => a.wrapping_add(b),
+        Sub => a.wrapping_sub(b),
+        Mul => a.wrapping_mul(b),
+        // #544: `MIN / -1` is a SIGNED-only overflow. At an unsigned width
+        // both operands are zero-extended and non-negative, so `-1` can
+        // never be the divisor and the signed `wrapping_div` on two
+        // non-negative i64s IS the unsigned division.
+        Div => {
+            if b == 0 { 0 }
+            else if w.is_signed() && a == w.min() && b == -1 {
+                return Err(RuntimeError::msg(format!(
+                    "integer overflow: {} / {} exceeds the {} range", a, b, w.name())));
+            }
+            else { a.wrapping_div(b) }
+        },
+        Mod => {
+            if b == 0 { 0 }
+            else if w.is_signed() && a == w.min() && b == -1 {
+                return Err(RuntimeError::msg(format!(
+                    "integer overflow: {} % {} exceeds the {} range", a, b, w.name())));
+            }
+            else { a.wrapping_rem(b) }
+        },
+        _ => unreachable!(),
+    };
+    Ok(w.wrap(v))
+}
+
 fn scalar_arith(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     use BinOp::*;
     // int + int = int; otherwise float-promote
     if let (Some(a), Some(b)) = (l.as_int(), r.as_int()) {
         // #540: the result's width is the operands' — SPEC §3.1, arithmetic on
-        // a fixed-width integer type wraps at that width. Everything below
-        // computes in i64 and wraps once at the end. For `+ - * **` that is
-        // exactly arithmetic at the narrow width, because reduction mod 2^w is
-        // a ring homomorphism, so wrapping late equals wrapping early — as long
-        // as the i64 computation itself does not overflow, which `**` still
-        // reports rather than wrapping (the JIT does not lower integer `**` at
-        // all, so nothing diverges). `/` and `%` cannot leave the range their
-        // operands are already in, except `MIN / -1`, guarded at the width.
+        // a fixed-width integer type wraps at that width.
         let w = IW::join(int_width(l), int_width(r));
-        let (a, b) = (w.wrap(a), w.wrap(b));
-        // Integer power needs fallible handling (#215): the exponent was cast via
-        // `as u32`, silently truncating exponents > u32::MAX and wrapping on
-        // i64 overflow. Validate the exponent range and use checked_pow.
-        if matches!(op, Pow | StarStar) {
-            if b < 0 || b > u32::MAX as i64 {
-                return Err(RuntimeError::msg(format!(
-                    "integer exponent {} out of range (expected 0..={})", b, u32::MAX)));
-            }
-            return match a.checked_pow(b as u32) {
-                Some(v) => Ok(Value::Int(w.wrap(v), w)),
-                None => Err(RuntimeError::msg(format!(
-                    "integer overflow: {} ** {} exceeds the i64 range", a, b))),
-            };
-        }
-        let v = match op {
-            // 2's-complement wrap, matching the JIT's iadd/isub/imul (#300 ruling:
-            // overflow wraps everywhere — systems-language norm, no per-op cost).
-            // div-by-zero stays 0 (#208) and INT_MIN/-1 stays a trap (below), the
-            // two cases that have no defined wrapped value.
-            Add => a.wrapping_add(b),
-            Sub => a.wrapping_sub(b),
-            Mul => a.wrapping_mul(b),
-            // #544: `MIN / -1` is a SIGNED-only overflow. At an unsigned width
-            // both operands are zero-extended and non-negative, so `-1` can
-            // never be the divisor and the signed `wrapping_div` on two
-            // non-negative i64s IS the unsigned division.
-            Div => {
-                if b == 0 { 0 }
-                else if w.is_signed() && a == w.min() && b == -1 {
-                    return Err(RuntimeError::msg(format!(
-                        "integer overflow: {} / {} exceeds the {} range", a, b, w.name())));
-                }
-                else { a.wrapping_div(b) }
-            },
-            Mod => {
-                if b == 0 { 0 }
-                else if w.is_signed() && a == w.min() && b == -1 {
-                    return Err(RuntimeError::msg(format!(
-                        "integer overflow: {} % {} exceeds the {} range", a, b, w.name())));
-                }
-                else { a.wrapping_rem(b) }
-            },
-            _ => unreachable!(),
-        };
-        return Ok(Value::Int(w.wrap(v), w));
+        return Ok(Value::Int(int_arith(op, a, b, w)?, w));
     }
     if let (Some(a), Some(b)) = (l.as_float(), r.as_float()) {
         let v = match op {
@@ -6096,8 +6269,61 @@ fn float_result_dtype(operands: &[&Value]) -> DType {
     if operands.iter().all(narrow) { DType::F32 } else { DType::F64 }
 }
 
+/// The integer element WIDTH an elementwise operand contributes (#571): a
+/// tensor's element width, or a scalar integer's own. `None` for anything
+/// float-valued, which sends the op down the f64 path where it belongs.
+#[inline]
+fn int_operand_width(v: &Value) -> Option<IW> {
+    match v {
+        Value::Tensor(t) => match t.dtype { DType::Int(w) => Some(w), _ => None },
+        Value::Int(_, w) => Some(*w),
+        _ => None,
+    }
+}
+
+/// `a .OP b` over integer elements (#571): integer arithmetic at the element
+/// width, element by element, through the same `int_arith` the scalar `a[0] OP
+/// b[0]` goes through.
+///
+/// Computing these in the f64 backing lanes — what the interpreter did before —
+/// is wrong twice over: it does not wrap (`2147483647 .+ 1` on `Tensor[i32]`
+/// answered 2147483648, which is not an i32), and it is not integer division
+/// (`.\/` gave 0.5 where `/` gives 0, and ∞ where §3.1 defines 0). A product of
+/// two large `i64` lanes also silently lost precision f64 cannot carry.
+fn tensor_elementwise_int(op: BinOp, l: &Value, r: &Value, w: IW) -> EvalResult<Value> {
+    use BinOp::*;
+    // The scalar op the dotted spelling means. `Pow` is the transient dispatch
+    // tag `apply_binop` already hands to `scalar_arith` for `.^` (#501 S16).
+    let base = match op {
+        DotAdd => Add, DotSub => Sub, DotMul => Mul, DotDiv => Div,
+        _ => Pow, // DotPow
+    };
+    let a = as_tensor(l)?;
+    let b = as_tensor(r)?;
+    // A scalar operand is a rank-0 array here, which `numpy_broadcast` pads to
+    // the other side's rank like any shorter shape — so `t .+ 1` needs no
+    // separate path, and there is one loop to keep correct.
+    let (a, b) = if a.shape() == b.shape() { (a, b) } else { numpy_broadcast(a, b)? };
+    let mut out = a.clone();
+    for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *o = int_arith(base.clone(), *x as i64, *y as i64, w)? as f64;
+    }
+    Ok(Value::tensor_dt(out, DType::Int(w)))
+}
+
 fn tensor_elementwise(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     use BinOp::*;
+    // #571: an elementwise op over integer elements is INTEGER arithmetic at
+    // the element width, not f64 arithmetic over the f64-backed lanes. `a .+ b`
+    // on two `Tensor[i32, …]` wraps at 32 bits exactly as `a[0] + b[0]` does,
+    // and through the same function. Comparisons stay on the float path below:
+    // they read the (already wrapped) lane values and produce a 0/1 mask, which
+    // the element width does not change.
+    if matches!(op, DotAdd | DotSub | DotMul | DotDiv | DotPow) {
+        if let (Some(wl), Some(wr)) = (int_operand_width(l), int_operand_width(r)) {
+            return tensor_elementwise_int(op, l, r, IW::join(wl, wr));
+        }
+    }
     let dt = float_result_dtype(&[l, r]);
     let a = as_tensor(l)?;
     let b = as_tensor(r)?;
@@ -6398,6 +6624,45 @@ fn type_shape_spec(ty: &Type) -> Option<&ShapeSpec> {
 fn streaming_axis_from_type(ty: &Type) -> Option<usize> {
     let spec = type_shape_spec(ty)?;
     spec.elems.iter().position(|elem| matches!(elem, ShapeElem::Streaming(_)))
+}
+
+/// Bring a `<-` appendee up to the stream's rank.
+///
+/// `SPEC.md §4.8` accepts two spellings of the appendee for a `KV[T, S]`: `S`
+/// with the streaming axis carrying the appended extent, or `S` with that axis
+/// **dropped**, which appends a single frame. Only the first ever worked —
+/// `ndarray::concatenate` requires equal rank, so the dropped form died as
+/// `ShapeError/IncompatibleShape` (probe p31). Appending one `[4, 8]` token
+/// into a `KV[f32, [4, ~, 8]]` cache is the shape the spec leads with and the
+/// shape a decode loop actually writes.
+///
+/// Promoting here rather than at the `concatenate` call also fixes the capacity
+/// check, which reads the appended extent off `shape()[axis]`: for a dropped-form
+/// `[4, 8]` that is `shape()[1]` — 8, the *feature* width — so a 64-frame cache
+/// would have reported itself full after 8 appends.
+fn promote_stream_appendee(existing: &ArrayD<f64>, new: &ArrayD<f64>, axis: usize)
+    -> Result<ArrayD<f64>, String>
+{
+    if new.ndim() == existing.ndim() {
+        return Ok(new.clone());
+    }
+    if new.ndim() + 1 != existing.ndim() {
+        return Err(format!(
+            "cannot append a {}-d value to a {}-d stream: expected {}-d (streaming axis \
+             carrying the appended extent) or {}-d (streaming axis dropped, appending one frame)",
+            new.ndim(), existing.ndim(), existing.ndim(), existing.ndim() - 1,
+        ));
+    }
+    let mut want: Vec<usize> = existing.shape().to_vec();
+    want.remove(axis);
+    if new.shape() != want.as_slice() {
+        return Err(format!(
+            "cannot append shape {:?} to a {:?} stream: with the streaming axis (axis {}) \
+             dropped the appendee must be {:?}",
+            new.shape(), existing.shape(), axis, want,
+        ));
+    }
+    Ok(new.clone().insert_axis(Axis(axis)))
 }
 
 /// Extract the `capacity = N` literal from a KV constructor expression like
@@ -6721,8 +6986,15 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
             _ => Err(RuntimeError::msg(format!("\\> requires numeric/tensor, got {}", v.type_name()))),
         }
         GeLU => match v {
-            // GeLU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-            Value::Tensor(t) => Ok(Value::tensor_dt(t.map(|x| gelu(*x)), float_result_dtype(&[v]))),
+            // #567: `\<` IS the stdlib `gelu()` — OPERATORS.md says so, and the
+            // JIT compiles both through one `emit_gelu_f32`. So both spellings
+            // go through one kernel here too: `activation_f64`, then the f32
+            // rounding `builtin_activation` applies. `\<` used to run its own
+            // unrounded f64 kernel, which made `\<(x) == gelu(x)` false under
+            // `dmc run` (off by ~1.6e-8) and true under `dmc jit`.
+            // Tensors take the builtin's `Value::tensor` construction for the
+            // same reason: it is where the per-element f32 rounding happens.
+            Value::Tensor(t) => Ok(Value::tensor(t.data.mapv(|x| gelu(x)))),
             Value::Float(x, w) => Ok(Value::Float(w.round(gelu(*x)), *w)),
             _ => Err(RuntimeError::msg(format!("\\< requires numeric/tensor, got {}", v.type_name()))),
         }
@@ -6734,9 +7006,14 @@ fn apply_unop(op: UnOp, v: &Value) -> EvalResult<Value> {
     }
 }
 
+/// The one GeLU (#567): the tanh approximation of `activation_f64`, rounded
+/// through f32 exactly as `builtin_activation` rounds it — which is what the
+/// JIT computes, since `emit_gelu_f32` evaluates the whole expression in f32.
+/// Both spellings of the operator call this, so there is one number to be
+/// right about instead of two.
+#[inline]
 fn gelu(x: f64) -> f64 {
-    let c = (2.0f64 / std::f64::consts::PI).sqrt();
-    0.5 * x * (1.0 + (c * (x + 0.044715 * x.powi(3))).tanh())
+    quantize_f32(activation_f64("gelu", x))
 }
 
 /// Cast by type name string — used when the directive carries the type as an identifier.
@@ -6776,8 +7053,12 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
     // Int (so element reads round-trip as integers, #125); float targets keep
     // values and tag Float. Other targets (bool/str) fall through unchanged.
     if let Value::Tensor(t) = v {
-        if is_int_type_name(ty_name) {
-            return Value::tensor_dt(t.data.mapv(|x| x.trunc()), DType::Int);
+        // #571: the cast names the element type, so the result carries that
+        // element WIDTH, and every element is narrowed into it — the same
+        // table `apply_cast` uses for the `as` spelling, which until now
+        // narrowed while this one only truncated.
+        if let Some(w) = int_type_name_width(ty_name) {
+            return Value::tensor_dt(cast_tensor_to_int_width(&t.data, w), DType::Int(w));
         }
         if ty_name == "f64" {
             // Widening retag — no value change (f32-rounded data is exact in f64).
@@ -6796,7 +7077,8 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
             if let Value::Str(s) = v {
                 let bytes: Vec<f64> = s.bytes().map(|b| b as f64).collect();
                 let arr = ndarray::Array1::from_vec(bytes).into_dyn();
-                return Value::tensor_dt(arr, DType::Int);
+                // The cast names `u8`, so the bytes are u8-wide elements (#571).
+                return Value::tensor_dt(arr, DType::Int(IW::U8));
             }
             if let Some(n) = v.as_int()   { return Value::Int((n as u8)  as i64, IW::U8); }
             if let Some(n) = v.as_float() { return Value::Int(n as u8 as i64, IW::U8); }
@@ -6866,17 +7148,13 @@ fn apply_cast(v: &Value, ty: &Type) -> Value {
         if let Value::Tensor(t) = v {
             return match s {
                 // Narrow each element through the concrete target width, matching
-                // the scalar cast path (#298 / #291.1). Narrow targets fit f64
-                // exactly; I64/U64/Int4/Int8 stay wide (f64 can't hold the full
-                // range, same as the prior behavior).
-                I8  => Value::tensor_dt(t.data.mapv(|x| x as i8  as f64), DType::Int),
-                I16 => Value::tensor_dt(t.data.mapv(|x| x as i16 as f64), DType::Int),
-                I32 => Value::tensor_dt(t.data.mapv(|x| x as i32 as f64), DType::Int),
-                U8  => Value::tensor_dt(t.data.mapv(|x| x as u8  as f64), DType::Int),
-                U16 => Value::tensor_dt(t.data.mapv(|x| x as u16 as f64), DType::Int),
-                U32 => Value::tensor_dt(t.data.mapv(|x| x as u32 as f64), DType::Int),
-                I64 | U64 | Int4 | Int8 =>
-                    Value::tensor_dt(t.data.mapv(|x| x.trunc()), DType::Int),
+                // the scalar cast path (#298 / #291.1), and TAG that width so the
+                // element keeps it (#571) — `int4`/`int8` narrow here too, where
+                // before they only truncated and left an element that did not fit.
+                I8 | I16 | I32 | U8 | U16 | U32 | I64 | U64 | Int4 | Int8 => {
+                    let w = scalar_int_width(s).unwrap_or(IW::I64);
+                    Value::tensor_dt(cast_tensor_to_int_width(&t.data, w), DType::Int(w))
+                }
                 F64 => Value::tensor_dt(t.data.clone(), DType::F64),
                 F16 | Bf16 | Tf32 | F32 | Fp8E4M3 | Fp8E5M2 =>
                     Value::tensor_dt(t.data.clone(), DType::F32),
@@ -6975,6 +7253,17 @@ fn detect_host_features() -> std::collections::HashSet<String> {
         if is_x86_feature_detected!("avx512cd") { f.insert("avx512cd".into()); }
     }
 
+    // #578: `accelerate` — a BLAS `cblas_sgemm` is in this process's image, so
+    // a large f32 matmul can reach the platform's matrix unit (the AMX
+    // coprocessor, on Apple silicon). Unlike the ISA flags above this is not a
+    // property of the CPU but of what is linked, which is exactly what a
+    // program dispatching on it needs to know: `@host match { .accelerate =>
+    // … }` asks the same question the JIT's own kernel selection asks, from
+    // the same detection, so the two cannot disagree.
+    if crate::jit::blas_gemm_available() {
+        f.insert("accelerate".into());
+    }
+
     f
 }
 
@@ -6994,7 +7283,9 @@ fn expand_iter(v: &Value) -> EvalResult<Vec<Value>> {
             // (and a bool tensor yields Bools).
             let dtype = t.dtype;
             let scalar = move |x: f64| match dtype {
-                DType::Int  => Value::Int(x as i64, IW::I64),
+                // #571: iterating a narrow integer tensor yields elements at
+                // the element width, exactly as indexing one does.
+                DType::Int(w) => Value::Int(w.wrap(x as i64), w),
                 DType::Bool => Value::Bool(x != 0.0),
                 _ => Value::Float(x, FW::F64),
             };
@@ -7128,7 +7419,9 @@ fn port_handle_id(v: Option<&Value>) -> Option<i64> {
 fn wire_dtype_of(dt: DType) -> Option<crate::ports::WireDType> {
     use crate::ports::WireDType as W;
     Some(match dt {
-        DType::Int => W::I64,
+        // The wire protocol carries integers as 64-bit lanes at every element
+        // width; the narrow value already fits (#571).
+        DType::Int(_) => W::I64,
         DType::F32 => W::F32,
         DType::F64 => W::F64,
         DType::Bool => W::Bool,
@@ -7870,7 +8163,9 @@ impl Interpreter {
                     let data: Vec<f64> = bytes.iter().map(|&b| b as f64).collect();
                     let arr = ArrayD::from_shape_vec(IxDyn(&[n]), data)
                         .map_err(|e| RuntimeError::at(format!("read_bytes: {}", e), sp))?;
-                    Ok(Value::Tuple(vec![Value::tensor_dt(arr, DType::Int), Value::Nil]))
+                    // Raw bytes with no declared element type: i64-wide, so
+                    // byte arithmetic downstream is not silently taken mod 256.
+                    Ok(Value::Tuple(vec![Value::tensor_dt(arr, DType::Int(IW::I64)), Value::Nil]))
                 }
                 Err(e) => Ok(Value::Tuple(vec![Value::Nil, Value::Str(e.to_string())])),
             }
@@ -9975,7 +10270,9 @@ fn builtin_activation(name: &str, args: &[Value], sp: Span) -> EvalResult<Value>
             let x = v.as_float().ok_or_else(|| RuntimeError::at(
                 format!("{name}: requires an f32 scalar or f32 tensor"), sp.clone()))?;
             // f32-round the scalar result so run/jit agree at f32 precision.
-            Ok(Value::Float(activation_f64(name, x) as f32 as f64, FW::F64))
+            // #567: `\<` rounds here too, through `gelu` — the two spellings of
+            // GeLU must not differ by the rounding alone.
+            Ok(Value::Float(quantize_f32(activation_f64(name, x)), FW::F64))
         }
         None => Err(RuntimeError::at(format!("{name}: needs 1 argument"), sp)),
     }

@@ -594,6 +594,15 @@ pub struct Env {
     /// into assignment / arg-passing compatibility (where a concrete shape would
     /// wrongly clash with symbolic model fields or `View` params).
     ctor_shapes: Vec<HashMap<String, Shape>>,
+    /// #575: the element `ScalarType` half of the same literal-constructor
+    /// fact `ctor_shapes` tracks the shape half of. A bound name's own
+    /// `TyType` stays `Unknown` for the same reason `ctor_shapes` exists
+    /// (constructors deliberately report `Unknown`, see #248 above) — kept in
+    /// its own side-table rather than folded into `ctor_shapes` so the many
+    /// existing `lookup_ctor_shape` call sites (matmul, indexing, the general
+    /// tensor-fallback helper) are untouched by this addition. Same scoping
+    /// discipline as `ctor_shapes`: parallel to `scopes`, cleared on rebind.
+    ctor_elems: Vec<HashMap<String, ScalarType>>,
     /// #403 (MEMORY §2): bindings allocated by `forge.uninit`/`vault.uninit`
     /// that no write has landed on yet. Parallel to `scopes`, masked by
     /// shadowing bindings exactly like `ctor_shapes`.
@@ -639,6 +648,7 @@ impl Env {
         self.scopes.push(HashMap::new());
         self.mutable_idents.push(std::collections::HashSet::new());
         self.ctor_shapes.push(HashMap::new());
+        self.ctor_elems.push(HashMap::new());
         self.uninit_bindings.push(std::collections::HashSet::new());
         self.vault_bindings.push(std::collections::HashSet::new());
         self.trit_bindings.push(std::collections::HashSet::new());
@@ -647,6 +657,7 @@ impl Env {
         self.scopes.pop();
         self.mutable_idents.pop();
         self.ctor_shapes.pop();
+        self.ctor_elems.pop();
         self.uninit_bindings.pop();
         self.vault_bindings.pop();
         self.trit_bindings.pop();
@@ -852,6 +863,30 @@ impl Env {
     pub fn lookup_ctor_shape(&self, name: &str) -> Option<&Shape> {
         for (vals, shapes) in self.scopes.iter().rev().zip(self.ctor_shapes.iter().rev()) {
             if let Some(s) = shapes.get(name) { return Some(s); }
+            if vals.contains_key(name) { return None; }
+        }
+        None
+    }
+
+    /// #575: record (or clear) a binding's static constructor element type —
+    /// the `ScalarType` half of the same fact `set_ctor_shape` records the
+    /// shape half of. Call alongside `set_ctor_shape` on every `let` so a
+    /// rebind to a non-constructor value drops the stale entry in this scope.
+    pub fn set_ctor_elem(&mut self, name: impl Into<String>, elem: Option<ScalarType>) {
+        if let Some(scope) = self.ctor_elems.last_mut() {
+            let n: String = name.into();
+            match elem {
+                Some(e) => { scope.insert(n, e); }
+                None => { scope.remove(&n); }
+            }
+        }
+    }
+
+    /// #575: look up a binding's static constructor element type, with the
+    /// same inside-out / shadow-masking discipline as `lookup_ctor_shape`.
+    pub fn lookup_ctor_elem(&self, name: &str) -> Option<&ScalarType> {
+        for (vals, elems) in self.scopes.iter().rev().zip(self.ctor_elems.iter().rev()) {
+            if let Some(e) = elems.get(name) { return Some(e); }
             if vals.contains_key(name) { return None; }
         }
         None

@@ -4,6 +4,132 @@ This file tracks releases of the public demoniC repository. Releases are
 periodic snapshots of ongoing development, so each entry batches multiple
 changes rather than corresponding to a single commit.
 
+## 2026-09-04 — compiler: the real Rust floor, `@comptime` folding, backend-parity fixes
+
+### Changed
+
+- **The stated Rust requirement is 1.94, not 1.75.** The declared floor was
+  never real: the Cranelift crates in the committed lockfile each require
+  1.94, so a build on 1.75 produced a wall of dependency errors instead of
+  the documented requirement. `compiler/Cargo.toml` and `README.md` now state
+  the version the crate actually builds on.
+- The compiler crate is on the **Rust 2024 edition**. No behavior change; the
+  test count is the same on either edition.
+- `@comptime` folds rather than parsing and doing nothing. It evaluates its
+  block at compile time and replaces it with the resulting literal, before
+  either backend lowers the program. The fold set is normative and narrow —
+  integers, booleans, and shape arithmetic; floats, tensors, strings, and
+  every call are refused as `comptime-non-static`, and a non-terminating body
+  fails the compile as `comptime-budget` rather than hanging it. Previously
+  `dmc run` evaluated the block and warned while `dmc jit` refused the same
+  program outright, so a program that ran was a program that would not
+  compile. Specified in `docs/SPEC.md §7.5` (Comptime evaluation), catalogued
+  in `docs/DIRECTIVES.md §1` and `§3`.
+- `extern fn` is enforced, not just specified. A parameter or return type the
+  boundary does not admit is `extern-boundary`; a call from `@grad fn`,
+  `@fuse`, or `@deterministic` is `extern-context`; a symbol the process
+  cannot resolve is a `jit-extern` refusal naming the declaration, where it
+  previously panicked inside the code generator with no span. `docs/SPEC.md
+  §6.7` gains the tensor-to-`*T` materialization rule and the pointer's
+  call-scoped lifetime.
+- JIT refusals are classified more accurately: 64 sites that reported an
+  unclassified `jit error` are lowering gaps and now say so, across five new
+  refusal codes (`jit-element-type`, `jit-rank`, `jit-type-form`,
+  `jit-slice`, `jit-conversion`). Nothing about acceptance moves — every site
+  refuses, or succeeds, exactly as before. The differential tools score an
+  unclassified error as a divergence, so the misclassification was hiding
+  real gaps from the batteries that watch for them.
+
+### Added
+
+- `docs/NUMERICS.md` — the numerics contract: what the language promises
+  about float accumulation, backend parity, integer wrap-at-width, and port
+  wire numerics across versions, and what it deliberately does not promise.
+- `docs/STABILITY.md` — the stability policy. There is no frozen version
+  line, but surface that has shipped as documented, normative behavior does
+  not move silently: a breaking change to the table in §2 requires a
+  deprecation window, changelog entries, and a test that pins the
+  replacement.
+- `docs/SPEC.md §7.2b` — the float accumulation contract, which both
+  backends have honored all along and no section stated: f32 reductions
+  accumulate at f32 width in index order, and f32 matmul accumulates
+  ascending over the inner dimension with one fused multiply-add per step,
+  on both backends and every kernel. `docs/NUMERICS.md` is built on it.
+- `dmc jit --blas` routes an f32 matmul of at least 2^17 MACs to the host's
+  `cblas_sgemm`, reached by dynamic-symbol lookup rather than by linking a
+  framework. It is **off by default** and **never** selected inside a
+  `@deterministic` block: BLAS accumulates in its own blocked order, so the
+  result is tolerance-equal to the default kernel's, not bit-equal. With the
+  flag off, every matmul lowers exactly as it did before. The same detection
+  is exposed as the `@host` feature name `accelerate`.
+- Examples for the newly gated behavior: `comptime_fold.dmc`,
+  `shift_ops.dmc`, `int_tensor_widths.dmc`, `int_tensor_dotted_widths.dmc`,
+  `embed_index_type.dmc`, and wider coverage in `generic_slice_bounds.dmc`.
+
+### Fixed
+
+- **The release build was broken on aarch64.** An aarch64-gated SIMD matmul
+  kernel was missed by the edition migration; on ARM under `-D warnings` its
+  intrinsics and raw-pointer work were 26 hard errors. x86-64 hosts never
+  compile that kernel, so it built clean there.
+- **A match-arm or loop binding no longer destroys an outer local.** The JIT
+  held one flat map of locals per function, so an enum-payload binding, a
+  catch-all arm binding, or a `for` index wrote over an outer name of the
+  same spelling and never restored it — including from an arm that never
+  executed, since the map is consulted while lowering. The clobbered local
+  then read as zero: both backends exited 0 and printed different numbers.
+- **Integer elementwise tensor ops run at the element width.** The
+  interpreter's dtype tag did not carry the width, so `.+ .- .* ./ .^` on a
+  narrow-integer tensor fell through to f64 lanes: `2147483647 .+ 1` on two
+  `Tensor[i32]` answered 2147483648 — a value that does not fit the element
+  type — while the scalar spelling of the same addition answered
+  -2147483648. Integer `./` is integer division, division by zero is 0, and
+  unsigned elements wrap unsigned, exactly as the scalar operators do.
+- **`\<` and `gelu()` compute one number.** The prefix operator evaluated an
+  unrounded f64 kernel while the builtin rounded to f32, so `\<(x) ==
+  gelu(x)` was false in the interpreter for the same input; the JIT compiled
+  both through one kernel all along.
+- An untyped float literal in an enum payload match arm adopts the payload's
+  width. `match s { Circle(r) => r * r, Empty => 0.0 }` in an `-> f32`
+  function — the specification's own worked example — ran under `dmc run`
+  and was refused by `dmc jit` as arms disagreeing on type.
+- A slab whose bound is a shape parameter (`x[0..S]`) keeps its tensor type
+  instead of collapsing to the element type. The colon spelling of the same
+  slab already typed correctly, so the two spellings disagreed.
+- A trailing directive block yields the value of an `if` or `match`
+  statement inside it, in the checker and the interpreter, instead of typing
+  the enclosing function body as `nil`. The JIT already did.
+- A negative resolved start on a runtime-start, statically-sized slice
+  (`t[i..i+K]`) is out-of-bounds rather than counted from the end — the
+  static extent already fixes the window's size. `docs/SPEC.md §4.3`
+  (Indexing and slicing) states the exception; a scalar index and a slice
+  bound assigned into still end-resolve as before.
+- `embed` refuses a non-integer `ids` tensor at check time
+  (`embed-index-type`). A float `ids` passed `--check`, after which the
+  interpreter gathered rows by a truncated float index and `dmc jit` refused.
+- `<-` accepts an appendee with the streaming axis dropped — the spelling
+  `docs/SPEC.md §3.6` leads with, and the one a decode loop writes. Only the
+  full-rank spelling ever worked; the dropped form died inside the array
+  library. The capacity check on that path also read the appended extent off
+  the wrong axis.
+- `f16` narrowing carries the NaN payload across instead of collapsing every
+  NaN onto two bit patterns, so 2044 of 65536 half patterns that did not
+  survive a round trip now do.
+
+### Documentation
+
+- `docs/SPEC.md`, `docs/DIRECTIVES.md`, `docs/PORTS.md`, `docs/OPERATORS.md`,
+  and `docs/ASSIMILATE.md` are brought level with the behavior above.
+- Seven claims the shipped binary contradicted were corrected across the
+  reference docs: `>>` is the arithmetic right shift rather than a second
+  pipe spelling (and moves in the grammar accordingly), `\<` is GeLU rather
+  than an inverted ReLU, and the JIT does lower port calls.
+- `docs/PORTS.md §3.1`'s whole-value int/float wire decision is ratified and
+  dated: the canonical writer emits `2.0` as `2`, the ambiguity is permanent
+  by design, and a caller needing the distinction carries it in the payload.
+- `docs/ASSIMILATE.md §4` documents `schema` as an integer *token* — `1.0`
+  and `1e0` are rejected, which is what the reader already did.
+
 ## 2026-08-22 — compiler: assimilation, the port argument ABI, decode performance
 
 ### Added

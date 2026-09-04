@@ -1,0 +1,208 @@
+# shift_ops.dmc — `<<` and `>>`, the two operators the corpus never numerically
+# gated.
+#
+# `>>` is young. The token spelled the pipe operator for most of this language's
+# life; the pipe spelling was withdrawn, and the freed token became the
+# ARITHMETIC right shift. That is a large amount of new lowering on both
+# backends for an operator that, until this file, no example ran: the whole
+# corpus contained `>>` exactly twice, both times inside the self-hosted lexer,
+# where it is a two-character STRING being tokenized rather than a shift being
+# evaluated. A print-only spec probe and one JIT probe were the entire numeric
+# gate.
+#
+# Two properties are worth pinning hard, because getting either wrong produces a
+# number rather than a crash:
+#
+#   1. `>>` is ARITHMETIC on signed operands — the sign bit is copied in, so a
+#      negative operand FLOORS. `-7 >> 1` is -4 while `-7 / 2` is -3. A backend
+#      that lowered a logical shift instead would answer 9223372036854775804 for
+#      the first, which is visibly wrong; a backend that lowered `/ 2` would
+#      answer -3, which is not.
+#   2. A shift happens at the LEFT OPERAND's width. `>>` on a `u32` is a logical
+#      shift of 32 bits; `>>` on an `i32` is an arithmetic shift of 32 bits. The
+#      two answers differ for the same bit pattern, so a shift that quietly ran
+#      at 64 bits returns a plausible number and nothing notices.
+#
+# Every test below states its expected value as a literal computed by hand from
+# the definition, not as a second expression the same lowering could get wrong
+# in the same way.
+#
+# Run:
+#   dmc test examples/shift_ops.dmc
+#   dmc test --jit examples/shift_ops.dmc
+
+# ─── `>>` is arithmetic, and that is not the same as dividing ────────────────
+
+# The headline: the sign bit is copied in, so the result floors toward negative
+# infinity. Truncating division rounds toward zero. The two disagree on every
+# negative operand that is not an exact multiple.
+fn test_right_shift_floors_where_division_truncates() -> bool {
+    (-7 >> 1) == -4 && (-7 / 2) == -3
+}
+
+# On a non-negative operand the two DO agree, which is exactly why the negative
+# case above has to be tested: a `/ 2` lowering passes this one.
+fn test_right_shift_of_a_positive_matches_division() -> bool {
+    (100 >> 3) == 12 && (100 / 8) == 12
+}
+
+# -1 is all ones. An arithmetic shift of it by anything is still all ones; a
+# logical shift by 63 would be 1.
+fn test_all_ones_stays_all_ones() -> bool {
+    (-1 >> 1) == -1 && (-1 >> 63) == -1
+}
+
+# Shifting by zero is the identity, at either sign. An off-by-one in the count
+# lowering shows up here first.
+fn test_shift_by_zero_is_the_identity() -> bool {
+    (7 >> 0) == 7 && (-7 >> 0) == -7 && (7 << 0) == 7
+}
+
+# Zero shifts to zero regardless of direction or count.
+fn test_zero_shifts_to_zero() -> bool {
+    (0 >> 5) == 0 && (0 << 5) == 0
+}
+
+# ─── The count boundary ──────────────────────────────────────────────────────
+
+# 63 is the largest legal count for a 64-bit operand — one past it is a runtime
+# error, not a masked shift, so this is the last value that answers at all.
+# `1 << 63` is the sign bit: the most negative i64.
+fn test_max_count_reaches_the_sign_bit() -> bool {
+    (1 << 63) == (0 - 9223372036854775807 - 1)
+}
+
+# …and shifting that sign bit all the way back is -1, not 1 — the arithmetic
+# shift is what makes the round trip lossy in this particular way.
+fn test_sign_bit_shifted_back_is_all_ones() -> bool {
+    ((1 << 63) >> 63) == -1
+}
+
+# ─── The count can be a runtime value ────────────────────────────────────────
+
+# A loop variable as the count exercises the variable-count lowering rather than
+# the constant-folded one. `>>` on a non-negative operand is exact division by
+# a power of two, checked against that definition at every count.
+fn test_runtime_count_is_a_power_of_two_divide() -> bool {
+    let !ok = true
+    for k in 0..6 {
+        if (64 >> k) != (64 / (1 << k)) { ok = false }
+    }
+    ok
+}
+
+# The same sweep on a NEGATIVE operand, where the floor shows: -256 >> k is
+# -256/2^k exactly (every one is a clean multiple), and the running total is
+# -256 - 128 - 64 - 32 - 16 - 8 - 4 - 2 = -510.
+fn test_runtime_count_on_a_negative_operand() -> bool {
+    let !acc = 0
+    for k in 0..8 { acc = acc + (-256 >> k) }
+    acc == -510
+}
+
+# ─── The shift runs at the left operand's width ──────────────────────────────
+
+# A 32-bit arithmetic shift: the operand is the most negative i32, and copying
+# ITS sign bit gives -1. A shift that ran at 64 bits would see a sign-extended
+# operand and still answer -1 — so the companion test below, where the two
+# widths disagree, is the one that separates them.
+fn test_i32_right_shift_is_arithmetic() -> bool {
+    let a: i32 = -2147483648
+    ((a >> 31) as i64) == -1
+}
+
+# The separating case. `u32` all-ones is 4294967295; a LOGICAL shift by 2 is
+# 1073741823. Held as a signed 64-bit -1 instead, an arithmetic shift would
+# answer -1. The two differ by more than rounding.
+fn test_u32_right_shift_is_logical() -> bool {
+    let z: u32 = 0
+    let one: u32 = 1
+    let two: u32 = 2
+    (((z - one) >> two) as i64) == 1073741823
+}
+
+# `<<` at a narrow width wraps at that width: an i16 1 shifted into its own sign
+# bit is -32768, not 32768.
+fn test_i16_left_shift_lands_in_its_own_sign_bit() -> bool {
+    let a: i16 = 1
+    ((a << 15) as i64) == -32768
+}
+
+# The unsigned narrow mirror: u16 all-ones shifted left by one drops the top bit
+# and keeps 16 of them — 65534, not 131070.
+fn test_u16_left_shift_wraps_at_16_bits() -> bool {
+    let a: u16 = 65535u16
+    ((a << 1) as i64) == 65534
+}
+
+# The smallest widths behave the same way, signed and unsigned.
+fn test_i8_right_shift_is_arithmetic() -> bool {
+    let a: i8 = -8
+    ((a >> 1) as i64) == -4
+}
+
+fn test_u8_right_shift_is_logical() -> bool {
+    let a: u8 = 255u8
+    ((a >> 4) as i64) == 15
+}
+
+# Sign recovery through both directions at a narrow width: an i32 -1 shifted
+# right by 31 is -1, and shifting that back left by one is -2.
+fn test_narrow_shift_round_trip() -> bool {
+    let a: i32 = -1
+    (((a >> 31) << 1) as i64) == -2
+}
+
+# ─── Placement in the grammar ────────────────────────────────────────────────
+
+# The shifts bind LOOSER than `+`, so this is `(1 + 2) >> 1`, which is 1. Read
+# as `1 + (2 >> 1)` it would be 2.
+fn test_shift_binds_looser_than_addition() -> bool {
+    (1 + 2 >> 1) == 1
+}
+
+# …and TIGHTER than comparison, so this is `(1 << 3) > 4` — true — rather than
+# `1 << (3 > 4)`, which would not be a shift by an integer at all.
+fn test_shift_binds_tighter_than_comparison() -> bool {
+    (1 << 3 > 4) == true
+}
+
+# Left-associative: `((1024 >> 2) >> 3)` is 32. Grouped the other way it would be
+# `1024 >> (2 >> 3)`, which is `1024 >> 0` — 1024.
+fn test_shifts_chain_left_to_right() -> bool {
+    (1024 >> 2 >> 3) == 32
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+# The byte-for-byte half of the parity gate: the differential harness only
+# compares files whose `main` runs, so a test-only file would be invisible to
+# it. These are the same quantities the tests assert, printed.
+fn main() -> i64 {
+    print_i64(-7 >> 1)
+    print_i64(-7 / 2)
+    print_i64(100 >> 3)
+    print_i64(-1 >> 63)
+    print_i64(7 >> 0)
+    print_i64((1 << 63) >> 63)
+    print_i64(1 + 2 >> 1)
+    print_i64(1024 >> 2 >> 3)
+
+    let a: i32 = -2147483648
+    print_i64((a >> 31) as i64)
+
+    let z: u32 = 0
+    let one: u32 = 1
+    let two: u32 = 2
+    print_i64(((z - one) >> two) as i64)
+
+    let h: i16 = 1
+    print_i64((h << 15) as i64)
+
+    let b: i8 = -8
+    print_i64((b >> 1) as i64)
+
+    let u: u8 = 255u8
+    print_i64((u >> 4) as i64)
+    0
+}

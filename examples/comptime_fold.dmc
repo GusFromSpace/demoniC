@@ -1,0 +1,81 @@
+# comptime_fold.dmc — @comptime: the reference interpreter at compile time.
+#
+# See DIRECTIVES.md §3 for the rules this file exercises.
+#
+# @comptime folds integers, booleans and shape arithmetic — nothing else. The
+# float cut is deliberate: folding a float would raise whether a compile-time
+# float must equal a run-time one, and none of what @comptime is for (shape
+# computation, table sizes, directive arguments) needs an answer to that.
+#
+# Every fold below is checked against the value written out by hand, so this
+# file fails if the fold ever disagrees with ordinary evaluation — which is
+# the whole promise of using the reference interpreter as the evaluator.
+
+# A closed block is evaluated once, at compile time, and the whole directive is
+# replaced by a literal before either backend sees the program.
+fn test_folds_arithmetic() -> bool {
+    let x = @comptime { 3 * 7 + 1 }
+    x == 22
+}
+
+fn test_folds_a_boolean() -> bool {
+    let c = @comptime { 2 > 1 && 3 != 4 }
+    c
+}
+
+# `if` is an expression, so a comptime conditional picks its arm at compile
+# time — the branch condition is already a constant when the backend reaches
+# it.
+fn test_folds_a_conditional() -> bool {
+    let n = @comptime { if 3 > 2 { 10 } else { 20 } }
+    n == 10
+}
+
+# Loops are in the fold set, which is what makes the "configuration table" use
+# real rather than decorative — and why compile-time evaluation is bounded by
+# a step budget.
+fn test_folds_a_loop() -> bool {
+    let total = @comptime {
+        let !acc = 0
+        let !i = 1
+        while i <= 4 { acc += i  i += 1 }
+        acc
+    }
+    total == 10
+}
+
+# The fold is the interpreter's own arithmetic, not a second const-folder
+# beside it: division truncates toward zero and `%` takes the dividend's sign,
+# exactly as the same expression does at run time.
+fn test_fold_uses_interpreter_integer_semantics() -> bool {
+    let q = @comptime { (0 - 7) / 2 }
+    let r = @comptime { (0 - 7) % 2 }
+    q == 0 - 3 && r == 0 - 1
+}
+
+# A shape parameter is comptime-known but fixed only per monomorphization, so
+# this block is not replaced by a literal — it is checked, then folded by
+# whichever backend compiles the call. Both must reach the same number.
+fn scaled[N](x: Tensor[f32, [N]]) -> i64 {
+    let k = @comptime { N * 2 }
+    k
+}
+
+fn test_folds_shape_arithmetic() -> bool {
+    let t = forge.zeros[f32, [4]]
+    scaled(t) == 8
+}
+
+# A folded value is an ordinary integer afterward: it sizes loops and indexes
+# tensors like any other.
+fn test_folded_value_drives_a_loop() -> bool {
+    let n = @comptime { 2 * 2 }
+    let !acc = 0
+    for i in 0..n { acc += i }
+    acc == 6
+}
+
+fn main() -> i64 {
+    let x = @comptime { 3 * 7 + 1 }
+    x
+}

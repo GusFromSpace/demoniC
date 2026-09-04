@@ -3,8 +3,8 @@ name = "dmc"
 # Compiler version is independent of spec version (currently 0.0.4-draft).
 # The spec is the source of truth; this tracks compiler bootstrap progress.
 version = "0.0.1"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.94"
 description = "demoniC compiler — bootstrap phases 1-3.5 (lexer + parser + typechecker + tree-walking interpreter pre-alpha)"
 license = "Apache-2.0"
 homepage = "https://github.com/GusFromSpace/demoniC"

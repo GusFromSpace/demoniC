@@ -16,7 +16,8 @@ and others.
 
 ## Building
 
-Requires stable Rust.
+Requires Rust 1.94 or newer — the floor the Cranelift backend's dependencies
+declare, and the version `compiler/Cargo.toml` states.
 
 ```
 cd compiler
@@ -37,6 +38,14 @@ The binary is `compiler/target/release/dmc`.
 | `dmc test --jit path` | additionally run JIT-eligible tests on both backends and compare |
 | `dmc fmt f.dmc`     | canonical pretty-print                              |
 | `dmc selftest`      | generate random well-typed programs, run both backends, diff the results |
+
+`dmc jit --blas` opts one run into routing large f32 matmuls to the host's
+`cblas_sgemm` — on macOS that is Accelerate, which is how the platform's
+matrix unit is reached at all. It is off by default and never selected
+inside a `@deterministic` block: BLAS accumulates in its own blocked order,
+so its result is tolerance-equal to the default kernel's rather than
+bit-equal. With the flag off, every matmul lowers exactly as it did before
+the flag existed. See [docs/NUMERICS.md](docs/NUMERICS.md) for the full rule.
 
 ## Example
 
@@ -162,9 +171,16 @@ faster, and these are what catch it.
 
 ## Status
 
-Pre-0.1 draft. Breaking changes are expected on every revision. The
-interpreter is the reference semantics; the JIT compiles a statically typed
-subset and reports a clear error for constructs outside it.
+Pre-0.1 draft: the language surface is still open, and there is no frozen
+version line. The interpreter is the reference semantics; the JIT compiles a
+statically typed subset and reports a clear error for constructs outside it.
+
+Surface that has already shipped as documented, normative behavior does not
+move silently. [docs/STABILITY.md](docs/STABILITY.md) lists what that covers,
+what it explicitly does not, and the procedure a breaking change to it has to
+follow. What the language promises about float arithmetic across versions,
+and what it deliberately does not promise, is in
+[docs/NUMERICS.md](docs/NUMERICS.md).
 
 ## License
 

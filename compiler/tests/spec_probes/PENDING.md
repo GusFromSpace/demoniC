@@ -1,35 +1,13 @@
 # Pending probes
 
-Two probes from the spec-coverage audit that don't pass cleanly today
-and therefore aren't part of the active regression suite. Both surface
-real edges, not malformed tests; move them into the suite once the
-underlying gap closes.
+Probes from the spec-coverage audit that don't pass cleanly today and
+therefore aren't part of the active regression suite. Move one into the
+suite once the underlying gap closes.
 
-## p31 — KV stream `<-` append
-
-```dmc
-fn main() -> nil {
-    stream {
-        let !cache: KV[f32, [4, ~, 8]] = forge.kv[f32, [4, ~, 8]](capacity = 64)
-        let new_token = forge.zeros[f32, [4, 8]]
-        cache <- new_token
-    }
-    nil
-}
-```
-
-**Current state:** parse + check pass; interpreter rejects the append
-with `ShapeError/IncompatibleShape`.
-
-**Spec reference:** §3.6 declares `KV[T, S]` types with `~` axis markers;
-§4.8 specifies that `c <- v` appends a view `v: View[T, S_inner]` where
-`S_inner` is `S` with the streaming axis dropped. The probe shapes
-match that contract — `KV[f32, [4, ~, 8]]` should accept a `[4, 8]`
-appendee.
-
-**Activation criterion:** interpreter accepts the canonical shape pair
-and the cache's streaming-axis cursor advances by `v`'s extent. Once
-that lands, move this file into the active suite.
+p31 (KV stream `<-` append) was activated: the interpreter concatenated
+the two `<-` operands directly, which requires equal rank, so the
+dropped-streaming-axis spelling §4.8 allows could never work. It lives
+in the suite now as `p31_kv_stream_append.dmc`.
 
 ## p41 — `@shard` axis must include mesh divisor
 

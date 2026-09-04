@@ -2326,12 +2326,55 @@ fn null8_kv_multiple_appends_accumulate() {
     assert!((as_float(&v) - 16.0).abs() < 1e-9, "expected 16.0 after two KV appends, got {:?}", v);
 }
 
+// ── Trailing directive block whose body ends in an `if` / `match` statement ──
+//
+// `@deterministic { if c { 10 } else { 20 } }` in tail position is a
+// `Stmt::DirectiveBlock` whose body has no `tail_expr` — the `if` is a
+// keyword-led statement. The block's value is that statement's value, as in a
+// plain block; the interpreter used to read only the body's `tail_expr` here
+// and yield nil. (The `let x = @deterministic { … }` form goes through
+// `Expr::DirectiveBlock` → `eval_block` and was always right.)
+
+#[test]
+fn trailing_directive_block_yields_its_if_statement() {
+    let v = run("fn main() -> i64 { @deterministic { if 3 > 2 { 10 } else { 20 } } }");
+    assert_eq!(as_int(&v), 10);
+}
+
+#[test]
+fn trailing_directive_block_yields_its_match_statement() {
+    let v = run("fn main() -> i64 {\n    let n = 3\n    @deterministic { match n { 3 => 10, _ => 20 } }\n}");
+    assert_eq!(as_int(&v), 10);
+}
+
+#[test]
+fn trailing_directive_block_if_sees_inner_lets_and_else_arm() {
+    let v = run("fn main() -> i64 { @deterministic { let k = 1  if k > 2 { k } else { 20 } } }");
+    assert_eq!(as_int(&v), 20);
+}
+
+#[test]
+fn trailing_cast_block_casts_its_if_statement_value() {
+    // The `@cast` applied to the recovered value, same as for a tail expr.
+    let v = run("fn main() -> f64 { @cast(f64) { if 3 > 2 { 10 } else { 20 } } }");
+    assert_eq!(as_float(&v), 10.0);
+}
+
 #[test]
 fn null10_comptime_evaluates_static_expr() {
     // Null 10: @comptime evaluation is total on static operands.
-    // In the reference interpreter @comptime blocks evaluate at runtime;
-    // a non-terminating @comptime would require static analysis (JIT phase).
-    // Verify literal arithmetic inside @comptime produces the correct result.
+    //
+    // This comment used to say a non-terminating @comptime "would require
+    // static analysis (JIT phase)". #505 made that false: `comptime.rs` folds
+    // the block before either backend runs, under a step budget, so a
+    // non-terminating body is a `comptime-budget` compile error
+    // (COMPTIME_V1.md §6) rather than a hang.
+    //
+    // This file's `run` helper deliberately does NOT fold: it drives the
+    // interpreter straight off the parsed tree, so these tests keep covering
+    // the interpreter's own `DirectiveBlock` path — the one a residual
+    // (shape-parameter) block still takes in the shipped binary. The value
+    // must be the same one the fold produces; `comptime_tests` pins that side.
     let v = run(r#"
         fn main() -> i64 {
             let x = @comptime { 3 * 7 + 1 }
@@ -2674,6 +2717,33 @@ fn host_match_real_feature_detected() {
     "#);
     let n = as_int(&v);
     assert!(n != 0, "expected a real feature arm to match (sse2=10 or neon=20), got wildcard 0");
+}
+
+#[test]
+fn host_match_accelerate_tracks_the_jit_fast_path() {
+    // #578: `accelerate` is a host feature like the ISA flags, but it reports
+    // what is *linked* rather than what the CPU can do — a BLAS `cblas_sgemm`
+    // in this process's image, which is how a large f32 matmul reaches the
+    // platform's matrix unit.
+    //
+    // The assertion is agreement, not presence: the arm a program selects and
+    // the kernel the JIT selects must come from one detection, or a program
+    // could dispatch on `.accelerate` and get the Cranelift kernel anyway.
+    // Presence itself is a property of the host and not assertable here — on
+    // macOS libSystem re-exports vecLib's BLAS, on a bare Linux box there is
+    // none, and both are correct.
+    let v = run(r#"
+        fn main() -> i64 {
+            let chosen = @host match {
+                .accelerate => 1,
+                _           => 0,
+            }
+            chosen
+        }
+    "#);
+    let expected = if crate::jit::blas_gemm_available() { 1 } else { 0 };
+    assert_eq!(as_int(&v), expected,
+        "`@host match .accelerate` disagrees with the JIT's own BLAS detection");
 }
 
 /// B7: Unicode (Greek-letter) identifiers work end-to-end

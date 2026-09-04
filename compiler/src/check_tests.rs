@@ -5,12 +5,24 @@ use super::check::Checker;
 use super::lexer::Lexer;
 use super::parser::Parser;
 
-fn check(src: &str) -> Vec<String> {
+/// Parse, then run the pipeline the `dmc` binary runs before its checker:
+/// #505's `@comptime` fold, whose diagnostics are seeded into the `Checker`
+/// exactly as `main.rs` seeds them. A helper that skipped the fold would test
+/// a compiler no user has — it would miss every `comptime-non-static`, and it
+/// would hand the checker an unfolded tree where the binary hands it a
+/// literal.
+fn checked(src: &str) -> Checker {
     let tokens = Lexer::new(src).tokenize().expect("lex failed");
-    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut program = Parser::new(tokens).parse_program().expect("parse failed");
+    let comptime_errors = super::comptime::fold_program(&mut program);
     let mut checker = Checker::new();
+    checker.errors = comptime_errors;
     checker.check_program(&program, None);
-    checker.errors.iter().map(|e| e.msg.clone()).collect()
+    checker
+}
+
+fn check(src: &str) -> Vec<String> {
+    checked(src).errors.iter().map(|e| e.msg.clone()).collect()
 }
 
 fn passes(src: &str) -> bool { check(src).is_empty() }
@@ -18,20 +30,12 @@ fn passes(src: &str) -> bool { check(src).is_empty() }
 /// Whole `TypeError`s, for the tests that assert on a diagnostic's hint rather
 /// than only its message.
 fn check_full(src: &str) -> Vec<super::check::TypeError> {
-    let tokens = Lexer::new(src).tokenize().expect("lex failed");
-    let program = Parser::new(tokens).parse_program().expect("parse failed");
-    let mut checker = Checker::new();
-    checker.check_program(&program, None);
-    checker.errors.clone()
+    checked(src).errors.clone()
 }
 
 /// Lint diagnostics (non-fatal warnings), as message strings.
 fn warnings(src: &str) -> Vec<String> {
-    let tokens = Lexer::new(src).tokenize().expect("lex failed");
-    let program = Parser::new(tokens).parse_program().expect("parse failed");
-    let mut checker = Checker::new();
-    checker.check_program(&program, None);
-    checker.warnings.iter().map(|w| w.msg.clone()).collect()
+    checked(src).warnings.iter().map(|w| w.msg.clone()).collect()
 }
 
 fn writeback_warns(src: &str) -> bool {
@@ -961,11 +965,12 @@ fn match_guarded_bare_ident_on_enum_does_not_warn() {
 
 #[test]
 fn unimplemented_directive_warns() {
-    // #369: `@recompute` / `@comptime` / `@inplace` are parsed but have no
-    // effect — warn so they aren't silent no-ops. Each is written on a target
-    // DIRECTIVES.md §1 allows it on: `@inplace` on an assignment statement,
-    // the other two on a fn.
-    for d in ["recompute(budget=2)", "comptime"] {
+    // #369: `@recompute` / `@inplace` are parsed but have no effect — warn so
+    // they aren't silent no-ops. Each is written on a target DIRECTIVES.md §1
+    // allows it on: `@inplace` on an assignment statement, `@recompute` on a
+    // fn. `@comptime` left this list at #505 — see
+    // `effective_directives_do_not_warn`.
+    for d in ["recompute(budget=2)"] {
         let src = format!("@{d}\nfn f() -> i64 {{ 1 }}\nfn main() -> i64 {{ f() }}");
         let ws = warnings(&src);
         assert!(ws.iter().any(|w| w.contains("is not implemented") && w.contains("no effect")),
@@ -979,16 +984,20 @@ fn unimplemented_directive_warns() {
 #[test]
 fn effective_directives_do_not_warn() {
     // Directives the compiler acts on must stay quiet — including `@host match`,
-    // which is functional (host-feature dispatch), not a no-op.
+    // which is functional (host-feature dispatch), not a no-op, and `@comptime`,
+    // which folds at #505. The residual (shape-parameter) `@comptime` is the
+    // form that survives to the checker at all, so it is the one that could
+    // still have warned.
     let ws = warnings(r#"
         @grad fn loss(!w: Tensor[f32, [4]], x: Tensor[f32, [4]]) -> f32 {
             sum((w .* x) .* (w .* x))
         }
         fn pick() -> i64 { @host match { .avx2 => 1, _ => 0 } }
-        fn main() -> i64 { pick() }
+        fn tile[N](x: Tensor[f32, [N]]) -> i64 { @comptime { N * 2 } }
+        fn main() -> i64 { pick() + tile(forge.zeros[f32, [4]]) }
     "#);
     assert!(!ws.iter().any(|w| w.contains("is not implemented")),
-            "effective directives (@grad, @host) must not warn, got: {:?}", ws);
+            "effective directives (@grad, @host, @comptime) must not warn, got: {:?}", ws);
 }
 
 #[test]
@@ -2818,6 +2827,310 @@ fn comptime_block_passes() {
             x
         }
     "#));
+}
+
+// A trailing `@directive { … }` parses as a `Stmt::DirectiveBlock`, not a
+// tail expression, and its body's last element may itself be a keyword-led
+// `if` / `match` STATEMENT. That statement is the block's value, exactly as it
+// is in a plain block. The checker used to read only the body's `tail_expr`
+// here and type the whole fn body as nil — bound to a `let` first, the same
+// block checked fine. Directive-independent: the arm is shared.
+
+#[test]
+fn trailing_directive_block_yields_its_if_statement() {
+    for d in ["@deterministic", "@comptime"] {
+        let src = format!("fn main() -> i64 {{ {d} {{ if 3 > 2 {{ 10 }} else {{ 20 }} }} }}");
+        assert!(passes(&src), "{d}: {:?}", check(&src));
+    }
+}
+
+#[test]
+fn trailing_directive_block_yields_its_match_statement() {
+    let src = "fn main() -> i64 {\n    let n = 3\n    @deterministic { match n { 3 => 10, _ => 20 } }\n}";
+    assert!(passes(src), "{:?}", check(src));
+}
+
+#[test]
+fn trailing_directive_block_keeps_inner_lets_in_scope_for_its_if() {
+    let src = "fn main() -> i64 { @deterministic { let k = 5  if k > 2 { k } else { 0 } } }";
+    assert!(passes(src), "{:?}", check(src));
+}
+
+#[test]
+fn trailing_directive_block_if_value_is_checked_against_return_type() {
+    // The value now flows: an `if` yielding bool from an `-> i64` fn is the
+    // ordinary body-type mismatch, not a nil.
+    let errs = check("fn main() -> i64 { @deterministic { if 3 > 2 { true } else { false } } }");
+    assert!(errs.iter().any(|e| e.contains("body produces") && e.contains("Bool")),
+            "got: {:?}", errs);
+}
+
+// ── #505: `@comptime` v1 — the fold set and what it refuses ─────────────────
+//
+// SPEC.md §7.8 / DIRECTIVES.md §3 / COMPTIME_V1.md §5. Every entry below is a
+// rule that was specified and unenforced before #505, so each test is the
+// difference between the directive meaning something and being a no-op.
+
+fn comptime_errs(errs: &[String]) -> Vec<&String> {
+    errs.iter()
+        .filter(|e| e.contains("comptime-non-static")
+                 || e.contains("comptime-budget")
+                 || e.contains("port-forbidden"))
+        .collect()
+}
+
+// The silence cases first. A refusal battery with no positives only proves the
+// gate says no.
+
+#[test]
+fn comptime_folds_closed_integer_arithmetic() {
+    assert!(passes(r#"fn main() -> i64 { @comptime { 3 * 7 + 1 } }"#));
+}
+
+#[test]
+fn comptime_folds_a_boolean() {
+    assert!(passes(r#"fn main() -> bool { @comptime { 2 > 1 && 3 != 4 } }"#));
+}
+
+#[test]
+fn comptime_folds_a_conditional() {
+    // Both spellings. The tail form needed #583 — a trailing directive block
+    // whose body ends in an `if` STATEMENT used to type as `nil` whatever the
+    // directive was — so pinning it here keeps the fold and that fix honest
+    // about each other.
+    assert!(passes(r#"fn main() -> i64 { @comptime { if 3 > 2 { 10 } else { 20 } } }"#));
+    assert!(passes(r#"
+        fn main() -> i64 {
+            let x = @comptime { if 3 > 2 { 10 } else { 20 } }
+            x
+        }
+    "#));
+}
+
+#[test]
+fn comptime_folds_a_loop_that_terminates() {
+    // A `while` accumulating a sum is the "configuration table" case SPEC.md
+    // §7.8 names, and the reason the budget of §6 has to exist at all.
+    let errs = check(r#"
+        fn main() -> i64 {
+            @comptime {
+                let !acc = 0
+                let !i = 1
+                while i <= 4 { acc += i  i += 1 }
+                acc
+            }
+        }
+    "#);
+    assert!(comptime_errs(&errs).is_empty(), "got: {:?}", errs);
+}
+
+#[test]
+fn comptime_accepts_a_shape_parameter() {
+    // Tier 2 (COMPTIME_V1.md §4): comptime-known, but constant only per
+    // monomorphization, so the pass accepts it and leaves it to the backends.
+    let errs = check(r#"
+        fn tile[N](x: Tensor[f32, [N]]) -> i64 { @comptime { N * 2 } }
+        fn main() -> i64 { tile(forge.zeros[f32, [4]]) }
+    "#);
+    assert!(comptime_errs(&errs).is_empty(), "a shape param is comptime; got: {:?}", errs);
+}
+
+#[test]
+fn comptime_accepts_a_model_shape_parameter() {
+    let errs = check(r#"
+        model Block[D] {
+            w: Tensor[f32, [D]]
+            fn width(self) -> i64 { @comptime { D + 1 } }
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(comptime_errs(&errs).is_empty(), "got: {:?}", errs);
+}
+
+// The refusals. Each names the offending construct, because "not comptime"
+// with no noun is a diagnostic the reader has to guess at.
+
+#[test]
+fn a_float_literal_inside_comptime_is_non_static() {
+    // The v1 cut, and the one most likely to be argued with: folding a float
+    // would re-open whether a folded float must equal a computed one (#320).
+    let errs = check(r#"fn main() -> i64 { let x = @comptime { 1.5 * 2.0 }  0 }"#);
+    assert!(errs.iter().any(|e| e.contains("comptime-non-static") && e.contains("float `1.5`")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn a_runtime_binding_inside_comptime_is_non_static() {
+    let errs = check(r#"fn f(n: i64) -> i64 { let x = @comptime { n + 1 }  0 }"#);
+    assert!(errs.iter().any(|e| e.contains("comptime-non-static") && e.contains("`n` is not comptime")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn a_port_call_inside_comptime_is_port_forbidden() {
+    // PORTS.md §5's fourth restriction — specified since the document was
+    // written, and the only one of the four that did not bind before #505.
+    for prim in ["port_open", "port_call", "port_close"] {
+        let src = format!("fn main() -> i64 {{ let x = @comptime {{ {}(1) }}  0 }}", prim);
+        let errs = check(&src);
+        assert!(errs.iter().any(|e| e.contains("port-forbidden") && e.contains(prim)),
+            "expected port-forbidden for {}, got: {:?}", prim, errs);
+    }
+}
+
+#[test]
+fn an_extern_fn_call_inside_comptime_is_non_static() {
+    // SPEC.md §5: "An `extern fn` may not be called from `@comptime`".
+    let errs = check(r#"
+        extern fn c_add(x: i32) -> i32
+        fn main() -> i64 { let x = @comptime { c_add(1) }  0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("comptime-non-static") && e.contains("extern fn c_add")),
+        "got: {:?}", errs);
+}
+
+// ─── #578: the extern boundary, and the three constructs that forbid a call ──
+
+#[test]
+fn an_extern_boundary_refuses_a_tensor_parameter() {
+    // Until #578 this checked clean and JIT-compiled clean. At a boundary that
+    // performs no shape, alignment or aliasing check, a silently-accepted
+    // tensor parameter is a segfault waiting for a call site.
+    let errs = check("extern fn bad(t: Tensor[f32, [4]]) -> nil\nfn main() -> i64 { 0 }");
+    assert!(errs.iter().any(|e| e.contains("extern-boundary") && e.contains("`t`")
+                             && e.contains("Tensor[f32, [4]]")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn an_extern_boundary_refuses_a_tensor_return_and_a_tuple() {
+    for (src, what) in [
+        ("extern fn bad(x: i32) -> Tensor[f32, [4]]\nfn main() -> i64 { 0 }", "return"),
+        ("extern fn bad(t: (i32, i32)) -> nil\nfn main() -> i64 { 0 }", "tuple"),
+        ("extern fn bad(t: [i32; 4]) -> nil\nfn main() -> i64 { 0 }", "array"),
+        ("extern fn bad(p: *Tensor[f32, [4]]) -> nil\nfn main() -> i64 { 0 }", "pointee"),
+    ] {
+        let errs = check(src);
+        assert!(errs.iter().any(|e| e.contains("extern-boundary")),
+            "no extern-boundary for the {} case: {:?}", what, errs);
+    }
+}
+
+#[test]
+fn an_extern_boundary_admits_scalars_pointers_and_nil() {
+    // The positive rule the spec states, exhaustively: scalar types, raw
+    // pointers `*T`, and `nil`. `str` is a scalar type, so the *checker*
+    // admits it — the JIT refuses it separately (`jit-extern`), because a
+    // demoniC `str` is not a `char*`. Narrowing here instead would be a
+    // change to shipped surface under `STABILITY.md §3`.
+    let errs = check(r#"
+        extern fn ok1(a: i8, b: i16, c: i32, d: i64, e: u8, f: u32, g: u64) -> i64
+        extern fn ok2(a: f32, b: f64, c: bool, d: str) -> f64
+        extern fn ok3(p: *f32, q: *nil, n: i64) -> *f32
+        extern fn ok4(x: i32) -> nil
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.is_empty(), "an admissible boundary was rejected: {:?}", errs);
+}
+
+#[test]
+fn an_extern_fn_call_is_forbidden_in_the_three_effect_constructs() {
+    // The spec's `extern fn` rules name four constructs. `@comptime` is
+    // covered by its own total ban on calls (the test above); these are the
+    // other three, and they were unenforced before #578.
+    //
+    // The `@deterministic` row is what makes "no foreign accumulation order
+    // inside `@deterministic`" a property of the language rather than of one
+    // kernel-selection arm — see `docs/design/EXTERN_FN_LOWERING.md §3`.
+    for (src, what) in [
+        ("extern fn c_add(x: i32) -> i32\n\
+          fn main() -> i64 { let v = @deterministic { c_add(1) }  v as i64 }",
+         "`@deterministic` block"),
+        ("extern fn c_add(x: i32) -> i32\n\
+          fn main() -> i64 { let v = @fuse { c_add(1) }  v as i64 }",
+         "`@fuse` block"),
+        ("extern fn c_add(x: i32) -> i32\n\
+          @grad fn g(!w: Tensor[f32, [2]]) -> f32 { (c_add(1) as f32) + sum(w) }\n\
+          fn main() -> i64 { 0 }",
+         "`@grad fn`"),
+    ] {
+        let errs = check(src);
+        assert!(errs.iter().any(|e| e.contains("extern-context") && e.contains(what)),
+            "no extern-context naming {} in: {:?}", what, errs);
+    }
+}
+
+#[test]
+fn an_extern_fn_call_outside_those_constructs_is_fine() {
+    // The ban is scoped to the three constructs, not to `extern fn` generally
+    // — the fast path #578 exists for is an ordinary call in ordinary code.
+    let errs = check("extern fn c_add(x: i32) -> i32\n\
+                      fn main() -> i64 { c_add(1) as i64 }");
+    assert!(errs.is_empty(), "got: {:?}", errs);
+}
+
+#[test]
+fn a_user_fn_call_inside_comptime_is_non_static() {
+    // v1 admits no call at all — that total ban is what makes the effect gate
+    // structural, with no interprocedural scan to get wrong.
+    let errs = check(r#"
+        fn helper(x: i64) -> i64 { x + 1 }
+        fn main() -> i64 { let x = @comptime { helper(2) }  0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("comptime-non-static") && e.contains("call to `helper`")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn non_integer_constructs_inside_comptime_are_non_static() {
+    // One assertion per construct, each naming itself in the diagnostic.
+    for (body, noun) in [
+        ("[1.0, 2.0]",            "a tensor literal"),
+        ("\"hi\"",                "a string literal"),
+        ("(1, 2)",                "a tuple"),
+        ("1 as f32",              "`as`"),
+        ("@cast(bf16) { 1 }",     "a nested directive"),
+    ] {
+        let src = format!("fn main() -> i64 {{ let x = @comptime {{ {} }}  0 }}", body);
+        let errs = check(&src);
+        assert!(errs.iter().any(|e| e.contains("comptime-non-static") && e.contains(noun)),
+            "expected {} to be refused as {}, got: {:?}", body, noun, errs);
+    }
+}
+
+#[test]
+fn a_non_terminating_comptime_exhausts_the_budget() {
+    // COMPTIME_V1.md §6. Loops are in the fold set, so this is the rule that
+    // stops a `@comptime` from hanging the compiler rather than failing it.
+    let errs = check(r#"
+        fn main() -> i64 { let x = @comptime { let !i = 0  loop { i += 1 }  i }  0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("comptime-budget") && e.contains("may not terminate")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn comptime_may_not_assign_to_a_binding_it_did_not_make() {
+    // A fold that wrote through to the surrounding program would be an effect,
+    // which is the one thing compile-time evaluation may not have.
+    let errs = check(r#"
+        fn main() -> i64 { let !a = 1  let x = @comptime { a = 2  a }  0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("comptime-non-static") && e.contains("did not bind")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn comptime_on_a_fn_is_refused_by_attachment() {
+    // DIRECTIVES.md §1 gives the attachment as *block*. Honouring only that is
+    // what stops the directive being a silent no-op one level up — the same
+    // shape as `@inplace`'s and `@fuse`'s attachment rules.
+    let errs = check(r#"
+        @comptime
+        fn f() -> i64 { 1 }
+        fn main() -> i64 { f() }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("`@comptime` on a `fn`")), "got: {:?}", errs);
 }
 
 #[test]
@@ -5562,6 +5875,53 @@ fn casts_involving_unmodelled_types_are_not_refused_550() {
         "a dynamically-typed map read still casts");
 }
 
+/// (6) inside a SHAPE-GENERIC body. Every case above is written at the top
+/// level, where the checker has concrete types for everything; a generic body
+/// is the environment where it does not, and the cast rule has to hold there
+/// too. Two ways it could fail: refuse a legal cast because a shape parameter
+/// made the surrounding types unresolved, or wave an illegal one through for
+/// the same reason — the second being the #550 hole re-opened one scope in.
+#[test]
+fn cast_legality_holds_inside_a_generic_body_550() {
+    // Illegal: `str` has no numeric reading here either, and the message must
+    // be the same one the top-level form gets.
+    let errs = check(
+        "fn g[N](x: Tensor[f32, [N]]) -> i64 {\n\
+         let s: str = \"abc\"\n\
+         (s as i64) + N\n\
+         }\n\
+         fn main() -> i64 { let t = forge.zeros[f32, [2]]  g(t) }\n",
+    );
+    assert!(errs.iter().any(|e| e == "cannot convert `str` to `i64`"),
+        "an illegal cast in a generic body must be refused, got {errs:?}");
+
+    // Legal, and must stay legal: a concrete-to-concrete scalar cast whose
+    // operand happens to live beside a shape parameter.
+    assert!(passes(
+        "fn g[N](x: Tensor[f32, [N]]) -> i64 {\n\
+         let a: i32 = 1\n\
+         (a as i64) + N\n\
+         }\n\
+         fn main() -> i64 { let t = forge.zeros[f32, [2]]  g(t) }\n"),
+        "a legal scalar cast must not be refused just for sharing a scope with `N`");
+
+    // The elementwise tensor cast keeps the shape PARAMETER, rather than
+    // collapsing to a scalar or to an unresolved shape.
+    assert!(passes(
+        "fn g[N](x: Tensor[f32, [N]]) -> Tensor[i64, [N]] { x as i64 }\n\
+         fn main() -> i64 { let t = forge.zeros[f32, [2]]  let u = g(t)  u[0] }\n"),
+        "an elementwise cast in a generic body yields Tensor[i64, [N]]");
+
+    // …and typed as the bare scalar it is still the #550 soundness hole, with
+    // `N` carried into the diagnostic rather than erased to a placeholder.
+    let errs = check(
+        "fn g[N](x: Tensor[f32, [N]]) -> i64 { x as i64 }\n\
+         fn main() -> i64 { let t = forge.zeros[f32, [2]]  g(t) }\n",
+    );
+    assert!(errs.iter().any(|e| e.contains("returns `I64`") && e.contains("Tensor[I64, [N]]")),
+        "the generic elementwise cast must not type as a scalar, got {errs:?}");
+}
+
 /// #549 fixed the recursion into a cast's operand and left the cast alone.
 /// Both halves must now fire, and the operand's own diagnostics must not be
 /// swallowed by the new one.
@@ -5651,4 +6011,254 @@ fn a_rebound_trit_binding_stops_being_a_trit_533() {
         "the name now holds an f32 tensor: {:?}",
         check("fn main() -> str { let !t = forge.trit[2, 2]  \
                                   let t = forge.zeros[f32, [2]]  port_tensor_encode(t) }"));
+}
+
+// ── #562: `..` range slabs with a shape-parameter bound ───────────────────
+//
+// `x[0 .. S]` parses as `IndexElem::Expr(Expr::Range)`, not
+// `IndexElem::Slice` — interp.rs and jit.rs both already special-case that
+// (see their own "#276" / "not `IndexElem::Slice`" comments). The checker's
+// `PostfixOp::Index` arm didn't: it tested `matches!(e, IndexElem::Expr(_))`
+// to mean "plain scalar index", which is also true of a `Range`-wrapping
+// `Expr`, so `x[0..S]` read as one scalar index and collapsed the whole
+// tensor to its element type. The colon spelling (`x[0:S]`) went through
+// `IndexElem::Slice` and *looked* right only because the non-scalar branch
+// returned bare `Unknown` — permissive enough to duck any shape mismatch,
+// not an actually-correct derived shape. Both are covered below via
+// `classify_index_axis`/`derive_slice_shape`, the one place that now decides
+// scalar-vs-slice and the sliced shape for every spelling.
+
+/// The issue's own repro: a `..` slab whose end is a bare shape parameter,
+/// passed across a function boundary that expects a tensor.
+#[test]
+fn range_slab_with_shape_param_end_types_as_tensor_562() {
+    let src = "\
+        fn take[N](t: Tensor[f32, [N]]) -> f32 { sum(t) } \
+        fn demo[S](x: Tensor[f32, [S]]) -> nil { \
+            let v = x[0 .. S] \
+            let _ = take(v) \
+            nil \
+        }";
+    assert!(passes(src), "expected Check OK, got {:?}", check(src));
+}
+
+/// The other repro in the issue: a derived extent (`S / 2`), not just a bare
+/// shape parameter. `SymDim` can represent `S/2` (it has `Div`), so this must
+/// type as `Tensor[F32, [(S/2)]]`, not fall back to `Unknown`.
+#[test]
+fn range_slab_with_derived_extent_types_precisely_562() {
+    let right = "\
+        fn take_half[H](t: Tensor[f32, [H]]) -> f32 { sum(t) } \
+        fn demo[S](x: Tensor[f32, [S]]) -> nil { \
+            let v = x[0 .. S / 2] \
+            let _ = take_half(v) \
+            nil \
+        }";
+    assert!(passes(right), "expected Check OK, got {:?}", check(right));
+
+    // Prove the shape is the real derived extent and not merely "some
+    // tensor": binding it against an incompatible CONSTANT shape must still
+    // be rejected. If this passed, the slab would be typing as `Unknown`
+    // (or any other shape-erasing fallback) again, not as `S/2`.
+    let wrong = "\
+        fn take99(t: Tensor[f32, [99]]) -> f32 { sum(t) } \
+        fn demo[S](x: Tensor[f32, [S]]) -> nil { \
+            let v = x[0 .. S / 2] \
+            let _ = take99(v) \
+            nil \
+        }";
+    assert!(!passes(wrong), "a [99]-shaped param must reject a derived (S/2) arg");
+}
+
+/// The colon spelling of the same slab. Before the fix this passed `--check`
+/// for the wrong reason (the non-scalar branch returned `Unknown`, which is
+/// argument-compatible with anything); pin that it now passes for the RIGHT
+/// reason by also rejecting an incompatible constant shape, the same way the
+/// `..` spelling does above.
+#[test]
+fn colon_slab_with_shape_param_end_is_precise_not_unknown_562() {
+    let right = "\
+        fn take_half[H](t: Tensor[f32, [H]]) -> f32 { sum(t) } \
+        fn demo[S](x: Tensor[f32, [S]]) -> nil { \
+            let v = x[0 : S / 2] \
+            let _ = take_half(v) \
+            nil \
+        }";
+    assert!(passes(right), "expected Check OK, got {:?}", check(right));
+
+    let wrong = "\
+        fn take99(t: Tensor[f32, [99]]) -> f32 { sum(t) } \
+        fn demo[S](x: Tensor[f32, [S]]) -> nil { \
+            let v = x[0 : S / 2] \
+            let _ = take99(v) \
+            nil \
+        }";
+    assert!(!passes(wrong),
+        "colon-form slab must be precise too, not an Unknown that swallows a [99] mismatch: {:?}",
+        check(wrong));
+}
+
+/// Literal bounds must be exactly as precise as shape-parameter bounds: the
+/// derived extent is a concrete `Const`, and a mismatched fixed-size param
+/// must still be rejected (this used to collapse to the element scalar too,
+/// just like the shape-param case — the bug was never about `..` vs `:`, or
+/// about literals vs shape params, only about the combination).
+#[test]
+fn range_slab_with_literal_bounds_types_precisely_562() {
+    let right = "\
+        fn take3(t: Tensor[f32, [3]]) -> f32 { sum(t) } \
+        fn demo(x: Tensor[f32, [4]]) -> nil { \
+            let v = x[0 .. 3] \
+            let _ = take3(v) \
+            nil \
+        }";
+    assert!(passes(right), "expected Check OK, got {:?}", check(right));
+
+    let wrong = "\
+        fn take4(t: Tensor[f32, [4]]) -> f32 { sum(t) } \
+        fn demo(x: Tensor[f32, [4]]) -> nil { \
+            let v = x[0 .. 3] \
+            let _ = take4(v) \
+            nil \
+        }";
+    assert!(!passes(wrong), "a [3]-shaped slab must reject a [4]-shaped param: {:?}", check(wrong));
+}
+
+/// A bare `..` (full axis, `IndexElem::FullSlice`) keeps a shape-parametric
+/// dim unchanged — the pre-existing case `classify_index_axis` must not
+/// regress.
+#[test]
+fn full_slice_keeps_shape_param_dim_562() {
+    let src = "\
+        fn take[N](t: Tensor[f32, [N]]) -> f32 { sum(t) } \
+        fn demo[S](x: Tensor[f32, [S]]) -> nil { \
+            let v = x[..] \
+            let _ = take(v) \
+            nil \
+        }";
+    assert!(passes(src), "expected Check OK, got {:?}", check(src));
+}
+
+/// Mixed indexing: a scalar axis (dropped) alongside a `..` slab on a second
+/// axis (derived). Exercises `derive_slice_shape`'s per-axis dispatch, not
+/// just the single-axis case in the issue.
+#[test]
+fn scalar_and_range_slab_mix_on_rank2_562() {
+    let src = "\
+        fn take[N](t: Tensor[f32, [N]]) -> f32 { sum(t) } \
+        fn demo[M, N](t: Tensor[f32, [M, N]]) -> nil { \
+            let row = t[0, 0 .. N] \
+            let _ = take(row) \
+            nil \
+        }";
+    assert!(passes(src), "expected Check OK, got {:?}", check(src));
+}
+
+/// A slice this can't reason about symbolically (a stepped slice, `a:b:c`)
+/// must fall back to `Unknown` rather than assert a wrong shape — the task's
+/// explicit caution: "a wrong shape is worse than the current error". This
+/// pins the fallback, not a regression of the stepped-slice case (which
+/// was, and remains, permissive).
+#[test]
+fn stepped_slice_still_falls_back_to_unknown_not_a_wrong_shape_562() {
+    let src = "fn main() -> nil { \
+        let t = forge.zeros[f32, [4]] \
+        let v = t[0:4:2] \
+        print(sum(v) as i64) \
+        nil \
+    }";
+    assert!(passes(src), "stepped slice must stay permissive (Unknown), got {:?}", check(src));
+}
+
+/// A negative-literal bound needs Python-style from-the-end resolution,
+/// which `derive_slice_shape` explicitly declines to model (see
+/// `is_negative_literal`) — must stay permissive (`Unknown`), not compute
+/// `dim - (-2)` as if it were a plain offset from zero.
+#[test]
+fn negative_literal_bound_still_falls_back_to_unknown_562() {
+    let src = "fn main() -> nil { \
+        let t = forge.zeros[f32, [4]] \
+        let v = t[-2 .. 4] \
+        print(sum(v) as i64) \
+        nil \
+    }";
+    assert!(passes(src), "negative bound must stay permissive (Unknown), got {:?}", check(src));
+}
+
+/// Regression guard for the pre-#562 behavior this must NOT touch: a plain
+/// all-scalar index (no slice/full-slice elem anywhere) still prunes the
+/// shape per-axis and still catches a static out-of-bounds constant index.
+#[test]
+fn scalar_only_indexing_is_unaffected_by_the_slab_fix_562() {
+    assert!(passes(
+        "fn main() -> nil { let t = forge.zeros[f32, [4, 8]]  let row = t[0]  nil }"),
+        "scalar indexing on a rank-2 tensor must still prune to the remaining axis");
+    let oob = check(
+        "fn main() -> nil { let t = forge.zeros[f32, [4]]  let x = t[9]  nil }");
+    assert!(oob.iter().any(|m| m.contains("out of bounds")),
+        "static OOB on a constant scalar index must still be caught: {:?}", oob);
+}
+
+// ── #575: `embed`'s `ids` argument must be an integer tensor ────────────────
+//
+// STDLIB.md §3.6 declares `embed(vocab, ids)` with `ids: Tensor[i64, [...B]]`.
+// Nothing enforced that at `--check` time — a float `ids` tensor passed
+// clean, the interpreter then gathered rows by truncating the float index,
+// and the JIT refused with `` `embed`: ids must be an integer tensor `` at
+// `dmc jit`. That backend split was the bug (deliberately left alone as a
+// checker hole, not a JIT gap, by #577's refusal-classification sweep): an
+// index has no defined meaning as a float, so the checker should have
+// rejected the program before either backend ever saw it.
+
+const EMBED_INDEX_TYPE_REFUSAL_PREFIX: &str = "embed-index-type: `embed`'s `ids` argument";
+
+/// The exact repro from #575: a float `ids` tensor now fails `--check`
+/// instead of passing and diverging between backends.
+#[test]
+fn embed_refuses_a_float_ids_tensor_575() {
+    let src = "fn main() -> nil { \
+        let !table = forge.zeros[f32, [4, 2]] \
+        table[0, 0] = 1.0   table[1, 0] = 2.0 \
+        let !ids = forge.zeros[f32, [2]] \
+        ids[0] = 1.0 \
+        let out = embed(table, ids) \
+        print(out[0, 0]) \
+        nil \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.starts_with(EMBED_INDEX_TYPE_REFUSAL_PREFIX)
+                                 && e.contains("Tensor[F32, [2]]")),
+        "expected an embed-index-type refusal naming the float tensor type, got {errs:?}");
+}
+
+/// Both integer element types the two backends actually accept (`i64`, and
+/// `i32` per the JIT's `ScalarKind::I32` arm) stay legal — this is a type
+/// check, not a ban on `embed` gaining new callers.
+#[test]
+fn embed_still_accepts_integer_ids_575() {
+    for ty in ["i64", "i32"] {
+        let src = format!(
+            "fn main() -> nil {{ \
+                let table = forge.zeros[f32, [4, 2]] \
+                let ids = forge.zeros[{ty}, [2]] \
+                let out = embed(table, ids) \
+                print(out[0, 0]) \
+                nil \
+            }}");
+        assert!(passes(&src), "Tensor[{ty}, ...] ids must stay legal, got {:?}", check(&src));
+    }
+}
+
+/// An `Unknown`-typed `ids` (e.g. the `any` escape hatch, #186 — demoniC has
+/// no user-level generic element type, so this is the realistic way a call
+/// site's `ids` type comes in undetermined) must not be flagged — the check
+/// only fires when the element type is known and provably non-integral, per
+/// the same conservatism as the neighboring `#533` trit check.
+#[test]
+fn embed_leaves_unknown_ids_type_alone_575() {
+    let src = "fn call_embed(vocab: Tensor[f32, [4, 2]], ids: any) -> nil { \
+        let out = embed(vocab, ids) \
+        nil \
+    }";
+    assert!(passes(src), "an `any`-typed ids must not be flagged, got {:?}", check(src));
 }

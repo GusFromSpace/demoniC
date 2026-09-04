@@ -78,6 +78,24 @@ impl PortBan {
                  and no port carries one yet",
         }
     }
+
+    /// #578: why this construct cannot contain an `extern fn` call. Same three
+    /// constructs, different reasons — the gradient tape and the fusion pass
+    /// fail on any opaque call, but `@deterministic` fails on a specific
+    /// property of foreign code: its accumulation order is not this
+    /// language's to fix.
+    fn extern_because(self) -> &'static str {
+        match self {
+            PortBan::GradFn =>
+                "a foreign call is a hard non-differentiable barrier — the tape \
+                 cannot record what it does",
+            PortBan::Fuse =>
+                "no fusion crosses a foreign call, so the block cannot be one kernel",
+            PortBan::Deterministic =>
+                "foreign code accumulates in its own order, which this language \
+                 does not fix and cannot reproduce",
+        }
+    }
 }
 
 /// PORTS.md §5: does this directive stack forbid port calls in what it wraps?
@@ -158,6 +176,12 @@ pub struct Checker {
     /// are rejected here with a `port-forbidden` diagnostic. Outermost wins:
     /// the diagnostic names the construct the call first escaped.
     port_ban: Option<PortBan>,
+    /// #578: the names declared `extern fn`, so a call to one can be rejected
+    /// in the three constructs the spec's `extern fn` rules forbid — the same
+    /// three `port_ban` already tracks, for the same reason: a foreign call is
+    /// an effect boundary. `env.functions` cannot answer this; it holds every
+    /// signature under one key space.
+    extern_fns: std::collections::HashSet<String>,
     pub checked_modules: HashMap<PathBuf, ModuleEnv>,
     /// Demon mode: the Control Art Restriction released. When set, the
     /// safe-mode lint family (`warn()`) is suppressed entirely — raw, full
@@ -188,6 +212,7 @@ impl Checker {
             model_names: std::collections::HashSet::new(),
             typing_callee: false,
             port_ban: None,
+            extern_fns: std::collections::HashSet::new(),
             checked_modules: HashMap::new(),
             demon: false,
             max_file_lines: None,
@@ -503,6 +528,7 @@ impl Checker {
         let ret = e.ret_type.as_ref().map(|t| self.resolve_type(t)).unwrap_or(TyType::Unit);
         self.env.pop_shape_scope();
         self.env.functions.insert(e.name.clone(), FnSig { shape_params, params, ret });
+        self.extern_fns.insert(e.name.clone());
         self.fn_mut_params.insert(
             e.name.clone(),
             e.params.iter().map(|p| p.mutating).collect(),
@@ -589,7 +615,8 @@ impl Checker {
                 // SPEC.md §6.8 / §9: an `extern fn` is always exported in the
                 // linkage sense (foreign symbols are a process-wide resource),
                 // so the `pub` keyword on it is meaningless — and a compile-time
-                // error. Nothing else to check: an extern decl has no body.
+                // error. An extern decl has no body; what remains to check is
+                // the boundary itself.
                 if is_public {
                     self.error(
                         format!(
@@ -600,6 +627,7 @@ impl Checker {
                         e.span.clone(),
                     );
                 }
+                self.check_extern_boundary(e);
             }
             Item::Model(m)    => self.check_model(m),
             Item::TypeAlias(_) => {}
@@ -618,13 +646,73 @@ impl Checker {
         }
     }
 
+    /// #578: enforce the spec's `extern fn` boundary-type rule. Parameter and
+    /// return types are *restricted to* scalar types, raw pointer types `*T`,
+    /// and `nil`; the same section names `Tensor`, `View`, `KV`, `Mesh`,
+    /// `Port`, `model`, tuple and `fn` illegal there. Until this, the rule was
+    /// prose only: `extern fn f(t: Tensor[f32, [4]]) -> str` checked clean and
+    /// JIT-compiled clean, which at a boundary that performs no shape,
+    /// alignment or aliasing check is a segfault waiting for a call site.
+    ///
+    /// The **positive** rule is what is enforced, not the list of examples: the
+    /// first is exhaustive and the second is not. `str` is a scalar type, so it
+    /// is admitted here and refused by the JIT instead (`jit-extern`) — an
+    /// implementation-capability refusal belongs in the JIT subset, which
+    /// `STABILITY.md §4` marks explicitly not-stable, rather than in the
+    /// checker, where narrowing past the spec's own rule would be a change to
+    /// shipped surface under `STABILITY.md §3`.
+    fn check_extern_boundary(&mut self, e: &ExternFnDecl) {
+        // A shape-generic extern decl is refused by the JIT; here the shape
+        // scope only has to exist so an annotation naming a shape param
+        // resolves to a dim rather than cascading an "undefined" error.
+        self.env.push_shape_scope();
+        for sp in &e.shape_params {
+            self.env.bind_shape_param(&sp.name, None);
+        }
+        for p in &e.params {
+            if let Some(ast_ty) = &p.ty {
+                let ty = self.resolve_type(ast_ty);
+                if !extern_boundary_ty_ok(&ty) {
+                    self.error(
+                        format!(
+                            "extern-boundary: parameter `{}` of `extern fn {}` has type `{}` — \
+                             an extern boundary is restricted to scalar types, raw pointers \
+                             `*T`, and `nil`; a tensor crosses as its data pointer (`*f32`) \
+                             plus separately passed extents (see the spec's `extern fn` rules)",
+                            p.name, e.name, render_ty(&ty)),
+                        p.span.clone(),
+                    );
+                }
+            }
+        }
+        if let Some(ret_ty) = &e.ret_type {
+            let ty = self.resolve_type(ret_ty);
+            if !extern_boundary_ty_ok(&ty) {
+                self.error(
+                    format!(
+                        "extern-boundary: `extern fn {}` returns `{}` — an extern boundary is \
+                         restricted to scalar types, raw pointers `*T`, and `nil` \
+                         (see the spec's `extern fn` rules)",
+                        e.name, render_ty(&ty)),
+                    e.span.clone(),
+                );
+            }
+        }
+        self.env.pop_shape_scope();
+    }
+
     /// #369: directives the compiler actually acts on. Any `@ident` parses, so
-    /// a documented-but-unimplemented directive (`@comptime`, `@inplace`,
-    /// `@recompute`) or a typo is otherwise a silent no-op — warn instead of
-    /// quietly doing nothing. (`@host` stays effective via `@host match`.)
+    /// a documented-but-unimplemented directive (`@inplace`, `@recompute`) or
+    /// a typo is otherwise a silent no-op — warn instead of quietly doing
+    /// nothing. (`@host` stays effective via `@host match`.)
+    ///
+    /// #505 removed `@comptime` from the unimplemented set: `comptime.rs`
+    /// folds it before this checker runs, so the warning would now be false —
+    /// the directive has an effect, and on a folded block there is no longer a
+    /// directive here to warn about at all.
     fn lint_unimplemented_directives(&mut self, directives: &[Directive]) {
         const EFFECTIVE: &[&str] =
-            &["grad", "cast", "shard", "tp", "pp", "fuse", "deterministic", "host"];
+            &["grad", "cast", "shard", "tp", "pp", "fuse", "deterministic", "host", "comptime"];
         for d in directives {
             if !EFFECTIVE.contains(&d.name.as_str()) {
                 self.warn(
@@ -646,9 +734,11 @@ impl Checker {
     ///
     /// Two of the six §3 entries are enforced here (`@cast @cast`,
     /// `@fuse @fuse`); `@inplace`'s attachment rule is
-    /// `check_inplace_target`, `@shard`'s is `check_sharding_directives`, and
-    /// the remaining two (`fuse-infeasible`, `comptime-non-static`) are
-    /// properties of directives that do not execute yet.
+    /// `check_inplace_target`, `@shard`'s is `check_sharding_directives`,
+    /// `fuse-infeasible` is `check_fuse_feasible` (#503), and
+    /// `comptime-non-static` is `comptime.rs`, which runs before this checker
+    /// and seeds its diagnostics into `self.errors` (#505). All six are
+    /// enforced.
     fn check_illegal_stack(&mut self, stack: &[Directive], nested: &[&Directive]) {
         for name in ["cast", "fuse"] {
             let mut hits = stack.iter().chain(nested.iter().copied()).filter(|d| d.name == name);
@@ -694,7 +784,7 @@ impl Checker {
             self.error(
                 format!("fuse-infeasible: a `{}` statement inside `@fuse` materializes \
                          an intermediate — the block collapses a single elementwise \
-                         expression (SPEC.md §7.7)", stmt_kind(stmt)),
+                         expression (DIRECTIVES.md §3)", stmt_kind(stmt)),
                 stmt_span(stmt).clone(),
             );
             return;
@@ -702,7 +792,7 @@ impl Checker {
         let Some(tail) = body.tail_expr.as_deref() else {
             self.error(
                 "fuse-infeasible: the `@fuse` block is empty — there is nothing \
-                 to collapse (SPEC.md §7.7)".to_string(),
+                 to collapse (DIRECTIVES.md §3)".to_string(),
                 span.clone(),
             );
             return;
@@ -723,7 +813,7 @@ impl Checker {
             // that writes a tensor, and there is no loop to emit here.
             Ok(FuseLane::Scalar) => self.error(
                 "fuse-infeasible: the fused expression yields a scalar — a fused \
-                 kernel writes a tensor, one lane per element (SPEC.md §7.7)".to_string(),
+                 kernel writes a tensor, one lane per element (DIRECTIVES.md §3)".to_string(),
                 e.span_of(),
             ),
             Ok(FuseLane::Tensor(_)) => {}
@@ -750,7 +840,7 @@ impl Checker {
                     match (l, r) {
                         (FuseLane::Scalar, FuseLane::Scalar) => Err((format!(
                             "fuse-infeasible: `{}` has no tensor operand here — a fused \
-                             lane reads at least one tensor (SPEC.md §7.7)",
+                             lane reads at least one tensor (DIRECTIVES.md §3)",
                             crate::fmt::binop_str(op)), span.clone())),
                         // Two tensor operands pair elements one-to-one: the
                         // fused kernel reads every leaf at one lane offset, so
@@ -762,7 +852,7 @@ impl Checker {
                                 return Err((format!(
                                     "fuse-infeasible: `{}` reads tensors of shapes {} \
                                      and {} — fused lanes pair elements one-to-one, and \
-                                     only float scalars broadcast (SPEC.md §7.7)",
+                                     only float scalars broadcast (DIRECTIVES.md §3)",
                                     crate::fmt::binop_str(op), a, b), span.clone()));
                             }
                             Ok(FuseLane::Tensor(Some(a)))
@@ -776,7 +866,7 @@ impl Checker {
                 }
                 _ => Err((format!(
                     "fuse-infeasible: `{}` is not elementwise — only `.+ .- .* ./ .^ \
-                     .** .< .> .<= .>=` and `\\>` collapse into one kernel (SPEC.md §7.7)",
+                     .** .< .> .<= .>=` and `\\>` collapse into one kernel (DIRECTIVES.md §3)",
                     crate::fmt::binop_str(op)), span.clone())),
             },
             Expr::UnOp { op: UnOp::ReLU, operand, span } => {
@@ -784,7 +874,7 @@ impl Checker {
                     FuseLane::Tensor(s) => Ok(FuseLane::Tensor(s)),
                     FuseLane::Scalar =>
                         Err(("fuse-infeasible: `\\>` (ReLU) needs a tensor operand inside \
-                              `@fuse` (SPEC.md §7.7)".to_string(), span.clone())),
+                              `@fuse` (DIRECTIVES.md §3)".to_string(), span.clone())),
                 }
             }
             Expr::UnOp { op, span, .. } => {
@@ -794,7 +884,7 @@ impl Checker {
                 };
                 Err((format!(
                     "fuse-infeasible: unary `{}` is outside the fusable set — `\\>` \
-                     (ReLU) is its only unary op (SPEC.md §7.7)", tok), span.clone()))
+                     (ReLU) is its only unary op (DIRECTIVES.md §3)", tok), span.clone()))
             }
             Expr::Ident(name, span) => {
                 // An unresolved or unknown-typed name is the normal checker's
@@ -809,12 +899,12 @@ impl Checker {
                                      TyType::Scalar(ScalarType::F32) | TyType::FloatLit(_)) {
                             return Err((format!(
                                 "fuse-infeasible: `{}` is a {} — the fused kernel \
-                                 computes in f32 (SPEC.md §7.7)", name, ty), span.clone()));
+                                 computes in f32 (DIRECTIVES.md §3)", name, ty), span.clone()));
                         }
                         if shape.dims.iter().any(|d| matches!(d, SymDim::Streaming)) {
                             return Err((format!(
                                 "fuse-infeasible: `{}` carries a streaming `~` extent — \
-                                 a fused lane needs a static shape (SPEC.md §7.7)",
+                                 a fused lane needs a static shape (DIRECTIVES.md §3)",
                                 name), span.clone()));
                         }
                         Ok(FuseLane::Tensor(Some(shape.clone())))
@@ -822,13 +912,13 @@ impl Checker {
                     t if t.is_float() => Ok(FuseLane::Scalar),
                     _ => Err((format!(
                         "fuse-infeasible: `{}` is a {} — only f32 tensors and float \
-                         scalars fuse (SPEC.md §7.7)", name, ty), span.clone())),
+                         scalars fuse (DIRECTIVES.md §3)", name, ty), span.clone())),
                 }
             }
             Expr::Literal(Literal::Float(..), _) => Ok(FuseLane::Scalar),
             Expr::Literal(_, span) => Err((
                 "fuse-infeasible: only float literals broadcast into a fused kernel \
-                 (SPEC.md §7.7)".to_string(), span.clone())),
+                 (DIRECTIVES.md §3)".to_string(), span.clone())),
             Expr::Postfix { expr, op: PostfixOp::Call(_), span } => {
                 let callee = match expr.as_ref() {
                     Expr::Ident(n, _) => format!("`{}`", n),
@@ -837,35 +927,35 @@ impl Checker {
                 };
                 Err((format!(
                     "fuse-infeasible: a call to {} does not collapse — calls are \
-                     outside the elementwise set (SPEC.md §7.7)", callee), span.clone()))
+                     outside the elementwise set (DIRECTIVES.md §3)", callee), span.clone()))
             }
             Expr::Postfix { op: PostfixOp::Transpose, span, .. } => Err((
                 "fuse-infeasible: `'` (transpose) is not elementwise — it reorders \
-                 lanes (SPEC.md §7.7)".to_string(), span.clone())),
+                 lanes (DIRECTIVES.md §3)".to_string(), span.clone())),
             Expr::Postfix { op: PostfixOp::Index(_), span, .. } => Err((
                 "fuse-infeasible: indexing does not collapse into a fused lane \
-                 (SPEC.md §7.7)".to_string(), span.clone())),
+                 (DIRECTIVES.md §3)".to_string(), span.clone())),
             Expr::Cast { span, .. } => Err((
                 "fuse-infeasible: an `as` cast is outside the fusable set — cast \
-                 above the block (SPEC.md §7.7)".to_string(), span.clone())),
+                 above the block (DIRECTIVES.md §3)".to_string(), span.clone())),
             Expr::TensorLit(_, span) => Err((
                 "fuse-infeasible: a tensor literal does not fuse — bind it to a `let` \
-                 above the block (SPEC.md §7.7)".to_string(), span.clone())),
+                 above the block (DIRECTIVES.md §3)".to_string(), span.clone())),
             Expr::DirectiveBlock { directives, span, .. } => {
                 let name = directives.first()
                     .map(|d| format!("`@{}`", d.name))
                     .unwrap_or_else(|| "directive".to_string());
                 Err((format!(
                     "fuse-infeasible: a {} block inside `@fuse` does not collapse — \
-                     wrap `@fuse` in it, not the other way (SPEC.md §7.7)", name),
+                     wrap `@fuse` in it, not the other way (DIRECTIVES.md §3)", name),
                     span.clone()))
             }
             Expr::If(_) | Expr::Match(_) => Err((
                 "fuse-infeasible: control flow inside `@fuse` breaks the single-pass \
-                 contract (SPEC.md §7.7)".to_string(), e.span_of())),
+                 contract (DIRECTIVES.md §3)".to_string(), e.span_of())),
             other => Err((
                 "fuse-infeasible: this expression is outside the fusable set — only \
-                 elementwise ops over f32 tensor operands collapse (SPEC.md §7.7)"
+                 elementwise ops over f32 tensor operands collapse (DIRECTIVES.md §3)"
                     .to_string(), other.span_of())),
         }
     }
@@ -1428,15 +1518,25 @@ impl Checker {
         // annotation: an explicit `let k: KV[..] = forge.ones[..]` must not be
         // treated as a plain tensor (and would round-trip the wrong type anyway).
         if let Pattern::Ident(name, _) = &l.pattern {
-            let ctor_shape = if l.ty.is_none() {
-                ctor_tensor_ty(&l.value).and_then(|t| match t {
-                    TyType::Tensor(_, s) => Some(s),
-                    _ => None,
-                })
-            } else {
-                None
-            };
+            let ctor_ty = if l.ty.is_none() { ctor_tensor_ty(&l.value) } else { None };
+            let ctor_shape = ctor_ty.as_ref().and_then(|t| match t {
+                TyType::Tensor(_, s) => Some(s.clone()),
+                _ => None,
+            });
             self.env.set_ctor_shape(name.clone(), ctor_shape);
+            // #575: same fact, element-type half — see `Env::set_ctor_elem`.
+            // `embed`'s `ids` argument check needs to see e.g. `f32` on a
+            // bound `let ids = forge.zeros[f32, [2]]` even though `ids`
+            // itself types as `Unknown` (constructors deliberately report
+            // `Unknown`, #248 above), the same way its shape survives.
+            let ctor_elem = ctor_ty.and_then(|t| match t {
+                TyType::Tensor(e, _) => match *e {
+                    TyType::Scalar(s) => Some(s),
+                    _ => None,
+                },
+                _ => None,
+            });
+            self.env.set_ctor_elem(name.clone(), ctor_elem);
             // #533 (PORTS.md §3.2): remember a `forge.trit[K, N]` RHS. The
             // constructor has no element-type argument, so nothing else on this
             // path records that the binding holds a packed ternary tensor — and
@@ -1667,7 +1767,18 @@ impl Checker {
 
     fn check_block(&mut self, block: &Block) -> TyType {
         self.env.push_scope();
+        let ty = self.check_block_body(block);
+        self.env.pop_scope();
+        ty
+    }
 
+    /// The statements and value of `block`, checked in the CURRENT scope.
+    /// `check_block` wraps this in a scope of its own; the trailing
+    /// directive-block arm below calls it directly so the inner `let`s stay
+    /// visible to the enclosing block, and so a body that ends in an `if` /
+    /// `match` STATEMENT (keyword-led, so parsed as a stmt rather than a tail
+    /// expr) yields that statement's value exactly as a plain block does.
+    fn check_block_body(&mut self, block: &Block) -> TyType {
         // If there's no explicit tail expr but the last stmt is a yielding
         // form (directive block, bare expr, stage, or if/match — the latter
         // two are expressions parsed as stmts when at the head of a block),
@@ -1684,7 +1795,7 @@ impl Checker {
             self.check_stmt(stmt);
         }
 
-        let ty = if let Some(tail) = &block.tail_expr {
+        if let Some(tail) = &block.tail_expr {
             self.check_expr(tail)
         } else if deferred_last {
             match &block.stmts[n - 1] {
@@ -1696,15 +1807,10 @@ impl Checker {
                     self.check_illegal_stack(directives, &nested_directive_stack(body));
                     self.check_inplace_target(directives, "a block");
                     self.check_fuse_feasible(directives, body, db_span);
-                    let ty = self.with_port_ban(directives, |c| {
-                        // Walk the body's stmts in the outer scope so lets are visible.
-                        for s in &body.stmts {
-                            c.check_stmt(s);
-                        }
-                        if let Some(t) = &body.tail_expr {
-                            c.check_expr(t)
-                        } else { TyType::Unit }
-                    });
+                    // Walk the body in the outer scope so its lets are visible,
+                    // and take its value the way any block does — a body that
+                    // ends in an `if` / `match` statement yields that value.
+                    let ty = self.with_port_ban(directives, |c| c.check_block_body(body));
                     self.check_sharding_directives(directives, &ty, db_span.clone());
                     ty
                 }
@@ -1723,9 +1829,7 @@ impl Checker {
             TyType::Unknown
         } else {
             TyType::Unit
-        };
-        self.env.pop_scope();
-        ty
+        }
     }
 
     /// True when evaluating `e` has no observable side effect, so discarding its
@@ -2774,6 +2878,36 @@ impl Checker {
         })
     }
 
+    /// #575: the tensor type `embed`'s `ids` argument carries, seen through
+    /// the same `Unknown`-reporting gap `ctor_tensor_fallback` covers for the
+    /// general case — but recovering the *element* half too, where
+    /// `ctor_tensor_fallback` deliberately leaves it `Unknown` (its own doc
+    /// comment: "through the side-table only the shape survives"). The
+    /// element half comes from `Env::lookup_ctor_elem`, #575's counterpart to
+    /// `lookup_ctor_shape`. Returns `Some` only when the element type is
+    /// actually known; a `None` here means "the checker can't tell", never
+    /// "not an integer" — the caller must leave those alone.
+    fn embed_ids_ty(&self, e: &Expr, ty: Option<&TyType>) -> Option<TyType> {
+        if let Some(t) = ty {
+            if let Some((elem, shape)) = t.as_tensor_like() {
+                if !matches!(elem, TyType::Unknown) {
+                    return Some(TyType::Tensor(Box::new(elem.clone()), shape.clone()));
+                }
+            }
+        }
+        if let Some(t @ TyType::Tensor(_, _)) = ctor_tensor_ty(e) {
+            return Some(t);
+        }
+        if let Expr::Ident(name, _) = e {
+            if let (Some(elem), Some(shape)) =
+                (self.env.lookup_ctor_elem(name), self.env.lookup_ctor_shape(name))
+            {
+                return Some(TyType::Tensor(Box::new(TyType::Scalar(elem.clone())), shape.clone()));
+            }
+        }
+        None
+    }
+
     /// #550: type an `expr as Type`, rejecting a cast the language defines no
     /// conversion for. Reuses the JIT's wording — `cannot convert `str` to
     /// `i64`` — because the JIT already refuses exactly these programs and the
@@ -3426,32 +3560,41 @@ impl Checker {
             PostfixOp::Index(elems) => {
                 if !is_callee { self.reject_uncalled_method_bracket(expr, op, &span); }
                 if let Some(ty) = self.tensor_split_type(expr, op) { return ty; }
-                // Type-check each index expr; result shape pruned per scalar indices.
+                // Type-check each index expr; result shape pruned per scalar
+                // indices. #562: `t[a..b]` parses as `IndexElem::Expr(Expr::Range)`
+                // (see parser.rs's `parse_index_elem_or_arg`, and jit.rs/interp.rs's
+                // own "not `IndexElem::Slice`" notes), so its bounds must be
+                // checked explicitly here too — `check_expr` on a bare `Expr::Range`
+                // returns `Unknown` without recursing into `start`/`end`.
                 for e in elems {
-                    if let IndexElem::Expr(e) = e {
-                        let _ = self.check_expr(e);
-                    } else if let IndexElem::Slice { start, end, step, .. } = e {
-                        if let Some(e) = start.as_deref() { let _ = self.check_expr(e); }
-                        if let Some(e) = end.as_deref()   { let _ = self.check_expr(e); }
-                        if let Some(e) = step.as_deref()  { let _ = self.check_expr(e); }
+                    match classify_index_axis(e) {
+                        IndexAxis::Scalar(e) => { let _ = self.check_expr(e); }
+                        IndexAxis::Full => {}
+                        IndexAxis::Slice { start, end, step, .. } => {
+                            if let Some(e) = start { let _ = self.check_expr(e); }
+                            if let Some(e) = end   { let _ = self.check_expr(e); }
+                            if let Some(e) = step  { let _ = self.check_expr(e); }
+                        }
                     }
                 }
-                // Only return element type for full scalar indexing (no slice elems).
-                let all_scalar = elems.iter().all(|e| matches!(e, IndexElem::Expr(_)));
+                // #248: fall back to the constructor shape when the receiver
+                // is a literal `forge.zeros[..]` or a binding whose RHS was one
+                // (via the side-table), so static OOB is caught without
+                // enriching (and contaminating) binding types.
+                let recv_shape = recv.as_tensor_like()
+                    .map(|(t, s)| (t.clone(), s.clone()))
+                    .or_else(|| ctor_tensor_ty(expr).and_then(|t|
+                        t.as_tensor_like().map(|(e, s)| (e.clone(), s.clone()))))
+                    .or_else(|| match expr {
+                        Expr::Ident(name, _) => self.env.lookup_ctor_shape(name)
+                            .map(|s| (TyType::Unknown, s.clone())),
+                        _ => None,
+                    });
+                // Only return element type for full scalar indexing (no slice
+                // elems anywhere in the bracket) — `..` and `:` are two
+                // spellings of the same axis-slice and must agree (#562).
+                let all_scalar = elems.iter().all(|e| matches!(classify_index_axis(e), IndexAxis::Scalar(_)));
                 if all_scalar {
-                    // #248: fall back to the constructor shape when the receiver
-                    // is a literal `forge.zeros[..]` or a binding whose RHS was one
-                    // (via the side-table), so static OOB is caught without
-                    // enriching (and contaminating) binding types.
-                    let recv_shape = recv.as_tensor_like()
-                        .map(|(t, s)| (t.clone(), s.clone()))
-                        .or_else(|| ctor_tensor_ty(expr).and_then(|t|
-                            t.as_tensor_like().map(|(e, s)| (e.clone(), s.clone()))))
-                        .or_else(|| match expr {
-                            Expr::Ident(name, _) => self.env.lookup_ctor_shape(name)
-                                .map(|s| (TyType::Unknown, s.clone())),
-                            _ => None,
-                        });
                     if let Some((elem_ty, shape)) = recv_shape {
                         // #248: static out-of-bounds on a constant index into a
                         // constant axis is a compile-time error (SPEC §417).
@@ -3486,6 +3629,24 @@ impl Checker {
                         let remaining = shape.dims[elems.len()..].to_vec();
                         return TyType::Tensor(Box::new(elem_ty.clone()), Shape::new(remaining));
                     }
+                    return TyType::Unknown;
+                }
+                // #562: at least one elem is a slice/full-slice — the result is
+                // a tensor, never the element type. Derive the real sliced shape
+                // when every slice axis' extent is expressible in the SymDim
+                // algebra (handles both `x[0..S]` and the derived `x[0..S/2]`);
+                // fall back to `Unknown` rather than assert a shape that might
+                // be wrong (e.g. a stepped slice, or a negative-literal bound
+                // that needs Python-style from-the-end resolution).
+                if let Some((elem_ty, shape)) = recv_shape {
+                    if !matches!(elem_ty, TyType::Unknown) {
+                        if let Some(mut dims) = derive_slice_shape(elems, &shape) {
+                            if elems.len() < shape.rank() {
+                                dims.extend(shape.dims[elems.len()..].iter().cloned());
+                            }
+                            return TyType::Tensor(Box::new(elem_ty.clone()), Shape::new(dims));
+                        }
+                    }
                 }
                 TyType::Unknown
             }
@@ -3515,6 +3676,25 @@ impl Checker {
                             self.error(
                                 format!("port-forbidden: `{}` is illegal inside a {} — {} \
                                          (PORTS.md §5)", name, ban.what(), ban.because()),
+                                span.clone(),
+                            );
+                        }
+                        // #578: the spec's `extern fn` rules forbid a call from
+                        // exactly these three constructs, for the same reason
+                        // the port rule above does — a foreign call is an
+                        // effect boundary. `@comptime` is the fourth, already
+                        // enforced by its own total ban on calls
+                        // (`comptime-non-static`), so it is not repeated here.
+                        //
+                        // The `@deterministic` row is what makes "no foreign
+                        // accumulation order inside `@deterministic`" a
+                        // property of the language rather than of one
+                        // kernel-selection arm (#578's BLAS fast path).
+                        else if self.extern_fns.contains(name) {
+                            self.error(
+                                format!("extern-context: `extern fn {}` is illegal inside a {} \
+                                         — {} (see the spec's `extern fn` rules)",
+                                        name, ban.what(), ban.extern_because()),
                                 span.clone(),
                             );
                         }
@@ -3605,6 +3785,38 @@ impl Checker {
                                     "{}: a `trit` tensor has no copy-mode wire dtype \
                                      (PORTS.md §3.2)", name),
                                     span.clone());
+                            }
+                        }
+                    }
+                }
+
+                // #575: `embed(vocab, ids)` declares `ids: Tensor[i64, [...B]]`
+                // (STDLIB.md §3.6), but nothing enforced it — a float `ids`
+                // tensor passed `--check` clean. The two backends then
+                // disagreed at run time: the interpreter truncated each float
+                // id and gathered the row, while the JIT refused with `` `embed`:
+                // ids must be an integer tensor ``. That split is the bug, not
+                // the JIT's refusal (deliberately not reclassified as a JIT gap
+                // in #577's sweep) — an index has no defined meaning as a
+                // float, so this is a hole in the checker's acceptance, and the
+                // fix is to close it here rather than teach the JIT to accept
+                // what the interpreter was wrong to allow. Scoped to the case
+                // the checker can actually decide: `ids` typed as a tensor with
+                // a known, non-integral element type. An `Unknown` element (an
+                // opaque or already-errored expression) is left alone rather
+                // than risk a cascade.
+                if let Expr::Ident(name, _) = expr {
+                    if name == "embed" {
+                        if let Some(CallArg::Positional(ids_expr)) = args.get(1) {
+                            if let Some(ids_full_ty) = self.embed_ids_ty(ids_expr, arg_tys.get(1)) {
+                                let elem_is_integral = ids_full_ty.as_tensor_like()
+                                    .is_some_and(|(e, _)| e.is_integral());
+                                if !elem_is_integral {
+                                    self.error(format!(
+                                        "embed-index-type: `embed`'s `ids` argument must be an \
+                                         integer tensor (STDLIB.md §3.6), got {}", ids_full_ty),
+                                        span.clone());
+                                }
                             }
                         }
                     }
@@ -4354,6 +4566,89 @@ fn is_vault_ctor(expr: &Expr) -> bool {
     }
 }
 
+/// #562: a single index-bracket element, classified for shape-typing.
+/// `t[a..b]` (an `IndexElem::Expr(Expr::Range)`) and `t[a:b]` (an
+/// `IndexElem::Slice`) are two parses of the same axis-slice concept —
+/// jit.rs's `classify_index`/`classify_index_static` and interp.rs's
+/// `eval_index_elems` already unify them (see the "#276" / "not
+/// `IndexElem::Slice`" comments there). The checker didn't: `PostfixOp::Index`
+/// used to test `matches!(e, IndexElem::Expr(_))` to decide "is this whole
+/// bracket a plain scalar index", which is also true of `IndexElem::Expr(Range)`
+/// — so `x[0..S]` read as a single scalar index and collapsed the result to
+/// the tensor's element type instead of a sliced tensor. This is the one
+/// place that decides "scalar vs. slice" for the checker; every caller in
+/// this file goes through it so the two spellings can't drift apart again.
+enum IndexAxis<'a> {
+    /// A single scalar index — drops the axis.
+    Scalar(&'a Expr),
+    /// `..` alone (full axis) — keeps the axis at its current extent.
+    Full,
+    /// `a..b` / `a..=b` / `a:b` / `a:b:c` — keeps the axis at a derived extent.
+    Slice { start: Option<&'a Expr>, end: Option<&'a Expr>, step: Option<&'a Expr>, inclusive: bool },
+}
+
+fn classify_index_axis(e: &IndexElem) -> IndexAxis<'_> {
+    match e {
+        IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => IndexAxis::Slice {
+            start: start.as_deref(), end: end.as_deref(), step: None, inclusive: *inclusive,
+        },
+        IndexElem::Expr(e) => IndexAxis::Scalar(e),
+        IndexElem::FullSlice(_) => IndexAxis::Full,
+        IndexElem::Slice { start, end, step, .. } => IndexAxis::Slice {
+            start: start.as_deref(), end: end.as_deref(), step: step.as_deref(), inclusive: false,
+        },
+    }
+}
+
+/// True iff `d` simplifies to a negative constant. A negative slice bound
+/// is Python-style "from the end" (SPEC), not a plain offset from zero —
+/// `derive_slice_shape` can't model that arithmetic, so it bails to
+/// `Unknown` rather than compute a wrong extent (e.g. `dim - (-2)` instead
+/// of the real extent `2`).
+fn is_negative_literal(d: &SymDim) -> bool {
+    matches!(d, SymDim::Const(n) if *n < 0)
+}
+
+/// #562: derive the sliced output shape of an index bracket that contains
+/// at least one slice/full-slice element (mixed with scalar elems is fine —
+/// scalar axes are dropped, same as plain scalar indexing). Returns `None`
+/// when any slice axis' extent isn't expressible in the `SymDim` algebra:
+/// a stepped slice (`a:b:c`, extent needs a ceiling division this doesn't
+/// model), a negative-literal bound, or a bound this can't reduce past
+/// `SymDim::Unknown`. The caller falls back to `TyType::Unknown` in that
+/// case — a wrong shape is worse than the current "can't say" answer.
+fn derive_slice_shape(elems: &[IndexElem], shape: &Shape) -> Option<Vec<SymDim>> {
+    let mut out = Vec::with_capacity(shape.rank());
+    for (i, elem) in elems.iter().enumerate() {
+        if i >= shape.rank() { return None; }
+        let axis_dim = shape.dims[i].clone();
+        match classify_index_axis(elem) {
+            IndexAxis::Scalar(_) => {} // dropped
+            IndexAxis::Full => out.push(axis_dim),
+            IndexAxis::Slice { start, end, step, inclusive } => {
+                if step.is_some() { return None; }
+                let start_dim = match start {
+                    Some(e) => SymDim::from_expr(e).simplify(),
+                    None => SymDim::Const(0),
+                };
+                if is_negative_literal(&start_dim) { return None; }
+                let end_dim = match end {
+                    Some(e) => SymDim::from_expr(e).simplify(),
+                    None => axis_dim,
+                };
+                if is_negative_literal(&end_dim) { return None; }
+                let mut extent = SymDim::Sub(Box::new(end_dim), Box::new(start_dim)).simplify();
+                if inclusive {
+                    extent = SymDim::Add(Box::new(extent), Box::new(SymDim::Const(1))).simplify();
+                }
+                if matches!(extent, SymDim::Unknown) { return None; }
+                out.push(extent);
+            }
+        }
+    }
+    Some(out)
+}
+
 fn ctor_tensor_ty(expr: &Expr) -> Option<TyType> {
     let (base, idxs) = match expr {
         Expr::Postfix { expr: base, op: PostfixOp::Index(idxs), .. } => (base.as_ref(), idxs),
@@ -4532,6 +4827,25 @@ fn cast_result_ty(from: &TyType, to: &TyType) -> TyType {
         }
     }
     to.clone()
+}
+
+/// #578: is `t` a type an `extern fn` boundary admits? The spec restricts a
+/// parameter or return type there to scalar types, raw pointer types `*T`, and
+/// `nil`. A raw pointer's pointee is itself restricted to a scalar type or
+/// `nil` — `*Tensor[f32, [4]]` is not a pointer form the language has.
+///
+/// The literal types are admitted because a defaulted literal concretizes to a
+/// scalar, and `Unknown` is ⊥: an annotation the checker could not resolve has
+/// already produced its own diagnostic, and a second one here would be a
+/// cascade rather than information.
+fn extern_boundary_ty_ok(t: &TyType) -> bool {
+    match t {
+        TyType::Scalar(_) | TyType::IntLit(_) | TyType::FloatLit(_)
+        | TyType::Unit | TyType::Unknown => true,
+        TyType::RawPtr(inner) => matches!(**inner,
+            TyType::Scalar(_) | TyType::Unit | TyType::Unknown),
+        _ => false,
+    }
 }
 
 fn ty_has_no_methods(t: &TyType) -> bool {

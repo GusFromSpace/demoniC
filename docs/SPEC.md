@@ -537,6 +537,16 @@ Slicing never copies. Negative indices count from the end. Static
 out-of-bounds is a compile-time error; dynamic out-of-bounds is a runtime
 panic.
 
+One construct does not end-resolve a negative index. A slice whose start is
+a runtime value but whose extent is statically known (`t[i..i+K]` for a
+compile-time `K`) treats a negative resolved `i` as dynamic out-of-bounds and
+panics, rather than counting from the end: the static extent already fixes
+the window's size, so end-resolving the start would silently change which
+elements a fixed-size window reads. A runtime scalar index (`t[i]`) and a
+runtime slice bound assigned into (`t[a..b] = rhs`) both still end-resolve a
+negative value as everywhere else in this section. Both backends agree on
+the exception.
+
 ### 4.4 Math operators
 
 - `A @ B` — matrix multiply. Both operands must have rank ≥ 2.
@@ -842,12 +852,42 @@ pointer plus separately passed scalar shape arguments. An `extern fn` is
 always visible to importers without `pub` (and `pub` on one is an error). An
 `extern fn` may not be called from `@comptime`, `@grad fn`, `@fuse`, or
 `@deterministic`; autodiff treats any `extern fn` call as a hard
-non-differentiable barrier.
+non-differentiable barrier. Inside `@comptime` the ban is a consequence of
+§7.5's total ban on calls, and is reported as `comptime-non-static` naming
+the `extern fn`.
+
+Both are enforced at check time, under their own diagnostic tags: a
+parameter or return type the boundary does not admit is `extern-boundary`,
+and a call from a forbidden context is `extern-context`. An implementation may
+additionally refuse, as a *backend* limitation rather than a language one,
+an admissible type whose machine width in that backend is not the width the
+annotation names — `str`, and the widths a backend emulates.
+
+**Passing a tensor.** A tensor argument at a `*T` parameter is the
+materialization §3.10 describes. The value passed is the address of element
+zero of the tensor's data in the Forge, row-major, with no header and no
+padding ahead of it, at the tensor's **storage** width — the width the
+element type has in the running backend, not necessarily the width the `*T`
+annotation names. The pointee type is not checked against the tensor's
+element type; `*nil` accepts any tensor.
+
+The pointer is valid for the **dynamic extent of the call only**. A callee
+that retains it is wrong, and `forge.reset()` invalidates every pointer
+previously materialized from a Forge tensor. Access past the tensor's
+element count is out of bounds and unchecked: the callee is told the extents
+by scalar arguments the caller wrote by hand, and nothing verifies they
+agree with the tensor.
 
 The boundary is unsafe by design: the JIT performs no shape, alignment,
-lifetime, or aliasing check across the call. The interpreter parses and
-type-checks `extern fn` declarations but rejects calls to them at runtime;
-foreign calls require `dmc jit`.
+lifetime, or aliasing check across the call. A miscompiled call segfaults;
+the language offers no mitigation. `extern` is the marking, and there is no
+second one. A symbol the process cannot resolve is a JIT refusal
+(`jit-extern`) naming the declaration, not a crash inside the code
+generator.
+
+The interpreter parses and type-checks `extern fn` declarations but rejects
+calls to them at runtime — it has no pointer representation for a tensor to
+hand across. Foreign calls require `dmc jit`.
 
 ## 7. Execution model
 
@@ -901,6 +941,42 @@ integer tensor — it does not run the enclosed ops in integer arithmetic.
 The arm chosen at JIT time is the only one whose opcodes are emitted. The
 host-feature set is interrogated once at startup.
 
+A feature name is a property of the host the program runs on, not
+necessarily of its CPU. Alongside the ISA flags — `avx512`, `avx2`, `neon`
+and the rest of the per-target set — the name **`accelerate`** means a BLAS
+`cblas_sgemm` is resolvable in this process's dynamic symbol table, and
+therefore that a large f32 matmul can reach the platform's matrix unit. It
+is present or absent for the same reason an ISA flag is: a program's arms
+are chosen by what this machine can actually do. Adding a feature name is
+additive and does not change the meaning of any existing one.
+
+### 7.2b Float accumulation contract
+
+`f32` **reductions** (`sum`, `mean`, `variance`, the `*_along` family)
+accumulate at f32 width in index order, rounding after every add. `sum(t)` is
+therefore the same number as the loop it stands for:
+
+```
+let !s = 0.0f32
+for i in 0..len(t) { s = s + t[i] }
+```
+
+`f32` **matmul** (`@`) accumulates over the inner dimension ascending and
+**contracts**: each multiply-add is one fused operation with a single
+rounding. It is consequently *not* the same number as a hand-written
+`s = s + a[i]*b[i]` loop, which rounds twice per step — matmul is a
+primitive with a defined accumulation, not shorthand for that loop.
+Contraction is the more accurate of the two, and it is host-independent:
+where the hardware has no FMA unit the backends fall back to a correctly
+rounded software implementation rather than splitting the operation.
+
+Both rules hold on **both backends and every kernel**. In particular the
+answer does not depend on which kernel a shape selects.
+
+This is a per-op contract, not a claim that demoniC's float output matches
+another implementation's. `docs/NUMERICS.md` states what is and is not
+promised across versions, including the edges this contract does not cover.
+
 ### 7.3 Determinism contract (`@deterministic`)
 
 Inside `@deterministic { expr }`: given identical inputs and identical `Rng`
@@ -908,6 +984,16 @@ state, the bytes of every output are bit-exact on repeated execution on the
 same host. Reduction orders are fixed, kernel selection ignores
 non-deterministic fast paths, and all RNG paths consume `Rng` linearly.
 Outside the block, faster non-deterministic kernels may be selected.
+
+"Ignores non-deterministic fast paths" is enforced against the one such path
+that exists: the `--blas` GEMM offload (`docs/NUMERICS.md §2.2`) is
+unreachable inside the block, whatever the flag says.
+
+This is the strongest cross-run reproducibility promise the language makes.
+`docs/NUMERICS.md` states how it composes with the rest of the numerics
+contract, and what it does *not* promise — in particular that it fixes
+demoniC's own accumulation order and says nothing about agreement with an
+external reference implementation.
 
 ### 7.4 Forced fusion (`@fuse`)
 
@@ -922,12 +1008,41 @@ Shape parameters in `[ ]` and integer literals are implicitly comptime: a
 function monomorphizes over its shape parameters, so shape arithmetic folds per
 instantiation.
 
-`@comptime { expr }` is the explicit form for derived values. In this version it
-evaluates `expr` and yields its value, but does not yet force compile-time
-folding: a body whose operands are not comptime-known is evaluated like any
-other block rather than rejected. On a function declaration (`@comptime fn`) it
-is inert, and the compiler warns that it has no effect. Read the directive as
-declared intent until folding lands.
+`@comptime { expr }` is the explicit form for derived values. It evaluates
+`expr` at compile time with the reference interpreter, before either backend
+lowers the program, and the result is a compile-time constant in the
+surrounding monomorphization. A block whose body cannot be fully evaluated at
+compile time is a compile-time error (`comptime-non-static`) citing the first
+non-comptime operand encountered.
+
+**The fold set is integers, booleans, and shape arithmetic.** This is
+normative, not an implementation status. A block whose body evaluates to an
+integer or a boolean is replaced by that literal before check completes; a
+block reading a shape parameter is folded per monomorphization by whichever
+backend compiles the call. Everything else is `comptime-non-static`: floats
+of every width, tensors, strings, and every other value the language has.
+
+The float cut is deliberate. Folding a float would decide whether a
+compile-time float must equal a run-time one, and nothing `@comptime` exists
+for needs that decided. Widening the fold set is a spec amendment, not an
+implementation change.
+
+The body admits literals, names the block binds, shape parameters of the
+enclosing `fn` or `model`, arithmetic, comparison, boolean logic, `if`/`else`,
+`while`/`loop`/`for` over integer ranges, and assignment to a binding the
+block itself made. It admits **no calls** — not to a user `fn`, a builtin, a
+port, or an `extern fn`. That total ban is what makes the effect restrictions
+of `docs/PORTS.md §5` and §6.7's `extern fn` rule hold without
+interprocedural analysis: nothing reachable from a legal body can perform an
+effect.
+
+Because the body may loop, compile-time evaluation is bounded. Exhausting the
+step budget is a compile-time error (`comptime-budget`) naming the block; a
+non-terminating `@comptime` fails the compile rather than hanging it.
+
+`@comptime` attaches to a block. On a `fn`, an item, or a bare statement it is
+rejected, with a hint to the supported spelling. `dmc fmt` prints `@comptime`
+as written: folding is a compilation step, not a source rewrite.
 
 ## 8. Errors and diagnostics
 

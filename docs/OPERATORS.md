@@ -68,6 +68,15 @@ parenthesize when in doubt.
 - **Type:** numpy/julia broadcasting.
 - **Lowering:** fused SIMD loop. Chained broadcast ops inside a `\|>` pipeline fuse into a single kernel — no intermediate Forge allocation.
 
+**On integer elements these are integer arithmetic at the element width**
+(`docs/SPEC.md §3.1` (Scalar types)). A tensor's element type carries its
+width the way a scalar's does, so `a .+ b` on two `Tensor[i32, [N]]` wraps at
+32 bits, `a ./ b` is integer division (`7 ./ 2` is 3, and division by zero is
+0), and unsigned elements wrap unsigned. `MIN ./ -1` is the same runtime
+error the scalar `/` raises, naming the width. The JIT does not lower integer
+elementwise ops at all today — it refuses them (`elementwise ops are
+f32-only`) rather than computing a second answer.
+
 ### 2.4 Scalar math: `+ - * / % **`
 
 Native instructions. No surprises.

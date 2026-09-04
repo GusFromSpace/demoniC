@@ -1,0 +1,161 @@
+# int_tensor_dotted_widths.dmc — an ELEMENTWISE op wraps at the element width.
+#
+# `int_tensor_widths.dmc` pins that a narrow integer tensor ELEMENT keeps its
+# width across a load, a store, a `!`-param writeback and a comparison. This
+# file is the other half of that question: the same tensors, but operated on
+# WHOLE, with the dotted operators.
+#
+# The distinction is not cosmetic. Every test in the sibling file names the
+# element's type somewhere — `let v: i32 = x[i]` — so a backend that lost the
+# width on the load could still recover it from the annotation. A dotted op
+# names nothing: `a .+ b` mentions neither element, so the ONLY place the width
+# can come from is the tensor's own type. That is the path that was computing
+# in the f64 backing buffer instead, where `2147483647 .+ 1` is 2147483648 — a
+# number that does not fit the `i32` the type-checker assigned it.
+#
+# Every test is written so the WRONG width still produces a plausible number
+# rather than an error, because that is how this class of bug survives: nothing
+# crashes, the arithmetic just stops wrapping.
+#
+# The JIT refuses integer elementwise ops ("elementwise ops are f32-only"), so
+# `dmc test --jit` skips this file entirely and the numbers below are gated
+# under the interpreter alone. That refusal is also why this file is separate:
+# the JIT compiles a file as a unit, and one `.+` here would have dropped the
+# sibling file's ten JIT-runnable tests out of the gate with it. When the JIT
+# gains integer elementwise lowering, these become two-backend tests and the
+# two files can merge.
+#
+# Run:
+#   dmc test examples/int_tensor_dotted_widths.dmc
+
+# `.+ .- .*` at the i32 boundary. The multiply is the one that also pins
+# precision: (2^31-1)^2 is 4611686014132420609, which an f64 cannot represent at
+# all, so an f64 computation cannot even round-trip the wrong answer — mod 2^32
+# it is 1.
+fn test_dotted_arithmetic_wraps_at_the_element_width() -> bool {
+    let !hi = forge.zeros[i32, [1]]
+    hi[0] = 2147483647
+    let !lo = forge.zeros[i32, [1]]
+    lo[0] = -2147483648
+    let !one = forge.zeros[i32, [1]]
+    one[0] = 1
+    let add: i32 = (hi .+ one)[0]
+    let sub: i32 = (lo .- one)[0]
+    let mul: i32 = (hi .* hi)[0]
+    (add as i64) == -2147483648 && (sub as i64) == 2147483647 && (mul as i64) == 1
+}
+
+# `./` on integer elements is INTEGER division — 7/2 is 3, not 3.5 — and
+# division by zero is 0, the value the scalar rule defines for it. A float
+# division would answer 3.5 and infinity.
+fn test_dotted_division_is_integer_division() -> bool {
+    let !a = forge.zeros[i32, [3]]
+    a[0] = 7
+    a[1] = -7
+    a[2] = 5
+    let !b = forge.zeros[i32, [3]]
+    b[0] = 2
+    b[1] = 2
+    b[2] = 0
+    let d = a ./ b
+    let q0: i32 = d[0]
+    let q1: i32 = d[1]
+    let q2: i32 = d[2]
+    (q0 as i64) == 3 && (q1 as i64) == -3 && (q2 as i64) == 0
+}
+
+# A scalar on the other side of the dot adopts the tensor's element width, the
+# way an untyped literal adopts the other operand's width in scalar arithmetic.
+fn test_a_scalar_operand_adopts_the_element_width() -> bool {
+    let !a = forge.zeros[i32, [2]]
+    a[0] = 2147483647
+    a[1] = -2147483648
+    let up: i32 = (a .+ 1)[0]
+    let dn: i32 = (a .- 1)[1]
+    (up as i64) == -2147483648 && (dn as i64) == 2147483647
+}
+
+# Unsigned wraps UNSIGNED at both ends: 255 + 1 is 0 and 0 - 1 is 255, never -1.
+# An op that wrapped signed would answer -1 for the second, which prints as a
+# perfectly ordinary number.
+fn test_unsigned_dotted_ops_wrap_unsigned() -> bool {
+    let !a = forge.zeros[u8, [2]]
+    a[0] = 255
+    a[1] = 0
+    let !one = forge.zeros[u8, [2]]
+    one[0] = 1
+    one[1] = 1
+    let hi: u8 = (a .+ one)[0]
+    let lo: u8 = (a .- one)[1]
+    (hi as i64) == 0 && (lo as i64) == 255
+}
+
+# The packed widths are widths like any other: `int4` wraps at four bits, so 7+1
+# is -8, and `int8` wraps at eight.
+fn test_the_packed_widths_wrap_elementwise() -> bool {
+    let !p = forge.zeros[int4, [1]]
+    p[0] = 7
+    let !o = forge.zeros[int4, [1]]
+    o[0] = 1
+    let !q = forge.zeros[int8, [1]]
+    q[0] = 127
+    let !r = forge.zeros[int8, [1]]
+    r[0] = 1
+    let small: int4 = (p .+ o)[0]
+    let byte:  int8 = (q .+ r)[0]
+    (small as i64) == -8 && (byte as i64) == -128
+}
+
+# The control for the whole section: the rule is the DECLARED element width, not
+# the magnitude 2^31. The same sum in an i64 element does not wrap.
+fn test_dotted_ops_at_i64_do_not_wrap_narrow() -> bool {
+    let !t = forge.zeros[i64, [1]]
+    t[0] = 2147483647
+    let !one = forge.zeros[i64, [1]]
+    one[0] = 1
+    let v: i64 = (t .+ one)[0]
+    v == 2147483648
+}
+
+# The width comes from the cast when a cast is what named the element type: an
+# i64 tensor narrowed to `i8` wraps at eight bits from then on.
+fn test_a_cast_names_the_element_width_for_later_ops() -> bool {
+    let !t = forge.zeros[i64, [1]]
+    t[0] = 127
+    let narrow = t as i8
+    let bumped: i8 = (narrow .+ 1)[0]
+    (bumped as i64) == -128
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+# `main` runs the same quantities to stdout so the file is exercised end to end
+# by `dmc run`, not only by `dmc test`.
+fn main() -> i64 {
+    let !hi = forge.zeros[i32, [1]]
+    hi[0] = 2147483647
+    let !one = forge.zeros[i32, [1]]
+    one[0] = 1
+    print_i64((hi .+ one)[0] as i64)
+    print_i64((hi .* hi)[0] as i64)
+
+    let !a = forge.zeros[i32, [2]]
+    a[0] = 7
+    a[1] = 5
+    let !b = forge.zeros[i32, [2]]
+    b[0] = 2
+    b[1] = 0
+    let d = a ./ b
+    print_i64(d[0] as i64)
+    print_i64(d[1] as i64)
+
+    let !u = forge.zeros[u8, [2]]
+    u[0] = 255
+    u[1] = 0
+    let !uo = forge.zeros[u8, [2]]
+    uo[0] = 1
+    uo[1] = 1
+    print_i64((u .+ uo)[0] as i64)
+    print_i64((u .- uo)[1] as i64)
+    0
+}

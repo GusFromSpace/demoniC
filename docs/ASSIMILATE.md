@@ -191,8 +191,16 @@ demoniC signatures.
 }
 ```
 
-- `schema` is the descriptor format's version — an integer, currently `1`
-  — and the introspector stamps it into every descriptor it writes. A
+- `schema` is the descriptor format's version — an integer **token**,
+  currently `1` — and the introspector stamps it into every descriptor it
+  writes. Written as `1.0` or `1e0` it is rejected (`` `schema` must be an
+  integer ``): the JSON reader elsewhere in the toolchain widens a whole
+  float where a numeric field wants an integer, but `schema` does not, on
+  purpose. The field is a format-version gate, not an arithmetic value, and
+  no hand-written or generated descriptor has a reason to spell a version
+  number as a float — a `1.0` is far more likely a generator bug than an
+  intentional respelling of `1`, so the reader treats it as the malformed
+  descriptor it almost certainly is rather than silently widening it. A
   descriptor without the field is schema 1: every descriptor written
   before the field existed. A reader rejects a schema it does not know,
   with a diagnostic naming the descriptor's version and its own; unknown

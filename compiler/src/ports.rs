@@ -33,240 +33,7 @@ use crate::interp::{decode_kind, json_encode_str, json_encode_value, json_parse,
 /// the widening is undone on the way out. Otherwise the same program's
 /// `dmc.echo` would return `bf16` or `f32` depending on whether numpy happened
 /// to be installed on the far side.
-const PY_PORT_HARNESS: &str = r#"
-import sys, json, importlib, builtins, base64, struct
-class _ABI(Exception):
-    pass  # signals a malformed payload -> port-protocol, not port-call
-
-# --- PORTS.md 3.2 copy mode ---------------------------------------------
-_TAG = 'dmc_tensor'
-_VER = 1
-_LAYOUT = 'row_major'
-_WIDTH = {'i64': 8, 'i32': 4, 'f64': 8, 'f32': 4, 'bf16': 2, 'f16': 2, 'bool': 1}
-_STRUCT = {'i64': '<q', 'i32': '<i', 'f64': '<d', 'f32': '<f', 'bool': '?'}
-_NP_WIRE = {'int64': 'i64', 'int32': 'i32', 'float64': 'f64',
-            'float32': 'f32', 'float16': 'f16', 'bool': 'bool'}
-_NP_READ = {'i64': '<i8', 'i32': '<i4', 'f64': '<f8', 'f32': '<f4',
-            'f16': '<f2', 'bool': '|b1'}
-try:
-    import numpy as _np
-except Exception:
-    _np = None
-
-# id(ndarray) -> (the array, its arrival dtype), for the arrays this request
-# rehydrated from an envelope whose dtype numpy cannot hold natively (bf16).
-# The dtype belongs to the tensor, not to the storage numpy needed to compute
-# with it, so an array the callee hands straight back crosses back as it came;
-# an array numpy newly allocated is not in here and crosses as numpy's own.
-_ARRIVED = {}
-
-class _Tensor(object):
-    # A copy-mode tensor without numpy: the metadata and the raw payload,
-    # kept verbatim so an unmodified round trip is byte-identical.
-    def __init__(self, dtype, shape, data):
-        self.dtype, self.shape, self.data = dtype, shape, data
-    def __repr__(self):
-        return 'Tensor(%s, %r)' % (self.dtype, self.shape)
-    def flat(self):
-        # Elements in row-major order, as Python floats -- a convenience for a
-        # callee with no numpy, not part of the round trip, which re-encodes
-        # `self.data` verbatim. A Python float is a C double, so a signaling
-        # NaN quiets on the way through here; that is unavoidable without a
-        # real f32 type and costs nothing, because nothing re-encodes from
-        # this. bf16 is widened by hand: it is a truncation of f32's top 16
-        # bits, which is the whole conversion.
-        if self.dtype == 'bf16':
-            return [struct.unpack('<f', struct.pack('<I', h << 16))[0]
-                    for (h,) in struct.iter_unpack('<H', self.data)]
-        if self.dtype == 'f16':
-            return [struct.unpack('<e', self.data[i:i+2])[0]
-                    for i in range(0, len(self.data), 2)]
-        return [v for (v,) in struct.iter_unpack(_STRUCT[self.dtype], self.data)]
-
-def _envelope(dtype, shape, data):
-    return {'data': base64.b64encode(data).decode('ascii'), _TAG: _VER,
-            'dtype': dtype, 'layout': _LAYOUT, 'shape': [int(d) for d in shape]}
-
-def _int(x):
-    # A JSON integer, the way the Rust reader means it. Python's `bool` is a
-    # subclass of `int` and `1.0 == 1`, so a bare `== 1` accepts `true` and
-    # `1.0` -- and then this reader and `unpack_raw` disagree about which
-    # documents are envelopes, which PORTS.md 3.2 says they never do.
-    return isinstance(x, int) and not isinstance(x, bool)
-
-def _tensor_in(v):
-    if not _int(v.get(_TAG)) or v.get(_TAG) != _VER:
-        raise _ABI('tensor envelope version %r is not %d' % (v.get(_TAG), _VER))
-    extra = set(v) - {_TAG, 'data', 'dtype', 'layout', 'shape'}
-    if extra:
-        # The manifest rule (PORTS.md 3.2) covers the fields, not just the
-        # version. This side is the mirror case the section names: an envelope
-        # *sent* to a runtime, refused before any foreign code runs.
-        raise _ABI('tensor envelope has unknown field(s) %s'
-                   % ', '.join(repr(k) for k in sorted(extra)))
-    if v.get('layout') != _LAYOUT:
-        raise _ABI('tensor layout %r is not %r' % (v.get('layout'), _LAYOUT))
-    dt = v.get('dtype')
-    if dt not in _WIDTH:
-        raise _ABI('unknown tensor dtype %r' % (dt,))
-    shape = v.get('shape')
-    if (not isinstance(shape, list) or not shape or len(shape) > 8
-            or not all(_int(d) and d > 0 for d in shape)):
-        # `_int`, not `isinstance(d, int)`: `[true]` would otherwise pass here
-        # and die in `reshape` instead, surfacing as `port-call` where 3.2
-        # promises `port-protocol`.
-        raise _ABI('tensor shape must be 1 to 8 positive integers')
-    try:
-        data = base64.b64decode(v.get('data') or '', validate=True)
-    except Exception:
-        raise _ABI('tensor data is not valid base64')
-    n = 1
-    for d in shape:
-        n *= d
-    if len(data) != n * _WIDTH[dt]:
-        raise _ABI('tensor payload is %d bytes but %s%r needs %d'
-                   % (len(data), dt, shape, n * _WIDTH[dt]))
-    t = _Tensor(dt, shape, data)
-    if _np is None:
-        return t
-    if dt == 'bf16':
-        # numpy has no bfloat16. Widen to f32 so the callee has something it
-        # can compute with, and remember that this array arrived as bf16 so
-        # _dehydrate can undo the widening rather than publish it.
-        #
-        # The widening is a bit move, done in numpy: shift the pattern into
-        # f32's high half and reinterpret. Routing it through a Python float
-        # would not be the same function -- a Python float is a C double, and
-        # f32 -> f64 -> f32 quiets a signaling NaN, so 126 of the 65536 bf16
-        # patterns (the two sNaN bands) would come back changed. Going through
-        # the buffer is also ~300x faster, which copy mode needs: this is the
-        # path weight-shaped tensors cross on.
-        a = (_np.frombuffer(data, dtype='<u2').astype(_np.uint32) << 16) \
-            .view(_np.float32).reshape(shape)
-        _ARRIVED[id(a)] = (a, dt)
-        return a
-    return _np.frombuffer(data, dtype=_np.dtype(_NP_READ[dt])).copy().reshape(shape)
-
-def _bf16_bytes(a):
-    # f32 -> bf16 by truncating the low 16 mantissa bits, the same narrowing
-    # ports.rs `write_elem` and the JIT's `dmc_f32_to_bf16` do. It is the exact
-    # inverse of the widening above, so an untouched round trip returns the
-    # sender's bytes -- all 65536 of them, sNaN included.
-    u = _np.ascontiguousarray(a, dtype=_np.float32).view(_np.uint32)
-    return (u >> 16).astype('<u2').tobytes()
-
-def _rehydrate(v):
-    if isinstance(v, dict):
-        if _TAG in v:
-            return _tensor_in(v)
-        return dict((k, _rehydrate(x)) for k, x in v.items())
-    if isinstance(v, list):
-        return [_rehydrate(x) for x in v]
-    return v
-
-def _dehydrate(v):
-    if isinstance(v, _Tensor):
-        return _envelope(v.dtype, v.shape, v.data)
-    if _np is not None:
-        if isinstance(v, _np.ndarray):
-            if v.ndim == 0:
-                return v.item()   # a 0-d array is a scalar, not a tensor
-            came = _ARRIVED.get(id(v))
-            if came is not None and came[0] is v:
-                return _envelope(came[1], list(v.shape), _bf16_bytes(v))
-            name = v.dtype.name
-            if name not in _NP_WIRE:
-                raise _ABI('numpy dtype %r has no copy-mode wire dtype' % name)
-            v = _np.ascontiguousarray(v)
-            return _envelope(_NP_WIRE[name], list(v.shape), v.tobytes())
-        if isinstance(v, _np.generic):
-            return v.item()
-    if isinstance(v, dict):
-        return dict((k, _dehydrate(x)) for k, x in v.items())
-    if isinstance(v, (list, tuple)):
-        return [_dehydrate(x) for x in v]
-    return v
-
-class _Dmc(object):
-    # The `dmc.*` namespace the harness itself serves (PORTS.md 3.2). The
-    # name is reserved: it is resolved here before any importable module of
-    # the same name, so a copy-mode round trip needs no third-party runtime.
-    @staticmethod
-    def echo(x=None):
-        return x
-    @staticmethod
-    def shape(x):
-        return list(getattr(x, 'shape', []))
-    @staticmethod
-    def dtype(x):
-        if isinstance(x, _Tensor):
-            return x.dtype
-        if _np is not None and isinstance(x, _np.ndarray):
-            came = _ARRIVED.get(id(x))
-            if came is not None and came[0] is x:
-                return came[1]
-            return _NP_WIRE.get(x.dtype.name, x.dtype.name)
-        return type(x).__name__
-
-def _resolve(name):
-    parts = name.split('.')
-    if parts[0] == 'dmc':
-        obj = _Dmc
-        for p in parts[1:]:
-            obj = getattr(obj, p)
-        return obj
-    if len(parts) == 1 and hasattr(builtins, parts[0]):
-        return getattr(builtins, parts[0])
-    obj = importlib.import_module(parts[0])
-    for p in parts[1:]:
-        obj = getattr(obj, p)
-    return obj
-def _unpack(payload):
-    # (args, kwargs) from the JSON payload per PORTS.md §2. null/empty -> no
-    # args; array -> positional; object -> {args, kwargs} envelope; a bare
-    # scalar is not an argument vector and is an ABI error. Tensor envelopes
-    # anywhere inside are rehydrated (§3.2) before the call sees them.
-    if payload in (None, ''):
-        return (), {}
-    try:
-        p = json.loads(payload)
-    except Exception as e:
-        raise _ABI('payload is not valid JSON: %s' % e)
-    if isinstance(p, list):
-        return tuple(_rehydrate(p)), {}
-    if isinstance(p, dict) and _TAG in p:
-        raise _ABI('a tensor is a value, not an argument vector: '
-                   'wrap the envelope in a JSON array')
-    if isinstance(p, dict):
-        extra = set(p) - {'args', 'kwargs'}
-        if extra:
-            raise _ABI('payload object must contain only "args"/"kwargs", got %s'
-                       % ', '.join(sorted(extra)))
-        a = p.get('args', [])
-        k = p.get('kwargs', {})
-        if not isinstance(a, list):
-            raise _ABI('"args" must be a JSON array')
-        if not isinstance(k, dict):
-            raise _ABI('"kwargs" must be a JSON object')
-        return tuple(_rehydrate(a)), _rehydrate(k)
-    raise _ABI('payload must be a JSON array, an {args, kwargs} object, or null')
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    _ARRIVED.clear()   # arrival dtypes live for exactly one request
-    try:
-        req = json.loads(line)
-        args, kwargs = _unpack(req.get('payload'))
-        fn = _resolve(req['name'])
-        out = json.dumps({'ok': _dehydrate(fn(*args, **kwargs))})
-    except _ABI as e:
-        out = json.dumps({'perr': str(e)})
-    except Exception as e:
-        out = json.dumps({'err': str(e)})
-    sys.stdout.write(out + '\n')
-    sys.stdout.flush()
-"#;
+const PY_PORT_HARNESS: &str = include_str!("py/port_harness.py");
 
 /// #402: an open process port (PORTS.md §7.1) — a child runtime speaking
 /// line-oriented JSON over its own stdin/stdout. The demoniC side holds the
@@ -738,8 +505,22 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let exp = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x007f_ffff;
     if exp == 0xff {
-        // Inf / NaN — keep NaN non-zero-mantissa so it stays a NaN.
-        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+        if mant == 0 {
+            return sign | 0x7c00; // ±inf
+        }
+        // NaN. Carry the payload across instead of flattening every NaN to one
+        // pattern: `| 0x0200` mapped all 2046 half NaNs onto 0x7e00 / 0xfe00,
+        // so 2044 of them did not survive a round trip (#534, item 2 — the
+        // half of the domain a sampled test never looks at).
+        //
+        // The half's 10 mantissa bits are the single's top 10, which keeps the
+        // quiet bit in place and so keeps a quiet NaN quiet. Truncation can
+        // leave all ten zero — the payload lived below the cut — and a zero
+        // mantissa here would silently become an infinity, so that case sets
+        // the quiet bit to stay a NaN. The value is the same NaN either way;
+        // only the payload of an already-payload-losing narrowing differs.
+        let payload = (mant >> 13) as u16;
+        return sign | 0x7c00 | if payload != 0 { payload } else { 0x0200 };
     }
     let e = exp - 127 + 15;
     if e >= 0x1f { return sign | 0x7c00; }          // overflow → ±inf
@@ -1346,5 +1127,95 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&blocked);
+    }
+
+    /// #534, item 2: where the domain is 16 bits, sweep it rather than sample
+    /// it. The port's own bf16 gate above is the precedent — two sampled
+    /// values passed while 126 patterns were being corrupted. These in-process
+    /// narrowings are the same shape and had no gate at all.
+    ///
+    /// The rule these pin is not blanket identity, because the encoder cannot
+    /// offer it. `write_elem` takes an `f64` — the interpreter carries every
+    /// tensor element as one — so a half reaching the wire has been through
+    /// f32 -> f64 and back, and that hop quiets a signaling NaN. So the rule
+    /// is: **every pattern round-trips unchanged except a signaling NaN, which
+    /// arrives as itself with the quiet bit set, and nothing else moves.**
+    ///
+    /// Written this way the gate still fails on the two things worth catching:
+    /// any ordinary value that shifts, and any change to the size or shape of
+    /// the signaling band. An `assert!(bad.is_empty())` could not be written
+    /// here at all, and asserting only a count would pass on the wrong 126.
+    ///
+    /// `exp_mask` selects the exponent field, `mant_mask` the mantissa, and
+    /// `quiet` the mantissa's top bit.
+    fn assert_only_snans_are_quieted(
+        label: &str, dt: WireDType, widen: fn(u16) -> f32,
+        exp_mask: u16, mant_mask: u16, quiet: u16,
+    ) {
+        let is_snan = |h: u16| {
+            h & exp_mask == exp_mask && h & mant_mask != 0 && h & quiet == 0
+        };
+        let mut moved = 0usize;
+        let mut wrong: Vec<String> = Vec::new();
+        for h in 0u32..65536 {
+            let h = h as u16;
+            let mut out = Vec::new();
+            write_elem(dt, widen(h) as f64, &mut out);
+            let back = u16::from_le_bytes([out[0], out[1]]);
+            if back == h {
+                // An sNaN that came back untouched would mean the band moved.
+                if is_snan(h) {
+                    wrong.push(format!("{:#06x} is sNaN but survived", h));
+                }
+                continue;
+            }
+            moved += 1;
+            if !is_snan(h) || back != h | quiet {
+                wrong.push(format!("{:#06x}->{:#06x}", h, back));
+            }
+        }
+        assert!(wrong.is_empty(),
+            "{}: {} pattern(s) broke the rule (an sNaN quiets, nothing else moves): {:?}",
+            label, wrong.len(), &wrong[..wrong.len().min(8)]);
+        // The signaling band is every all-ones-exponent value with a non-zero
+        // mantissa whose top bit is clear, both signs.
+        let want = 2 * ((mant_mask as usize + 1) / 2 - 1);
+        assert_eq!(moved, want,
+            "{}: expected exactly the {} signaling-NaN patterns to quiet, saw {}",
+            label, want, moved);
+    }
+
+    #[test]
+    fn only_signaling_bf16_nans_change_through_write_elem() {
+        assert_only_snans_are_quieted(
+            "bf16", WireDType::Bf16, crate::jit::bf16_bits_to_f32,
+            0x7f80, 0x007f, 0x0040);
+    }
+
+    /// Before the payload fix this moved 2044 of 65536 — every half NaN was
+    /// flattened onto 0x7e00 / 0xfe00. Now only the signaling band moves, and
+    /// it moves by exactly the quiet bit.
+    #[test]
+    fn only_signaling_f16_nans_change_through_write_elem() {
+        assert_only_snans_are_quieted(
+            "f16", WireDType::F16, crate::jit::f16_bits_to_f32,
+            0x7c00, 0x03ff, 0x0200);
+    }
+
+    /// The JIT's own narrowing, with no f64 hop in the way. Truncating the low
+    /// 16 bits is exactly the inverse of the widener's `<< 16`, so this one
+    /// does hold across the whole space, every NaN payload included — which is
+    /// what makes the f64 hop, not the narrowing, the thing costing the port
+    /// path its signaling NaNs.
+    #[test]
+    fn every_bf16_pattern_survives_the_jit_narrowing() {
+        let bad: Vec<String> = (0u32..65536).filter_map(|h| {
+            let h = h as u16;
+            let back = (crate::jit::bf16_bits_to_f32(h).to_bits() >> 16) as u16;
+            (back != h).then(|| format!("{:#06x}->{:#06x}", h, back))
+        }).collect();
+        assert!(bad.is_empty(),
+            "{} of 65536 bf16 patterns changed through the JIT narrowing: {:?}",
+            bad.len(), &bad[..bad.len().min(8)]);
     }
 }

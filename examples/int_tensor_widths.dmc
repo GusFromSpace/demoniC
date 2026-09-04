@@ -1,0 +1,246 @@
+# int_tensor_widths.dmc — a narrow integer ELEMENT keeps its width.
+#
+# `int_widths.dmc` pins the fixed-width arithmetic rule for scalars: an `i32`
+# is 32 bits wide at run time, every result is taken mod 2^32, and both
+# backends agree about it. This file asks the same question one level down,
+# where the value lives in a TENSOR element rather than in a local, and where
+# the code touching it is shape-generic.
+#
+# That is a different code path on both backends and it was untested. A tensor
+# element is loaded from a buffer whose element width is part of the tensor's
+# type, not part of the expression, so the load has to decide the width on its
+# own — and the JIT decides it per instantiation while the interpreter decides
+# it per value. Either one can settle on 64 bits by accident. Nothing crashes
+# when they do: the arithmetic simply stops wrapping, and a program that was
+# relying on the wrap gets a bigger number than it asked for.
+#
+# So every test below is written so that the WRONG width still produces a
+# number. `2147483647 + 1` is either -2147483648 (correct, 32 bits) or
+# 2147483648 (a load that widened) — never an error. And every generic is
+# called at more than one shape, so an instantiation that got folded once and
+# reused shows up as a wrong total rather than as a shape mismatch.
+#
+# Elementwise DOTTED ops on these tensors are covered by the sibling file
+# `int_tensor_dotted_widths.dmc`, and they live there rather than here for one
+# mechanical reason: the JIT refuses integer elementwise ops outright
+# ("elementwise ops are f32-only"), and it compiles a file as a unit — so a
+# single dotted `.+` anywhere in THIS file would drop every test in it out of
+# the JIT half of the gate, including the ten that run there today. Keeping the
+# two apart is what lets each be gated as far as its backend support goes. When
+# the JIT gains integer elementwise lowering the two files can merge.
+#
+# Run:
+#   dmc test examples/int_tensor_widths.dmc
+#   dmc test --jit examples/int_tensor_widths.dmc
+
+# ─── Generics over an i32-element tensor ─────────────────────────────────────
+
+# Adds one to every element and accumulates in an i64, so the ONLY narrowing in
+# the function is the one under test: `v + 1` at the element's own width.
+fn wrap_sum[N](x: Tensor[i32, [N]]) -> i64 {
+    let !acc: i64 = 0
+    for i in 0..N {
+        let v: i32 = x[i]
+        acc = acc + ((v + 1) as i64)
+    }
+    acc
+}
+
+# The same shape over `>>`, which is arithmetic at the element's width: a
+# 32-bit shift of the most negative i32 is -2^30, not -2^62.
+fn shr_sum[N](x: Tensor[i32, [N]]) -> i64 {
+    let !acc: i64 = 0
+    for i in 0..N {
+        let v: i32 = x[i]
+        acc = acc + ((v >> 1) as i64)
+    }
+    acc
+}
+
+# Squares every element IN PLACE through a `!` tensor parameter, so the wrap has
+# to survive being written back into the buffer as well as being computed.
+fn square_in_place[N](!x: Tensor[i32, [N]]) -> i64 {
+    for i in 0..N {
+        let v: i32 = x[i]
+        x[i] = v * v
+    }
+    let first: i32 = x[0]
+    first as i64
+}
+
+# A predicate over the elements, so the comparison — not just the arithmetic —
+# has to see the wrapped value.
+fn count_negative[N](x: Tensor[i32, [N]]) -> i64 {
+    let !n: i64 = 0
+    for i in 0..N {
+        let v: i32 = x[i]
+        if v < 0 { n = n + 1 }
+    }
+    n
+}
+
+# ─── Tests ───────────────────────────────────────────────────────────────────
+
+# Two shapes, and the wrap happens a different number of times in each. On [2]:
+# 2147483647 wraps to -2147483648 and 5 becomes 6, so -2147483642. On [3] the
+# wrap happens TWICE and the third element contributes 1. An element load that
+# widened to 64 bits would answer 2147483654 and 4294967297 instead — both
+# perfectly ordinary-looking numbers.
+fn test_element_arithmetic_wraps_at_the_element_width() -> bool {
+    let !a = forge.zeros[i32, [2]]
+    a[0] = 2147483647
+    a[1] = 5
+    let !b = forge.zeros[i32, [3]]
+    b[0] = 2147483647
+    b[1] = 2147483647
+    b[2] = 0
+    wrap_sum(a) == -2147483642 && wrap_sum(b) == -4294967295
+}
+
+# `>>` at the element width: -8 >> 1 is -4, 7 >> 1 is 3, and the most negative
+# i32 >> 1 is -1073741824. A shift performed at 64 bits on a sign-extended load
+# gives the same three answers — which is why the wrap test above is the one
+# that separates the widths, and this one pins that `>>` is ARITHMETIC (a
+# logical shift would answer 2147483644 for the third element).
+fn test_element_right_shift_is_arithmetic() -> bool {
+    let !a = forge.zeros[i32, [3]]
+    a[0] = -8
+    a[1] = 7
+    a[2] = -2147483648
+    shr_sum(a) == -1073741825
+}
+
+# 100000^2 is 10^10, which does not fit in 32 bits; what survives is
+# 10^10 mod 2^32 = 1410065408. The value is computed AND stored AND read back,
+# so a store that widened would be caught here even if the multiply narrowed.
+fn test_in_place_multiply_wraps_through_the_buffer() -> bool {
+    let !a = forge.zeros[i32, [1]]
+    a[0] = 100000
+    square_in_place(a) == 1410065408
+}
+
+# The write is visible to the caller, and the value the caller reads back is
+# the wrapped one — the callee's narrowing is not undone on the way out.
+fn test_writeback_carries_the_wrapped_value() -> bool {
+    let !a = forge.zeros[i32, [1]]
+    a[0] = 100000
+    let returned = square_in_place(a)
+    let seen: i32 = a[0]
+    returned == 1410065408 && (seen as i64) == 1410065408
+}
+
+# The comparison sees the wrapped value, not the mathematical one: before the
+# add nothing is negative; after it, the element that crossed the top is.
+fn test_comparison_sees_the_wrapped_element() -> bool {
+    let !a = forge.zeros[i32, [2]]
+    a[0] = 2147483647
+    a[1] = 0
+    let v0: i32 = a[0]
+    let v1: i32 = a[1]
+    let !b = forge.zeros[i32, [2]]
+    b[0] = v0 + 1
+    b[1] = v1 + 1
+    count_negative(a) == 0 && count_negative(b) == 1
+}
+
+# Rank 2, both boundaries at once: over the top is back to the bottom, under the
+# bottom is back to the top. The second index is what makes the load address
+# arithmetic non-trivial, so the width has to survive that too.
+fn test_rank_two_elements_wrap_at_both_boundaries() -> bool {
+    let !m = forge.zeros[i32, [2, 2]]
+    m[0, 0] = 2147483647
+    m[1, 1] = -2147483648
+    let hi: i32 = m[0, 0]
+    let lo: i32 = m[1, 1]
+    ((hi + 1) as i64) == -2147483648 && ((lo - 1) as i64) == 2147483647
+}
+
+# The control: the rule is about the DECLARED element width, not about the
+# magnitude 2^31. An `i64` element has room for the same sum and does not wrap.
+fn test_an_i64_element_has_room_for_the_same_sum() -> bool {
+    let !t = forge.zeros[i64, [1]]
+    t[0] = 2147483647
+    let v: i64 = t[0]
+    (v + 1) == 2147483648
+}
+
+# A fresh allocation reads as zero at every index, which is what makes the sums
+# above attributable to the elements that were written rather than to whatever
+# the arena last held.
+fn test_a_fresh_i32_allocation_reads_as_zero() -> bool {
+    let !t = forge.zeros[i32, [3]]
+    let first: i32 = t[0]
+    let last: i32 = t[2]
+    (first as i64) == 0 && (last as i64) == 0
+}
+
+# Widening back out is lossless and sign-correct: an element holding the 32-bit
+# all-ones pattern is -1, and it is still -1 at 64 bits.
+fn test_widening_an_element_preserves_the_sign() -> bool {
+    let !t = forge.zeros[i32, [1]]
+    t[0] = -1
+    let v: i32 = t[0]
+    (v as i64) == -1
+}
+
+# The two casts INTO the same element type do different things, and both
+# backends agree about which is which: an integer `as i32` WRAPS (keeps the low
+# 32 bits, so 4294967298 becomes 2), while a float `as i32` SATURATES to the
+# range end (so 4294967298.0 becomes 2147483647). Reaching for the wrong one is
+# a silent factor-of-a-billion error in a quantization path.
+fn test_int_cast_wraps_where_float_cast_saturates() -> bool {
+    let !t = forge.zeros[i32, [2]]
+    let wide: i64 = 4294967298
+    let far:  f64 = 4294967298.0
+    t[0] = wide as i32
+    t[1] = far as i32
+    let wrapped: i32 = t[0]
+    let clamped: i32 = t[1]
+    (wrapped as i64) == 2 && (clamped as i64) == 2147483647
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+# The differential harness only compares files whose `main` runs, so the same
+# quantities go to stdout: that is the byte-for-byte half of the parity gate,
+# with `dmc test --jit` as the numeric half.
+fn main() -> i64 {
+    let !a = forge.zeros[i32, [2]]
+    a[0] = 2147483647
+    a[1] = 5
+    print_i64(wrap_sum(a))
+
+    let !b = forge.zeros[i32, [3]]
+    b[0] = 2147483647
+    b[1] = 2147483647
+    b[2] = 0
+    print_i64(wrap_sum(b))
+
+    let !s = forge.zeros[i32, [3]]
+    s[0] = -8
+    s[1] = 7
+    s[2] = -2147483648
+    print_i64(shr_sum(s))
+
+    let !q = forge.zeros[i32, [1]]
+    q[0] = 100000
+    print_i64(square_in_place(q))
+    print_i64(q[0] as i64)
+
+    let !m = forge.zeros[i32, [2, 2]]
+    m[0, 0] = 2147483647
+    m[1, 1] = -2147483648
+    let hi: i32 = m[0, 0]
+    let lo: i32 = m[1, 1]
+    print_i64((hi + 1) as i64)
+    print_i64((lo - 1) as i64)
+
+    let !t = forge.zeros[i32, [2]]
+    let wide: i64 = 4294967298
+    let far:  f64 = 4294967298.0
+    t[0] = wide as i32
+    t[1] = far as i32
+    print_i64(t[0] as i64)
+    print_i64(t[1] as i64)
+    0
+}

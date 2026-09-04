@@ -13,6 +13,9 @@ Classification per probe:
     * DIVERGE       — both succeed but DISAGREE  → a miscompile/semantics bug (FAIL)
     * jit-gap       — run ok, jit emits a clean "not lowered" error (informational;
                     allowlist the tracked ones below so only NEW gaps surface)
+    * interp-refusal — the mirror image: run refuses, jit answers. A defect for
+                    every construct but `extern fn`, where SPEC §9 REQUIRES it,
+                    so this one is an explicit allowlist (INTERP_REFUSAL)
     * both-fail     — both reject (e.g. a deliberate trap probe); fine
 
 Exits non-zero iff any probe DIVERGES (a silent run/jit mismatch). This battery
@@ -47,6 +50,39 @@ GAP_ALLOWLIST = {
     "copy_i64_mut_arg": "#552 — `!` params lower only inside a `@grad fn`",
     "copy_f64_mut_arg": "#552 — `!` params lower only inside a `@grad fn`",
     "copy_bool_mut_arg": "#552 — `!` params lower only inside a `@grad fn`",
+    # #572 — the JIT allocates f32/i32/i64 tensors; the narrow integer widths
+    # the interpreter carries (i8/i16/u8/u16/u32) have no Forge element type
+    # yet. Until #572 these refusals said `jit error`, so a probe over them
+    # scored as a DIVERGENCE and could not be allowlisted at all — which is
+    # why narrow-element tensors had no coverage and `int_tensor_widths.dmc`
+    # stopped at i32/i64.
+    "narrow_tensor_i8_wrap": "#572 — no narrow-integer tensor element type in the JIT",
+    "narrow_tensor_u8_wrap": "#572 — no narrow-integer tensor element type in the JIT",
+    "narrow_tensor_i16_wrap": "#572 — no narrow-integer tensor element type in the JIT",
+    "zeros_bool_tensor": "#572 — `forge.zeros[bool, ..]`: the JIT's zero-fill is 32-bit",
+    "ones_i64_tensor": "#572 — `forge.ones` fills f32 only in the JIT",
+    # #563 — a colon slab needs literal bounds, and no stride, in the JIT.
+    # Same story: `jit error` until #563, so the colon spelling was unprobeable.
+    "slab_shape_param_end": "#563 — a colon slab's end must be a literal int in the JIT",
+    "slab_strided": "#563 — strided slices (`a:b:c`) are not lowered in the JIT",
+    "slab_open_end": "#563 — a range slice needs an explicit end in the JIT",
+}
+
+# #578: probes where the INTERPRETER refuses and the JIT answers — the mirror
+# image of a jit-gap, and for `extern fn` it is the *specified* behavior, not a
+# defect. SPEC.md §9 requires an implementation without a JIT backend to reject
+# `extern fn` calls at runtime, so `dmc run` refusing and `dmc jit` returning a
+# value is the contract being kept. Without this class the battery scored such
+# a probe as a DIVERGENCE (the catch-all `else` below), which is why the JIT's
+# `extern fn` lowering had no probe coverage at all.
+#
+# Deliberately an explicit allowlist and not a rule: "run failed, jit
+# succeeded" is a real defect for every construct BUT this one, and it must
+# stay a divergence there.
+INTERP_REFUSAL = {
+    "extern_libc_abs": "SPEC §9 — the interpreter must reject an `extern fn` call",
+    "extern_libc_sqrtf": "SPEC §9 — the interpreter must reject an `extern fn` call",
+    "extern_tensor_ptr": "SPEC §9 — the interpreter must reject an `extern fn` call",
 }
 
 # name -> (source, note on what it probes). Every program returns a scalar.
@@ -59,11 +95,21 @@ PROBES = {
     "int_shl_63":         ("fn main()->i64{ let !n=63  1<<n }", "max in-range shift"),
     # i32 operands: the count is checked at the operand's width, not always 64
     # (`OPERATORS.md §8a`). Newlines are load-bearing — `= 2  (a<<n)` parses as
-    # a call on the literal. Only counts whose result fits in i32 are probed:
-    # a 32-bit shift that loses bits has no shared answer with the interpreter,
-    # which carries every integer as i64.
+    # a call on the literal.
     "int_shl_i32":        ("fn main()->i64{\n let a:i32=256\n let n:i32=2\n (a<<n) as i64\n}", "i32 `<<`, count checked at 32 bits"),
     "int_shr_i32":        ("fn main()->i64{\n let a:i32=-8\n let n:i32=1\n (a>>n) as i64\n}", "i32 `>>`, arithmetic and 32-bit"),
+    # Narrow shifts that LOSE bits. These used to be unprobeable: the
+    # interpreter carried every integer as an i64, so a shift out of a narrow
+    # range had no answer the two backends shared. Both narrow at the declared
+    # width now, which makes the lossy cases the interesting ones — each result
+    # below is reachable only if the shift really ran at the operand's width,
+    # and a backend that fell back to 64 bits answers something else entirely.
+    "int_shl_i32_lossy":  ("fn main()->i64{\n let a:i32=1\n let n:i32=31\n (a<<n) as i64\n}", "i32 `<<` into the sign bit → i32 MIN, not 2^31"),
+    "int_shr_i32_sign":   ("fn main()->i64{\n let a:i32=-2147483648\n let n:i32=31\n (a>>n) as i64\n}", "i32 `>>` copies the 32-bit sign bit → -1"),
+    "int_shr_u32_logical":("fn main()->i64{\n let z:u32=0\n let o:u32=1\n let t:u32=2\n ((z-o)>>t) as i64\n}", "u32 `>>` is LOGICAL → 1073741823, not -1"),
+    "int_shl_u16_wrap":   ("fn main()->i64{\n let a:u16=65535\n let n:u16=1\n (a<<n) as i64\n}", "u16 `<<` drops the top bit → 65534"),
+    "int_shr_i8_arith":   ("fn main()->i64{\n let a:i8=-8\n let n:i8=1\n (a>>n) as i64\n}", "i8 `>>` is arithmetic at 8 bits → -4"),
+    "int_shr_63":         ("fn main()->i64{\n let !n=63\n (1<<n)>>n\n}", "the sign bit shifted back is -1, not 1"),
     "int_big_mul_wrap":   ("fn main()->i64{ 1000000000 * 1000000000 }", "i64 multiply wrap"),
     "int_add_overflow":   ("fn main()->i64{ let a:i64=9223372036854775807  a+1 }", "#300 add overflow wraps (both backends)"),
     "int_sub_overflow":   ("fn main()->i64{ let a:i64=-9223372036854775807-1  a-1 }", "#300 sub overflow wraps to MAX"),
@@ -115,6 +161,25 @@ PROBES = {
     "i64_literal_index":  ("fn main()->i64{ let ids=[[785,6722,315]] ids[0,1] }", "#274 i64 literal index"),
     "i64_param_read":     ("fn first[B,S](x:Tensor[i64,[B,S]])->i64{ x[0,0] } fn main()->i64{ first([[5,6]]) }", "#274 i64 tensor param"),
     "embed_gather":       ("fn main()->i64{ let ids=[10,20,30] let !e=forge.zeros[f32,[40]] e[20]=5.0 let id=ids[1] e[id] as i64 }", "#274 id-driven gather"),
+    # ── narrow-integer tensor elements (#572) ───────────────────────────────
+    # These are the probes #572 says the misclassification suppressed. Each
+    # wraps at its declared width, so a backend that widened to i64 answers
+    # something else entirely; today the JIT declines to allocate the element
+    # type at all, and — since #572 — says so as a GAP, which is what lets
+    # these live here instead of reddening the gate.
+    "narrow_tensor_i8_wrap":  ("fn main()->i64{\n let !t=forge.uninit[i8,[2]]\n t[0]=127\n let v:i8=t[0]\n (v+1) as i64\n}", "#572 i8 tensor element wraps at 8 bits -> -128"),
+    "narrow_tensor_u8_wrap":  ("fn main()->i64{\n let !t=forge.uninit[u8,[2]]\n t[0]=255\n let v:u8=t[0]\n (v+1) as i64\n}", "#572 u8 tensor element wraps at 8 bits -> 0"),
+    "narrow_tensor_i16_wrap": ("fn main()->i64{\n let !t=forge.uninit[i16,[2]]\n t[0]=32767\n let v:i16=t[0]\n (v+1) as i64\n}", "#572 i16 tensor element wraps at 16 bits -> -32768"),
+    "zeros_bool_tensor":      ("fn main()->i64{\n let t=forge.zeros[bool,[4]]\n if t[0] { 1 } else { 0 }\n}", "#572 `forge.zeros[bool,..]` is false everywhere"),
+    "ones_i64_tensor":        ("fn main()->i64{\n let t=forge.ones[i64,[4]]\n t[0]+t[3]\n}", "#572 `forge.ones[i64,..]` is 1 everywhere -> 2"),
+    # ── colon slabs (#563) ──────────────────────────────────────────────────
+    # The colon spelling of a slice. `x[0:S/2]` folds only if S is bound; the
+    # JIT wants a literal, and the strided and open-ended forms are not lowered
+    # at all. All three were unprobeable until #563 made them announce as gaps.
+    "slab_literal_bounds":  ("fn main()->i64{\n let !x=forge.zeros[f32,[4]]\n for i in 0..4 { x[i]=1.0 }\n sum(x[0:2]) as i64\n}", "#563 the literal-bound slab that DOES lower — 2"),
+    "slab_shape_param_end": ("fn half[S](x:Tensor[f32,[S]])->i64{ sum(x[0 : S / 2]) as i64 }\nfn main()->i64{\n let !x=forge.zeros[f32,[4]]\n for i in 0..4 { x[i]=1.0 }\n half(x)\n}", "#563 the issue's repro: a slab end that is a shape expression"),
+    "slab_strided":         ("fn main()->i64{\n let !x=forge.zeros[f32,[4]]\n for i in 0..4 { x[i]=1.0 }\n sum(x[0::2]) as i64\n}", "#563 a strided slab"),
+    "slab_open_end":        ("fn main()->i64{\n let !x=forge.zeros[f32,[4]]\n for i in 0..4 { x[i]=1.0 }\n sum(x[1..]) as i64\n}", "#563 a range slice with no end"),
     # cached GQA attention (#277) — k/v from KV caches, runtime history length
     "attn_gqa_cached_kv": ("fn main()->i64{\n"
                             "  let !kc=forge.kv[f32,[1,1,~,2]](capacity=4)\n"
@@ -206,6 +271,17 @@ PROBES = {
     "f32_branch_lit_else":  ("fn main()->f64{ let a=0.1f32\n let z=if a>1.0f32 {a} else {0.1}\n (z+0.2f32) as f64 }", "#478 unsuffixed literal adopts the f32 branch (else taken)"),
     "f32_match_lit_arm":    ("fn main()->f64{ let a=0.1f32\n let n=2\n let z=match n { 1 => a, _ => 0.1 }\n (z+0.2f32) as f64 }", "#478 same at a match join (literal arm taken)"),
     "f32_branch_lit_f64":   ("fn main()->f64{ let a=0.5\n let z=if a>1.0 {a} else {0.1}\n z }", "#478 must NOT narrow: an all-f64 join stays f64 (#209)"),
+    # #566: the same rule through an ENUM PAYLOAD binding. #478's pre-pass reads
+    # a bound name's width out of the JIT's local types, so an ordinary arm
+    # (`match k { 0 => x_f32, _ => 0.1 }`) already worked; a payload binding is
+    # not declared until the arm block is entered, i.e. after the hint has to be
+    # fixed, so the literal kept its f64 default and the arms were refused as
+    # disagreeing. `dmc run` answered, `dmc jit` did not — SPEC.md §4.5's own
+    # worked example. These probe both arm-taken directions plus the half that
+    # must not move.
+    "enum_payload_lit_arm":  ("enum S { C(f32), E }\nfn a(s:S)->f32{ match s { C(r) => r*r, E => 0.1 } }\nfn main()->f64{ (a(S.E)+0.2f32) as f64 }", "#566 untyped literal beside an f32 payload arm (literal arm taken)"),
+    "enum_payload_lit_pay":  ("enum S { C(f32), E }\nfn a(s:S)->f32{ match s { C(r) => r*r, E => 0.1 } }\nfn main()->f64{ (a(S.C(0.5f32))+0.2f32) as f64 }", "#566 …and the payload arm, whose f32 the literal adopts"),
+    "enum_payload_lit_f64":  ("enum S { C(f64), E }\nfn a(s:S)->f64{ match s { C(r) => r*r, E => 0.1 } }\nfn main()->f64{ a(S.E) }", "#566 must NOT narrow: an f64 payload leaves the literal f64 (#209)"),
     "f32_branch_join":    ("fn main()->f64{ let a=0.1f32\n let z=if a>0.0f32 {a+0.2f32} else {0.0f32}\n (z+0.3f32) as f64 }", "#473 both if-branches f32"),
     "f32_match_join":     ("fn main()->f64{ let n=1\n let a=0.1f32\n let z=match n { 1 => a+0.2f32, _ => 0.0f32 }\n (z+0.3f32) as f64 }", "#473 both match arms f32"),
     "f32_pow":            ("fn main()->f64{ let a=1.1f32\n let b=3.0f32\n (a**b) as f64 }", "#473 `**` widens to the f64 libm call and rounds back"),
@@ -548,6 +624,77 @@ PROBES = {
         "fn main()->i64{ let !a=forge.zeros[f32,[4]]\n for i in 0..4 { a[i]=(i+1) as f32 }\n"
         " (pick(a,0)*10000.0+pick(a,1)*100.0+pick(a,9)) as i64 }",
         "…same at a match join, and the default arm yields a buffer the callee never allocated"),
+    # #574 region scoping. The JIT kept `locals` as one flat map per function,
+    # so a binding introduced by a match arm or a loop overwrote an outer local
+    # of the same name for the rest of the function — and did it at lowering
+    # time, which knows nothing about which branch runs, so an arm that never
+    # executed still destroyed the name. Silent: both backends exited 0 and
+    # printed different numbers. The corpus reaches none of these shapes,
+    # because no example shadows an outer local with a region binding, which is
+    # why diff_backends had nothing to fire on.
+    "scope_payload_untaken_arm": (
+        "enum Shape { Circle(f32), Empty }\n"
+        "fn probe(s:Shape)->f32{ let r=2.0f32\n"
+        " let a=match s { Circle(r) => r*r, Empty => 0.0f32, }\n r+0.5f32 }\n"
+        "fn main()->i64{ (probe(Shape.Empty)*100.0) as i64 }",
+        "the payload arm never runs; the outer `r` must still be 2.0 → 250"),
+    "scope_payload_taken_arm": (
+        "enum Shape { Circle(f32), Empty }\n"
+        "fn probe(s:Shape)->f32{ let r=2.0f32\n"
+        " let a=match s { Circle(r) => r*r, Empty => 0.0f32, }\n a+r }\n"
+        "fn main()->i64{ (probe(Shape.Circle(3.0f32))*100.0) as i64 }",
+        "the other direction: the payload binding must still work inside its own arm → 1100"),
+    "scope_catch_all_arm": (
+        "fn probe(s:i64)->i64{ let n=7\n"
+        " let a=match s { 1 => 100, n => n*2, }\n n+a }\n"
+        "fn main()->i64{ probe(1)*1000 + probe(5) }",
+        "a catch-all arm binding the scrutinee is the same defect → 107017"),
+    "scope_for_loop_index": (
+        "fn probe()->i64{ let i=42\n for i in 0..3 { }\n i }\n"
+        "fn main()->i64{ probe() }",
+        "a loop index does not outlive its loop → 42, not the last value reached"),
+    "scope_nested_regions": (
+        "fn probe(a:i64,b:i64)->i64{ let n=1\n"
+        " let outer=match a { 0 => 0, n => { let inner=match b { 0 => 0, n => n*10, }\n inner+n }, }\n"
+        " outer+n }\n"
+        "fn main()->i64{ probe(5,7) }",
+        "the inner arm restores to the OUTER arm's binding, not the function's → 76"),
+
+    # #505 @comptime v1. Before it, `dmc run` answered and `dmc jit` refused
+    # every one of these — the directive was a parity hole, not just a no-op.
+    "comptime_fold_int": (
+        "fn main()->i64{ let x = @comptime { 3 * 7 + 1 }\n x }",
+        "#505 tier-1: a closed block folds to a literal both backends see → 22"),
+    "comptime_fold_bool": (
+        "fn main()->i64{ let c = @comptime { 2 > 1 }\n if c { 1 } else { 0 } }",
+        "#505 a folded boolean is what #384 Option A needs → 1"),
+    "comptime_fold_loop": (
+        "fn main()->i64{ let x = @comptime { let !a=0\n let !i=1\n"
+        " while i <= 4 { a += i\n i += 1 }\n a }\n x }",
+        "#505 real evaluation under the step budget, not literal folding → 10"),
+    "comptime_int_semantics": (
+        "fn main()->i64{ let x = @comptime { (0-7)/2 }\n x }",
+        "#505 the fold uses the interpreter's truncating division → -3"),
+    "comptime_shape_param": (
+        "fn tile[N](x:Tensor[f32,[N]])->i64{ let k = @comptime { N * 2 }\n k }\n"
+        "fn main()->i64{ tile(forge.zeros[f32,[4]]) }",
+        "#505 tier-2: residual block, folded per monomorphization by each backend → 8"),
+
+    # #578 `extern fn`. Classified by INTERP_REFUSAL above: `dmc run` refuses by
+    # spec, `dmc jit` answers. The three symbols are libc/libm and are in every
+    # CI host's process image, so the probes need no linkage of their own.
+    "extern_libc_abs": (
+        "extern fn abs(x: i32) -> i32\nfn main()->i64{ abs(-7) as i64 }",
+        "#578 the C ABI scalar call path, integer in / integer out → 7"),
+    "extern_libc_sqrtf": (
+        "extern fn sqrtf(x: f32) -> f32\n"
+        "fn main()->i64{ (sqrtf(9.0f32) * 100.0f32) as i64 }",
+        "#578 …and the float registers, which use a different ABI class → 300"),
+    "extern_tensor_ptr": (
+        "extern fn memcpy(dst: *f32, src: *f32, n: i64) -> *nil\n"
+        "fn main()->i64{ let !a=forge.zeros[f32,[4]]\n let !b=forge.zeros[f32,[4]]\n"
+        " b[0]=5.0f32\n memcpy(a, b, 16)\n (a[0]*10.0f32) as i64 }",
+        "#578 SPEC §3.12 tensor-to-`*T` materialization, written through → 50"),
 }
 
 _VAL = re.compile(r"=>\s*(-?[\d.]+(?:e[-+]?\d+)?|true|false|NaN|inf)")
@@ -587,11 +734,23 @@ def main() -> int:
         return 2
 
     diverged, new_gaps, ok, gaps = [], [], 0, 0
+    refusals = 0
     for name, (src, _note) in PROBES.items():
         rs, rv = run(args.dmc, "run", src, args.timeout)
         js, jv = run(args.dmc, "jit", src, args.timeout)
         verdict = None
-        if rs == "ok" and js == "ok" and rv == jv:
+        if name in INTERP_REFUSAL:
+            # The interpreter must refuse and the JIT must answer. Both halves
+            # are asserted: a probe whose `dmc run` starts succeeding is no
+            # longer probing what it was allowlisted for.
+            if rs != "ok" and js == "ok":
+                refusals += 1
+                verdict = f"interp-refusal (by spec): jit={jv}"
+            else:
+                diverged.append(name)
+                verdict = (f"DIVERGE: allowlisted as an interpreter refusal, but "
+                           f"run={rs}:{rv!r} jit={js}:{jv!r}")
+        elif rs == "ok" and js == "ok" and rv == jv:
             ok += 1
             verdict = f"OK ({rv})"
         elif rs == "ok" and js == "ok":
@@ -617,8 +776,8 @@ def main() -> int:
         if args.verbose or "DIVERGE" in verdict or (verdict.startswith("jit-gap") and name not in GAP_ALLOWLIST):
             print(f"  {name:22} {verdict}")
 
-    print(f"\njit_probes: {ok} ok, {gaps} jit-gap, {len(diverged)} divergence(s), "
-            f"{len(new_gaps)} untracked gap(s)")
+    print(f"\njit_probes: {ok} ok, {gaps} jit-gap, {refusals} interp-refusal, "
+            f"{len(diverged)} divergence(s), {len(new_gaps)} untracked gap(s)")
     for name, msg in new_gaps:
         print(f"  {name}: warning: untracked jit-gap — fix or add to GAP_ALLOWLIST: {msg}")
     for name in diverged:

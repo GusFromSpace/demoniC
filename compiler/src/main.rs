@@ -12,6 +12,9 @@ mod ast;
 mod diag;
 mod parser;
 mod desugar;
+// #505: `@comptime` folding — the reference interpreter at compile time.
+// Runs after parse and before check, so both backends lower the same tree.
+mod comptime;
 mod shape;
 mod types;
 mod check;
@@ -41,6 +44,9 @@ mod parser_tests;
 #[cfg(test)]
 #[path = "check_tests.rs"]
 mod check_tests;
+#[cfg(test)]
+#[path = "comptime_tests.rs"]
+mod comptime_tests;
 #[cfg(test)]
 #[path = "interp_tests.rs"]
 mod interp_tests;
@@ -110,6 +116,34 @@ fn check_diag(
         d = d.shapes(&exp.dims, &act.dims);
     }
     d
+}
+
+/// #505: fold every `@comptime` block in a resolved program set, before any
+/// checker runs (`COMPTIME_V1.md §3`).
+///
+/// The pass rewrites the AST in place — a closed block becomes an integer or
+/// boolean literal — so every consumer downstream of here, both backends
+/// included, lowers the same tree. Its diagnostics are `check::TypeError`s,
+/// returned per file and seeded into that file's `Checker` before
+/// `check_program` runs, which is why the human renderer, the exit code and
+/// the `--json` stream need no case for them: they are checker errors by the
+/// time anything reports them.
+///
+/// `dmc fmt` deliberately does not call this, so `@comptime` source
+/// round-trips through the formatter unfolded (`COMPTIME_V1.md §7`).
+fn fold_comptime_all(
+    r: &mut resolver::Resolver,
+) -> std::collections::HashMap<std::path::PathBuf, Vec<check::TypeError>> {
+    let mut out = std::collections::HashMap::new();
+    for p in r.sorted_paths.clone() {
+        if let Some(prog) = r.files.get_mut(&p) {
+            let errs = comptime::fold_program(prog);
+            if !errs.is_empty() {
+                out.insert(p, errs);
+            }
+        }
+    }
+    out
 }
 
 /// A `JitError` in `--json` form. A refusal (`JitErrorKind::Unsupported`) is
@@ -462,6 +496,8 @@ fn run_tests(
             continue;
         }
 
+        let folded = fold_comptime_all(&mut resolver);
+
         let program = match resolver.files.get(&canonical_file) {
             Some(prog) => prog.clone(),
             None => {
@@ -480,6 +516,7 @@ fn run_tests(
         for p in &resolver.sorted_paths {
             let prog = resolver.files.get(p).unwrap();
             let mut checker = Checker::new();
+            checker.errors = folded.get(p).cloned().unwrap_or_default();
             checker.checked_modules = checked_modules.clone();
             checker.check_program(prog, Some(p));
             if !checker.errors.is_empty() {
@@ -748,6 +785,13 @@ fn real_main() {
     let mut demon_mode = false;
     let mut jit_test = false;
     let mut gpu_mode = false;
+    // #578: `--blas` routes a large f32 matmul to the host BLAS
+    // (`cblas_sgemm`, Accelerate/AMX on macOS) instead of the Cranelift
+    // kernel. Off by default — BLAS accumulates in its own blocked order, so
+    // the numbers move (`NUMERICS.md §2.2`); the flag is where that trade is
+    // stated. Inert on a host with no BLAS in its process image, and never
+    // selected inside `@deterministic`.
+    let mut blas_mode = false;
     // #485: `--json` re-encodes the diagnostics as JSON Lines on stderr. It
     // changes nothing else — not the set of diagnostics, not the exit code.
     let mut json_mode = false;
@@ -763,6 +807,7 @@ fn real_main() {
         else if a == "--demon" { demon_mode = true; }
         else if a == "--jit" { jit_test = true; }
         else if a == "--gpu" { gpu_mode = true; }
+        else if a == "--blas" { blas_mode = true; }
         else if a == "--json" { json_mode = true; }
         else if let Some(which) = arena::flag_arena(a) {
             let value = match a.split_once('=') {
@@ -969,6 +1014,7 @@ fn real_main() {
                     None => { eprintln!("{}", e); std::process::exit(1); }
                 }
             }
+            let folded = fold_comptime_all(&mut resolver);
             let mut checked_modules = std::collections::HashMap::new();
             let mut total_errors = 0;
             let mut items_count = 0;
@@ -976,6 +1022,7 @@ fn real_main() {
                 let prog = resolver.files.get(p).unwrap();
                 items_count += prog.items.len();
                 let mut checker = Checker::new();
+                checker.errors = folded.get(p).cloned().unwrap_or_default();
                 checker.demon = demon_mode;
                 checker.checked_modules = checked_modules.clone();
                 checker.check_program(prog, Some(p));
@@ -1023,11 +1070,13 @@ fn real_main() {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }
+            let folded = fold_comptime_all(&mut resolver);
             let mut checked_modules = std::collections::HashMap::new();
             let mut total_errors = 0;
             for p in &resolver.sorted_paths {
                 let prog = resolver.files.get(p).unwrap();
                 let mut checker = Checker::new();
+                checker.errors = folded.get(p).cloned().unwrap_or_default();
                 checker.demon = demon_mode;
                 checker.checked_modules = checked_modules.clone();
                 checker.check_program(prog, Some(p));
@@ -1096,7 +1145,7 @@ fn real_main() {
             // #15 slice 1); only one example in the corpus imports at all, and
             // it is outside the JIT subset.
             let mut parser = Parser::new(tokens);
-            let program = match parser.parse_program() {
+            let mut program = match parser.parse_program() {
                 Ok(p) => p,
                 Err(e) => match emitter.take() {
                     Some(mut em) => {
@@ -1113,6 +1162,12 @@ fn real_main() {
                     None => { eprintln!("{}", e); std::process::exit(1); }
                 },
             };
+            // #505: fold `@comptime` before the checker, on this path too. The
+            // single-file JIT route does not go through the resolver, so it
+            // needs its own call — without one, `dmc jit` and `dmc run` would
+            // disagree about a folded program, which is the exact defect the
+            // directive's v1 closes.
+            let comptime_errors = comptime::fold_program(&mut program);
             // #478 step 1: `dmc jit` type-checks, like `dmc run` already did.
             // It used to lower raw AST and rely on the JIT's own per-function
             // validation, so it accepted programs the checker rejects —
@@ -1123,6 +1178,7 @@ fn real_main() {
             // Measured at f8affbe: every corpus example passes `--check`, so
             // this rejects nothing that used to work.
             let mut checker = Checker::new();
+            checker.errors = comptime_errors;
             checker.demon = demon_mode;
             checker.check_program(&program, Some(&path));
             if !checker.errors.is_empty() {
@@ -1175,6 +1231,25 @@ fn real_main() {
                     }
                 }
             }
+            if blas_mode {
+                // Honored only where `cblas_sgemm` resolves in this process.
+                // Elsewhere the setter is inert and the Cranelift kernel runs,
+                // so a build or a host without a BLAS needs no cfg — the
+                // absence of the symbol is the whole mechanism.
+                jit.set_blas(true);
+                if !jit::blas_gemm_available() {
+                    const BLAS_IGNORED: &str =
+                        "--blas ignored (no `cblas_sgemm` in this process's dynamic symbol table)";
+                    match &mut emitter {
+                        Some(em) => em.emit(&diag::Diagnostic::new(
+                            diag::Kind::Cli,
+                            diag::Severity::Warning,
+                            BLAS_IGNORED,
+                        ).code("blas-unavailable")),
+                        None => eprintln!("warning: {}", BLAS_IGNORED),
+                    }
+                }
+            }
             if let Err(e) = jit.compile_program(&program) {
                 // The payload #485 exists for: an agent iterating a program
                 // toward JIT eligibility reads `code` and `line`/`col`, not an
@@ -1223,11 +1298,13 @@ fn real_main() {
             }
             println!("✅ Lex OK");
             println!("✅ Parse OK");
+            let folded = fold_comptime_all(&mut resolver);
             let mut checked_modules = std::collections::HashMap::new();
             let mut total_errors = 0;
             for p in &resolver.sorted_paths {
                 let prog = resolver.files.get(p).unwrap();
                 let mut checker = Checker::new();
+                checker.errors = folded.get(p).cloned().unwrap_or_default();
                 checker.demon = demon_mode;
                 checker.checked_modules = checked_modules.clone();
                 checker.check_program(prog, Some(p));

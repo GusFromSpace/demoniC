@@ -52,9 +52,12 @@ pub fn max_file_lines_in(text: &str) -> Option<usize> {
     let root = Json::parse(text)?;
     let lints = root.get("lints")?;
     match lints.get("max_file_lines")? {
-        Json::Num(n) if n.fract() == 0.0 && *n >= 1.0 && *n <= usize::MAX as f64 => {
-            Some(*n as usize)
-        }
+        // #518/#514: `Json::Int` only — a `Json::Num` here is a `1e1` or
+        // `10.0` token, and `tools/validate_manifest.py` fails `make check`
+        // on either. Arming the lint from one anyway was the divergence:
+        // a manifest `make check` rejects must not still work for the
+        // compiler's own reader.
+        Json::Int(n) if *n >= 1 => Some(*n as usize),
         _ => None,
     }
 }
@@ -65,7 +68,17 @@ pub fn max_file_lines_in(text: &str) -> Option<usize> {
 enum Json {
     Null,
     Bool(bool),
+    /// A number token with a `.` and/or an exponent — a JSON *float* literal,
+    /// even when its value happens to be integral (`10.0`, `1e1`). Kept
+    /// distinct from `Int` (#518/#514) so a manifest dial that wants "an
+    /// integer" can require the written *token form*, matching
+    /// `tools/validate_manifest.py`'s `isinstance(value, int)` (Python's
+    /// `json` module makes the identical distinction — `10` decodes to
+    /// `int`, `10.0`/`1e1` to `float`, regardless of value).
     Num(f64),
+    /// A number token with neither a `.` nor an exponent — a JSON *integer*
+    /// literal. See `Num`.
+    Int(i64),
     Str(String),
     Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
@@ -216,13 +229,51 @@ impl JsonParser<'_> {
         Some(v)
     }
 
+    /// #518/#514: strict JSON number grammar — `-? INT FRAC? EXP?` where
+    /// `INT` is `0` or a non-zero digit followed by more digits (no leading
+    /// zeros: `007` is not a JSON number), `FRAC` is `.` plus one-or-more
+    /// digits, and `EXP` is `[eE] [+-]? ` plus one-or-more digits. The
+    /// previous version of this scanner accepted any run of
+    /// `[0-9.eE+-]` — which read straight through a leading-zero `007` the
+    /// grammar forbids (Rust's `f64::parse` accepts it as 7.0, so nothing
+    /// downstream caught it either) — and, the leniency #514/#518 named
+    /// directly, could not tell `10` from `10.0`/`1e1` at all: every number
+    /// token became the same `Json::Num(f64)`, so `max_file_lines_in` had no
+    /// way to require the plain-integer token `tools/validate_manifest.py`
+    /// requires. Returns `Json::Int` for a token with no `.`/exponent,
+    /// `Json::Num` otherwise — see the `Json` enum doc.
     fn number(&mut self) -> Option<Json> {
         let start = self.pos;
         if self.peek() == Some(b'-') { self.pos += 1; }
-        while matches!(self.peek(), Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')) {
+        match self.peek() {
+            Some(b'0') => { self.pos += 1; }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) { self.pos += 1; }
+            }
+            _ => return None,
+        }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') {
+            is_float = true;
             self.pos += 1;
+            let frac_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) { self.pos += 1; }
+            if self.pos == frac_start { return None; } // `.` needs >=1 digit
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            is_float = true;
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) { self.pos += 1; }
+            let exp_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) { self.pos += 1; }
+            if self.pos == exp_start { return None; } // exponent needs >=1 digit
         }
         let s = std::str::from_utf8(&self.src[start..self.pos]).ok()?;
-        s.parse::<f64>().ok().filter(|n| n.is_finite()).map(Json::Num)
+        if is_float {
+            s.parse::<f64>().ok().filter(|n| n.is_finite()).map(Json::Num)
+        } else {
+            s.parse::<i64>().ok().map(Json::Int)
+        }
     }
 }

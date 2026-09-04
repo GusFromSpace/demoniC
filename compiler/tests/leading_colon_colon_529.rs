@@ -38,7 +38,7 @@ fn run_mode(name: &str, mode: &str, src: &str) -> Output {
 
 /// Strided slices (any `a:b:c` form, with or without an omitted start) are
 /// not JIT-lowered at all yet — `jit.rs` refuses them with a dedicated
-/// "need slice-5 support" message, pre-existing and independent of #529
+/// "strided slices (`a:b:c`)" message, pre-existing and independent of #529
 /// (confirmed below: the already-working `x[3::-1]` hits the identical
 /// refusal). So only the interpreter (`run`) is exercised for numeric
 /// correctness here; `dmc --check` covers the parse side on both backends'
@@ -101,7 +101,8 @@ fn issue_529_start_present_negative_stride_unaffected() {
 }
 
 /// The JIT does not lower ANY strided slice yet (`jit.rs`: "strided slices
-/// (`a:b:c`) need slice-5 support") — confirmed pre-existing and orthogonal
+/// (`a:b:c`)", a `jit unsupported` refusal since the #563 sweep reclassified
+/// it from `jit error`) — confirmed pre-existing and orthogonal
 /// to #529 by checking it fires identically for the already-working
 /// start-present form and the newly-parseable start-omitted form. Both get
 /// PAST parsing (the #529 fix) and fail at JIT lowering with the same
@@ -125,8 +126,15 @@ fn issue_529_jit_strided_slice_gap_is_preexisting_not_a_parse_error() {
         assert!(!out.status.success(), "{}: expected jit to refuse, it didn't", label);
         let se = String::from_utf8_lossy(&out.stderr).to_string();
         assert!(
-            se.contains("need slice-5 support"),
-            "{}: expected the pre-existing slice-5 refusal, got: {}",
+            se.contains("strided slices (`a:b:c`)"),
+            "{}: expected the pre-existing strided-slice refusal, got: {}",
+            label, se
+        );
+        // #563: the refusal is a lowering GAP, not a defect, and says so —
+        // that prefix is what `tools/jit_probes.py` classifies on.
+        assert!(
+            se.contains("jit unsupported at"),
+            "{}: the strided-slice gap is not classified as a gap: {}",
             label, se
         );
         assert!(

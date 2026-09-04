@@ -140,6 +140,26 @@ pub enum Refusal {
     Grad,
     /// `@grad @grad` over a builtin with no second-order rule.
     SecondOrder,
+    /// A tensor / cache / value element type outside the lowered set — the
+    /// JIT cannot allocate or compute in it (#572). Distinct from `F32Only`,
+    /// which is about an *op* narrower than the types it accepts, and from
+    /// `OperandType`, which is about an operator's operand.
+    ElementType,
+    /// A rank outside the bound an op is lowered over (#572 sweep). The shape
+    /// is statically known — that is what separates this from `DynamicShape`;
+    /// there are simply no lowered loops for that many axes.
+    Rank,
+    /// A slice or index form outside the lowered subset — a non-literal or
+    /// absent bound, a stride, a non-contiguous axis order (#563).
+    Slice,
+    /// A value conversion the JIT does not lower, including into a type it
+    /// has no representation for (`(T, Err)`'s `Err` half, #568).
+    Conversion,
+    /// A type in a signature, annotation, or model field the JIT cannot
+    /// build — `any`, a `nil` parameter, a KV type with no streaming axis, a
+    /// template parameter outside scalar/Tensor/KV. `Signature` is the older,
+    /// narrower class for *parameter forms*; this one is about the type.
+    TypeForm,
 }
 
 impl Refusal {
@@ -165,6 +185,11 @@ impl Refusal {
             Refusal::Axis => "jit-axis",
             Refusal::Grad => "jit-grad",
             Refusal::SecondOrder => "jit-second-order",
+            Refusal::ElementType => "jit-element-type",
+            Refusal::Rank => "jit-rank",
+            Refusal::Slice => "jit-slice",
+            Refusal::Conversion => "jit-conversion",
+            Refusal::TypeForm => "jit-type-form",
         }
     }
 
@@ -177,8 +202,10 @@ impl Refusal {
         Refusal::Axis,
         Refusal::BranchType,
         Refusal::Construct,
+        Refusal::Conversion,
         Refusal::Directive,
         Refusal::DynamicShape,
+        Refusal::ElementType,
         Refusal::Extern,
         Refusal::F32Only,
         Refusal::Grad,
@@ -188,8 +215,11 @@ impl Refusal {
         Refusal::LoopForm,
         Refusal::OperandType,
         Refusal::Pattern,
+        Refusal::Rank,
         Refusal::SecondOrder,
         Refusal::Signature,
+        Refusal::Slice,
+        Refusal::TypeForm,
         Refusal::UnknownFn,
     ];
 }
@@ -236,11 +266,20 @@ fn unsupported<T>(span: &Span, class: Refusal, what: &str) -> Result<T, JitError
 /// reclassify refusals that were historically raised through `err` and so were
 /// scored as divergences by the probe battery (#480).
 fn unsupported_msg<T>(span: &Span, class: Refusal, msg: impl Into<String>) -> Result<T, JitError> {
-    Err(JitError {
+    Err(unsupported_err(span, class, msg))
+}
+
+/// The `JitError` value behind `unsupported_msg`, for the sites that need the
+/// error itself rather than a `Result` — `ok_or_else` on a failed literal fold,
+/// for instance. Without it those sites build a `JitError` by hand, which is
+/// how they ended up defaulting to `JitErrorKind::Error` and scoring as
+/// divergences (#563).
+fn unsupported_err(span: &Span, class: Refusal, msg: impl Into<String>) -> JitError {
+    JitError {
         msg: msg.into(), line: span.line, col: span.col,
         kind: JitErrorKind::Unsupported,
         refusal: Some(class),
-    })
+    }
 }
 
 /// Render a `define_function` failure with the detail attached.
@@ -444,9 +483,9 @@ const INT_CAST_BLOCK_UNSUPPORTED: &str =
      (bf16/f16/tf32/f32/f64) is supported here";
 
 /// Name of an *integer* target type in a `@cast(<ty>) { … }` directive.
-/// The interpreter truncates such tensor casts toward zero and retags
-/// DType::Int (interp.rs `apply_cast_by_name`, #125). Mirrors interp's
-/// `is_int_type_name`.
+/// The interpreter narrows such tensor casts into the named element width and
+/// retags `DType::Int(w)` (interp.rs `apply_cast_by_name`, #125/#571). Mirrors
+/// interp's `int_type_name_width`.
 fn is_int_cast_type_name(name: &str) -> bool {
     matches!(name,
         "i8" | "i16" | "i32" | "i64" |
@@ -496,11 +535,12 @@ fn scalar_from_ast(ty: &Type) -> Result<ScalarKind, JitError> {
             // and `fn f(ch: u32)` could not be JIT-compiled at all.
             other if narrow_scalar_kind(other).is_some() =>
                 Ok(narrow_scalar_kind(other).unwrap()),
-            other => err(&span, format!(
-                "scalar type `{:?}` not yet supported by the JIT (slice 1)", other,
+            other => unsupported_msg(&span, Refusal::TypeForm, format!(
+                "scalar type `{:?}` is not lowered by the JIT; use `dmc run` for full semantics",
+                other,
             )),
         },
-        _ => err(&span, "JIT slice 1 accepts only scalar types in fn signatures"),
+        _ => unsupported(&span, Refusal::TypeForm, "a non-scalar type where the JIT needs a scalar"),
     }
 }
 
@@ -809,6 +849,80 @@ impl TyKind {
     fn is_map(&self) -> bool { matches!(self, TyKind::Map) }
 }
 
+/// #578: is `ty` a type this backend can put in a C ABI signature?
+///
+/// The language rule is wider (see `check.rs::check_extern_boundary`); this is
+/// the machine one. Two families the language admits are refused here:
+///
+/// * **`str`** — a demoniC `str` is an i64 pointer to a forge `[len, bytes]`
+///   pair, not a `char*`. Passing it would hand a foreign callee a pointer to
+///   a length word. `*u8` plus a separately passed length is the form that
+///   works.
+/// * **the narrow integers and the exotic floats** — `i8`/`i16`/`u8`/`u16`/
+///   `u32` are i64-backed and masked in this backend (#544), and `f16`/`bf16`/
+///   `tf32`/`fp8_*`/`int4`/`int8`/`trit` are f32- or i64-backed (#179). Their
+///   machine width is not the width the annotation names, so a C callee
+///   reading them at the declared width reads the wrong bytes — and a narrow
+///   *return* would read whatever the callee left in the upper bits.
+///
+/// Everything admitted below has a machine width equal to its declared one:
+/// `i32`, `i64`/`u64`, `f32`, `f64`, `bool` (C `_Bool`, one byte), `*T`, and
+/// `nil` as the return type.
+fn check_extern_abi_ty(ty: &Type, span: &Span, fn_name: &str, param: Option<&str>)
+    -> Result<(), JitError>
+{
+    use ScalarType as S;
+    let refused: &str = match ty {
+        Type::RawPtr(_, _) => return Ok(()),
+        Type::Scalar(s, _) => match s {
+            S::I32 | S::I64 | S::U64 | S::F32 | S::F64 | S::Bool | S::Nil => return Ok(()),
+            S::Str => "`str` (a forge `[len, bytes]` pointer, not a `char*` — use `*u8` \
+                       plus a length)",
+            S::I8 | S::I16 | S::U8 | S::U16 | S::U32 =>
+                "a narrow integer type (i64-backed and masked in the JIT, so its machine \
+                 width is not the declared one — use `i32` or `i64`)",
+            _ => "an exotic float or packed type (f32-/i64-backed in the JIT, so its \
+                  machine width is not the declared one — use `f32` or `f64`)",
+        },
+        // Everything else the language forbids outright; `check.rs` reports it
+        // as `extern-boundary`. `dmc jit` skips the checker, so it is reported
+        // here too rather than reaching `ty_from_ast` and failing as something
+        // else.
+        _ => "a type an extern boundary does not admit (scalar types, raw pointers `*T`, \
+              and `nil` only)",
+    };
+    let what = match param {
+        Some(p) => format!("param `{}` of `extern fn {}`", p, fn_name),
+        None => format!("the return type of `extern fn {}`", fn_name),
+    };
+    // `unsupported_msg`, not `unsupported`: the latter appends "use `dmc run`
+    // for full semantics", which is the one remedy that cannot work here — the
+    // interpreter refuses every `extern fn` call by spec (§9).
+    unsupported_msg(span, Refusal::Extern, format!("{} is {}", what, refused))
+}
+
+/// #578: does the process's dynamic symbol table hold `name`?
+///
+/// `Some(true)`/`Some(false)` is a definite answer; `None` means this target
+/// has no resolver here and the caller should not draw a conclusion — a
+/// pre-flight that cannot see the linker must not refuse what the linker would
+/// have found.
+///
+/// `RTLD_DEFAULT` searches the images already loaded. It loads nothing, which
+/// is what makes it safe to run over every declaration in a program.
+#[cfg(unix)]
+fn process_symbol_present(name: &str) -> Option<bool> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated C string that outlives the call,
+    // and `dlsym` over `RTLD_DEFAULT` only reads the loaded images' symbol
+    // tables. The returned address is compared against null and discarded.
+    let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+    Some(!addr.is_null())
+}
+
+#[cfg(not(unix))]
+fn process_symbol_present(_name: &str) -> Option<bool> { None }
+
 /// #350: post-resolve enum-named types. `ty_from_ast` / `lower_ty_for_model`
 /// have no view of the enum registry, so an enum-named type (`l: Light`) comes
 /// back as `TyKind::Model("Light", [])`. Rewrite any such name that is actually
@@ -870,7 +984,8 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                     resolve_shape_elem(d, env, span)
                 }).collect::<Result<_, _>>()?;
                 if dims.len() != 2 {
-                    return err(span, "trit tensors must be 2-D: Tensor[trit, [K, N]]");
+                    return unsupported(span, Refusal::Rank,
+                        "a trit tensor that is not 2-D (`Tensor[trit, [K, N]]`)");
                 }
                 return Ok(TyKind::TritTensor(TritTensorTy { k: dims[0], n: dims[1] }));
             }
@@ -887,8 +1002,9 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                     // at elem.cl()); float-math ops (sum/matmul/…) stay f32-only.
                     ScalarType::I64 | ScalarType::U64 => ScalarKind::I64,
                     ScalarType::I32 | ScalarType::U32 => ScalarKind::I32,
-                    other => return err(span, format!(
-                        "tensor element type `{:?}` not supported (f32/bf16/i64/i32 only)",
+                    other => return unsupported_msg(span, Refusal::ElementType, format!(
+                        "tensor element type `{:?}` is not lowered (f32/bf16/i64/i32 only); \
+                         use `dmc run` for full semantics",
                         other,
                     )),
                 },
@@ -903,8 +1019,9 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                 dims.push(val);
             }
             if dims.is_empty() || dims.len() > 4 {
-                return err(span, format!(
-                    "JIT supports tensor ranks 1..=4, got rank {}", dims.len(),
+                return unsupported_msg(span, Refusal::Rank, format!(
+                    "a rank-{} tensor (the JIT lowers ranks 1..=4); \
+                     use `dmc run` for full semantics", dims.len(),
                 ));
             }
             Ok(TyKind::Tensor(TensorTy { elem, shape: dims }))
@@ -912,7 +1029,8 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
         Type::KV(inner, shape, span) => {
             let elem = match inner.as_ref() {
                 Type::Scalar(ScalarType::F32, _) => ScalarKind::F32,
-                _ => return err(span, "KV element type must be f32 (JIT slice surface)"),
+                _ => return unsupported(span, Refusal::ElementType,
+                        "a KV cache whose element type is not `f32`"),
             };
             let mut dims: Vec<i64> = Vec::new();
             let mut stream_axis: Option<usize> = None;
@@ -933,17 +1051,15 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                     }
                 }
             }
-            let stream_axis = stream_axis.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-                msg: "KV type must contain a streaming `~` axis".into(),
-                line: span.line, col: span.col,
-            })?;
+            let stream_axis = stream_axis.ok_or_else(|| unsupported_err(span, Refusal::TypeForm,
+                "a KV type with no streaming `~` axis; use `dmc run` for full semantics"))?;
             // Capacity is not carried in the parameter type — it lives in the
             // runtime header (see KvTy). `cap: None` marks it compile-time unknown.
             Ok(TyKind::KV(KvTy { elem, dims, stream_axis, cap: None }))
         }
         Type::RawPtr(_, _) => Ok(TyKind::Scalar(ScalarKind::I64)),
-        Type::Named { name, span, .. } if name == "any" => err(span,
-            "`any`-typed values are dynamically typed and cannot be JIT-compiled; use `dmc run`"),
+        Type::Named { name, span, .. } if name == "any" => unsupported(span, Refusal::TypeForm,
+            "`any`-typed values (they are dynamically typed)"),
         Type::Named { name, .. } if name == "Map" => Ok(TyKind::Map),
         // `Port[python]` / bare `Port` (SPEC §3.11) — an open port's handle.
         // SPEC says a handle "may be passed, returned, and closed explicitly",
@@ -974,11 +1090,13 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                         return ty_from_ast(&Type::KV(f32_elem, shape.clone(), kspan.clone()), env);
                     }
                 }
-                err(span, "JIT only supports `[KV[...]; N]` or `[ModelName; N]` fixed-size array types in fn signatures")
+                unsupported(span, Refusal::TypeForm,
+                    "an array type other than `[KV[...]; N]` or `[ModelName; N]`")
             })?;
             let kv = match kv_ty_raw {
                 TyKind::KV(k) => k,
-                _ => return err(span, "JIT only supports `[KV[...]; N]` or `[ModelName; N]` fixed-size array types in fn signatures"),
+                _ => return unsupported(span, Refusal::TypeForm,
+                        "an array type other than `[KV[...]; N]` or `[ModelName; N]`"),
             };
             let n = resolve_shape_expr(count_expr, env, span)?;
             if n <= 0 {
@@ -994,8 +1112,8 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
             let ret = ty_from_ast(ret_ty, env)?;
             Ok(TyKind::Fn(params, Box::new(ret)))
         }
-        _ => err(&type_span(ty),
-            "JIT accepts only scalar and Tensor types in fn signatures"),
+        _ => unsupported(&type_span(ty), Refusal::TypeForm,
+            "this type in a signature (the JIT accepts scalar and Tensor types)"),
     }
 }
 
@@ -1019,8 +1137,8 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
             };
             Ok(TyKind::Scalar(sk))
         }
-        Type::Named { name, span, .. } if name == "any" => err(span,
-            "`any`-typed model fields are dynamically typed and cannot be JIT-compiled; use `dmc run`"),
+        Type::Named { name, span, .. } if name == "any" => unsupported(span, Refusal::TypeForm,
+            "`any`-typed model fields (they are dynamically typed)"),
         Type::Named { name, args, .. } => Ok(TyKind::Model(name.clone(), type_named_dims(args, env))),
         Type::Tensor(inner, shape, tspan) => {
             // Map the element type to the nearest representable ScalarKind.
@@ -1176,8 +1294,8 @@ fn resolve_shape_elem(
     match d {
         ShapeElem::Expr(e) => resolve_shape_expr(e, env, span),
         ShapeElem::Wildcard(_) | ShapeElem::Streaming(_) | ShapeElem::Spread(_) => {
-            err(span,
-                "JIT requires concrete dimensions (`~`, `..`, `?` need slice-4 support)")
+            unsupported(span, Refusal::DynamicShape,
+                "a non-concrete dimension (`~`, `..`, `?`)")
         }
     }
 }
@@ -1201,12 +1319,14 @@ fn resolve_shape_expr(
                 BinOp::Sub => Ok(l - r),
                 BinOp::Mul => Ok(l * r),
                 BinOp::Div if r != 0 => Ok(l / r),
-                _ => err(span, format!(
-                    "shape expressions support `+ - * /` only, got `{:?}`", op,
+                _ => unsupported_msg(span, Refusal::DynamicShape, format!(
+                    "a shape expression using `{:?}` (the JIT folds `+ - * /` only); \
+                     use `dmc run` for full semantics", op,
                 )),
             }
         }
-        _ => err(span, "shape elements must be literal ints, idents, or arithmetic"),
+        _ => unsupported(span, Refusal::DynamicShape,
+                "a shape element that is not a literal int, ident, or arithmetic"),
     }
 }
 
@@ -1473,6 +1593,16 @@ pub struct Jit {
     /// CPU `__dmc_matmul_bf16`. Only honored when built with `--features gpu`
     /// on macOS; otherwise the symbol is absent and the flag is a no-op.
     gpu: bool,
+
+    /// #578: when true (set by `--blas`), an f32 matmul at or above
+    /// `BLAS_MIN_MACS` is routed to `cblas_sgemm` instead of the Cranelift
+    /// kernel — on a host where the symbol resolves, and never inside
+    /// `@deterministic`. Off by default: BLAS accumulates in its own blocked
+    /// order, and `SPEC.md §7.4b` promises the ascending-k contracted FMA on
+    /// "both backends and every kernel". Opt-in keeps that promise
+    /// unqualified and puts the trade on the command line, where a consumer
+    /// can read it (`NUMERICS.md §2.2`).
+    blas: bool,
 }
 
 #[derive(Clone)]
@@ -1677,6 +1807,10 @@ impl Jit {
         builder.symbol("__dmc_vault_load_npz", dmc_vault_load_npz as *const u8);
         // #323: multi-threaded f32 matmul for the large Linear layers.
         builder.symbol("__dmc_matmul_par", dmc_matmul_par as *const u8);
+        // #578: the BLAS/AMX fast path, same ABI. Registered unconditionally;
+        // whether it is ever *called* is decided at lowering time by
+        // `blas_gemm_available()` and the `--blas` flag.
+        builder.symbol("__dmc_matmul_blas", dmc_matmul_blas as *const u8);
         // #324: bf16-direct matmul kernel + upconvert-on-use helper.
         builder.symbol("__dmc_matmul_bf16", dmc_matmul_bf16 as *const u8);
         // #326: GPU/Metal bf16 decode GEMV — only present on macOS + `--features gpu`.
@@ -1725,6 +1859,7 @@ impl Jit {
             enums: HashMap::new(),
             enum_payload_layouts: HashMap::new(),
             gpu: false,
+            blas: false,
         })
     }
 
@@ -1734,6 +1869,15 @@ impl Jit {
     #[cfg(all(target_os = "macos", feature = "gpu"))]
     pub fn set_gpu(&mut self, on: bool) {
         self.gpu = on;
+    }
+
+    /// #578: enable the BLAS/AMX GEMM fast path (`--blas`). Honored only where
+    /// `cblas_sgemm` resolves in this process; elsewhere it is inert and the
+    /// Cranelift kernel runs, which is what keeps the Linux path — untestable
+    /// on this repo's macOS-only CI — a missing symbol rather than a second
+    /// code path.
+    pub fn set_blas(&mut self, on: bool) {
+        self.blas = on;
     }
 
     /// Pre-register a symbol address for an `extern fn` declaration.
@@ -1920,6 +2064,14 @@ impl Jit {
     }
 
     // ─── Pass 0: extern fn declarations ──────────────────────────────────────
+    //
+    // #578. `check.rs` enforces the spec's *language* rule for this boundary
+    // (scalar types, `*T`, `nil` — `extern-boundary`). What follows is the
+    // narrower *implementation* rule: which of those this backend can put in a
+    // C ABI signature. The two differ deliberately, and the difference is
+    // always the same shape — a type the language admits and this backend has
+    // no honest machine representation for. `STABILITY.md §4` puts the
+    // JIT-supported subset outside the stability policy for exactly this.
 
     fn declare_extern_fns(&mut self, program: &Program) -> Result<(), JitError> {
         for item in &program.items {
@@ -1956,13 +2108,13 @@ impl Jit {
         }
         if let Some(abi) = &e.abi {
             if abi != "C" {
-                return unsupported(&e.span, Refusal::Extern,
-                    &format!("extern \"{}\" ABI not yet supported in JIT (only C ABI)", abi));
+                return unsupported_msg(&e.span, Refusal::Extern,
+                    format!("extern \"{}\" ABI is not lowered (only the C ABI is)", abi));
             }
         }
         if !e.shape_params.is_empty() {
-            return unsupported(&e.span, Refusal::Extern,
-                "shape-generic extern fn not supported in JIT");
+            return unsupported_msg(&e.span, Refusal::Extern,
+                "a shape-generic `extern fn` is not lowered");
         }
 
         let empty_env: HashMap<String, i64> = HashMap::new();
@@ -1974,6 +2126,7 @@ impl Jit {
                 msg: format!("extern fn `{}` param `{}` has no type annotation", e.name, p.name),
                 line: p.span.line, col: p.span.col,
             })?;
+            check_extern_abi_ty(ast_ty, &p.span, &e.name, Some(&p.name))?;
             let ty = ty_from_ast(ast_ty, &empty_env)?;
             sig.params.push(AbiParam::new(ty.cl()));
             params.push((p.name.clone(), ty, p.span.clone()));
@@ -1981,7 +2134,10 @@ impl Jit {
 
         let ret = match &e.ret_type {
             None => TyKind::Scalar(ScalarKind::Nil),
-            Some(t) => ty_from_ast(t, &empty_env)?,
+            Some(t) => {
+                check_extern_abi_ty(t, &e.span, &e.name, None)?;
+                ty_from_ast(t, &empty_env)?
+            }
         };
         if !matches!(ret, TyKind::Scalar(ScalarKind::Nil)) {
             sig.returns.push(AbiParam::new(ret.cl()));
@@ -1991,6 +2147,26 @@ impl Jit {
         if let Some(&addr) = self.extern_sym_addrs.get(&e.name) {
             self.emit_extern_trampoline(&e.name, sig, params, ret, addr, &e.span)
         } else {
+            // #578: pre-flight the symbol. The spec resolves an `extern fn`
+            // against "the process's dynamic symbol table", which is what
+            // `cranelift-jit` does at finalize — by *panicking* if it misses
+            // (`can't resolve symbol NAME`, exit 101, no span, a Rust
+            // backtrace). That is the failure every first use of `extern fn`
+            // hits, and a panic is not a diagnostic. Ask `dlsym` the same
+            // question here, where the declaration's span is in hand, and
+            // refuse cleanly instead.
+            //
+            // The `__dmc_` runtime builtins are registered with the JIT
+            // builder rather than exported from the process image, so they are
+            // resolvable to Cranelift and invisible to `dlsym`; exclude the
+            // prefix rather than refusing a name that would in fact link.
+            if !e.name.starts_with("__dmc_") && process_symbol_present(&e.name) == Some(false) {
+                return unsupported_msg(&e.span, Refusal::Extern, format!(
+                    "`extern fn {}`: no symbol `{}` in this process's dynamic symbol table \
+                     — an `extern fn` resolves against the images already loaded, so the \
+                     library providing it must be linked into `dmc` itself",
+                    e.name, e.name));
+            }
             let id = self.module
                 .declare_function(&e.name, Linkage::Import, &sig)
                 .map_err(|e_| JitError { kind: JitErrorKind::Error, refusal: None,
@@ -2224,10 +2400,11 @@ impl Jit {
             })?;
             let ty = enumify(ty_from_ast(ty_ast, shape_env)?, &self.enums);
             if matches!(ty, TyKind::Scalar(ScalarKind::Nil)) {
-                return err(&p.span, "`nil` parameters are not meaningful");
+                return unsupported(&p.span, Refusal::TypeForm, "`nil` parameters");
             }
             if p.mutating && !ty.is_tensor() {
-                return err(&p.span, "`@grad` mut parameters must be tensors in slice 6");
+                return unsupported(&p.span, Refusal::Grad,
+                    "a non-tensor `!` parameter on a `@grad fn`");
             }
             sig.params.push(AbiParam::new(ty.cl()));
             params.push((p.name.clone(), ty, p.span.clone()));
@@ -2959,6 +3136,21 @@ impl Jit {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
+        // #578: __dmc_matmul_blas(l, r, out, m, k, n) — same ABI as
+        // __dmc_matmul_par, routed through `cblas_sgemm`. Declared always;
+        // emitted only where `--blas` is on, the symbol resolves, the shape
+        // clears `BLAS_MIN_MACS`, and no `@deterministic` block encloses it.
+        {
+            let mut sig = self.module.make_signature();
+            for _ in 0..6 { sig.params.push(AbiParam::new(cl::I64)); }
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_matmul_blas", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_matmul_blas: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_matmul_blas".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
         // #324: __dmc_matmul_bf16(l, r, out, m, k, n) — bf16-RHS variant of
         // __dmc_matmul_par (r is *const u16). No return (writes `out`).
         {
@@ -3221,6 +3413,8 @@ impl Jit {
             mut_param_out: Vec::new(),
             ret: meta.ret.clone(),
             gpu: self.gpu,
+            blas: self.blas,
+            deterministic_depth: 0,
             gpu_defer_hint: false,
             float_lit_hint: None,
             gpu_defer_pending: false,
@@ -3230,6 +3424,7 @@ impl Jit {
             ad: if matches!(meta.grad_mode, GradMode::FwdBwd | GradMode::FwdBwdBwd) {
                 Some(AdState::new())
             } else { None },
+            tuple_elem_spans: None,
         };
 
         // ── Trampoline body ─────────────────────────────────────────────────
@@ -3415,7 +3610,20 @@ impl Jit {
                 match (&meta.ret, tail_val) {
                     (TyKind::Scalar(ScalarKind::Nil), _) => { tr.ret_void(); }
                     (want, Some((v, k))) => {
-                        let v = tr.coerce_to(v, &k, want, &meta.span)?;
+                        // #568: a return-position coercion used to report the
+                        // `fn`'s own span. Prefer the tail expression's, and
+                        // hand `coerce_to` the element spans when it is a tuple
+                        // literal so a refused element points at the element.
+                        let rspan = meta.body.tail_expr.as_ref()
+                            .map_or_else(|| meta.span.clone(), |e| e.span_of());
+                        if let Some(Expr::Tuple(els, _)) =
+                            meta.body.tail_expr.as_deref()
+                        {
+                            tr.tuple_elem_spans =
+                                Some(els.iter().map(|e| e.span_of()).collect());
+                        }
+                        let v = tr.coerce_to(v, &k, want, &rspan)?;
+                        tr.tuple_elem_spans = None;
                         if let Some(mark_v) = mark_v {
                             tr.call_import1("__dmc_forge_restore", mark_v);
                         }
@@ -3709,30 +3917,26 @@ fn classify_index_static(ie: &IndexElem, span: &Span) -> Result<StaticIndexCat, 
         // `IndexElem::Expr(Expr::Range)`, not `IndexElem::Slice`. Recognize it as
         // a range with literal bounds (exclusive `a..b`, inclusive `a..=b`).
         IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) => {
-            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-                msg: "range slice start must be a literal int in the JIT".into(),
-                line: span.line, col: span.col,
-            })?;
-            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-                msg: "range slice end must be a literal int in the JIT".into(),
-                line: span.line, col: span.col,
-            })?;
+            let s = lit_int(start.as_deref()).ok_or_else(|| unsupported_err(span, Refusal::Slice,
+                "range slice start must be a literal int in the JIT; \
+                 use `dmc run` for full semantics"))?;
+            let e = lit_int(end.as_deref()).ok_or_else(|| unsupported_err(span, Refusal::Slice,
+                "range slice end must be a literal int in the JIT; \
+                 use `dmc run` for full semantics"))?;
             Ok(StaticIndexCat::Range { start: s, end: if *inclusive { e + 1 } else { e } })
         }
         IndexElem::Expr(_) => Ok(StaticIndexCat::Scalar),
         IndexElem::FullSlice(_) => Ok(StaticIndexCat::Full),
         IndexElem::Slice { start, end, step, .. } => {
             if step.is_some() {
-                return err(span, "strided slices (`a:b:c`) need slice-5 support");
+                return unsupported(span, Refusal::Slice, "strided slices (`a:b:c`)");
             }
-            let s = lit_int(start.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-                msg: "slice start must be a literal int in slice 4".into(),
-                line: span.line, col: span.col,
-            })?;
-            let e = lit_int(end.as_deref()).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-                msg: "slice end must be a literal int in slice 4".into(),
-                line: span.line, col: span.col,
-            })?;
+            let s = lit_int(start.as_deref()).ok_or_else(|| unsupported_err(span, Refusal::Slice,
+                "slice start must be a literal int in the JIT; \
+                 use `dmc run` for full semantics"))?;
+            let e = lit_int(end.as_deref()).ok_or_else(|| unsupported_err(span, Refusal::Slice,
+                "slice end must be a literal int in the JIT; \
+                 use `dmc run` for full semantics"))?;
             Ok(StaticIndexCat::Range { start: s, end: e })
         }
     }
@@ -3835,7 +4039,8 @@ fn kv_ctor_elem_ty(e: &Expr, env: &HashMap<String, i64>, span: &Span)
     }
     match targs[0] {
         Expr::Ident(t, _) if matches!(t.as_str(), "f32" | "bf16" | "f16" | "tf32") => {}
-        _ => return Some(err(span, "JIT KV element type must be f32 or bf16/f16 (computed as f32)")),
+        _ => return Some(unsupported(span, Refusal::ElementType,
+                "a KV cache whose element type is not `f32`/`bf16`/`f16`")),
     }
     let elems = match targs[1] {
         Expr::TensorLit(es, _) => es,
@@ -4019,9 +4224,11 @@ fn unify_param_type(
                     ScalarType::I8 | ScalarType::I16 | ScalarType::U8 | ScalarType::U16
                     | ScalarType::Int4 | ScalarType::Int8
                     | ScalarType::Fp8E4M3 | ScalarType::Fp8E5M2 => ScalarKind::I32,
-                    _ => return err(span, "unsupported tensor template element type"),
+                    _ => return unsupported(span, Refusal::ElementType,
+                            "this tensor template element type"),
                 },
-                _ => return err(span, "tensor template params must have a scalar element type"),
+                _ => return unsupported(span, Refusal::ElementType,
+                        "a tensor template parameter with a non-scalar element type"),
             };
             if tt.elem != expected_elem {
                 return err(span, "element type mismatch in template instantiation");
@@ -4073,7 +4280,8 @@ fn unify_param_type(
         (Type::KV(elem_ast, shape_ast, span), TyKind::KV(kv)) => {
             let expected_elem = match elem_ast.as_ref() {
                 Type::Scalar(ScalarType::F32, _) => ScalarKind::F32,
-                _ => return err(span, "KV template params must be f32 element"),
+                _ => return unsupported(span, Refusal::ElementType,
+                        "a KV template parameter whose element type is not `f32`"),
             };
             if kv.elem != expected_elem {
                 return err(span, "element type mismatch in KV template instantiation");
@@ -4160,7 +4368,8 @@ fn unify_param_type(
                 | Type::Scalar(ScalarType::Bf16, _)
                 | Type::Scalar(ScalarType::F16, _)
                 | Type::Scalar(ScalarType::Tf32, _) => ScalarKind::F32,
-                _ => return err(span, "KV array template params must be f32/bf16/f16 element"),
+                _ => return unsupported(span, Refusal::ElementType,
+                        "a KV-array template parameter whose element type is not `f32`/`bf16`/`f16`"),
             };
             if kv.elem != expected_elem {
                 return err(span, "element type mismatch in KV array template instantiation");
@@ -4221,7 +4430,8 @@ fn unify_param_type(
         | (Type::Tensor(_, _, span), TyKind::Scalar(_)) => {
             err(span, "scalar/tensor kind mismatch in template arg")
         }
-        _ => err(pspan, "JIT template params support scalar, Tensor, and KV types only"),
+        _ => unsupported(pspan, Refusal::TypeForm,
+                "a template parameter outside scalar / Tensor / KV"),
     }
 }
 
@@ -4260,7 +4470,7 @@ fn declare_template_signature(
         })?;
         let ty = enumify(ty_from_ast(ty_ast, shape_env)?, enums);
         if matches!(ty, TyKind::Scalar(ScalarKind::Nil)) {
-            return err(&p.span, "`nil` parameters are not meaningful");
+            return unsupported(&p.span, Refusal::TypeForm, "`nil` parameters");
         }
         // #249: track `!` tensor params so the call site can copy-in/copy-out.
         if p.mutating { mut_param_idxs.push(idx); }
@@ -4341,6 +4551,18 @@ struct Translator<'a> {
     ret: TyKind,
     /// #326: copied from `Jit::gpu` — route the m==1 bf16 decode GEMV to Metal.
     gpu: bool,
+
+    /// #578: copied from `Jit::blas` — route a large f32 matmul to
+    /// `cblas_sgemm`.
+    blas: bool,
+
+    /// #578: how many enclosing `@deterministic` blocks this lowering is
+    /// inside. `SPEC.md §7.5` says kernel selection there "ignores
+    /// non-deterministic fast paths", and the BLAS path is one, so it is
+    /// unreachable at depth > 0. A depth rather than a flag because
+    /// `@deterministic` blocks nest, and an inner one ending must not clear
+    /// the outer one's guarantee.
+    deterministic_depth: u32,
     /// #326 dispatch pipelining: true while lowering a statement whose NEXT
     /// sibling is also a `gpu_defer_candidate` — tells the bf16-GPU batched
     /// fast path to emit the *deferred* call (commit without wait), keeping
@@ -4381,6 +4603,13 @@ struct Translator<'a> {
     /// differentiable operation; after the body, the backward pass walks
     /// these in reverse to accumulate gradients.
     ad: Option<AdState>,
+    /// Per-element spans for the tuple value about to be coerced (#568).
+    /// A tuple is one packed value by the time `coerce_to` sees it, so a
+    /// refused *element* conversion had no span of its own and reported the
+    /// enclosing `fn`. A caller that knows the tuple came from a tuple literal
+    /// leaves the element spans here; the tuple arm `take`s them, so only the
+    /// outermost tuple uses them and nothing leaks into a later coercion.
+    tuple_elem_spans: Option<Vec<Span>>,
 }
 
 struct LoopFrame {
@@ -4666,7 +4895,7 @@ impl<'a> Translator<'a> {
                     }
                     if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
                         self.float_lit_hint = want;
-                        return self.lower_block_value(body);
+                        return self.with_deterministic(directives, |me| me.lower_block_value(body));
                     }
                     return unsupported(span, Refusal::Directive,
                         "directive blocks in tail position (only @fuse, @deterministic, @cast are supported)");
@@ -4739,12 +4968,18 @@ impl<'a> Translator<'a> {
                 if cast_directive_is_int_target(directives) {
                     return unsupported(span, Refusal::Directive, INT_CAST_BLOCK_UNSUPPORTED);
                 }
-                if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
+                // #505: `@comptime` in statement position. Anything foldable
+                // was already spliced away before this backend ran, so what
+                // reaches here reads a shape parameter — a constant inside the
+                // JIT. Lower it like the other pass-throughs.
+                if directives.iter().all(|d|
+                    matches!(d.name.as_str(), "deterministic" | "cast" | "comptime"))
+                {
                     // All directives are no-op pass-throughs; lower the block normally.
-                    let _ = self.lower_block_value(body)?;
+                    let _ = self.with_deterministic(directives, |me| me.lower_block_value(body))?;
                     return Ok(());
                 }
-                unsupported(span, Refusal::Directive, "directives inside a fn body (only @fuse, @deterministic, @cast are supported)")
+                unsupported(span, Refusal::Directive, "directives inside a fn body (only @fuse, @deterministic, @cast, @comptime are supported)")
             }
         }
     }
@@ -5345,6 +5580,8 @@ impl<'a> Translator<'a> {
             Pattern::Wildcard(_) => None,
             _ => return unsupported(span, Refusal::Pattern, "destructuring patterns in `for` loops"),
         };
+        let loop_shadow: Vec<(String, Option<Variable>, Option<TyKind>)> =
+            bound_name.iter().map(|n| self.shadow(n)).collect();
         if let Some(ref name) = bound_name {
             // Create a Cranelift variable for the body binding; we will
             // re-define it on each iteration in the body block.
@@ -5413,6 +5650,8 @@ impl<'a> Translator<'a> {
         self.builder.seal_block(header);
         self.enter(exit);
         self.builder.seal_block(exit);
+        // The loop variable does not outlive the loop (#574).
+        self.unshadow(loop_shadow);
         Ok(())
     }
 
@@ -5528,18 +5767,54 @@ impl<'a> Translator<'a> {
     /// the value's payload slots (loaded from the scrutinee pointer). A no-op for
     /// tag-only patterns and non-payload scrutinees. v1 binds identifier
     /// sub-patterns; a nested sub-pattern routes the program out of the JIT subset.
+    /// What a name was bound to before a scoped construct rebound it. `None`
+    /// in a slot means the name was unbound, so putting it back removes it.
+    ///
+    /// `self.locals` is one flat map for the whole function, which is right
+    /// for `let` (a shadow does run to the end of the function) and wrong for
+    /// every construct whose binding belongs to a *region*: a match arm, a
+    /// loop. Those wrote into the map and never put back what they displaced,
+    /// so an outer local of the same name was destroyed for the rest of the
+    /// function — including when the arm never ran, because the map is
+    /// consulted at lowering time and knows nothing about which branch is
+    /// taken (#574). The interpreter scopes all of these correctly; these two
+    /// helpers are how the JIT catches up without growing a scope stack.
+    fn shadow(&mut self, name: &str) -> (String, Option<Variable>, Option<TyKind>) {
+        (name.to_string(),
+         self.locals.get(name).copied(),
+         self.local_tys.get(name).cloned())
+    }
+
+    /// Put back every binding a region displaced, in the order they were taken.
+    fn unshadow(&mut self, saved: Vec<(String, Option<Variable>, Option<TyKind>)>) {
+        for (name, var, ty) in saved {
+            match var {
+                Some(v) => { self.locals.insert(name.clone(), v); }
+                None => { self.locals.remove(&name); }
+            }
+            match ty {
+                Some(t) => { self.local_tys.insert(name, t); }
+                None => { self.local_tys.remove(&name); }
+            }
+        }
+    }
+
+    /// Binds a payload variant's sub-patterns. Returns what it displaced; the
+    /// caller must `unshadow` it once the arm body is lowered.
+    #[must_use = "the displaced outer bindings must be restored with unshadow"]
     fn bind_enum_payload(&mut self, pat: &Pattern, scr_val: Value, scr_ty: &TyKind, span: &Span)
-        -> Result<(), JitError>
+        -> Result<Vec<(String, Option<Variable>, Option<TyKind>)>, JitError>
     {
-        let enum_name = match scr_ty { TyKind::Enum(n) => n, _ => return Ok(()) };
+        let mut saved: Vec<(String, Option<Variable>, Option<TyKind>)> = Vec::new();
+        let enum_name = match scr_ty { TyKind::Enum(n) => n, _ => return Ok(saved) };
         let layout = match self.enum_payload_layouts.get(enum_name) {
-            Some(l) => l.clone(), None => return Ok(()),
+            Some(l) => l.clone(), None => return Ok(saved),
         };
         let (variant, bindings) = match pat {
             Pattern::EnumVariant { variant, bindings, .. } if !bindings.is_empty() => (variant, bindings),
-            _ => return Ok(()),
+            _ => return Ok(saved),
         };
-        let off = match layout.variant_off.get(variant) { Some(&o) => o, None => return Ok(()) };
+        let off = match layout.variant_off.get(variant) { Some(&o) => o, None => return Ok(saved) };
         let tys = layout.variant_tys.get(variant).cloned().unwrap_or_default();
         for (i, b) in bindings.iter().enumerate() {
             match b {
@@ -5551,6 +5826,7 @@ impl<'a> Translator<'a> {
                     let loaded = self.decode_from_slot(fptr, &fty);
                     let var = self.builder.declare_var(fty.cl());
                     self.builder.def_var(var, loaded);
+                    saved.push(self.shadow(name));
                     self.locals.insert(name.clone(), var);
                     self.local_tys.insert(name.clone(), fty);
                 }
@@ -5559,7 +5835,7 @@ impl<'a> Translator<'a> {
                     "nested sub-pattern in an enum payload binding (v1 binds identifiers; use `dmc run`)"),
             }
         }
-        Ok(())
+        Ok(saved)
     }
 
     fn match_scrutinee_i64(&mut self, scr_val: Value, scr_ty: &TyKind, span: &Span)
@@ -5626,6 +5902,7 @@ impl<'a> Translator<'a> {
                     // Bind: re-declare so the arm body can read it.
                     let bind_var = self.builder.declare_var(scr_ty.cl());
                     self.builder.def_var(bind_var, scr_val);
+                    let arm_shadow = vec![self.shadow(name)];
                     self.locals.insert(name.clone(), bind_var);
                     self.local_tys.insert(name.clone(), scr_ty.clone());
                     // Evaluate guard if present.
@@ -5637,6 +5914,8 @@ impl<'a> Translator<'a> {
                         self.builder.seal_block(after_guard);
                     }
                     self.lower_expr_effect(&arm.body)?;
+                    // The bound name belongs to this arm only (#574).
+                    self.unshadow(arm_shadow);
                     if !self.is_filled() { self.jump(merge, &[]); }
                     self.enter(next_check);
                     self.builder.seal_block(next_check);
@@ -5668,7 +5947,7 @@ impl<'a> Translator<'a> {
             self.builder.seal_block(arm_block);
             // #350 Part 2b: bind a payload variant's sub-patterns to the
             // scrutinee's payload slots (no-op for tag-only / non-payload).
-            self.bind_enum_payload(&arm.pattern, scr_val, &scr_ty, &m.span)?;
+            let arm_shadows = self.bind_enum_payload(&arm.pattern, scr_val, &scr_ty, &m.span)?;
             if let Some(guard) = &arm.guard {
                 let (gv, _gk) = self.lower_expr(guard)?;
                 let after_guard = self.builder.create_block();
@@ -5677,6 +5956,8 @@ impl<'a> Translator<'a> {
                 self.builder.seal_block(after_guard);
             }
             self.lower_expr_effect(&arm.body)?;
+            // The payload names belong to this arm only (#574).
+            self.unshadow(arm_shadows);
             if !self.is_filled() { self.jump(merge, &[]); }
 
             self.enter(next_check);
@@ -5697,14 +5978,16 @@ impl<'a> Translator<'a> {
     /// produce the same type; the result is the selected arm's value.
     fn lower_match_expr(&mut self, m: &MatchExpr) -> Result<(Value, TyKind), JitError> {
         // #478: same up-front decision as `lower_if` — what an unsuffixed
-        // float literal in an arm body means, read off the other arms. Taken
-        // before the scrutinee is lowered so the scrutinee never sees it.
+        // float literal in an arm body means, read off the other arms. The
+        // hint is taken before the scrutinee is lowered so the scrutinee never
+        // sees it; the answer itself is computed after, because an enum arm's
+        // payload types are only knowable from the scrutinee's type (#566).
         let inherited = self.float_lit_hint.take();
-        let lit_hint = Self::join_float_hint(
-            m.arms.iter().map(|a| self.static_float_kind(&a.body)),
-            inherited,
-        );
         let (scr_val, scr_ty) = self.lower_expr(&m.scrutinee)?;
+        let arm_kinds: Vec<Option<ScalarKind>> = m.arms.iter()
+            .map(|a| self.static_float_kind_of_arm(a, &scr_ty))
+            .collect();
+        let lit_hint = Self::join_float_hint(arm_kinds, inherited);
         // #350: enums join the supported scrutinee kinds (already an i64 ordinal).
         let scr_i64 = self.match_scrutinee_i64(scr_val, &scr_ty, &m.span)?;
 
@@ -5739,6 +6022,7 @@ impl<'a> Translator<'a> {
                     self.builder.seal_block(arm_block);
                     let bind_var = self.builder.declare_var(scr_ty.cl());
                     self.builder.def_var(bind_var, scr_val);
+                    let arm_shadow = vec![self.shadow(name)];
                     self.locals.insert(name.clone(), bind_var);
                     self.local_tys.insert(name.clone(), scr_ty.clone());
                     if let Some(guard) = &arm.guard {
@@ -5750,6 +6034,8 @@ impl<'a> Translator<'a> {
                     }
                     self.float_lit_hint = lit_hint;
                     let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
+                    // The bound name belongs to this arm only (#574).
+                    self.unshadow(arm_shadow);
                     if let Some(ref rk) = result_ty {
                         if rk != &arm_kind {
                             return unsupported_msg(&m.span, Refusal::BranchType, format!(
@@ -5803,7 +6089,7 @@ impl<'a> Translator<'a> {
             self.enter(arm_block);
             self.builder.seal_block(arm_block);
             // #350 Part 2b: bind a payload variant's sub-patterns (no-op otherwise).
-            self.bind_enum_payload(&arm.pattern, scr_val, &scr_ty, &m.span)?;
+            let arm_shadows = self.bind_enum_payload(&arm.pattern, scr_val, &scr_ty, &m.span)?;
             if let Some(guard) = &arm.guard {
                 let (gv, _gk) = self.lower_expr(guard)?;
                 let after_guard = self.builder.create_block();
@@ -5813,6 +6099,8 @@ impl<'a> Translator<'a> {
             }
             self.float_lit_hint = lit_hint;
             let (arm_val, arm_kind) = self.lower_expr(&arm.body)?;
+            // The payload names belong to this arm only (#574).
+            self.unshadow(arm_shadows);
             if let Some(ref rk) = result_ty {
                 if rk != &arm_kind {
                     return err(&m.span, format!(
@@ -5970,14 +6258,29 @@ impl<'a> Translator<'a> {
                 }
                 // @deterministic and @cast(bf16) are accepted as no-ops: bit-exactness
                 // and bf16-compute semantics are not yet enforced by the JIT.
-                if directives.iter().all(|d| matches!(d.name.as_str(), "deterministic" | "cast")) {
+                //
+                // #505: @comptime joins them, and for a stronger reason than
+                // "not enforced yet". A block that could be folded to a
+                // constant already was, by `comptime.rs`, before this backend
+                // saw the program — so the only @comptime that reaches here is
+                // the residual form, whose body reads a shape parameter.
+                // Inside the JIT a shape parameter *is* a compile-time
+                // constant (`shape_env`), so lowering the body normally is
+                // exactly the fold the directive promises, per
+                // monomorphization as SPEC.md §7.8 specifies. Refusing it was
+                // the parity hole: `dmc run` returned a value for the same
+                // program.
+                if directives.iter().all(|d|
+                    matches!(d.name.as_str(), "deterministic" | "cast" | "comptime"))
+                {
                     self.float_lit_hint = want;
-                    return self.lower_block_value(body)?.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-                        msg: "directive block (@deterministic/@cast) must yield a value".into(),
-                        line: span.line, col: span.col,
-                    });
+                    return self.with_deterministic(directives, |me| me.lower_block_value(body))?
+                        .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+                            msg: "directive block (@deterministic/@cast/@comptime) must yield a value".into(),
+                            line: span.line, col: span.col,
+                        });
                 }
-                unsupported(span, Refusal::Directive, "directive blocks as expressions (only @fuse, @deterministic, @cast are supported)")
+                unsupported(span, Refusal::Directive, "directive blocks as expressions (only @fuse, @deterministic, @cast, @comptime are supported)")
             }
             Expr::StructLit { name, type_args, fields, span } => {
                 self.lower_struct_lit(name, type_args, fields, span)
@@ -6594,6 +6897,56 @@ impl<'a> Translator<'a> {
         })
     }
 
+    /// #566: the payload bindings an enum-variant arm pattern introduces, as
+    /// `(name, type)` pairs read off the scrutinee enum's layout — the same
+    /// pairs `bind_enum_payload` will declare as locals once the arm block is
+    /// entered, answered here without emitting any code.
+    ///
+    /// The types have to be answered separately because of *when* the two
+    /// happen. `static_float_kind` reads a bound identifier's width out of
+    /// `local_tys`, which is why an ordinary arm gets this right: in
+    /// `match k { 0 => x, _ => 0.0 }` the `x: f32` local is already in
+    /// `local_tys` when the pre-pass runs, so `0.0` adopts `f32`. An enum
+    /// payload binding is not — it does not exist until `bind_enum_payload`
+    /// declares it, which is after the hint has to be fixed (Cranelift wants
+    /// the join's phi type before the second arm is lowered). So the pre-pass
+    /// saw `Circle(r) => r * r` as "cannot say", `0.0` kept #209's f64 default,
+    /// and the arms were refused as disagreeing — SPEC.md §4.5's own example.
+    fn arm_payload_binding_tys(&self, scr_ty: &TyKind, pat: &Pattern) -> Vec<(String, TyKind)> {
+        let TyKind::Enum(enum_name) = scr_ty else { return Vec::new() };
+        let Some(layout) = self.enum_payload_layouts.get(enum_name) else { return Vec::new() };
+        let Pattern::EnumVariant { variant, bindings, .. } = pat else { return Vec::new() };
+        let Some(tys) = layout.variant_tys.get(variant) else { return Vec::new() };
+        bindings.iter().enumerate().filter_map(|(i, b)| match b {
+            Pattern::Ident(name, _) if name != "_" =>
+                tys.get(i).map(|t| (name.clone(), t.clone())),
+            _ => None,
+        }).collect()
+    }
+
+    /// `static_float_kind` for a match arm's body, with that arm's enum payload
+    /// bindings visible (#566). Binds them into `local_tys` for the duration of
+    /// the (code-free) query and restores the map exactly, so an arm's bindings
+    /// never leak into a sibling arm's answer.
+    fn static_float_kind_of_arm(&mut self, arm: &MatchArm, scr_ty: &TyKind)
+        -> Option<ScalarKind>
+    {
+        let binds = self.arm_payload_binding_tys(scr_ty, &arm.pattern);
+        if binds.is_empty() { return self.static_float_kind(&arm.body); }
+        let saved: Vec<(String, Option<TyKind>)> = binds.iter()
+            .map(|(n, _)| (n.clone(), self.local_tys.get(n).cloned()))
+            .collect();
+        for (n, t) in binds { self.local_tys.insert(n, t); }
+        let kind = self.static_float_kind(&arm.body);
+        for (n, prev) in saved {
+            match prev {
+                Some(t) => { self.local_tys.insert(n, t); }
+                None => { self.local_tys.remove(&n); }
+            }
+        }
+        kind
+    }
+
     /// Fold a join's per-branch answers into the hint an unsuffixed float
     /// literal in *any* of those branches should adopt (SPEC.md: a bare
     /// literal takes the type of "the other operand at its use site"). Only
@@ -6829,7 +7182,9 @@ impl<'a> Translator<'a> {
                     "i64" => ScalarKind::I64,
                     "bool" => ScalarKind::Bool,
                     "bf16" | "f16" | "tf32" => ScalarKind::F32,
-                    _ => return err(span, format!("`forge.{}`: unsupported element type `{}`", method, t)),
+                    _ => return unsupported_msg(span, Refusal::ElementType, format!(
+                            "`forge.{}`: element type `{}` is not lowered; \
+                             use `dmc run` for full semantics", method, t)),
                 };
                 (k, t.as_str())
             }
@@ -6872,11 +7227,13 @@ impl<'a> Translator<'a> {
             // pattern, and sub-word kinds (bool) keep the explicit-uninit path.
             "zeros" if matches!(elem, ScalarKind::F32 | ScalarKind::I32 | ScalarKind::I64) =>
                 self.fill_const(out, ty.nbytes() / 4, 0.0),
-            "zeros" => return err(span, format!(
-                "`forge.zeros[{}, ..]` not supported (zero-fill is 32-bit); use `forge.uninit` and fill explicitly", tname)),
+            "zeros" => return unsupported_msg(span, Refusal::ElementType, format!(
+                "`forge.zeros[{}, ..]` (the JIT's zero-fill is 32-bit); \
+                 use `forge.uninit` and fill explicitly, or `dmc run`", tname)),
             "ones" if elem == ScalarKind::F32 => self.fill_const(out, ty.nelems(), 1.0),
-            "ones" => return err(span, format!(
-                "`forge.ones[{}, ..]` not supported (only f32 `ones`); use `forge.uninit` and fill explicitly", tname)),
+            "ones" => return unsupported_msg(span, Refusal::ElementType, format!(
+                "`forge.ones[{}, ..]` (the JIT fills `ones` for f32 only); \
+                 use `forge.uninit` and fill explicitly, or `dmc run`", tname)),
             _ => {}
         }
         Ok((out, TyKind::Tensor(ty)))
@@ -6933,7 +7290,8 @@ impl<'a> Translator<'a> {
         // convention, #176/#179), so accept them and allocate the f32 layout below.
         match targs[0] {
             Expr::Ident(t, _) if matches!(t.as_str(), "f32" | "bf16" | "f16" | "tf32") => {}
-            _ => return err(span, "JIT KV constructor element type must be f32 or bf16/f16 (computed as f32)"),
+            _ => return unsupported(span, Refusal::ElementType,
+                    "a `forge.kv` element type other than `f32`/`bf16`/`f16`"),
         }
         let elems = match targs[1] {
             Expr::TensorLit(es, _) => es,
@@ -7526,7 +7884,7 @@ impl<'a> Translator<'a> {
         // #324: `bf16` now loads at native 2-byte width as a Bf16Tensor (no
         // widen, convert=0) so weight fields keep half the footprint and feed
         // the bf16-direct matmul kernel. f16 still widens to f32 (convert=2).
-        let bf16_direct = matches!(type_args[0], Expr::Ident(ref t, _) if t == "bf16");
+        let bf16_direct = matches!(type_args[0], Expr::Ident(t, _) if t == "bf16");
         let (elem_bytes, convert, ret_elem): (i64, i64, ScalarKind) = match type_args[0] {
             Expr::Ident(t, _) => match t.as_str() {
                 "f32"  => (4, 0, ScalarKind::F32),
@@ -9668,8 +10026,9 @@ impl<'a> Translator<'a> {
         }
         let (shape, leaves) = Self::flatten_tensor_literal(elems, span)?;
         if shape.len() > 4 {
-            return err(span, format!(
-                "tensor literal has rank {}; JIT supports 1..=4", shape.len(),
+            return unsupported_msg(span, Refusal::Rank, format!(
+                "a rank-{} tensor literal (the JIT lowers ranks 1..=4); \
+                 use `dmc run` for full semantics", shape.len(),
             ));
         }
         // Infer the element kind from the leaves: an all-integer-literal tensor
@@ -9919,10 +10278,10 @@ impl<'a> Translator<'a> {
             match cat {
                 IndexCat::Scalar(_) => {
                     if first_kept_seen {
-                        return err(span,
-                            "slice 4 only supports contiguous slicing: \
-                             scalar indices must come before any kept axis. \
-                             Got a scalar index after a slice.");
+                        return unsupported(span, Refusal::Slice,
+                            "non-contiguous slicing: \
+                             scalar indices must come before any kept axis \
+                             (got a scalar index after a slice)");
                     }
                 }
                 IndexCat::Full => {
@@ -9931,10 +10290,10 @@ impl<'a> Translator<'a> {
                 }
                 IndexCat::Range { start, end } => {
                     if first_kept_seen {
-                        return err(span,
-                            "slice 4 only supports contiguous slicing: \
+                        return unsupported(span, Refusal::Slice,
+                            "non-contiguous slicing: \
                              a range slice may only appear as the FIRST \
-                             kept axis. Trailing kept axes must be `:`.");
+                             kept axis, and trailing kept axes must be `:`");
                     }
                     // Normalize/clamp to match the interpreter (#291.4): negative
                     // bounds resolve from the end, positive bounds clamp to
@@ -9950,14 +10309,20 @@ impl<'a> Translator<'a> {
                 }
                 IndexCat::DynRange { start, extent } => {
                     if first_kept_seen {
-                        return err(span,
-                            "slice 4 only supports contiguous slicing: \
+                        return unsupported(span, Refusal::Slice,
+                            "non-contiguous slicing: \
                              a range slice may only appear as the FIRST \
-                             kept axis. Trailing kept axes must be `:`.");
+                             kept axis, and trailing kept axes must be `:`");
                     }
-                    // #511: the runtime start is resolved/checked (negative
-                    // counts from the end, the static-extent window must fit),
+                    // #511/#518: the runtime start is bounds-checked — negative
+                    // is dynamic OOB and traps (SPEC §4.3; see
+                    // `bounds_check_slice_start`'s own doc comment, and #517,
+                    // which brought the interpreter in line with this trap) —
                     // then folded into the runtime offset like a scalar index.
+                    // (A previous version of this comment said a negative start
+                    // "counts from the end"; commit 6cb93e5 made it trap
+                    // instead. Do not revert to end-resolution here — that is
+                    // exactly the bug the trap fixed.)
                     let ri = self.bounds_check_slice_start(*start, *extent, dim);
                     let stride_v = self.builder.ins().iconst(cl::I64, stride);
                     let scaled = self.builder.ins().imul(ri, stride_v);
@@ -10133,7 +10498,8 @@ impl<'a> Translator<'a> {
         if let IndexElem::Expr(Expr::Range { start, end, inclusive, .. }) = ie {
             let end_expr = match end.as_deref() {
                 Some(e) => e,
-                None => return err(span, "range slice needs an explicit end in the JIT"),
+                None => return unsupported(span, Refusal::Slice,
+                    "a range slice with no explicit end"),
             };
             // Fully static bounds — the pre-#511 path, unchanged.
             let s_static = match start.as_deref() {
@@ -10174,8 +10540,8 @@ impl<'a> Translator<'a> {
                     return Ok(IndexCat::DynRange { start: v, extent });
                 }
             }
-            return err(span,
-                "slice with a runtime bound needs a compile-time extent: \
+            return unsupported(span, Refusal::Slice,
+                "a slice with a runtime bound and no compile-time extent: \
                  in `a..b`, `b - a` must fold to a constant (e.g. `i..i+1`)");
         }
         let static_cat = classify_index_static(ie, span)?;
@@ -10434,7 +10800,7 @@ impl<'a> Translator<'a> {
                 }
                 IndexElem::Slice { start, end, step, .. } => {
                     if step.is_some() {
-                        return err(span, "slice-assign: stepped slices are not supported in the JIT");
+                        return unsupported(span, Refusal::Slice, "slice-assign with a stepped slice");
                     }
                     let s = if let Some(se) = start {
                         let (v, k) = self.lower_expr(se)?;
@@ -11090,6 +11456,8 @@ impl<'a> Translator<'a> {
                 // Declare the index local once; redefine it per unrolled
                 // iteration so the body reads the concrete value via lower_ident
                 // (a non-differentiable Const node — loop indices aren't traced).
+                let loop_shadow: Vec<(String, Option<Variable>, Option<TyKind>)> =
+                    idx_name.iter().map(|n| self.shadow(n)).collect();
                 let idx_var = idx_name.as_ref().map(|n| {
                     let var = self.builder.declare_var(cl::I64);
                     self.locals.insert(n.clone(), var);
@@ -11108,6 +11476,8 @@ impl<'a> Translator<'a> {
                         let _ = self.ad_lower_expr(t, sp)?;
                     }
                 }
+                // The unrolled index does not outlive the loop (#574).
+                self.unshadow(loop_shadow);
                 Ok(())
             }
             other => {
@@ -14354,6 +14724,14 @@ impl<'a> Translator<'a> {
     /// Dispatch to SIMD or scalar 2D matmul kernel.
     /// `l`, `r`, `out` are raw f32 pointers to the start of the slice.
     fn emit_2d_matmul_at(&mut self, l: Value, r: Value, out: Value, m: i64, k: i64, n: i64) {
+        // #578: the BLAS/AMX arm, ahead of the `n % 4` split because BLAS takes
+        // any leading dimension — it is reachable for shapes `simd_matmul` is
+        // not. Mutually exclusive with `__dmc_matmul_par`: BLAS threads itself,
+        // and splitting rows across our pool as well would oversubscribe.
+        if self.blas_gemm_applies(m, k, n) {
+            self.emit_runtime_matmul_call("__dmc_matmul_blas", l, r, out, m, k, n);
+            return;
+        }
         if n % 4 == 0 && n >= 4 {
             // #323: large multi-row Linear layers (prefill / batched) go to the
             // multi-threaded runtime kernel, which is bit-identical to `simd_matmul`
@@ -14374,13 +14752,63 @@ impl<'a> Translator<'a> {
 
     /// Emit a call to the threaded runtime matmul `__dmc_matmul_par`.
     fn emit_matmul_par_call(&mut self, l: Value, r: Value, out: Value, m: i64, k: i64, n: i64) {
+        self.emit_runtime_matmul_call("__dmc_matmul_par", l, r, out, m, k, n);
+    }
+
+    /// Emit a call to one of the `(l, r, out, m, k, n)` runtime matmul kernels.
+    fn emit_runtime_matmul_call(&mut self, sym: &str,
+                                l: Value, r: Value, out: Value, m: i64, k: i64, n: i64) {
         let m_v = self.builder.ins().iconst(cl::I64, m);
         let k_v = self.builder.ins().iconst(cl::I64, k);
         let n_v = self.builder.ins().iconst(cl::I64, n);
-        let entry = self.fns.get("__dmc_matmul_par")
-            .expect("__dmc_matmul_par not registered").clone();
+        let entry = self.fns.get(sym)
+            .unwrap_or_else(|| panic!("{} not registered", sym)).clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
         self.builder.ins().call(func_ref, &[l, r, out, m_v, k_v, n_v]);
+    }
+
+    /// #578: run `f` with the `@deterministic` guard raised, if `directives`
+    /// raises it.
+    ///
+    /// `SPEC.md §7.5` requires kernel selection inside `@deterministic` to
+    /// ignore non-deterministic fast paths. The JIT treats the directive as a
+    /// pass-through in every other respect — bf16 compute semantics and
+    /// bit-exactness are not enforced here — but "which kernel" is precisely
+    /// what the fast path changes, so this one property has to be tracked.
+    ///
+    /// A depth, not a flag: `@deterministic` blocks nest, and an inner one
+    /// ending must not clear the outer one's guarantee.
+    fn with_deterministic<T>(&mut self, directives: &[Directive],
+                             f: impl FnOnce(&mut Self) -> T) -> T {
+        let guard = directives.iter().any(|d| d.name == "deterministic");
+        if guard { self.deterministic_depth += 1; }
+        let out = f(self);
+        if guard { self.deterministic_depth -= 1; }
+        out
+    }
+
+    /// #578: does this f32 matmul go to `cblas_sgemm`?
+    ///
+    /// Four conditions, and the order they are written in is the order they
+    /// matter in:
+    ///
+    /// 1. **`--blas` is on.** Off by default. BLAS accumulates in its own
+    ///    blocked order, and `SPEC.md §7.4b` promises the ascending-k
+    ///    contracted FMA on "both backends and every kernel" — the #481
+    ///    defect was exactly an answer that depended on which kernel a shape
+    ///    selected. Default-on would make that promise silently conditional on
+    ///    whether the host process happens to contain a BLAS, with nothing in
+    ///    the source to say so.
+    /// 2. **No enclosing `@deterministic`.** `SPEC.md §7.5`: kernel selection
+    ///    there "ignores non-deterministic fast paths". This one is.
+    /// 3. **The shape clears `BLAS_MIN_MACS`.** Below it BLAS is *slower* —
+    ///    measured 0.15x on a 16,384-MAC GEMV, where per-call setup dominates
+    ///    a reduction the inline kernel does in registers.
+    /// 4. **The symbol resolves.** On a host without a BLAS this is where the
+    ///    fast path stops existing, with no cfg and no second code path.
+    fn blas_gemm_applies(&self, m: i64, k: i64, n: i64) -> bool {
+        blas_gemm_selected(self.blas, self.deterministic_depth, m, k, n)
+            && blas_gemm_available()
     }
 
     /// #324: emit one 2-D slice through the bf16-direct kernel. `r` is a 2-byte
@@ -15161,9 +15589,9 @@ impl<'a> Translator<'a> {
         -> Result<(Value, TyKind), JitError>
     {
         if args.len() != 1 {
-            return err(span, format!(
-                "`{}` on a tensor takes exactly 1 argument (scalar/variadic `{}` is not lowered in the JIT)",
-                name, name));
+            return unsupported_msg(span, Refusal::ArgForm, format!(
+                "scalar/variadic `{}` (the JIT lowers the 1-argument tensor form only); \
+                 use `dmc run` for full semantics", name));
         }
         let e = match &args[0] {
             CallArg::Positional(e) => e,
@@ -15184,7 +15612,8 @@ impl<'a> Translator<'a> {
                 (self.dyn_data_ptr(ptr, &dt), self.dyn_total_elems(ptr, &dt))
             }
             TyKind::Tensor(_) | TyKind::KV(_) | TyKind::DynTensor(_) =>
-                return err(span, format!("`{}` is f32-only", name)),
+                return unsupported_msg(span, Refusal::F32Only, format!(
+                    "`{}` is f32-only; use `dmc run` for full semantics", name)),
             _ => return err(span, format!("`{}` requires a tensor argument", name)),
         };
         let r = self.fused_minmax_v(data_ptr, count, is_max);
@@ -15229,7 +15658,8 @@ impl<'a> Translator<'a> {
                 // shape with `axis` dropped). The greedy-decode `argmax(.., -1)`.
                 self.lower_argreduce_axis(ptr, &t, axis as usize, want_max, span)
             }
-            TyKind::Tensor(_) => err(span, format!("`{}` is f32-only", name)),
+            TyKind::Tensor(_) => unsupported_msg(span, Refusal::F32Only, format!(
+                "`{}` is f32-only; use `dmc run` for full semantics", name)),
             _ => err(span, format!("`{}` requires a tensor argument", name)),
         }
     }
@@ -15382,7 +15812,7 @@ impl<'a> Translator<'a> {
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return err(span, "`variance` is f32-only in slice 3");
+            return unsupported(span, Refusal::F32Only, "`variance` on a non-f32 tensor");
         }
         let n = t.nelems();
         let n_v = self.builder.ins().f32const(n as f32);
@@ -15465,7 +15895,7 @@ impl<'a> Translator<'a> {
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return err(span, "`pull_to_mean` is f32-only in slice 3");
+            return unsupported(span, Refusal::F32Only, "`pull_to_mean` on a non-f32 tensor");
         }
         let (alpha, alpha_ty) = self.lower_expr(a_expr)?;
         let alpha = self.coerce_to(alpha, &alpha_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
@@ -15761,8 +16191,9 @@ impl<'a> Translator<'a> {
             return unsupported_msg(span, Refusal::F32Only, "per-axis reductions are f32-only");
         }
         if t.rank() < 2 {
-            return err(span, format!(
-                "per-axis reductions require rank >= 2 (rank-1 goes through `sum`/`mean`); got rank {}",
+            return unsupported_msg(span, Refusal::Rank, format!(
+                "a per-axis reduction over a rank-{} tensor (the JIT lowers rank >= 2; \
+                 rank-1 goes through `sum`/`mean`); use `dmc run` for full semantics",
                 t.rank(),
             ));
         }
@@ -15897,7 +16328,7 @@ impl<'a> Translator<'a> {
         };
         let axis = match a_expr {
             Expr::Literal(Literal::Int(n, _), _) => *n,
-            _ => return err(span, "axis must be a literal int in slice 5"),
+            _ => return unsupported(span, Refusal::Axis, "a non-literal reduction axis"),
         };
         Ok((t_expr, axis))
     }
@@ -16018,7 +16449,7 @@ impl<'a> Translator<'a> {
         };
         let axis = match a_expr {
             Expr::Literal(Literal::Int(n, _), _) => *n,
-            _ => return err(span, "axis must be a literal int"),
+            _ => return unsupported(span, Refusal::Axis, "a non-literal reduction axis"),
         };
 
         // Compute means_along(t, axis) — reuse via constructing args.
@@ -16031,7 +16462,8 @@ impl<'a> Translator<'a> {
         let (ptr, ty) = self.lower_expr(t_expr)?;
         let t = ty.as_tensor().expect("validated").clone();
         if t.rank() != 2 {
-            return err(span, "`pull_to_mean_along` requires a 2D tensor in slice 5");
+            return unsupported(span, Refusal::Rank,
+                "`pull_to_mean_along` over a tensor that is not 2-D");
         }
         let (alpha, alpha_ty) = self.lower_expr(alpha_expr)?;
         let alpha = self.coerce_to(alpha, &alpha_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
@@ -16151,7 +16583,7 @@ impl<'a> Translator<'a> {
                 return Ok((out, TyKind::DynTensor(dt)));
             }
             TyKind::KV(_) | TyKind::DynTensor(_) =>
-                return err(span, "softmax is f32-only"),
+                return unsupported(span, Refusal::F32Only, "`softmax` on a non-f32 tensor"),
             _ => {}
         }
 
@@ -16160,7 +16592,7 @@ impl<'a> Translator<'a> {
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return err(span, "softmax is f32-only in slice 5");
+            return unsupported(span, Refusal::F32Only, "`softmax` on a non-f32 tensor");
         }
         // Static rank ≥ 2: per-row softmax over the LAST axis (the attention
         // case, `softmax(scores, -1)`). Copy so we don't mutate the input, then
@@ -16904,7 +17336,8 @@ impl<'a> Translator<'a> {
             })?;
             let norm = if axis < 0 { axis + rank as i64 } else { axis };
             if norm != (rank as i64 - 1) {
-                return err(span, "softmax over a dynamic/KV tensor only supports the last axis");
+                return unsupported(span, Refusal::Axis,
+                    "`softmax` over a dynamic/KV tensor on an axis other than the last");
             }
         }
 
@@ -17092,7 +17525,7 @@ impl<'a> Translator<'a> {
             return err(span, "attn: q/k/v must all be rank-4 [B,H,S,D]");
         }
         if qt.elem != ScalarKind::F32 {
-            return err(span, "attn: f32 only");
+            return unsupported(span, Refusal::F32Only, "`attn` on non-f32 tensors");
         }
         let b = qt.shape[0]; let h = qt.shape[1];
         let s = qt.shape[2]; let d = qt.shape[3];
@@ -17144,7 +17577,7 @@ impl<'a> Translator<'a> {
             return err(span, "rope: x must be at least rank-2 [..., S, D]");
         }
         if xt.elem != ScalarKind::F32 {
-            return err(span, "rope: f32 only");
+            return unsupported(span, Refusal::F32Only, "`rope` on non-f32 tensors");
         }
         let rank = xt.rank();
         let s_dim = xt.shape[rank - 2];
@@ -17533,7 +17966,7 @@ impl<'a> Translator<'a> {
             return err(span, "attn_gqa: q/k/v must be rank-4 [B,H_q,S,D] / [B,H_kv,S,D]");
         }
         if qt.elem != ScalarKind::F32 {
-            return err(span, "attn_gqa: f32 only");
+            return unsupported(span, Refusal::F32Only, "`attn_gqa` on non-f32 tensors");
         }
         let b    = qt.shape[0];
         let h_q  = qt.shape[1];
@@ -17802,7 +18235,7 @@ impl<'a> Translator<'a> {
             return err(span, "attn_gqa: q/k/v must be rank-4 [B,H,*,D]");
         }
         if qt.elem != ScalarKind::F32 {
-            return err(span, "attn_gqa: f32 only");
+            return unsupported(span, Refusal::F32Only, "`attn_gqa` on non-f32 tensors");
         }
         let b   = qt.shape[0];
         let h_q = qt.shape[1];
@@ -17990,7 +18423,7 @@ impl<'a> Translator<'a> {
             line: span.line, col: span.col,
         })?.clone();
         if t.elem != ScalarKind::F32 {
-            return err(span, "`print_tensor` is f32-only in slice 2");
+            return unsupported(span, Refusal::F32Only, "`print_tensor` on a non-f32 tensor");
         }
         let (sym, dim_args) = match t.rank() {
             1 => ("__dmc_print_tensor_1d_f32",
@@ -18125,7 +18558,7 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         if t_ty.elem != ScalarKind::F32 {
-            return err(span, "`\\>` (ReLU) on tensors is f32-only");
+            return unsupported(span, Refusal::F32Only, "`\\>` (ReLU) on a non-f32 tensor");
         }
         let out_ty = t_ty.clone();
         let out_ptr = self.forge_alloc(out_ty.nbytes());
@@ -18250,7 +18683,7 @@ impl<'a> Translator<'a> {
     ) -> Result<(Value, TyKind), JitError> {
         let _ = span;
         if t_ty.elem != ScalarKind::F32 {
-            return err(span, "`\\<` (GeLU) on tensors is f32-only");
+            return unsupported(span, Refusal::F32Only, "`\\<` (GeLU) on a non-f32 tensor");
         }
         let out_ty  = t_ty.clone();
         let out_ptr = self.forge_alloc(out_ty.nbytes());
@@ -18297,7 +18730,8 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
         if t_ty.elem != ScalarKind::F32 {
-            return err(span, format!("`{}` on tensors is f32-only", sym));
+            return unsupported_msg(span, Refusal::F32Only, format!(
+                "`{}` on a non-f32 tensor; use `dmc run` for full semantics", sym));
         }
         let out_ty = t_ty.clone();
         let out_ptr = self.forge_alloc(out_ty.nbytes());
@@ -18353,7 +18787,8 @@ impl<'a> Translator<'a> {
         match k.clone() {
             TyKind::Tensor(tt) => {
                 if tt.elem != ScalarKind::F32 {
-                    return err(span, format!("`{}` on tensors is f32-only", name));
+                    return unsupported_msg(span, Refusal::F32Only, format!(
+                        "`{}` on a non-f32 tensor; use `dmc run` for full semantics", name));
                 }
                 match name {
                     "relu"    => self.lower_tensor_relu(v, &tt, span),
@@ -19138,12 +19573,18 @@ impl<'a> Translator<'a> {
             // float literal defaulting wide against a narrower declared
             // element type, e.g. `(7, 2.5)` returned as `(i64, f32)`.
             (TyKind::Tuple(fs), TyKind::Tuple(ts)) if fs.len() == ts.len() => {
+                // #568: point a refused element conversion at the element the
+                // caller wrote, not at the enclosing expression. `take` so a
+                // nested tuple falls back to `span` rather than reusing these.
+                let elem_spans = self.tuple_elem_spans.take()
+                    .filter(|ss| ss.len() == fs.len());
                 let out = self.forge_alloc(ts.len() as i64 * 8);
                 for (i, (ft, tt)) in fs.iter().zip(ts.iter()).enumerate() {
+                    let espan = elem_spans.as_ref().map_or(span, |ss| &ss[i]);
                     let off = self.builder.ins().iconst(cl::I64, i as i64 * 8);
                     let src = self.builder.ins().iadd(v, off);
                     let raw = self.decode_from_slot(src, ft);
-                    let conv = self.coerce_to(raw, ft, tt, span)?;
+                    let conv = self.coerce_to(raw, ft, tt, espan)?;
                     let packed = self.encode_for_slot(conv, tt);
                     let dst = self.builder.ins().iadd(out, off);
                     self.builder.ins().store(
@@ -19303,8 +19744,14 @@ impl<'a> Translator<'a> {
                 let call = self.builder.ins().call(func_ref, &[i64_v]);
                 Ok(self.builder.inst_results(call)[0])
             }
-            _ => err(span, format!(
-                "cannot convert `{}` to `{}`", from.render(), to.render(),
+            // #568: a conversion with no lowering — including into a type the
+            // JIT has no representation for at all, which is what a user-written
+            // `(T, Err)` hits (`Err` resolves to a model name the JIT never
+            // builds). The interpreter runs these, so this is a gap, not a
+            // defect, and it says so.
+            _ => unsupported_msg(span, Refusal::Conversion, format!(
+                "cannot convert `{}` to `{}`; use `dmc run` for full semantics",
+                from.render(), to.render(),
             )),
         }
     }
@@ -19403,7 +19850,9 @@ impl<'a> Translator<'a> {
             return match from {
                 ScalarKind::I64 => { let one = self.builder.ins().iconst(cl::I64, 1); Ok(self.pack_opt(one, v)) }
                 ScalarKind::Nil => Ok(self.builder.ins().iconst(cl::I128, 0)),
-                _ => err(span, format!("cannot convert `{}` to a maybe-nil value", from.name())),
+                _ => unsupported_msg(span, Refusal::Conversion, format!(
+                        "cannot convert `{}` to a maybe-nil value; \
+                         use `dmc run` for full semantics", from.name())),
             };
         }
         // #544: a masked narrow kind IS an i64 holding the extended value, so
@@ -19451,8 +19900,9 @@ impl<'a> Translator<'a> {
                 self.builder.ins().icmp(IntCC::NotEqual, v, z)
             }
             // nil is unit; coerce to/from anything is an error.
-            _ => return err(span, format!(
-                "cannot convert `{}` to `{}` (slice 1 cast set)", from.name(), to.name(),
+            _ => return unsupported_msg(span, Refusal::Conversion, format!(
+                "cannot convert `{}` to `{}` (outside the JIT's cast set); \
+                 use `dmc run` for full semantics", from.name(), to.name(),
             )),
         };
         Ok(v)
@@ -19604,11 +20054,11 @@ extern "C" fn builtin_fmod_f64(a: f64, b: f64) -> f64 { a % b }
 // resolution can find them when the test binary is the host process.
 
 #[cfg(test)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dmc_test_add_f32(a: f32, b: f32) -> f32 { a + b }
 
 #[cfg(test)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn dmc_test_scale_ptr(ptr: *const f32, n: i64, scale: f32) -> f32 {
     // Sum ptr[0..n] * scale — exercises pointer passing from a tensor.
     let mut acc = 0.0f32;
@@ -20784,6 +21234,148 @@ pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
     }
 }
 
+// ─── #578: the BLAS/AMX GEMM fast path ───────────────────────────────────────
+//
+// #466 measured this machine's ceiling: numpy reaches 775-1026 GFLOP/s on
+// shapes where the Cranelift kernel reaches 15-18 single-threaded, and that is
+// above the theoretical NEON peak for the chip. Accelerate is not a
+// better-tuned NEON kernel; it issues to the AMX matrix coprocessor, which
+// Cranelift-emitted NEON cannot address. #466 also measured the two obvious
+// software answers — cache blocking is flat (there is no cliff) and register
+// tiling regressed 2x. So the lever is not a better kernel; it is calling the
+// one that owns the hardware.
+//
+// `cblas_sgemm` is reached by `dlsym` against the process image, not by
+// linking Accelerate. Three reasons, in order of weight:
+//
+//   1. It keeps the crate's link line exactly as it is — no `build.rs`, no
+//      `-framework`, nothing new for the standalone-crate cold build to fail
+//      on, and no platform-conditional link for a symbol a run may never call.
+//   2. It degrades by *absence of a symbol* rather than by a cfg branch. A
+//      Linux host with OpenBLAS already loaded gets the fast path for free; a
+//      bare one keeps the Cranelift kernel. CI is macOS-only, so the Linux
+//      path cannot be tested here — which is exactly why it must not be a
+//      second code path that only a Linux box would ever execute.
+//   3. On macOS the symbol is already in the process image (libSystem
+//      re-exports vecLib's BLAS), so there is nothing to load.
+//
+// The accumulation order is BLAS's, not `SPEC.md §7.4b`'s ascending-k
+// contracted FMA. That is why this path is off unless `--blas` is given and is
+// unreachable inside `@deterministic` — see `docs/design/EXTERN_FN_LOWERING.md
+// §3` and `NUMERICS.md §2.2`.
+
+/// The C `cblas_sgemm`, as this file needs to call it. Row-major
+/// (`CblasRowMajor` = 101), no transpose on either operand (`CblasNoTrans` =
+/// 111).
+type CblasSgemm = unsafe extern "C" fn(
+    order: i32, trans_a: i32, trans_b: i32,
+    m: i32, n: i32, k: i32,
+    alpha: f32, a: *const f32, lda: i32,
+    b: *const f32, ldb: i32,
+    beta: f32, c: *mut f32, ldc: i32,
+);
+
+/// `cblas_sgemm`'s address in this process, resolved once.
+///
+/// `OnceLock` rather than a lazy static so the `dlsym` happens on the first
+/// question and never again — kernel selection asks it per matmul at lowering
+/// time, and the answer cannot change while the process runs.
+static CBLAS_SGEMM: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+fn cblas_sgemm_addr() -> Option<usize> {
+    *CBLAS_SGEMM.get_or_init(|| {
+        match process_symbol_present("cblas_sgemm") {
+            Some(true) => {
+                let c = std::ffi::CString::new("cblas_sgemm").ok()?;
+                // SAFETY: as `process_symbol_present` — `RTLD_DEFAULT` reads
+                // the loaded images' symbol tables and loads nothing. The
+                // address is kept as a `usize` and transmuted only at the one
+                // call site below, against the signature above.
+                #[cfg(unix)]
+                {
+                    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
+                    if p.is_null() { None } else { Some(p as usize) }
+                }
+                #[cfg(not(unix))]
+                { let _ = c; None }
+            }
+            _ => None,
+        }
+    })
+}
+
+/// The MAC count at or above which `cblas_sgemm` wins.
+///
+/// Measured on an M5 (see `docs/design/EXTERN_FN_LOWERING.md §2.2`): square
+/// GEMM crosses near 2^15 MACs and bandwidth-bound GEMV somewhere in
+/// 2^14–2^16, so the crossover is shape-dependent. 2^17 sits above every
+/// measured one with a ≥8x margin — the nearest measured points are 8.6x at
+/// 110,592 MACs and 14.6x at 262,144 — so the decision never turns on which
+/// side of a noisy boundary a shape lands. It is one eighth of the 2^20
+/// threading threshold, keeping both selection constants in the same
+/// power-of-two family.
+const BLAS_MIN_MACS: i128 = 1 << 17;
+
+/// #578: the three host-independent halves of the fast-path decision, split
+/// out from `blas_gemm_applies` so they can be tested without a Cranelift
+/// function around them. The fourth — does `cblas_sgemm` resolve — is a
+/// property of the process, not of the program, and is asked separately.
+fn blas_gemm_selected(blas_on: bool, deterministic_depth: u32,
+                      m: i64, k: i64, n: i64) -> bool {
+    blas_on
+        && deterministic_depth == 0
+        && (m as i128) * (k as i128) * (n as i128) >= BLAS_MIN_MACS
+}
+
+/// #578: is the BLAS GEMM fast path available on this host?
+///
+/// Also the source of the `accelerate` `@host` feature (`SPEC.md §7.4`), so a
+/// program's `@host match { .accelerate => … }` dispatches on exactly the
+/// predicate the JIT's own kernel selection tests — one detection, two
+/// consumers.
+pub fn blas_gemm_available() -> bool {
+    cblas_sgemm_addr().is_some()
+}
+
+/// #578: C[m,n] = A[m,k] @ B[k,n] through `cblas_sgemm`, all row-major f32.
+///
+/// Same ABI as `dmc_matmul_par`, so the two are interchangeable at the call
+/// site and the lowering picks one. BLAS threads itself, so this path and the
+/// threaded kernel are mutually exclusive by construction — the caller never
+/// emits both for one matmul.
+///
+/// Falls back to `dmc_matmul_par` if the symbol is somehow absent at run time.
+/// It cannot be — the lowering only emits this call after
+/// `blas_gemm_available()` answered yes in the same process — but the
+/// alternative to a fallback here is a null call, and a wrong answer is
+/// preferable to a crash in exactly zero situations.
+extern "C" fn dmc_matmul_blas(l: i64, r: i64, out: i64, m: i64, k: i64, n: i64) {
+    let Some(addr) = cblas_sgemm_addr() else {
+        dmc_matmul_par(l, r, out, m, k, n);
+        return;
+    };
+    if m == 0 || n == 0 || k == 0 { return; }
+    // Guard the i32 narrowing the C signature forces. A dimension past i32 is
+    // not a shape this backend can allocate anyway (the Forge would refuse a
+    // 2^31-row tensor long before), but the cast is silent, so check it.
+    if m > i32::MAX as i64 || n > i32::MAX as i64 || k > i32::MAX as i64 {
+        dmc_matmul_par(l, r, out, m, k, n);
+        return;
+    }
+    // SAFETY: `addr` is `cblas_sgemm` as resolved by `dlsym`, called against
+    // the C signature it is declared with. `l`/`r`/`out` are the data pointers
+    // of three row-major f32 tensors the caller sized `m*k`, `k*n` and `m*n` —
+    // the same contract `dmc_matmul_par` is called under, from the same site.
+    let f: CblasSgemm = unsafe { std::mem::transmute::<usize, CblasSgemm>(addr) };
+    unsafe {
+        f(101 /* CblasRowMajor */, 111 /* CblasNoTrans */, 111 /* CblasNoTrans */,
+          m as i32, n as i32, k as i32,
+          1.0, l as *const f32, k as i32,
+          r as *const f32, n as i32,
+          0.0, out as *mut f32, n as i32);
+    }
+}
+
 /// #323: Multi-threaded f32 matmul — C[m,n] = A[m,k] @ B[k,n], all row-major f32.
 ///
 /// Bit-identical to the inline JIT `simd_matmul` kernel: each output element is
@@ -20832,16 +21424,18 @@ extern "C" fn dmc_matmul_par(l: i64, r: i64, out: i64, m: i64, k: i64, n: i64) {
 #[inline]
 unsafe fn matmul_tile(a: *const f32, b: *const f32, c: *mut f32,
                       k: usize, n: usize, i0: usize, i1: usize) {
-    for i in i0..i1 {
-        let crow = c.add(i * n);
-        for j in 0..n { *crow.add(j) = 0.0; }
-        let arow = a.add(i * k);
-        for kk in 0..k {
-            let av = *arow.add(kk);
-            let brow = b.add(kk * n);
-            for j in 0..n {
-                let cj = crow.add(j);
-                *cj = av.mul_add(*brow.add(j), *cj);
+    unsafe {
+        for i in i0..i1 {
+            let crow = c.add(i * n);
+            for j in 0..n { *crow.add(j) = 0.0; }
+            let arow = a.add(i * k);
+            for kk in 0..k {
+                let av = *arow.add(kk);
+                let brow = b.add(kk * n);
+                for j in 0..n {
+                    let cj = crow.add(j);
+                    *cj = av.mul_add(*brow.add(j), *cj);
+                }
             }
         }
     }
@@ -20957,27 +21551,29 @@ extern "C" fn dmc_matmul_bf16(l: i64, r: i64, out: i64, m: i64, k: i64, n: i64) 
 /// interpreter — is untouched.
 #[inline]
 unsafe fn bf16_fma_row(av: f32, brow: *const u16, crow: *mut f32, j0: usize, j1: usize) {
-    let mut j = j0;
-    #[cfg(target_arch = "aarch64")]
-    {
-        use core::arch::aarch64::*;
-        let vav = vdupq_n_f32(av);
-        while j + 8 <= j1 {
-            let h = vld1q_u16(brow.add(j));
-            let lo = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_low_u16(h))));
-            let hi = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_high_u16(h))));
-            let c0 = vld1q_f32(crow.add(j));
-            let c1 = vld1q_f32(crow.add(j + 4));
-            vst1q_f32(crow.add(j), vfmaq_f32(c0, lo, vav));
-            vst1q_f32(crow.add(j + 4), vfmaq_f32(c1, hi, vav));
-            j += 8;
+    unsafe {
+        let mut j = j0;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use core::arch::aarch64::*;
+            let vav = vdupq_n_f32(av);
+            while j + 8 <= j1 {
+                let h = vld1q_u16(brow.add(j));
+                let lo = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_low_u16(h))));
+                let hi = vreinterpretq_f32_u32(vshlq_n_u32::<16>(vmovl_u16(vget_high_u16(h))));
+                let c0 = vld1q_f32(crow.add(j));
+                let c1 = vld1q_f32(crow.add(j + 4));
+                vst1q_f32(crow.add(j), vfmaq_f32(c0, lo, vav));
+                vst1q_f32(crow.add(j + 4), vfmaq_f32(c1, hi, vav));
+                j += 8;
+            }
         }
-    }
-    while j < j1 {
-        let bv = bf16_bits_to_f32(*brow.add(j));
-        let cj = crow.add(j);
-        *cj = av.mul_add(bv, *cj);
-        j += 1;
+        while j < j1 {
+            let bv = bf16_bits_to_f32(*brow.add(j));
+            let cj = crow.add(j);
+            *cj = av.mul_add(bv, *cj);
+            j += 1;
+        }
     }
 }
 
@@ -20992,34 +21588,36 @@ unsafe fn bf16_fma_row(av: f32, brow: *const u16, crow: *mut f32, j0: usize, j1:
 unsafe fn bf16_fma_rows4(av: [f32; 4], b: [*const u16; 4], crow: *mut f32,
                          j0: usize, j1: usize) {
     use core::arch::aarch64::*;
-    let z = vdupq_n_u16(0);
-    let va: [float32x4_t; 4] = [
-        vdupq_n_f32(av[0]), vdupq_n_f32(av[1]), vdupq_n_f32(av[2]), vdupq_n_f32(av[3]),
-    ];
-    let mut j = j0;
-    while j + 8 <= j1 {
-        let mut c0 = vld1q_f32(crow.add(j));
-        let mut c1 = vld1q_f32(crow.add(j + 4));
-        // per lane: (h as u32) << 16 == zip with a zero u16 below it
-        for r in 0..4 {
-            let h = vld1q_u16(b[r].add(j));
-            let lo = vreinterpretq_f32_u16(vzip1q_u16(z, h));
-            let hi = vreinterpretq_f32_u16(vzip2q_u16(z, h));
-            c0 = vfmaq_f32(c0, lo, va[r]);
-            c1 = vfmaq_f32(c1, hi, va[r]);
+    unsafe {
+        let z = vdupq_n_u16(0);
+        let va: [float32x4_t; 4] = [
+            vdupq_n_f32(av[0]), vdupq_n_f32(av[1]), vdupq_n_f32(av[2]), vdupq_n_f32(av[3]),
+        ];
+        let mut j = j0;
+        while j + 8 <= j1 {
+            let mut c0 = vld1q_f32(crow.add(j));
+            let mut c1 = vld1q_f32(crow.add(j + 4));
+            // per lane: (h as u32) << 16 == zip with a zero u16 below it
+            for r in 0..4 {
+                let h = vld1q_u16(b[r].add(j));
+                let lo = vreinterpretq_f32_u16(vzip1q_u16(z, h));
+                let hi = vreinterpretq_f32_u16(vzip2q_u16(z, h));
+                c0 = vfmaq_f32(c0, lo, va[r]);
+                c1 = vfmaq_f32(c1, hi, va[r]);
+            }
+            vst1q_f32(crow.add(j), c0);
+            vst1q_f32(crow.add(j + 4), c1);
+            j += 8;
         }
-        vst1q_f32(crow.add(j), c0);
-        vst1q_f32(crow.add(j + 4), c1);
-        j += 8;
-    }
-    while j < j1 {
-        let cj = crow.add(j);
-        let mut v = *cj;
-        for r in 0..4 {
-            v = av[r].mul_add(bf16_bits_to_f32(*b[r].add(j)), v);
+        while j < j1 {
+            let cj = crow.add(j);
+            let mut v = *cj;
+            for r in 0..4 {
+                v = av[r].mul_add(bf16_bits_to_f32(*b[r].add(j)), v);
+            }
+            *cj = v;
+            j += 1;
         }
-        *cj = v;
-        j += 1;
     }
 }
 
@@ -21030,28 +21628,32 @@ unsafe fn bf16_fma_rows4(av: [f32; 4], b: [*const u16; 4], crow: *mut f32,
 #[inline]
 unsafe fn matmul_tile_bf16_cols(a: *const f32, b: *const u16, c: *mut f32,
                                 k: usize, n: usize, j0: usize, j1: usize) {
-    for j in j0..j1 { *c.add(j) = 0.0; }
-    let mut kk = 0;
-    #[cfg(target_arch = "aarch64")]
-    while kk + 4 <= k {
-        bf16_fma_rows4(
-            [*a.add(kk), *a.add(kk + 1), *a.add(kk + 2), *a.add(kk + 3)],
-            [b.add(kk * n), b.add((kk + 1) * n), b.add((kk + 2) * n), b.add((kk + 3) * n)],
-            c, j0, j1);
-        kk += 4;
-    }
-    while kk < k {
-        let av = *a.add(kk);
-        let brow = b.add(kk * n);
-        bf16_fma_row(av, brow, c, j0, j1);
-        kk += 1;
+    unsafe {
+        for j in j0..j1 { *c.add(j) = 0.0; }
+        let mut kk = 0;
+        #[cfg(target_arch = "aarch64")]
+        while kk + 4 <= k {
+            bf16_fma_rows4(
+                [*a.add(kk), *a.add(kk + 1), *a.add(kk + 2), *a.add(kk + 3)],
+                [b.add(kk * n), b.add((kk + 1) * n), b.add((kk + 2) * n), b.add((kk + 3) * n)],
+                c, j0, j1);
+            kk += 4;
+        }
+        while kk < k {
+            let av = *a.add(kk);
+            let brow = b.add(kk * n);
+            bf16_fma_row(av, brow, c, j0, j1);
+            kk += 1;
+        }
     }
 }
 
 unsafe fn matmul_tile_bf16(a: *const f32, b: *const u16, c: *mut f32,
                            k: usize, n: usize, i0: usize, i1: usize) {
-    for i in i0..i1 {
-        matmul_tile_bf16_cols(a.add(i * k), b, c.add(i * n), k, n, 0, n);
+    unsafe {
+        for i in i0..i1 {
+            matmul_tile_bf16_cols(a.add(i * k), b, c.add(i * n), k, n, 0, n);
+        }
     }
 }
 
@@ -22938,6 +23540,47 @@ mod tests {
         assert_eq!(jit_run_i64(repro).unwrap(), 430);
     }
 
+    /// #518 (post-merge nit from #515): every `jit_runtime_start_slice_parity`
+    /// case above puts the runtime scalar in the *loop variable that builds
+    /// the range*, never as a SIBLING scalar index alongside a runtime-start
+    /// range on the same tensor (`t[i, m..m+2]` — a runtime `Scalar` on axis
+    /// 0, a `DynRange` kept on axis 1). A reviewer probe covered this
+    /// combination but nothing committed it. Scalar-before-kept-axis keeps it
+    /// on the contiguous view path (`lower_tensor_load_with`), the same one
+    /// #518's stale-comment fix touched.
+    #[test]
+    fn jit_mixed_runtime_scalar_and_runtime_start_range_518() {
+        let build = "let !t=forge.zeros[f32,[4,5]] \
+                     for i in 0..4 { for j in 0..5 { t[i,j]=(i as f32)*10.0+(j as f32) } }";
+        assert_jit_eq_interp(&format!(
+            "fn main()->i64{{ {build} let !a=0.0 \
+             for i in 0..4 {{ let !m=1 a=a+sum(t[i, m..m+2]) }} a as i64 }}"));
+        // Pin the exact value: row i contributes (10i+1)+(10i+2) = 20i+3, summed
+        // over i in 0..4 is 4*3 + 20*(0+1+2+3) = 12 + 120 = 132.
+        assert_eq!(jit_run_i64(&format!(
+            "fn main()->i64{{ {build} let !a=0.0 \
+             for i in 0..4 {{ let !m=1 a=a+sum(t[i, m..m+2]) }} a as i64 }}")).unwrap(), 132);
+    }
+
+    /// #518 (post-merge nit from #515): `classify_index`'s runtime-bound path
+    /// (#511) has a "static after all" fallback for when `affine_index_expr`
+    /// resolves a start bound to a constant (empty ident term map) that
+    /// `resolve_shape_expr`'s plain static path could not — its own comment
+    /// names a parenthesized bound as the example, because `resolve_shape_expr`
+    /// has no `Expr::Tuple` arm (the parser wraps `(e)` as a 1-tuple) while
+    /// `affine_index_expr` unwraps one. Nothing exercised that branch: every
+    /// other static-range test uses a bare literal, which resolves through
+    /// `resolve_shape_expr` directly and never reaches the affine path at all.
+    #[test]
+    fn jit_parenthesized_static_start_hits_the_affine_fallback_518() {
+        assert_jit_eq_interp(
+            "fn main()->i64{ let !t=forge.zeros[f32,[5]] \
+             t[1]=1.0 t[2]=2.0 t[3]=3.0 sum(t[(1)..4]) as i64 }");
+        assert_eq!(jit_run_i64(
+            "fn main()->i64{ let !t=forge.zeros[f32,[5]] \
+             t[1]=1.0 t[2]=2.0 t[3]=3.0 sum(t[(1)..4]) as i64 }").unwrap(), 6);
+    }
+
     #[test]
     fn jit_runtime_extent_slice_rejected() {
         // #511 scope line: a runtime EXTENT would make the result shape
@@ -22954,8 +23597,12 @@ mod tests {
              sum(t[0..b, ..]) as i64 }",
         ] {
             let e = jit_run_i64(src).unwrap_err();
-            assert!(e.contains("slice with a runtime bound needs a compile-time extent"),
+            // #563 sweep: still the same compile-time refusal, now announced as
+            // a lowering GAP (`jit unsupported`) rather than a defect, so the
+            // probe battery can allowlist it.
+            assert!(e.contains("a slice with a runtime bound and no compile-time extent"),
                     "unexpected error: {}", e);
+            assert!(e.starts_with("jit unsupported"), "not classified as a gap: {}", e);
         }
     }
 
@@ -26824,6 +27471,205 @@ fn main() -> i64 { 0 }
         assert_eq!(jit_run_i64(src).unwrap(), F32_ANSWER + 10000000000000000);
     }
 
+    // ─── #566: the hint reaches an enum arm's payload bindings ───────────────
+    //
+    // #478's pre-pass reads a bound identifier's width out of `local_tys`, so
+    // an ordinary arm (`match k { 0 => x_f32, _ => 0.0 }`) already gets this
+    // right. An enum payload binding is not in `local_tys` when the hint is
+    // fixed — `bind_enum_payload` declares it later, inside the arm block — so
+    // the pre-pass answered "cannot say", the literal kept its f64 default and
+    // the arms were refused as disagreeing. SPEC.md §4.5's own worked example
+    // was the casualty: `dmc run` printed 4, `dmc jit` refused the program.
+
+    /// SPEC.md §4.5's example verbatim, with the call the section makes.
+    /// `area` is `-> f32` and `Circle` carries an `f32`, so §3.1's untyped
+    /// literal in the `Empty` arm is an `f32` — on both backends.
+    const SPEC_45_AREA: &str = "
+        enum Shape { Circle(f32), Empty }
+        fn area(s: Shape) -> f32 {
+            match s {
+                Circle(r) => r * r,
+                Empty     => 0.0,
+            }
+        }
+    ";
+
+    #[test]
+    fn unsuffixed_literal_beside_an_f32_enum_payload_arm_566() {
+        // Both variants: the payload arm (whose f32 the literal adopts) and
+        // the literal arm itself, whose value is what a mistyped join would
+        // have carried at the wrong width.
+        for (call, want) in [("Shape.Circle(2.0)", 4), ("Shape.Empty", 0)] {
+            let src = format!(
+                "{SPEC_45_AREA}\nfn main() -> i64 {{ (area({call}) * 1000.0f32) as i64 }}");
+            assert_jit_eq_interp(&src);
+            assert_eq!(
+                jit_run_i64(&src).unwrap(), want * 1000,
+                "SPEC §4.5's example gave the wrong answer for {}", call,
+            );
+        }
+    }
+
+    #[test]
+    fn the_literal_arm_may_come_first_566() {
+        // The hint is joined across ALL arms before any is lowered, so the
+        // untyped literal adopts the payload's f32 even when it is the arm
+        // the lowering reaches first.
+        let src = "
+            enum Shape { Circle(f32), Empty }
+            fn area(s: Shape) -> f32 {
+                match s {
+                    Empty     => 0.0,
+                    Circle(r) => r * r,
+                }
+            }
+            fn main() -> i64 { (area(Shape.Circle(3.0)) * 1000.0f32) as i64 }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 9000);
+    }
+
+    // ── #505: `@comptime` reaches the JIT ───────────────────────────────────
+    //
+    // These helpers parse and lower directly, without running `comptime.rs`,
+    // so they exercise the JIT's own `DirectiveBlock` path — which is the path
+    // a residual (shape-parameter) block still takes in the shipped binary,
+    // and the path that used to refuse every `@comptime` outright.
+
+    #[test]
+    fn comptime_with_a_shape_param_lowers_and_agrees_505() {
+        // The parity defect #505 closes: `dmc run` answered 8 and `dmc jit`
+        // refused to compile the same program. Inside the JIT `N` is a
+        // compile-time constant, so lowering the body is the fold SPEC.md §7.8
+        // specifies "in the surrounding monomorphization".
+        let src = "
+            fn tile[N](x: Tensor[f32, [N]]) -> i64 {
+                let k = @comptime { N * 2 }
+                k
+            }
+            fn main() -> i64 { tile(forge.zeros[f32, [4]]) }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 8);
+    }
+
+    #[test]
+    fn comptime_in_statement_position_lowers_505() {
+        let src = "
+            fn main() -> i64 {
+                let !acc = 0
+                @comptime { 1 + 1 }
+                acc += 7
+                acc
+            }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 7);
+    }
+
+    #[test]
+    fn an_unfolded_closed_comptime_block_still_lowers_505() {
+        // The binary folds this to a literal before the JIT sees it, so this
+        // is the belt-and-braces case: even handed the raw directive, the
+        // backend must produce the interpreter's answer rather than refuse.
+        let src = "fn main() -> i64 { let x = @comptime { 3 * 7 + 1 }  x }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 22);
+    }
+
+    #[test]
+    fn an_annotated_literal_still_agrees_566() {
+        // The form that already worked (`0.0f32` names its own width) must
+        // keep working — the hint must not fight a suffix.
+        let src = "
+            enum Shape { Circle(f32), Empty }
+            fn area(s: Shape) -> f32 {
+                match s {
+                    Circle(r) => r * r,
+                    Empty     => 0.0f32,
+                }
+            }
+            fn main() -> i64 { (area(Shape.Circle(2.0)) * 1000.0f32) as i64
+                             + (area(Shape.Empty) * 1000.0f32) as i64 }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 4000);
+    }
+
+    #[test]
+    fn an_i64_payload_arm_is_unaffected_566() {
+        // The integer half of §3.1 goes through `adopt_int_literal_kind`, not
+        // the float hint; it was already at parity and stays there.
+        let src = "
+            enum Box { Val(i64), Empty }
+            fn get(b: Box) -> i64 {
+                match b {
+                    Val(n) => n * n,
+                    Empty  => 0,
+                }
+            }
+            fn main() -> i64 { get(Box.Val(3)) + get(Box.Empty) }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 9);
+    }
+
+    #[test]
+    fn a_non_enum_match_in_an_f32_fn_is_unaffected_566() {
+        // The scoping control from the issue: no enum in sight, so nothing
+        // about this program's lowering may change.
+        let src = "
+            fn pick(k: i64) -> f32 {
+                match k {
+                    0 => 1.5,
+                    _ => 0.0,
+                }
+            }
+            fn main() -> i64 { (pick(0) * 1000.0f32) as i64 + (pick(1) * 1000.0f32) as i64 }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 1500);
+    }
+
+    #[test]
+    fn an_f64_payload_arm_keeps_the_f64_default_566() {
+        // The half that must NOT move (#209): only a definite f32 sibling arms
+        // the hint, so an f64 payload leaves the literal at full f64 precision.
+        // 0.1 quantized through f32 is 0.10000000149011612 — a narrowed arm
+        // would not produce the f64 digits below.
+        let src = "
+            enum Shape { Circle(f64), Empty }
+            fn area(s: Shape) -> f64 {
+                match s {
+                    Circle(r) => r * r,
+                    Empty     => 0.1,
+                }
+            }
+            fn main() -> i64 { (area(Shape.Empty) * 100000000000000000.0) as i64 }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 10000000000000000);
+    }
+
+    #[test]
+    fn a_multi_field_payload_binding_answers_the_hint_566() {
+        // The binding that types the arm need not be the first field, and the
+        // other fields' types are irrelevant to it.
+        let src = "
+            enum P { Pair(i64, f32), None_ }
+            fn v(p: P) -> f32 {
+                match p {
+                    Pair(n, x) => x * (n as f32),
+                    None_      => 0.0,
+                }
+            }
+            fn main() -> i64 { (v(P.Pair(3, 1.5)) * 1000.0f32) as i64
+                             + (v(P.None_) * 1000.0f32) as i64 }
+        ";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 4500);
+    }
+
     // ─── f32 tensor reductions (#481) ────────────────────────────────────────
     //
     // `sum(t)` must equal the loop it is documented to mean. Each test compares
@@ -27166,6 +28012,105 @@ fn main() -> i64 { 0 }
     }
 
     #[test]
+    fn jit_gap_sweep_refusals_are_classified_unsupported() {
+        // The #563/#568/#572 sweep. Every source below is one `dmc run`
+        // executes and the JIT declines to lower; each used to render as
+        // `jit error`, which `tools/jit_probes.py` scores as a DIVERGENCE, so
+        // none of these shapes could be probed at all. The `code` is asserted
+        // too — a refusal with no class cannot appear in the generated
+        // JIT-support table, which is what #485 built the vocabulary for.
+        for (src, want_code) in [
+            // #563 — a colon slab whose end is not a literal.
+            ("fn half[S](x: Tensor[f32, [S]]) -> f32 { sum(x[0 : S / 2]) }\n\
+              fn main() -> i64 { half([1.0f32, 2.0f32, 3.0f32, 4.0f32]) as i64 }",
+             "jit-slice"),
+            // #563 — the strided spelling of the same slab.
+            ("fn main() -> i64 {\n\
+              let !x = forge.zeros[f32, [4]]\n\
+              sum(x[0::2]) as i64 }",
+             "jit-slice"),
+            // #563 — a range slice with no end.
+            ("fn main() -> i64 {\n\
+              let !x = forge.zeros[f32, [4]]\n\
+              sum(x[1..]) as i64 }",
+             "jit-slice"),
+            // #572 — a narrow integer tensor element the JIT cannot allocate.
+            ("fn main() -> i64 {\n\
+              let !t = forge.zeros[i8, [2]]\n\
+              t[0] = 3\n\
+              t[0] as i64 }",
+             "jit-element-type"),
+            // #572 sibling — `forge.zeros[bool, ..]` (32-bit zero-fill).
+            ("fn main() -> i64 {\n\
+              let t = forge.zeros[bool, [4]]\n\
+              if t[0] { 1 } else { 0 } }",
+             "jit-element-type"),
+            // #572 sibling — `forge.ones` fills f32 only.
+            ("fn main() -> i64 {\n\
+              let t = forge.ones[i64, [4]]\n\
+              t[0] }",
+             "jit-element-type"),
+            // #568 — a user-written `(T, Err)` returning `nil`.
+            ("fn g() -> (i64, Err) { (1, nil) }\n\
+              fn main() -> i64 { let (v, e) = g()  v }",
+             "jit-conversion"),
+            // sweep — a tensor element type in a SIGNATURE, not a constructor.
+            ("fn f(x: Tensor[i8, [2]]) -> i64 { x[0] as i64 }\n\
+              fn main() -> i64 { 0 }",
+             "jit-element-type"),
+            // sweep — a rank the JIT has no loops for.
+            ("fn f(x: Tensor[f32, [1,1,1,1,2]]) -> i64 { 0 }\n\
+              fn main() -> i64 { 0 }",
+             "jit-rank"),
+            // sweep — `any` is dynamically typed; the message always said
+            // "use `dmc run`" while the prefix said the opposite.
+            ("fn f(x: any) -> i64 { 1 }\n\
+              fn main() -> i64 { f(3) }",
+             "jit-type-form"),
+            // sweep — a scalar cast outside the JIT's cast set.
+            ("fn main() -> f64 { let b = true\n b as f64 }",
+             "jit-conversion"),
+            // sweep — an f64 tensor through an f32-only op.
+            ("fn main() -> f64 { let !t = forge.uninit[f64, [2]]\n\
+              t[0] = 1.0\n t[1] = 2.0\n max(t) }",
+             "jit-f32-only"),
+            // sweep — a non-literal reduction axis.
+            ("fn main() -> f64 {\n\
+              let !m = forge.zeros[f32, [2, 2]]\n\
+              let !a = 1\n\
+              sum(sum_along(m, a)) as f64 }",
+             "jit-axis"),
+        ] {
+            let e = jit_compile_jiterr(src);
+            assert_eq!(
+                e.kind, JitErrorKind::Unsupported,
+                "expected a classified refusal for:\n{}\ngot `{}`", src, e,
+            );
+            assert!(
+                e.to_string().starts_with("jit unsupported at "),
+                "refusal did not render with the `jit unsupported` prefix: {}", e,
+            );
+            assert_eq!(
+                e.refusal.map(|r| r.code()), Some(want_code),
+                "wrong refusal class for:\n{}\ngot `{}`", src, e,
+            );
+        }
+    }
+
+    #[test]
+    fn jit_tuple_err_refusal_points_at_the_offending_element() {
+        // #568 defect 3: the refusal reported the enclosing `fn`'s span, when
+        // the whole point of a span is to name the thing that cannot be
+        // lowered. `nil` is on line 2, column 9 — the `fn` is on line 1.
+        let e = jit_compile_jiterr("fn g() -> (i64, Err) {\n    (1, nil)\n}\n\
+                                    fn main() -> i64 { let (v, e) = g()  v }");
+        assert_eq!((e.line, e.col), (2, 9), "span should name the `nil`, got `{}`", e);
+        // …and defects 1 and 2: classified, and directing to `dmc run`.
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("use `dmc run`"), "no `dmc run` direction: {}", e);
+    }
+
+    #[test]
     fn jit_error_kind_defaults_to_error() {
         // 184 construction sites were given the field mechanically. `Error` is
         // the safe default: a site that should have been `Unsupported` costs a
@@ -27232,6 +28177,174 @@ fn main() -> i64 { 0 }
             fn main() -> i64 { 0 }
         "#);
         assert!(msg.contains("cuda"), "expected 'cuda' in: {}", msg);
+    }
+
+    // ─── #578: the BLAS/AMX GEMM fast path ───────────────────────────────
+
+    /// Run `src` with the fast path explicitly on or off. Both runs go through
+    /// the same lowering; the flag is the only difference.
+    fn jit_run_i64_blas(src: &str, blas: bool) -> Result<i64, String> {
+        let toks = Lexer::new(src).tokenize().map_err(|e| e.to_string())?;
+        let prog = Parser::new(toks).parse_program().map_err(|e| e.to_string())?;
+        let mut jit = Jit::new().map_err(|e| e.to_string())?;
+        jit.set_blas(blas);
+        jit.compile_program(&prog).map_err(|e| e.to_string())?;
+        jit.run_main().map_err(|e| e.to_string())
+    }
+
+    /// A `96 x 96 @ 96 x 96` f32 GEMM — 884,736 MACs, comfortably over
+    /// `BLAS_MIN_MACS` — reduced to one integer so the two runs compare
+    /// directly. The scale is chosen so a 1-ulp f32 difference in the sum
+    /// would be well under 1 in the returned integer, which is what makes
+    /// "equal" here mean "inside the oracle's tolerance" rather than "bitwise
+    /// identical": BLAS's blocked accumulation is not `SPEC.md §7.4b`'s order
+    /// and is not required to agree bit-for-bit.
+    const BLAS_GEMM_PROBE: &str = "
+        fn main() -> i64 {
+            let !a = forge.zeros[f32, [96, 96]]
+            let !b = forge.zeros[f32, [96, 96]]
+            for i in 0..96 {
+                for j in 0..96 {
+                    a[i, j] = (((i + j) % 7) as f32) * 0.125f32
+                    b[i, j] = (((i * 3 + j) % 5) as f32) * 0.25f32
+                }
+            }
+            let c = a @ b
+            (sum(c) * 100.0f32) as i64
+        }
+    ";
+
+    #[test]
+    fn jit_blas_fast_path_agrees_with_the_cranelift_kernel() {
+        let off = jit_run_i64_blas(BLAS_GEMM_PROBE, false).expect("kernel run");
+        let on = jit_run_i64_blas(BLAS_GEMM_PROBE, true).expect("blas run");
+        if !blas_gemm_available() {
+            // No BLAS in this process: the flag is inert and the two runs are
+            // the same program. Asserting equality still means something —
+            // it means `--blas` did not change anything it should not have.
+            assert_eq!(off, on, "--blas changed the answer on a host with no BLAS");
+            return;
+        }
+        // Tolerance, not bit-equality: the fast path accumulates in BLAS's
+        // blocked order (`NUMERICS.md §2.2`). The bound is the same shape as
+        // `tools/numpy_oracle.py`'s — relative, on a value near 1.6e7.
+        let (a, b) = (off as f64, on as f64);
+        let rel = (a - b).abs() / a.abs().max(1.0);
+        assert!(rel < 1e-5, "fast path outside tolerance: kernel={} blas={}", off, on);
+    }
+
+    #[test]
+    fn jit_blas_fast_path_is_unreachable_inside_deterministic() {
+        // `SPEC.md §7.5`: kernel selection inside `@deterministic` "ignores
+        // non-deterministic fast paths". So the flag must make no difference
+        // at all there — not "a small one", none.
+        let src = "
+            fn main() -> i64 {
+                let !a = forge.zeros[f32, [96, 96]]
+                let !b = forge.zeros[f32, [96, 96]]
+                for i in 0..96 {
+                    for j in 0..96 {
+                        a[i, j] = (((i + j) % 7) as f32) * 0.125f32
+                        b[i, j] = (((i * 3 + j) % 5) as f32) * 0.25f32
+                    }
+                }
+                let s = @deterministic {
+                    let c = a @ b
+                    sum(c)
+                }
+                (s * 100.0f32) as i64
+            }
+        ";
+        let off = jit_run_i64_blas(src, false).expect("kernel run");
+        let on = jit_run_i64_blas(src, true).expect("blas run");
+        assert_eq!(off, on, "--blas reached inside a @deterministic block");
+        // …and the guard is the block, not the program: the same shape outside
+        // one is eligible. (Equal here too, within tolerance — the point is
+        // that the *selection* differs, which the predicate test below pins.)
+        assert!(jit_run_i64_blas(BLAS_GEMM_PROBE, true).is_ok());
+    }
+
+    #[test]
+    fn jit_blas_selection_predicate() {
+        // The three host-independent conditions, one assertion each.
+        // 262,144 MACs (64^3) is over the 2^17 threshold; 32,768 (32^3) under.
+        assert!(blas_gemm_selected(true, 0, 64, 64, 64), "eligible shape refused");
+        assert!(!blas_gemm_selected(false, 0, 64, 64, 64), "selected with --blas off");
+        assert!(!blas_gemm_selected(true, 1, 64, 64, 64), "selected inside @deterministic");
+        assert!(!blas_gemm_selected(true, 0, 32, 32, 32), "selected below the threshold");
+        // The threshold is a MAC count, not a per-dimension one: a GEMV whose
+        // product clears it is eligible even at m == 1, and a square matmul
+        // whose product does not is not.
+        assert!(blas_gemm_selected(true, 0, 1, 512, 512), "large GEMV refused");
+        assert!(!blas_gemm_selected(true, 0, 1, 128, 128), "small GEMV selected");
+        // The exact boundary, both sides.
+        assert!(blas_gemm_selected(true, 0, 1, 1, 131_072), "at the threshold");
+        assert!(!blas_gemm_selected(true, 0, 1, 1, 131_071), "one under the threshold");
+    }
+
+    #[test]
+    fn jit_blas_defaults_off() {
+        // The default is the whole determinism story: with the flag unset,
+        // every matmul lowers exactly as it did before #578, so no golden
+        // output can move. `Jit::new()` is what the CLI builds without
+        // `--blas` and what every other test in this file uses.
+        let jit = Jit::new().expect("jit");
+        assert!(!jit.blas, "the BLAS fast path must be off by default");
+    }
+
+    #[test]
+    fn jit_extern_fn_unresolvable_symbol_is_a_refusal_not_a_panic() {
+        // #578. Before the `dlsym` pre-flight this went all the way to
+        // `JITModule::finalize_definitions`, which *panics* — `can't resolve
+        // symbol NAME` at cranelift-jit's backend.rs, exit 101, a Rust
+        // backtrace and no span. That is the failure every first use of
+        // `extern fn` hits, and a panic is not a diagnostic.
+        let e = jit_compile_jiterr(r#"
+            extern fn dmc_no_such_symbol_xyzzy(x: i32) -> i32
+            fn main() -> i64 { dmc_no_such_symbol_xyzzy(1) as i64 }
+        "#);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-extern"), "{}", e);
+        assert!(e.msg.contains("dmc_no_such_symbol_xyzzy"), "{}", e);
+        assert!(e.line > 0, "the refusal must carry the declaration's span: {}", e);
+        // …and it must NOT offer `dmc run`, the one remedy that cannot work:
+        // the interpreter refuses every `extern fn` call by spec.
+        assert!(!e.msg.contains("use `dmc run`"), "misleading direction: {}", e);
+    }
+
+    #[test]
+    fn jit_extern_abi_refuses_types_whose_machine_width_is_not_the_declared_one() {
+        // #578. The checker admits these (`str` is a scalar type; the narrow
+        // integers and exotic floats are too), and this backend cannot put
+        // them in a C ABI signature: `str` is a forge `[len, bytes]` pointer,
+        // and the rest are i64-/f32-backed, so a foreign callee reading them
+        // at the declared width reads the wrong bytes.
+        for src in [
+            "extern fn dmc_test_add_f32(a: str, b: f32) -> f32\nfn main() -> i64 { 0 }",
+            "extern fn dmc_test_add_f32(a: f32, b: f32) -> str\nfn main() -> i64 { 0 }",
+            "extern fn dmc_test_add_f32(a: i8, b: f32) -> f32\nfn main() -> i64 { 0 }",
+            "extern fn dmc_test_add_f32(a: bf16, b: f32) -> f32\nfn main() -> i64 { 0 }",
+        ] {
+            let e = jit_compile_jiterr(src);
+            assert_eq!(e.refusal.map(|r| r.code()), Some("jit-extern"),
+                "wrong class for:\n{}\ngot `{}`", src, e);
+            assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        }
+    }
+
+    #[test]
+    fn jit_extern_abi_admits_the_widths_that_match() {
+        // The other side of the rule: everything whose machine width equals
+        // its declared one goes through. `dmc_test_add_f32` is `no_mangle`, so
+        // the pre-flight resolves it against this test binary's own image.
+        jit_compile_only(r#"
+            extern fn dmc_test_add_f32(a: f32, b: f32) -> f32
+            fn main() -> i64 { 0 }
+        "#).expect("f32 should compile");
+        jit_compile_only(r#"
+            extern fn dmc_test_scale_ptr(p: *f32, n: i64, s: f32) -> f32
+            fn main() -> i64 { 0 }
+        "#).expect("*f32 + i64 should compile");
     }
 
     #[test]

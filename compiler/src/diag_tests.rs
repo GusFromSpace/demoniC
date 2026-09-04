@@ -288,7 +288,9 @@ fn every_variant_is_accounted_for(r: Refusal) {
         | Refusal::ArgForm | Refusal::AssignForm | Refusal::LoopForm
         | Refusal::IndirectCall | Refusal::UnknownFn | Refusal::OperandType
         | Refusal::BranchType | Refusal::F32Only | Refusal::DynamicShape
-        | Refusal::Axis | Refusal::Grad | Refusal::SecondOrder => {}
+        | Refusal::Axis | Refusal::Grad | Refusal::SecondOrder
+        | Refusal::ElementType | Refusal::Rank | Refusal::Slice
+        | Refusal::Conversion | Refusal::TypeForm => {}
     }
 }
 
@@ -296,7 +298,7 @@ fn every_variant_is_accounted_for(r: Refusal) {
 fn every_refusal_class_is_listed() {
     assert_eq!(
         Refusal::ALL.len(),
-        19,
+        24,
         "a class was added or removed — update the roster and this count",
     );
 }

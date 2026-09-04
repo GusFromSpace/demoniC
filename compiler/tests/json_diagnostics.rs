@@ -110,6 +110,18 @@ const TESTS_MIXED: &str = "fn test_add() -> bool { 1 + 1 == 2 }\nfn test_bad() -
 /// `--jit` parity verdict is `skip`, not a failure.
 const TESTS_OUTSIDE_JIT: &str = "fn test_range() -> bool {\n    let r = 0..3\n    true\n}\n";
 
+/// An element-type mismatch over EQUAL shapes — DIAGNOSTICS.md §4: "An
+/// element-type mismatch over equal shapes carries neither field [expected,
+/// actual] — the payload appears only when the shapes are the problem."
+/// `make()`'s declared return carries a real `Tensor[i64, [2]]` (unlike a bare
+/// `forge.zeros[i64, [2]]`, which types `Unknown` and would not mismatch at
+/// all — `let a: Tensor[f32, [2]] = forge.zeros[i64, [2]]` passes `--check`
+/// clean, so the function-return detour is what actually surfaces this
+/// diagnostic to test).
+const ELEM_TYPE_MISMATCH_EQUAL_SHAPES: &str =
+    "fn make() -> Tensor[i64, [2]] { forge.zeros[i64, [2]] }\n\
+     fn main() -> nil {\n    let a: Tensor[f32, [2]] = make()\n    nil\n}\n";
+
 // ── The envelope ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -286,6 +298,32 @@ fn a_shape_error_carries_expected_and_actual_as_data() {
              \"errors\":1,\"warnings\":0,\"items\":1,\"exit\":1}".to_string(),
         ],
     );
+}
+
+/// #518 (post-merge nit from #516): the companion case DIAGNOSTICS.md §4
+/// states in prose but nothing pinned — an element-type mismatch over EQUAL
+/// shapes carries the message and nothing else. Same shape `[2]` on both
+/// sides, only the element type differs, so `expected`/`actual` must be
+/// absent entirely (never present-but-equal, never null — §4's "optional
+/// fields are omitted").
+#[test]
+fn an_element_type_mismatch_over_equal_shapes_carries_no_shape_payload() {
+    let probe = Probe::new(ELEM_TYPE_MISMATCH_EQUAL_SHAPES);
+    let out = probe.run(&["--check", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let ls = lines(&out);
+    assert_eq!(
+        ls[0],
+        format!(
+            "{{\"schema\":1,\"kind\":\"check\",\"severity\":\"error\",\
+             \"message\":\"let binding has type Tensor[F32, [2]] but value \
+             has type Tensor[I64, [2]]\",\
+             \"file\":\"{}\",\"line\":3,\"col\":5,\"start\":79,\"end\":111}}",
+            probe.reported(),
+        ),
+    );
+    assert!(!ls[0].contains("\"expected\"") && !ls[0].contains("\"actual\""),
+        "an equal-shape mismatch must carry no shape payload: {}", ls[0]);
 }
 
 // ── JIT ineligibility ────────────────────────────────────────────────────────
@@ -491,6 +529,38 @@ fn a_test_file_with_no_tests_still_gets_the_envelope() {
          \"errors\":0,\"warnings\":0,\"passed\":0,\"failed\":0,\"exit\":0}\n",
     );
     assert_eq!(stdout(&out), "");
+}
+
+/// #518 (post-merge nit from #516): DIAGNOSTICS.md §7 states this path in
+/// prose — "Under `dmc test`, a file-level failure (`FAIL <file>: resolution
+/// failed …`) likewise arrives as `unstructured` — it is not a *test*, so it
+/// gets no `test` object, but it still counts into the summary's `failed`"
+/// — but nothing committed exercised it. A `use` of a file that does not
+/// exist fails `Resolver::resolve_all` before any test runs, which is a
+/// different path from every other test in this file (all of which fail
+/// inside a real test run, and so DO get a `test` object).
+#[test]
+fn a_file_level_test_failure_is_unstructured_with_no_test_object() {
+    let probe = Probe::new("use \"does_not_exist_518.dmc\" as m\n\
+                             fn test_never_runs() -> bool { true }\n");
+    let out = probe.run(&["test", "--json"]);
+    // Disclosed quirk (DIAGNOSTICS.md §4): a run that found no *tests* (this
+    // one never got that far) reports `exit:0` regardless — the exit code
+    // does not depend on `--json`, so neither do the numbers explaining it.
+    assert!(out.status.success(), "{}", stderr(&out));
+    let ls = lines(&out);
+    assert_eq!(ls.len(), 2, "expected exactly the failure line + summary:\n{:#?}", ls);
+    assert!(ls[0].starts_with("{\"schema\":1,\"kind\":\"unstructured\",\"severity\":\"error\",\
+                                \"message\":\"FAIL "),
+        "not unstructured: {}", ls[0]);
+    assert!(ls[0].contains("resolution failed"), "{}", ls[0]);
+    // No `test` object exists for this failure — `kind` is never `"test"`.
+    assert!(!ls[0].contains("\"kind\":\"test\""), "{}", ls[0]);
+    assert_eq!(
+        ls[1],
+        "{\"schema\":1,\"kind\":\"summary\",\"command\":\"test\",\"status\":\"ok\",\
+         \"errors\":1,\"warnings\":0,\"passed\":0,\"failed\":1,\"exit\":0}",
+    );
 }
 
 // ── Reserved categories ──────────────────────────────────────────────────────

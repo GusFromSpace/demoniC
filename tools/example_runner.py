@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -57,6 +58,26 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_DMC = REPO / "compiler" / "target" / "release" / "dmc"
 DEFAULT_EXAMPLES = REPO / "examples"
 BASELINE = Path(__file__).resolve().parent / "example_baseline.json"
+
+# An assimilation example (a subdirectory carrying a `*.assimilate.json`
+# descriptor) calls a python module that lives beside it rather than on the
+# stdlib path; the port spawns a child python3, which only finds it if that
+# directory is on PYTHONPATH. Scoped to those directories, never all of
+# examples/, so a companion source can never shadow a same-named stdlib
+# module another example's port_call reaches for (examples/calendar.py
+# exists and `calendar` is stdlib). A tree with no such directory adds nothing.
+_PORT_EXTRA_PYTHONPATH = sorted(
+    d for d in DEFAULT_EXAMPLES.iterdir()
+    if d.is_dir() and any(d.glob("*.assimilate.json"))
+) if DEFAULT_EXAMPLES.is_dir() else []
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    parts = [str(d) for d in _PORT_EXTRA_PYTHONPATH] + ([existing] if existing else [])
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
 
 RESULT_RE = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed")
 JIT_RE = re.compile(r"jit parity: (\d+) ran, (\d+) skipped")
@@ -111,7 +132,8 @@ def is_vacuous(body: str) -> bool:
 def run_file(dmc: Path, path: Path, jit: bool) -> tuple[int, int, int]:
     """Return (passed, failed, jit_ran) for one file. jit_ran is 0 in interp mode."""
     cmd = [str(dmc), "test"] + (["--jit"] if jit else []) + [str(path)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
+                           env=_subprocess_env())
     out = proc.stdout + proc.stderr
     if "0 tests" in out and not RESULT_RE.search(out):
         return 0, 0, 0

@@ -15,26 +15,25 @@ no user-defined directives. Adding one requires a spec revision.
 | ------------------ | ------------------ | ----------------------------------------------------- | ----------------- | --------------------- |
 | `@grad`            | `fn`               | emits forward + backward                              | `docs/AUTODIFF.md`     | Fully implemented |
 | `@cast(t)`         | block / expr       | runs everything inside in dtype `t`                    | `docs/SPEC.md §7.1` (Mixed-precision scopes (`@cast`))    | Value-preserving float casts (bf16/f16/tf32/f32/f64) implemented; quantized dtypes are f32-backed no-ops (fp8) or JIT-rejected (int) — dequant-during-compute not implemented |
-| `@host`            | `match`            | comptime hardware dispatch                             | `docs/SPEC.md §7.2` (Hardware dispatch (`@host`))    | Interpreter only; JIT lowering pending |
-| `@deterministic`   | block               | bit-exact reproducibility contract                     | `docs/SPEC.md §7.3` (Determinism contract (`@deterministic`))    | Fully implemented |
+| `@host`            | `match`            | comptime hardware dispatch                             | `docs/SPEC.md §7.2` (Hardware dispatch (`@host`))    | Interpreter only; JIT lowering pending. Feature names: the ISA flags detected per target, plus `accelerate` — a BLAS `cblas_sgemm` is in the process image, the same detection the JIT's `--blas` GEMM fast path uses |
+| `@deterministic`   | block               | bit-exact reproducibility contract                     | `docs/SPEC.md §7.3` (Determinism contract (`@deterministic`))    | Fully implemented. §7.3's "kernel selection ignores non-deterministic fast paths" is enforced against the one such path that exists: the `--blas` GEMM offload is unreachable inside the block |
 | `@recompute(...)`  | block               | activation-budget checkpointing                        | `docs/AUTODIFF.md §3`  | Parse-accepted no-op; not implemented |
 | `@inplace`         | assignment stmt     | fail if a write would CoW                              | —  | Attachment enforced (§3 — assignment statements only); the CoW diagnostic itself is not implemented |
 | `@shard(...)`      | `let` / expr       | marks a tensor for sharding along a named axis (parsed only) | `docs/SPEC.md §2.6` (Directives) | Parsed and type-checked; does not alter code generation in this version |
 | `@tp(...)`         | `let` / expr       | marks a tensor-parallel weight or op (parsed only)     | `docs/SPEC.md §2.6` (Directives) | Parsed and type-checked; does not alter code generation in this version |
 | `@pp(...)`         | `fn`                | pipeline-parallel function with `stage K:` body        | `docs/SPEC.md §2.6` (Directives) | Body-validated; the interpreter executes stages sequentially, threading `_` between them; JIT lowering pending |
 | `@fuse`            | block / expr       | force single-kernel emission                           | `docs/SPEC.md §7.4` (Forced fusion (`@fuse`))    | Fully implemented; the `fuse-infeasible` analysis is enforced at check time |
-| `@comptime`        | block / `fn`        | evaluates contents; does not yet force comptime folding | `docs/SPEC.md §7.5` (Comptime evaluation (`@comptime`))    | Block form runs as an ordinary block (no folding enforced); `@comptime fn` is inert; the compiler warns on both forms |
+| `@comptime`        | block               | force comptime evaluation of contents                   | `docs/SPEC.md §7.5` (Comptime evaluation (`@comptime`))    | Fully implemented for the v1 fold set — integers, booleans, shape arithmetic. Floats, tensors, and every call are `comptime-non-static`; widening the set is a spec amendment |
 
 **Note:** `@inplace` and `@recompute` are **parse-accepted no-ops** —
 the compiler does nothing with them today, and the type checker emits
 a warning (`directive @X is not implemented — it is parsed but has no
 effect`) so they aren't silent. `@inplace` is the partial exception:
 where it may be written is enforced (§3), only what it promises is not.
-`@comptime`'s block form evaluates its
-contents like an ordinary block without yet enforcing compile-time
-folding; a `@comptime fn` declaration is inert and warns the same way.
-`@host` is functional in the interpreter: `@host match { .feature =>
-... }` performs host-feature dispatch, with JIT lowering pending.
+`@host` is the other: `@host match { .feature => ... }` performs
+host-feature dispatch in the interpreter, with JIT lowering pending.
+`@comptime` used to be a no-op too; it now folds, and refuses what it
+cannot fold.
 
 ---
 
@@ -91,18 +90,20 @@ Illegal stacks are compile-time errors:
 - `@fuse @fuse` — idempotent, redundant. **Enforced.**
 - `@fuse` on a `fn` declaration or on a bare statement (`@fuse let x = …`) — the catalog's attachment is block / expr, and neither form honors the promise: a declaration's `@fuse` is ignored by both backends, and a statement-attached directive is refused by the JIT before any fuse analysis runs, feasible body or not. **Enforced:** refused like `@inplace`'s attachment rule, with a hint to the supported spelling — `@fuse { … }` in the body, `let x = @fuse { … }` for the statement.
 - `@fuse` wrapping an expression whose ops cannot be collapsed on the host — fails as `fuse-infeasible`, not a stacking error per se but reported at the same compile stage. **Enforced.** The collapsible set is what the JIT's fused kernel lowers: a single elementwise expression (`.+ .- .* ./ .^ .** .< .> .<= .>=`, `\>` ReLU) over f32 tensor operands whose shapes are provably equal, with float-scalar broadcasts — tensors do not broadcast against each other inside the block, and a symbolic dim pair the checker cannot prove equal (`N` against `M` across fn params) is refused, because the fused kernel refuses it at monomorphization when they differ. A `let` inside the block materializes an intermediate and is refused; the diagnostic names the offending op.
-- `@comptime` wrapping an expression containing any non-comptime operand — fails as `comptime-non-static`. **Not yet:** waits on comptime folding.
+- `@comptime` wrapping an expression containing any non-comptime operand — fails as `comptime-non-static`. **Enforced.** The fold set is integers, booleans and shape arithmetic (`docs/SPEC.md §7.5` (Comptime evaluation (`@comptime`))), so a float literal, a tensor, a string, an `as` conversion, a nested directive, or an identifier that is neither block-bound nor a shape parameter of the enclosing `fn`/`model` is refused, naming what it found. The body admits **no calls at all**: a port call is refused as `port-forbidden` (`docs/PORTS.md §5`) and an `extern fn` call as `comptime-non-static` naming the foreign function (`docs/SPEC.md §6.7` (Foreign function declarations (`extern fn`))), while any other call is refused as not comptime. Because the body may loop, evaluation is bounded by a step budget; exhausting it is `comptime-budget`.
+- `@comptime` on anything but a block — a `fn`, an item, or a bare statement. **Enforced:** refused like `@inplace`'s and `@fuse`'s attachment rules, with a hint to the supported spelling `@comptime { … }`.
 
 The two *stacking* rejections name both directives, so
 `@cast(f32) @cast(bf16)` reports which dtype won and `@fuse @fuse`
-points at the redundant one. The two *attachment* rejections have only
+points at the redundant one. The *attachment* rejections have only
 one directive to name, so they name it and what it was attached to:
 `@inplace` names the construct that holds no write to guard, `@shard`
-names the type that cannot accept the sharding annotation.
+names the type that cannot accept the sharding annotation, and
+`@comptime` names the construct that holds no expression to fold.
 
-A port call inside `@fuse` or `@deterministic` is rejected at the same
-stage, as `port-forbidden` rather than as a stacking error — the stack
-is legal, the call in it is not (`docs/PORTS.md §5`).
+A port call inside `@fuse`, `@deterministic`, or `@comptime` is rejected
+at the same stage, as `port-forbidden` rather than as a stacking error —
+the stack is legal, the call in it is not (`docs/PORTS.md §5`).
 
 ---
 
@@ -167,9 +168,11 @@ Procedure (binding on future PRs):
 3. Write the entry in this catalog.
 4. Add at least one example under `examples/`.
 5. The implementation must be a parser change **and** a JIT lowering;
-   parse-only directives are rejected. (Three grandfathered
-   exceptions predate this rule: `@comptime`, `@inplace`, `@recompute`
-   — see the catalog's status column.)
+   parse-only directives are rejected. (Two grandfathered exceptions
+   predate this rule: `@inplace` and `@recompute` — see the catalog's
+   status column. `@comptime` left that set in the way this rule asks:
+   it folds before lowering, and both backends consume the folded
+   form.)
 
 A directive that only logs, only warns, or only renames an existing
 behavior does not earn a slot. The set stays small on purpose.

@@ -38,6 +38,45 @@ fn malformed_or_wrong_typed_dial_is_none() {
     assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 9 } } x"#), None);
 }
 
+/// #518 (post-merge nit from #514): before this, `1e1`/`10.0` armed a
+/// 10-line dial the same as a plain `10` — the reader read straight through
+/// to the numeric VALUE. `tools/validate_manifest.py`'s
+/// `isinstance(value, int)` check rejects both (Python's `json.loads` keeps
+/// `10` an `int` but decodes `1e1`/`10.0` as `float`), so a manifest using
+/// either failed `make check` while still silently working under `dmc` —
+/// the exact divergence the issue named. Tightened to the plain-integer
+/// TOKEN, not the value: none of these arm the dial now, even though every
+/// one is numerically 10.
+#[test]
+fn a_float_form_token_does_not_arm_the_dial_even_at_an_integral_value() {
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 1e1 } }"#), None);
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 1E1 } }"#), None);
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 10.0 } }"#), None);
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 1.0e1 } }"#), None);
+}
+
+/// #518/#514: "leading-zero forms lex too" — `007` is not a JSON number at
+/// all (the grammar is `INT = "0" | [1-9] DIGIT*`), and the old number
+/// scanner's `[0-9.eE+-]` character class read straight through it as 7.
+/// `tools/validate_manifest.py` does not parse it as JSON either
+/// (`json.loads` raises on a leading zero), so `None` here — the manifest
+/// fails to parse at all, and this module's own stated design is that a
+/// manifest that does not parse is silently ignored — now matches, where
+/// the old scanner instead found a number and armed the lint from it.
+#[test]
+fn a_leading_zero_form_does_not_parse_as_a_number() {
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 007 } }"#), None);
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": -007 } }"#), None);
+}
+
+/// A plain integer token is still exactly what arms the dial — the
+/// tightening narrows accepted *forms*, not the ordinary case.
+#[test]
+fn a_plain_integer_token_still_arms_the_dial() {
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 10 } }"#), Some(10));
+    assert_eq!(max_file_lines_in(r#"{ "lints": { "max_file_lines": 1 } }"#), Some(1));
+}
+
 #[test]
 fn dial_not_confused_by_strings_or_nesting() {
     // The key must be found structurally, not textually: a string value

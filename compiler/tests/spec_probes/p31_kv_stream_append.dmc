@@ -1,0 +1,32 @@
+# Probe 31 — Spec §3.6 / §4.8: `<-` appends into a `KV[T, S]` streaming axis.
+# §4.8 gives the appendee two legal spellings: `S` with the streaming axis
+# carrying the appended extent, or `S` with that axis DROPPED, which appends a
+# single frame. Only the first ever worked — the interpreter concatenated the
+# two operands directly, which requires equal rank, so the dropped form died as
+# `ShapeError/IncompatibleShape`. That is the spelling §3.6 leads with and the
+# one a decode loop writes (`examples/kvcache.dmc:48` appends a `[B]` token into
+# a `KV[i32, [B, ~]]`).
+#
+# Both spellings are probed, and the cursor is read back through `sum` rather
+# than trusting a clean exit: appending is only correct if the streaming axis
+# actually advanced by the appendee's extent, and a probe that just checked for
+# the absence of an error would have passed on a `<-` that silently did nothing.
+fn main() -> nil {
+    # The §3.6 canonical form: one [4, 8] token into a [4, ~, 8] cache.
+    let !cache: KV[f32, [4, ~, 8]] = forge.kv[f32, [4, ~, 8]](capacity = 64)
+    let new_token = forge.ones[f32, [4, 8]]
+    cache <- new_token
+    cache <- new_token
+    # Two frames of 4x8 ones: the cursor advanced by 1 per append.
+    print(sum(cache)); print("\n")
+
+    # The equal-rank spelling, and the two mixed in one stream.
+    let !mixed: KV[f32, [2, ~, 3]] = forge.kv[f32, [2, ~, 3]](capacity = 8)
+    let pair = forge.ones[f32, [2, 2, 3]]
+    let single = forge.ones[f32, [2, 3]]
+    mixed <- pair
+    mixed <- single
+    # 2 frames + 1 frame, each 2x3 = 18 elements of 1.0.
+    print(sum(mixed)); print("\n")
+    nil
+}

@@ -66,6 +66,35 @@ fn slab_transposed[R, C](m: Tensor[f32, [R, C]]) -> f32 {
     sum(s')
 }
 
+# ─── Slabs that leave the tensor ─────────────────────────────────────────────
+#
+# A bound built from `S` is derived, not dynamic: the compiler resolves it at
+# monomorphization, so a slab that runs off the end is settled at compile time
+# and does not become a runtime bounds check. What it becomes instead is the
+# subject of this section, and the answer is not "an error": the slab is
+# intersected with the axis, and whatever survives is what you get.
+#
+# That is the quietest failure mode in the whole slicing surface. A window
+# anchored with an off-by-one — `x[S .. S + 1]` where `x[S - 1 .. S]` was meant
+# — does not trap, does not warn, and does not return a wrong-shaped tensor. It
+# returns an EMPTY one, and every reduction over an empty tensor is 0.0, which
+# is a number that flows onward and looks like data. The tests below pin each
+# way a slab can leave the axis, so that if either backend ever starts trapping,
+# clamping differently, or reading past the buffer, it is a corpus failure and
+# not a mystery in someone's model.
+fn past_end[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S .. S + 1]) }
+fn straddle_end[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S - 1 .. S + 1]) }
+fn far_past_end[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S + 2 .. S + 4]) }
+fn overlong[S](x: Tensor[f32, [S]]) -> f32 { sum(x[0 .. S + 3]) }
+fn inverted[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S .. 1]) }
+
+# A start that goes NEGATIVE is a different rule again: it is resolved from the
+# far end of the axis, the way a negative index is, rather than clamped to zero.
+fn from_the_far_end[S](x: Tensor[f32, [S]]) -> f32 { sum(x[S - 8 .. S]) }
+
+fn row_past_end[R, C](m: Tensor[f32, [R, C]]) -> f32 { sum(m[R .. R + 1, ..]) }
+fn col_straddle[R, C](m: Tensor[f32, [R, C]]) -> f32 { sum(m[.., C - 1 .. C + 2]) }
+
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
 # ramp6[i] = i+1, so sums over any window are consecutive-integer sums.
@@ -128,6 +157,18 @@ fn main() -> i64 {
     print_i64(slab_matmul(m, eye3()) as i64)
     print_i64(slab_sum_along(m) as i64)
     print_i64(slab_transposed(m) as i64)
+
+    print_i64(past_end(a) as i64)
+    print_i64(past_end(b) as i64)
+    print_i64(straddle_end(a) as i64)
+    print_i64(straddle_end(b) as i64)
+    print_i64(far_past_end(a) as i64)
+    print_i64(overlong(a) as i64)
+    print_i64(overlong(b) as i64)
+    print_i64(inverted(a) as i64)
+    print_i64(from_the_far_end(a) as i64)
+    print_i64(row_past_end(m) as i64)
+    print_i64(col_straddle(m) as i64)
     0
 }
 
@@ -227,4 +268,69 @@ fn test_slab_feeds_axis_reduction() -> bool {
 fn test_slab_transposes() -> bool {
     let m = grid43()
     abs(slab_transposed(m) - 36.0) < 1e-4
+}
+
+# ─── Tests: slabs that leave the tensor ──────────────────────────────────────
+
+# A slab that starts exactly AT the end is empty, and the sum of an empty
+# tensor is 0.0 — no trap, no diagnostic, no clamp back onto the last element.
+# This is the off-by-one that silently zeroes a window.
+fn test_slab_starting_at_the_end_is_empty() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(past_end(a)) < 1e-4 && abs(past_end(b)) < 1e-4
+}
+
+# Straddling the end keeps the part that exists: `x[S-1 .. S+1]` is the last
+# element alone, 6 on [6] and 12 on [3]. A backend that trusted the written
+# length would read one element past the buffer.
+fn test_slab_straddling_the_end_keeps_what_exists() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(straddle_end(a) - 6.0) < 1e-4 && abs(straddle_end(b) - 12.0) < 1e-4
+}
+
+# Entirely past the end — both bounds outside — is empty rather than a wrapped
+# or negative-length view.
+fn test_slab_entirely_past_the_end_is_empty() -> bool {
+    let a = ramp6()
+    abs(far_past_end(a)) < 1e-4
+}
+
+# An overlong slab from 0 is the whole tensor, at both instantiations: the end
+# is intersected with the axis, so the extra length contributes nothing rather
+# than reading uninitialized memory.
+fn test_overlong_slab_is_the_whole_tensor() -> bool {
+    let a = ramp6()
+    let b = ramp3()
+    abs(overlong(a) - 21.0) < 1e-4 && abs(overlong(b) - 33.0) < 1e-4
+}
+
+# An INVERTED slab — the start after the end — is empty, not a backwards view
+# and not a negative extent.
+fn test_inverted_slab_is_empty() -> bool {
+    let a = ramp6()
+    abs(inverted(a)) < 1e-4
+}
+
+# A start that lands BELOW zero is resolved from the far end of the axis, not
+# clamped to zero: `x[S-8 .. S]` on [6] is `x[-2 .. 6]`, the last two elements,
+# 5 + 6 = 11. Clamping to zero instead would give the whole tensor, 21.
+fn test_negative_slab_start_counts_from_the_far_end() -> bool {
+    let a = ramp6()
+    abs(from_the_far_end(a) - 11.0) < 1e-4
+}
+
+# The same rules on the row axis of a 2-D tensor: a row slab that starts at the
+# row count is empty.
+fn test_row_slab_past_the_end_is_empty() -> bool {
+    let m = grid43()
+    abs(row_past_end(m)) < 1e-4
+}
+
+# …and on the column axis, straddling keeps the one column that exists:
+# column 2 of the [4, 3] grid is 2, 5, 8, 11 → 26.
+fn test_column_slab_straddling_the_end_keeps_what_exists() -> bool {
+    let m = grid43()
+    abs(col_straddle(m) - 26.0) < 1e-4
 }

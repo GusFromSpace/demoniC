@@ -209,8 +209,14 @@ fn runtime_extent_still_rejected_at_compile_time() {
     assert_ne!(out.status.code(), Some(0), "expected a jit error");
     let se = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        se.contains("slice with a runtime bound needs a compile-time extent"),
+        se.contains("a slice with a runtime bound and no compile-time extent"),
         "unexpected stderr: {}", se
+    );
+    // #563 sweep: the refusal is a lowering GAP, and the prefix says so, so
+    // `tools/jit_probes.py` scores it as a gap instead of a divergence.
+    assert!(
+        se.contains("jit unsupported at"),
+        "the runtime-extent refusal is not classified as a gap: {}", se
     );
 }
 
