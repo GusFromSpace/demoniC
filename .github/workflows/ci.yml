@@ -53,10 +53,26 @@ jobs:
         # Diffs full program output between the interpreter and the JIT. The
         # interpreter is the reference semantics, so any unexplained
         # divergence is a JIT bug.
-        run: python3 tools/diff_backends.py
+        #
+        # --timeout is explicit here because a timeout FAILS this gate (it is
+        # its own bucket, never folded into a skip) and this runner is the
+        # slowest machine the corpus meets. The slowest example that runs to
+        # completion under `dmc run` is console/dv2.dmc, ~86 s on a quiet
+        # M-series box; a 2-core hosted ubuntu-latest runner is several times
+        # slower than that, so the 300 s default leaves no headroom and a
+        # green corpus would go red on load alone. 900 s is ~10x the measured
+        # cost and still an order of magnitude below the job's own limit, so
+        # a genuine hang is still bounded and still reported.
+        run: python3 tools/diff_backends.py --timeout 900
       - name: jit_probes.py (run-vs-jit edge-case battery)
         # Curated edge cases the example corpus does not reach.
         run: python3 tools/jit_probes.py
+      - name: rss_gate.py (peak resident memory)
+        # Every other gate here pins bytes CHARGED or program OUTPUT, so an
+        # allocator change that touches every page of a chunk while charging
+        # the same number passes all of them. This one measures the peak
+        # resident set of three tiny runs against generous ceilings.
+        run: python3 tools/rss_gate.py
       - name: lint_dmc.py
         # Style/consistency lints over the shipped .dmc corpus.
         run: python3 tools/lint_dmc.py

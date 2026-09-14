@@ -1,0 +1,17 @@
+# Probe 59 (entry) — SPEC §6.7 (#15): an entry over two mid-level modules onto
+# one shared leaf, the leaf's `pub model` crossing two file boundaries as a
+# field type. `dmc run` answers this correctly; `dmc jit` refuses it as
+# `jit-import` until the multi-file merge (slice 3) hands
+# `compile_program` the merged program instead of this file's own.
+#
+# `p59_multifile_flattened.dmc` is the same four files concatenated by hand: it
+# pins that the lowering the merged form needs already exists, so the gap is
+# delivery and not codegen.
+use "p59_multifile_boxed.dmc"
+use "p59_multifile_sum.dmc"
+fn main() -> nil {
+    let bx = boxed(4, 5)
+    let total = sum_pt(bx.p) + bx.tag
+    if total == 10 { print("Run OK") } else { print("FAIL: diamond import") }
+    nil
+}

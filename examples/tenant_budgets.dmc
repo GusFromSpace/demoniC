@@ -1,0 +1,340 @@
+# Per-tenant arena budgets — the acceptance program for the budget model.
+#
+# A budget is a host-lifetime handle on a region of Forge (MEMORY.md §3.2),
+# carved from a parent and bounded by the parent's free capacity. Four
+# operations:
+#
+#     forge.carve(parent, bytes) -> Budget     carve a child
+#     forge.zeros[f32, [N]] in b               allocate, charged to `b`
+#     forge.reap(b)                            release `b`; credit its extent
+#     forge.enter(b) { ... }                   push `b` as the entered budget
+#
+# There is no introspection API — a program cannot ask a budget how much it
+# has left — so every invariant here is asserted at a REFUSAL BOUNDARY. Every
+# budget below is carved at EXACTLY the bytes its own code needs, and no
+# budget below has slack: for each figure, either one byte less turns the test
+# into `forge arena exhausted` (the ceiling bites from below) or one byte more
+# is refused at the carve because the parent has nothing left (it bites from
+# above). Every figure was bisected on BOTH backends against the same binary,
+# and they agree exactly except for two named in the exit-edge test below.
+#
+# What is asserted (MEMORY.md §1.1's hierarchical meter rule), in five
+# invariants:
+#
+#     (INV)   a parent's capacity is the sum over its children of (free + used)
+#     (LOC)   E(r) = free(r) + used(r) + the sum of the children's extents
+#     (PRE)   a carve is bounded by the parent's free capacity
+#     (PRE-A) an allocation is bounded by the entered budget's free capacity
+#     (NN)    free and used never go negative
+#
+# The refused half of each boundary — the carve or the allocation one byte
+# over — cannot live in this file: it aborts the program rather than returning
+# `false`. Those halves are pinned on both backends in `tools/jit_probes.py`,
+# whose budget rows carry this file's figures.
+
+model Tenant { budget: Budget, id: i64 }
+
+# The tenant surface, as a host program spells it: a budget is carved in one
+# function, stored in a model field, and reaped in another.
+fn carve_tenant(parent: Budget, id: i64, bytes: i64) -> Tenant {
+    Tenant { budget: forge.carve(parent, bytes), id: id }
+}
+
+fn drop_tenant(r: Tenant) -> nil {
+    forge.reap(r.budget)
+    nil
+}
+
+# 64 KiB charged to `b` by the explicit `... in b` override.
+fn spend_all(b: Budget) -> f32 {
+    let !t = forge.zeros[f32, [16384]] in b
+    t[0] = 1.0
+    sum(t)
+}
+
+# 32 KiB, same override.
+fn spend_half(b: Budget) -> f32 {
+    let !t = forge.zeros[f32, [8192]] in b
+    t[0] = 1.0
+    sum(t)
+}
+
+# 16 KiB, same override.
+fn spend_quarter(b: Budget) -> f32 {
+    let !t = forge.zeros[f32, [4096]] in b
+    t[0] = 1.0
+    sum(t)
+}
+
+# 16 KiB charged to whatever budget is ENTERED at the call site — this one
+# names no budget, so it reads the ambient register.
+fn tick() -> f32 {
+    let !t = forge.zeros[f32, [4096]]
+    t[0] = 1.0
+    sum(t)
+}
+
+# (INV) — a parent's capacity is its children's WHOLE extents, spent and
+# unspent alike. `p` is carved at exactly four tenant extents and four
+# tenants come out of it, so `p` has nothing left: a fifth carve is refused
+# even though `b4` never allocates a byte, and each of the four figures is a
+# ceiling in both directions. The three tenants that do allocate then spend
+# their own extents to the last byte, which is (PRE-A) at three separate
+# ceilings.
+fn test_a_parent_capacity_is_its_children_whole_extents() -> bool {
+    let p = forge.carve(forge.root, 262144)
+    let b1 = forge.carve(p, 65536)
+    let b2 = forge.carve(p, 65536)
+    let b3 = forge.carve(p, 65536)
+    let b4 = forge.carve(p, 65536)
+    let s = spend_all(b1) + spend_all(b2) + spend_all(b3)
+    forge.reap(b1)
+    forge.reap(b2)
+    forge.reap(b3)
+    forge.reap(b4)
+    forge.reap(p)
+    s == 3.0
+}
+
+# (LOC) — reaping a child credits its WHOLE extent to the parent, not the
+# part it never spent. `c` fills `p` exactly and then spends a quarter of
+# itself; `p` has nothing free when the reap happens, so the second 64 KiB
+# carve is possible only if all 64 KiB came back rather than the 48 KiB `c`
+# left unspent.
+fn test_a_reap_credits_the_whole_extent_not_the_remainder() -> bool {
+    let p = forge.carve(forge.root, 65536)
+    let c = forge.carve(p, 65536)
+    let s = spend_quarter(c)
+    forge.reap(c)
+    let d = forge.carve(p, 65536)
+    let u = spend_all(d)
+    forge.reap(d)
+    forge.reap(p)
+    (s == 1.0) && (u == 1.0)
+}
+
+# (PRE) — a carve is checked against the parent's free capacity AT THE CARVE,
+# not at some later allocation. The two children exhaust `p` exactly; either
+# one byte bigger is refused on the spot, before it could allocate anything.
+fn test_a_nested_carve_is_bounded_by_the_parent_free_capacity() -> bool {
+    let p = forge.carve(forge.root, 65536)
+    let c1 = forge.carve(p, 32768)
+    let c2 = forge.carve(p, 32768)
+    let s = spend_half(c1) + spend_half(c2)
+    forge.reap(c1)
+    forge.reap(c2)
+    forge.reap(p)
+    s == 2.0
+}
+
+# (PRE-A) — two tenants meter SEPARATELY, each at its own ceiling. One spends
+# its extent through `forge.enter`, the other through the `... in b`
+# override, and neither can reach into the other's.
+fn step_tenant(r: Tenant) -> f32 {
+    let !s: f32 = 0.0
+    forge.enter(r.budget) {
+        s = tick() + tick() + tick() + tick()
+    }
+    s
+}
+
+fn test_two_tenants_meter_separately() -> bool {
+    let a = carve_tenant(forge.root, 1, 65536)
+    let b = carve_tenant(forge.root, 2, 65536)
+    let sa = step_tenant(a)
+    let sb = spend_all(b.budget)
+    drop_tenant(a)
+    drop_tenant(b)
+    (sa == 4.0) && (sb == 1.0) && (a.id == 1) && (b.id == 2)
+}
+
+# (NN) — free and used never go negative. Sixty-four reap-then-recarve cycles
+# leave the parent's capacity exactly where it started: cycle 65 still gets
+# the whole extent, and what it gets is real storage, not a credited counter.
+# An unsigned underflow in the reap credit would show up as an enormous free
+# capacity, and the refused half in the probe battery would then answer
+# instead of refusing.
+fn test_reap_and_recarve_cycles_leave_the_capacity_unchanged() -> bool {
+    let p = forge.carve(forge.root, 131072)
+    for i in 0..64 {
+        let c = forge.carve(p, 131072)
+        forge.reap(c)
+    }
+    let d = forge.carve(p, 131072)
+    let s = spend_all(d)
+    forge.reap(d)
+    forge.reap(p)
+    s == 1.0
+}
+
+# A reap with a live child is REFUSED. The refusal aborts the program, so
+# what runs here is its complement: the order a host must follow. `p` fills
+# `host` exactly and has two live children of its own; the children are
+# reaped first, `p` is then reapable, and its whole 128 KiB comes back to
+# `host` — the second carve of the same size out of `host` is what proves it.
+# The refused order itself is pinned on both backends in
+# `tools/jit_probes.py`.
+fn test_a_parent_is_reaped_after_its_children() -> bool {
+    let host = forge.carve(forge.root, 131072)
+    let p = forge.carve(host, 131072)
+    let c1 = forge.carve(p, 65536)
+    let c2 = forge.carve(p, 65536)
+    let s = spend_all(c1) + spend_all(c2)
+    forge.reap(c1)
+    forge.reap(c2)
+    forge.reap(p)
+    let again = forge.carve(host, 131072)
+    forge.reap(again)
+    forge.reap(host)
+    s == 2.0
+}
+
+# (a) — `forge.enter` pops the entered-budget register on EVERY exit edge:
+# normal exit, `return`, `break`, `continue`, and `?` (an early return, the
+# fifth edge). Each helper below leaves the extent by one of them; the 16 KiB
+# `tick()` that follows is charged to the OUTER budget and could never fit
+# the few hundred bytes of the extent the helper entered, so a register that
+# failed to pop turns each one into an exhaustion instead of an answer.
+#
+# TWO figures in this test are the JIT's minimum and sit 64 bytes above the
+# interpreter's, and the `?` edge is why in both cases: the propagated
+# `(i64, Err)` tuple is a Forge materialization on `dmc jit` and a Rust-stack
+# value on `dmc run`, so one backend is charged 64 aligned bytes for it and
+# the other is charged nothing. `b` bisects to 448 under `dmc run` and 512
+# under `dmc jit` (the tuple built inside the entered extent), and `q` to
+# 16384 and 16448 (the same tuple after the extent has been left). They are
+# the only two figures in this file the two backends do not agree on, and the
+# gap is exactly one 64-byte tuple each.
+fn leave_normally(b: Budget) -> nil {
+    forge.enter(b) {
+        let u = forge.zeros[f32, [16]]
+    }
+    nil
+}
+
+fn leave_by_return(b: Budget) -> i64 {
+    forge.enter(b) {
+        let u = forge.zeros[f32, [16]]
+        return 7
+    }
+    3
+}
+
+fn leave_by_break(b: Budget) -> i64 {
+    let !n = 0
+    for i in 0..3 {
+        n = n + 1
+        forge.enter(b) {
+            let u = forge.zeros[f32, [16]]
+            break
+        }
+        n = n + 10
+    }
+    n
+}
+
+fn leave_by_continue(b: Budget) -> i64 {
+    let !n = 0
+    for i in 0..3 {
+        n = n + 1
+        forge.enter(b) {
+            let u = forge.zeros[f32, [16]]
+            continue
+        }
+        n = n + 10
+    }
+    n
+}
+
+fn fail_with(msg: Err) -> (i64, Err) {
+    (0, msg)
+}
+
+fn leave_by_query(b: Budget, msg: Err) -> (i64, Err) {
+    forge.enter(b) {
+        let u = forge.zeros[f32, [16]]
+        let y = fail_with(msg)?
+        let v = forge.zeros[f32, [16]]
+    }
+    (5, nil)
+}
+
+fn test_the_entered_budget_pops_on_every_exit_edge() -> bool {
+    let msg = "the query edge"
+    let b = forge.carve(forge.root, 512)
+    let o = forge.carve(forge.root, 65536)
+    let q = forge.carve(forge.root, 16448)
+    let !acc: f32 = 0.0
+    let !k = 0
+    let !nb = 0
+    let !nc = 0
+    let !qv = 0
+    forge.enter(o) {
+        leave_normally(b)
+        acc = acc + tick()
+        k = leave_by_return(b)
+        acc = acc + tick()
+        nb = leave_by_break(b)
+        acc = acc + tick()
+        nc = leave_by_continue(b)
+        acc = acc + tick()
+    }
+    forge.enter(q) {
+        let (v, e) = leave_by_query(b, msg)
+        qv = v
+        acc = acc + tick()
+    }
+    forge.reap(q)
+    forge.reap(o)
+    forge.reap(b)
+    (acc == 5.0) && (k == 7) && (nb == 1) && (nc == 3) && (qv == 0)
+}
+
+# (b) — a budget carved in one function, stored in a model field and reaped in
+# another names the SAME budget. The tenant fills `p` exactly, so `p` has
+# nothing free; the second carve is possible only because `drop_tenant`'s
+# reap — which never sees the carve, only the field — credited `p` with the
+# same 64 KiB. This is the storage half of the same guarantee.
+fn test_a_budget_in_a_model_field_names_the_same_budget() -> bool {
+    let p = forge.carve(forge.root, 65536)
+    let r = carve_tenant(p, 3, 65536)
+    let s = spend_all(r.budget)
+    drop_tenant(r)
+    let again = forge.carve(p, 65536)
+    forge.reap(again)
+    forge.reap(p)
+    (s == 1.0) && (r.id == 3)
+}
+
+# (c) — the entered-budget register is AMBIENT across an ordinary demoniC
+# call. Neither helper below names a budget, and both allocations land in `b`
+# because the call sites are inside `forge.enter(b)`. `b` is carved at exactly
+# the two helpers' 64 KiB, so the boundary bites: one byte less and the second
+# call exhausts.
+#
+# This is NOT the same as a budget staying entered across a call OUT TO A
+# HOST and back — neither backend can observe that: `dmc run` refuses to call
+# an `extern fn` at all, and `dmc jit`'s `extern fn` is a one-way call out to
+# C that never re-enters demoniC, so the register has no host boundary to
+# survive here. That guarantee is discharged by a host program's own test,
+# not by this program.
+fn hop(n: i64) -> f32 {
+    deeper(n)
+}
+
+fn deeper(n: i64) -> f32 {
+    let !t = forge.zeros[f32, [8192]]
+    t[0] = 1.0
+    sum(t)
+}
+
+fn test_the_entered_budget_is_ambient_across_a_call() -> bool {
+    let b = forge.carve(forge.root, 65536)
+    let !s: f32 = 0.0
+    forge.enter(b) {
+        s = s + hop(1)
+        s = s + hop(2)
+    }
+    forge.reap(b)
+    s == 2.0
+}

@@ -37,7 +37,7 @@ its inputs. No Forge materialization of intermediates is permitted. A
 JIT release that violates this contract is **wrong**, not slow.
 
 The mechanism is the same one user code accesses via `@fuse`
-(`SPEC.md §7.4`, Forced fusion (`@fuse`)). Stdlib functions get it
+(`SPEC.md §7.7`, Forced fusion (`@fuse`)). Stdlib functions get it
 implicitly because their implementations sit inside an `@fuse` scope in
 the JIT IR.
 
@@ -245,6 +245,7 @@ do not carry the §2 fusion guarantee.
 | `to_string(x)` | alias of `to_str` | Same conversion under the longer name. |
 | `to_bin(x)` | `str` | Converts an integer to its binary-digit string. |
 | `to_binary(x)` | alias of `to_bin` | Same conversion under the longer name. |
+| `len(x)` | `Tensor[T, S] \| str \| Map \| Tuple -> i64` | Length, by argument kind: tensor — the first-dimension (row) size, not the flattened element count (§7's capacity-vs-data callout does not apply here — this reads the shape, not the data); str — byte length (not a char count: a multibyte UTF-8 character counts its full byte width); tuple — arity; map — entry count. `list`/`range` (interpreter-only dynamic values, not in this document's scope — §5) are not lowered in the JIT yet. `--check` validates this domain: an argument whose static type is a known, concrete kind outside `Tensor`/`str`/`Map`/`Tuple` (a `bool`, an int or float literal, `nil`, …) is a `--check`-time type error naming the argument; an argument the checker cannot pin down (`Unknown`, or a `list`/`range`-typed escape hatch — see above) still passes. |
 
 ### 3.8 Reductions and index-reductions
 
@@ -279,6 +280,38 @@ reduction — the axis is retained. See `examples/sim/`.
 
 > ⚠️ Whole-tensor reductions (`sum`, `mean`, `max`, `argmax`, …) fold over the
 > tensor's entire allocated capacity — see the capacity-vs-data callout in §7.
+
+### 3.9 Unsigned scalar builtins
+
+`abs`, `min`, `max` and `clamp` are registered builtins (not stdlib-catalog
+functions, §3.7) and do not carry the §2 fusion guarantee.
+
+The sign-sensitive scalar builtins read a `u64` operand unsigned: `abs` is the
+identity at this width (an unsigned type has no negative values), and `min`,
+`max` and `clamp` order unsigned. This governs the scalar forms only; a
+reduction over a `Tensor[u64]` is not covered here.
+
+### 3.10 File I/O
+
+Registered builtins (not §2-fused stdlib functions). `read_file`, `write_file`,
+`append_file` and `file_exists` lower on **both** backends: the JIT reaches
+them as host calls into the same `std::fs` operations the interpreter uses, so
+the `err` text (a `std::io::Error`'s message — "No such file or directory",
+etc.) is identical on `dmc run` and `dmc jit`. A read result is charged to
+the Forge meter on both backends: `read_file`'s content string is billed at
+its UTF-8 byte length under `--forge`, matching a tensor materialization of
+the same size. `read_bytes` (§7's numpy-idiom table) stays `dmc run` only —
+its `Tensor[i64,[N]]` result needs a runtime-extent tensor, and the JIT has
+one (a dynamic-tensor foundation used to materialize KV reads), but it is
+reachable only from those KV reads and is not yet plumbed for an i64-element
+host-call result.
+
+| Function | Signature | Description |
+| -------- | --------- | ----------- |
+| `read_file(path)` | `str -> (str, err)` | Reads the file at `path` as UTF-8 text. On failure the content half is `nil` and `err` carries the message; use `read_bytes` for non-UTF-8 data. |
+| `write_file(path, content)` | `(str, str) -> (nil, err)` | Writes `content`, replacing the file (creating it if absent). The first half of the pair is `nil` on both success and failure — there is no `bool` here. |
+| `append_file(path, content)` | `(str, str) -> (nil, err)` | Appends `content`, creating the file if it does not exist. Same pair shape as `write_file`. |
+| `file_exists(path)` | `str -> bool` | `true` iff a filesystem entry exists at `path`. |
 
 ---
 
@@ -329,7 +362,7 @@ implementation. demoniC compiles it. That's the deal.
 > date/time, string formatting (`format`), hashing (`hash_fnv`,
 > `hash_crc32`), CLI helpers, process execution (`exec_cmd`), linear
 > algebra (`solve`, `inv`, `lstsq`), trit-tensor ops, and the seeded
-> global RNG helpers (`SPEC.md §3.7`, Random as a value). They are
+> global RNG helpers (`SPEC.md §3.8`, Random as a value). They are
 > implemented and exercised by the example corpus; specifying them here
 > is tracked work. The "never will be" list above still governs what the
 > *core* promises.

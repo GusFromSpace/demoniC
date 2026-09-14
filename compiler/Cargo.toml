@@ -1,6 +1,6 @@
 [package]
 name = "dmc"
-# Compiler version is independent of spec version (currently 0.0.4-draft).
+# Compiler version is independent of spec version (currently 0.0.5-draft).
 # The spec is the source of truth; this tracks compiler bootstrap progress.
 version = "0.0.1"
 edition = "2024"

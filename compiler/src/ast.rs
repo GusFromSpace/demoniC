@@ -9,7 +9,7 @@
 // dead code (unused helpers/methods) is NOT suppressed anywhere else in the
 // crate.
 #![allow(dead_code)]
-/// demoniC AST — spec 0.0.4-draft
+/// demoniC AST — spec 0.0.5-draft
 ///
 /// Companion to: GRAMMAR.ebnf, SPEC.md
 ///
@@ -73,6 +73,11 @@ pub struct FnDecl {
     pub ret_type: Option<Type>,
     pub body: Block,
     pub span: Span,
+    /// The file this fn was declared in, as the interpreter numbers files
+    /// while loading them. A body resolves names against its own file
+    /// (SPEC §6.7), so the callee must know where it was written. `0` in a
+    /// freshly parsed AST; the loader stamps it.
+    pub module: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +132,74 @@ pub struct ArenaBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArenaKind { Vault, Forge, Stream }
+
+/// `forge.enter(b) { … }` (#674, the arena-budget grammar's `budget_block`
+/// rule). Pushes `b` as the
+/// entered budget for `body` and pops it on every exit edge (normal, `return`,
+/// `break`, `continue`, `?`); nothing is reaped and `b` outlives the block.
+/// Deliberately its own AST node rather than a fourth `ArenaKind`: `enter`
+/// selects a *budget* (a host-lifetime handle, `TyType::Budget`), not one of
+/// the three arenas `ArenaBlock`/`ArenaKind` name — conflating the two would
+/// make the checker's `budget_stack` (a SEPARATE lexical stack from
+/// `arena_stack`, `check.rs`) push an `ArenaKind` it must never push.
+#[derive(Debug, Clone)]
+pub struct BudgetBlock {
+    /// The `Budget`-typed expression named in `forge.enter(…)`.
+    pub operand: Box<Expr>,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// #674 slice 3a: the arena-constructor spine `(forge|vault|stream).<alloc_
+/// method>[…]` — the ONE shape both the `in b` budget-override postfix
+/// (`Expr::AllocIn`, §2.1 GRAMMAR.ebnf's side condition) and the checker's
+/// `budget-arena` (R3) diagnostic recognize. `parser.rs:parse_postfix`'s `in`
+/// arm and `check.rs`'s R3 sites both call THIS function rather than
+/// restating the pattern, per the design's own rule: "One definition of the
+/// spine, exported, not restated."
+///
+/// `MODEL_ARRAY_ALLOCATOR_METHODS` (below) is NOT this set: it is the
+/// narrower three-method set a *model-array* allocator uses
+/// (`check.rs:ctor_tensor_ty`/`model_array_alloc_arena_of`, which also admit
+/// only `forge`/`vault`, never `stream`). `identity` and `trit` are charged
+/// constructors on the spine (`interp.rs:try_arena_constructor`,
+/// `charge_ctor`) that `MODEL_ARRAY_ALLOCATOR_METHODS` has never covered.
+pub const ARENA_CTOR_ALLOC_METHODS: [&str; 6] =
+    ["zeros", "ones", "uninit", "identity", "kv", "trit"];
+
+/// The `(arena, method)` a postfix receiver names, if it is the FIELD half
+/// of an arena-constructor spine — `(forge|vault|stream).<alloc_method>`,
+/// with no `Index` wrapper yet applied. Shared by `is_arena_ctor_spine`
+/// (which adds the `Index` check) and by `check.rs`'s narrower model-array
+/// recognizers, so every caller answers from the same one definition of
+/// "which arena, which method" rather than a hand-rolled `Ident` match that
+/// could drift from it.
+pub fn arena_ctor_receiver(expr: &Expr) -> Option<(&str, &str)> {
+    let Expr::Postfix { expr: inner, op: PostfixOp::Field(method), .. } = expr else { return None };
+    if !ARENA_CTOR_ALLOC_METHODS.contains(&method.as_str()) { return None; }
+    let Expr::Ident(arena, _) = inner.as_ref() else { return None };
+    if !matches!(arena.as_str(), "forge" | "vault" | "stream") { return None; }
+    Some((arena.as_str(), method.as_str()))
+}
+
+/// #674 (the arena-budget grammar's constructor-spine rule): is `expr` an arena
+/// constructor spine — `(forge|vault|stream).<alloc_method>[…]`? The ONE
+/// predicate the `in` postfix (grammar side condition) and the checker's R3
+/// (`budget-arena`) both gate on, so a later generalization of `in` is a
+/// single-site code change rather than a silent reinterpretation (§7 R3).
+pub fn is_arena_ctor_spine(expr: &Expr) -> bool {
+    matches!(expr, Expr::Postfix { expr: base, op: PostfixOp::Index(_), .. }
+        if arena_ctor_receiver(base).is_some())
+}
+
+/// #728 rework (reviewer defect 3): the builtin allocator method names that
+/// can build a *model* array (`arena.<method>[Model, [dims]]`) — the same
+/// set `check.rs:ctor_tensor_ty` matches for a *scalar*-element allocator.
+/// Moved here (#674 slice 3a) beside `is_arena_ctor_spine`, which it is
+/// NOT the method set of (see that fn's doc comment) — kept beside it only
+/// so the two related-but-different allocator-method sets stay visibly
+/// paired rather than drifting apart in two separate files.
+pub const MODEL_ARRAY_ALLOCATOR_METHODS: [&str; 3] = ["zeros", "ones", "uninit"];
 
 #[derive(Debug, Clone)]
 pub struct ShapeParam {
@@ -255,6 +328,15 @@ pub enum Expr {
     Match(Box<MatchExpr>),
     FnLit(Box<FnLit>),
     ArenaBlock(ArenaBlock),
+    /// `forge.enter(b) { … }` (#674 slice 3a). See `BudgetBlock`'s own doc.
+    BudgetBlock(BudgetBlock),
+    /// `<ctor_spine> in <budget>` (#674 slice 3a, §2.1 GRAMMAR.ebnf) — the
+    /// per-constructor budget override. `expr` is always an arena-constructor
+    /// spine (`is_arena_ctor_spine(&expr)` held at parse time); `budget` is a
+    /// `postfix_expr`, not a general `expr` (`b`, `r.budget`, `bs[i]`,
+    /// `forge.root`, `mk()` all parse; `b + 1` does not — there is no
+    /// `Budget` arithmetic to want, §2.1).
+    AllocIn { expr: Box<Expr>, budget: Box<Expr>, span: Span },
     /// `@cast(bf16) { ... }` and similar — directive applied to block,
     /// used as an expression.
     DirectiveBlock { directives: Vec<Directive>, body: Block, span: Span },
@@ -409,6 +491,92 @@ pub enum ScalarType {
     Bool, Str, Nil,
 }
 
+impl ScalarType {
+    /// The byte width this scalar occupies inside a `@cast(Model) { bytes }`
+    /// overlay, or `None` when it has no byte form at all (#598).
+    ///
+    /// One table, consulted by both the checker (which refuses a model field
+    /// it answers `None` for, naming the field) and the interpreter (which
+    /// decodes with it), so the two can never disagree about which fields the
+    /// overlay admits or how wide they are.
+    ///
+    /// Admitted: the fixed-width integers, `bool`, and the IEEE floats —
+    /// every kind `docs/PORTS.md`'s element table gives a width for, plus the
+    /// narrow integer kinds it does not carry on the wire but whose declared
+    /// width is unambiguous all the same.
+    ///
+    /// Refused, and why each has no width to state:
+    ///   - `str`  — dynamic, arena-backed text; nothing fixes its extent.
+    ///   - `nil`  — the unit type occupies nothing.
+    ///   - `trit` — packed ternary is a demoniC storage format with no byte
+    ///     encoding (`PORTS.md`: "`trit` has no wire dtype").
+    ///   - `int4` — a packed 4-bit type; how two of them share a byte is not
+    ///     stated anywhere.
+    ///   - `tf32`, `fp8_e4m3`, `fp8_e5m2` — f32-backed *nominal tags*
+    ///     (`DIRECTIVES.md §4.1`, the #179 convention). They have no distinct
+    ///     storage form to read bytes out of.
+    pub fn overlay_byte_width(&self) -> Option<usize> {
+        use ScalarType::*;
+        Some(match self {
+            I8 | U8 | Int8 | Bool => 1,
+            I16 | U16 | F16 | Bf16 => 2,
+            I32 | U32 | F32 => 4,
+            I64 | U64 | F64 => 8,
+            Str | Nil | Trit | Int4 | Tf32 | Fp8E4M3 | Fp8E5M2 => return None,
+        })
+    }
+
+    /// Why the overlay has no layout for this scalar — the tail of the
+    /// `--check` diagnostic and of the interpreter's backstop error. `None`
+    /// when the kind IS admitted (`overlay_byte_width` answers `Some`).
+    pub fn overlay_refusal_reason(&self) -> Option<&'static str> {
+        use ScalarType::*;
+        Some(match self {
+            Str => "a `str` field's text is dynamic and arena-backed, so it has no fixed width",
+            Nil => "`nil` occupies no bytes",
+            Trit => "packed ternary has no byte encoding (PORTS.md: `trit` has no wire dtype)",
+            Int4 => "`int4` is packed 4 bits wide, and how two share a byte is unstated",
+            Tf32 | Fp8E4M3 | Fp8E5M2 =>
+                "an f32-backed nominal tag (DIRECTIVES.md §4.1) has no distinct byte storage",
+            _ => return None,
+        })
+    }
+
+    /// Map a constructor's value-position element-type NAME (the `f32` in
+    /// `forge.zeros[f32, […]]`) to its `ScalarType`. Returns `None` for
+    /// anything that is not a known constructor scalar-type name.
+    ///
+    /// This is the ONE table both `check.rs`'s `scalar_type_from_ident`
+    /// (which types the constructor at `--check`) and `interp.rs`'s
+    /// `arena_ctor_dtype` (which tags the constructed tensor's `DType`, #834)
+    /// resolve a bracket name through — so a name the checker admits here and
+    /// a name the interpreter accepts a bracket argument for can never
+    /// diverge into two different tables again (`arena_ctor_dtype` used to
+    /// keep its own ad hoc lexical copy of this list, missing `fp8_e4m3`/
+    /// `fp8_e5m2` and silently defaulting anything else to `DType::F32`).
+    ///
+    /// `str`/`nil` are deliberately absent: #817 is an open ruling on
+    /// whether either has a real tensor-element representation at all, and
+    /// this table does not decide that question either way — the checker
+    /// still admits both names in this (constructor value) position, and
+    /// the interpreter falls back to `DType::F32` for them as it did before
+    /// #834. Annotation position
+    /// (`Tensor[str, …]`) is a different table (`resolve_type`) and does
+    /// admit them (SPEC.md §3.2).
+    pub fn from_ctor_name(name: &str) -> Option<ScalarType> {
+        use ScalarType::*;
+        Some(match name {
+            "i8" => I8, "i16" => I16, "i32" => I32, "i64" => I64,
+            "u8" => U8, "u16" => U16, "u32" => U32, "u64" => U64,
+            "int4" => Int4, "int8" => Int8,
+            "f16" => F16, "bf16" => Bf16, "tf32" => Tf32, "f32" => F32, "f64" => F64,
+            "fp8_e4m3" => Fp8E4M3, "fp8_e5m2" => Fp8E5M2, "trit" => Trit,
+            "bool" => Bool,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShapeSpec {
     pub elems: Vec<ShapeElem>,
@@ -450,6 +618,32 @@ pub enum Literal {
 }
 
 // ─── Public Item Collection Helpers ──────────────────────────────────────────
+
+/// Every name a top-level `let` binds in this file, `pub` or not. `pub let`
+/// is itself a compile-time error (#616: `SPEC.md §6.7` exports only `pub
+/// fn`/`pub model`/`pub type`), so in practice this is always the *private*
+/// set — collected independent of visibility anyway so the invariant this
+/// leans on stays true even if that rule ever narrows. `check.rs`'s import
+/// machinery (#724) uses this to name a top-level `let` that leaked across a
+/// module boundary with its own diagnostic rather than a bare `undefined
+/// identifier`.
+pub fn collect_top_level_let_names(program: &Program) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in &program.items {
+        collect_top_level_let_names_in_item(item, &mut names);
+    }
+    names
+}
+
+fn collect_top_level_let_names_in_item(item: &Item, names: &mut HashSet<String>) {
+    match item {
+        Item::Let(l) => collect_pattern_names(&l.pattern, names),
+        Item::Pub(inner) | Item::Directive { inner, .. } => {
+            collect_top_level_let_names_in_item(inner, names);
+        }
+        _ => {}
+    }
+}
 
 pub fn collect_public_items(program: &Program) -> HashSet<String> {
     let mut public_names = HashSet::new();

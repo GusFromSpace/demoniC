@@ -1,0 +1,6 @@
+# Probe 59 (mid) — SPEC §6.7: the diamond's other arm. Takes the shared leaf's
+# `pub model` as a parameter type, so the leaf is reached twice and the
+# resolver's `visited` early return is what keeps it merged once.
+use "p59_multifile_point.dmc"
+pub fn sum_pt(p: Point) -> i64 { p.x + p.y }
+fn main() -> nil { print("Run OK") nil }

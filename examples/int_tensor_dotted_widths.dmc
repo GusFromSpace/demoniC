@@ -17,13 +17,16 @@
 # rather than an error, because that is how this class of bug survives: nothing
 # crashes, the arithmetic just stops wrapping.
 #
-# The JIT refuses integer elementwise ops ("elementwise ops are f32-only"), so
-# `dmc test --jit` skips this file entirely and the numbers below are gated
-# under the interpreter alone. That refusal is also why this file is separate:
-# the JIT compiles a file as a unit, and one `.+` here would have dropped the
-# sibling file's ten JIT-runnable tests out of the gate with it. When the JIT
-# gains integer elementwise lowering, these become two-backend tests and the
-# two files can merge.
+# The JIT refused integer elementwise ops outright ("elementwise ops are
+# f32-only") when this file was written, which is why it is separate from its
+# sibling: the JIT compiles a file as a unit, and one `.+` here would have
+# dropped that file's ten JIT-runnable tests out of the gate with it. The JIT
+# now lowers `.+ .- .* ./` at every byte-aligned element width, so most of what
+# is below runs on both backends — but not the file, which is
+# still held out as a unit by two tests the JIT declines for other reasons: the
+# sub-byte `int4` element (no storage lane) and the elementwise `as` cast of a
+# whole tensor (not lowered at any element type). Splitting those two out is
+# what would put the other five on the parity gate.
 #
 # Run:
 #   dmc test examples/int_tensor_dotted_widths.dmc

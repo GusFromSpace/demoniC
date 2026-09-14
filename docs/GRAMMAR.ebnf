@@ -1,4 +1,4 @@
-(* demoniC grammar, version 0.0.4-draft.                                  *)
+(* demoniC grammar, version 0.0.5-draft.                                  *)
 (* Companion to SPEC.md. The spec wins where this disagrees.              *)
 (* Notation: ISO EBNF.                                                    *)
 (*   { x } = zero or more x                                               *)
@@ -54,6 +54,17 @@ comptime_expr = expr ;        (* a comptime-evaluable expression          *)
                               (* enforced by the type-checker, not parser *)
 
 arena_block   = ( "vault" | "forge" | "stream" ) block ;
+
+(* `forge.enter(b) { … }` pushes `b` as the entered budget for the block and
+   pops it on every exit edge (normal, `return`, `break`, `continue`, `?`).
+   Parsed at statement position and at expression position only —
+   `budget_block` is DELIBERATELY NOT an alternative of `arena_block` (which
+   `item` admits, above): it is its own alternative of `primary`
+   (expressions, below), reachable from `stmt` only through `expr_stmt`'s
+   ordinary `expr` chain and never from `item` directly. The ratified surface
+   never asks for a module-level entered extent, and the AST carries no
+   variant for one. *)
+budget_block  = "forge" "." "enter" "(" expr ")" block ;
 
 model_decl    = "model" ident [ shape_params ] "{" { model_member } "}" ;
 model_member  = ident ":" type             (* field *)
@@ -140,7 +151,27 @@ matmul        = power     { "@" power } ;
 power         = unary     { ( "**" | ".^" | ".**" ) unary } ;
 unary         = [ "-" | "!" | "~" | "*" | "\\>" | "\\<" ] as_expr ;
 as_expr       = postfix_expr { "as" type } ;
-postfix_expr  = primary { postfix_op } ;
+(* SIDE CONDITION — a bare "optional `in` tail on any postfix_expr"
+   production would be undecidable, so the condition is written directly INTO
+   the production below rather than left in prose: "in" is admissible ONLY as
+   the tail of a `ctor_spine`, the ARENA CONSTRUCTOR SPINE alternative —
+   every other postfix_expr has no "in" alternative to take. One recognizer
+   backs both productions and the compiler, called by the parser's `in` arm
+   and by the checker's `budget-arena` sites alike, never restated. A
+   non-spine postfix_expr followed by a bare "in" token in expression
+   position is a located parse error naming the ctor-spine shape (`in`
+   applies only to an arena constructor, e.g. `forge.zeros[…] in b`); `in`
+   after a `for` pattern (`for_stmt`, above) and the `let in = 5` binding of
+   the identifier `in` are unaffected. The `in` operand is itself a
+   `postfix_expr`, not a general `expr`: `b`, `r.budget`, `bs[i]`,
+   `forge.root`, `mk()` all parse; `b + 1` does not (there is no `Budget`
+   arithmetic to want). *)
+postfix_expr  = primary { postfix_op }
+              | ctor_spine "in" postfix_expr ;
+ctor_spine    = ( "forge" | "vault" | "stream" ) "." alloc_method
+                "[" index_list "]" ;
+alloc_method  = "zeros" | "ones" | "uninit"
+              | "identity" | "kv" | "trit" ;
 postfix       = postfix_expr ;                          (* alias kept for cross-references *)
 postfix_op    = "'"
               | "?"
@@ -163,12 +194,13 @@ primary       = literal
               | match_stmt
               | fn_lit
               | arena_block                         (* `forge { ... }` is also an expression *)
+              | budget_block                        (* `forge.enter(b) { ... }`, expr position *)
               | directive_block ;                   (* @cast(bf16) { ... } as expr *)
 
 struct_lit    = ident [ "[" type_args "]" ] "{" field_init { "," field_init } [ "," ] "}" ;
 field_init    = ident ":" expr ;
 (* Disambiguation: struct_lit is only parsed when ident is a known model name
-   and "{" follows with "ident :" inside — see SPEC.md §3.9 (Models) and
+   and "{" follows with "ident :" inside — see SPEC.md §3.10 (Models) and
    parser disambiguation. *)
 
 fn_lit        = "fn" [ shape_params ] "(" [ params ] ")"
@@ -191,9 +223,9 @@ type          = scalar_type
               | ptr_type
               | ident [ "[" type_args "]" ] ;
 
-array_type    = "[" type ";" comptime_expr "]" ;    (* SPEC.md §3.9 (Models) — model arrays; e.g. [Block[D,H]; L] *)
+array_type    = "[" type ";" comptime_expr "]" ;    (* SPEC.md §3.10 (Models) — model arrays; e.g. [Block[D,H]; L] *)
 
-ptr_type      = "*" ( scalar_type | "nil" ) ;       (* extern fn only; SPEC.md §3.10 (Raw pointers) *)
+ptr_type      = "*" ( scalar_type | "nil" ) ;       (* extern fn only; SPEC.md §3.12 (Raw pointers) *)
 
 scalar_type   = "i8"|"i16"|"i32"|"i64"
               | "u8"|"u16"|"u32"|"u64"

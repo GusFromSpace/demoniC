@@ -105,7 +105,13 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
 }
 
 /// Render a byte count the way the sizing flags accept it back: binary units,
-/// one decimal place, no decimal when the value is exact.
+/// one decimal place, no decimal when the value is exact. Truncates rather
+/// than rounds-to-nearest (#805): round-to-nearest could display a figure
+/// one byte under a unit boundary — e.g. `600 * (1 << 20) - 1` — as the
+/// boundary itself (`600.0 MiB`), which reads as self-contradictory in an
+/// exhaustion message ("needs 600 MiB, but only 600.0 MiB is free"). Integer
+/// arithmetic only, so the truncation is exact — no float round-trip to
+/// second-guess.
 pub fn fmt_bytes(n: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
         (1 << 40, "TiB"),
@@ -118,8 +124,27 @@ pub fn fmt_bytes(n: u64) -> String {
             if n % scale == 0 {
                 return format!("{} {}", n / scale, name);
             }
-            return format!("{:.1} {}", n as f64 / scale as f64, name);
+            let whole = n / scale;
+            let tenths = (n % scale) * 10 / scale;
+            return format!("{}.{} {}", whole, tenths, name);
         }
     }
     format!("{} B", n)
+}
+
+/// Render `budget-reap`'s live-child refusal clause (R2, `children(b) != 0`)
+/// the same way on both backends: singular at exactly one live child ("reap
+/// it before reaping its parent"), plural otherwise ("reap them before
+/// reaping their parent"). Callers prepend their own `budget-reap:` prefix
+/// (and, on the JIT, a `runtime error at {line}:{col}:` header) — this only
+/// owns the part that must conjugate identically, so the interpreter and JIT
+/// can never drift on it again (#842).
+pub fn budget_live_child_clause(children: u64) -> String {
+    format!(
+        "this budget has {} live child budget{}; reap {} before reaping {} parent",
+        children,
+        if children == 1 { "" } else { "s" },
+        if children == 1 { "it" } else { "them" },
+        if children == 1 { "its" } else { "their" },
+    )
 }

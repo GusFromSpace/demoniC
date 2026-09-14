@@ -27,6 +27,7 @@
 //! | `check` | a type/shape checker diagnostic (`severity` error or warning) |
 //! | `jit-ineligible` | the JIT declines to lower a construct; always has `code` |
 //! | `jit-error` | the JIT failed on something it is supposed to handle (#480) |
+//! | `resolve` | a module-resolution diagnostic — a `use` that cannot be resolved, or closes a cycle; always has `code` |
 //! | `cli` | a command-line usage error |
 //! | `test` | one `dmc test` result; under `--jit` also the parity verdict |
 //! | `unstructured` | a diagnostic whose category has no schema yet |
@@ -53,8 +54,13 @@ pub enum Kind {
     Check,
     JitIneligible,
     JitError,
+    /// A module-resolution failure at a `use`: the target is missing or
+    /// unreadable (`import-unresolved`), or importing it would close a cycle
+    /// (`import-cycle`). Located at the `use` in the importing file.
+    Resolve,
     Cli,
-    /// A category with no schema yet (resolver prose, runtime errors, test
+    /// A category with no schema yet (a per-file I/O failure under `dmc
+    /// test` with no importing `use` to locate it at, runtime errors, test
     /// output). Carries `message` only.
     Unstructured,
 }
@@ -67,6 +73,7 @@ impl Kind {
             Kind::Check => "check",
             Kind::JitIneligible => "jit-ineligible",
             Kind::JitError => "jit-error",
+            Kind::Resolve => "resolve",
             Kind::Cli => "cli",
             Kind::Unstructured => "unstructured",
         }
@@ -110,6 +117,21 @@ pub struct Diagnostic {
     /// the rendered `Tensor[f32, [2, 3]]` out of `message`.
     pub expected: Option<String>,
     pub actual: Option<String>,
+    /// `dmc jit --json --all` only (#684): this refusal's position in the
+    /// collected list, 0-based in the order `compile_program_collect` found
+    /// them. Absent without `--all` — one refusal has nothing to index.
+    pub index: Option<usize>,
+    /// `dmc jit --json --all` only (#684): the top-level item this refusal
+    /// belongs to (a fn name, or a short label for a non-fn item) — the
+    /// fourth thing issue #684 asks each collected line to carry, alongside
+    /// `code`, the span, and `message`.
+    pub item: Option<String>,
+    /// `dmc jit --json --all` only (#684 R2): `Some(i)` when this refusal is
+    /// a cascade of an earlier item's refusal (`i` is that root site's
+    /// `index`) rather than a root blocker of its own. Absent for a root
+    /// blocker — not a fabricated `false`/`0`, the same "omit rather than
+    /// null" rule every other optional field here follows.
+    pub cascade_of: Option<usize>,
 }
 
 impl Diagnostic {
@@ -127,6 +149,9 @@ impl Diagnostic {
             hint: None,
             expected: None,
             actual: None,
+            index: None,
+            item: None,
+            cascade_of: None,
         }
     }
 
@@ -170,8 +195,32 @@ impl Diagnostic {
         self
     }
 
+    /// `dmc jit --json --all` only (#684): this refusal's 0-based position in
+    /// the collected list.
+    pub fn index(mut self, index: usize) -> Diagnostic {
+        self.index = Some(index);
+        self
+    }
+
+    /// `dmc jit --json --all` only (#684): the top-level item this refusal
+    /// belongs to.
+    pub fn item(mut self, item: impl Into<String>) -> Diagnostic {
+        self.item = Some(item.into());
+        self
+    }
+
+    /// `dmc jit --json --all` only (#684 R2): mark this refusal a cascade of
+    /// the root site at collected index `root`, rather than a root blocker.
+    pub fn cascade_of(mut self, root: Option<usize>) -> Diagnostic {
+        self.cascade_of = root;
+        self
+    }
+
     /// The JSON Lines encoding of this diagnostic — one line, no trailing
-    /// newline. Key order is fixed and part of the format.
+    /// newline. Key order is fixed and part of the format. `index`, `item`,
+    /// and `cascade_of` are appended last: all are new (#684) and appear only
+    /// under `--all`, so no existing consumer's positional read of an
+    /// established field ever crosses them.
     pub fn to_json(&self) -> String {
         let mut o = Obj::new();
         o.num("schema", SCHEMA as u64);
@@ -187,6 +236,9 @@ impl Diagnostic {
         if let Some(s) = self.start { o.num("start", s as u64); }
         if let Some(e) = self.end { o.num("end", e as u64); }
         if let Some(h) = &self.hint { o.str("hint", h); }
+        if let Some(i) = self.index { o.num("index", i as u64); }
+        if let Some(it) = &self.item { o.str("item", it); }
+        if let Some(r) = self.cascade_of { o.num("cascade_of", r as u64); }
         o.finish()
     }
 }
@@ -205,6 +257,19 @@ pub fn shape_array(dims: &[SymDim]) -> String {
     }
     out.push(']');
     out
+}
+
+/// A refusal-class multiset (`code` → count) as a pre-encoded JSON object,
+/// key order sorted so the same run always prints the same bytes (`--all`,
+/// #684). Shares `Obj`'s escaping with every other field in this module —
+/// a `jit-*` code is plain kebab-case ASCII today, but a diagnostic tag
+/// (`DIAGNOSTICS.md §5.1`) is admitted here too and is written by hand.
+pub fn classes_object(counts: &std::collections::BTreeMap<&str, u64>) -> String {
+    let mut o = Obj::new();
+    for (code, n) in counts {
+        o.num(code, *n);
+    }
+    o.finish()
 }
 
 /// The interp-vs-JIT verdict a `--jit` run attaches to each test.
@@ -241,6 +306,46 @@ pub struct TestResult {
     pub jit: Option<JitVerdict>,
     /// Why the JIT run failed. Omitted unless `jit` is `fail`.
     pub jit_message: Option<String>,
+    /// `dmc test --jit --json --all` only (#684 R2): the number of DISTINCT
+    /// root blockers in this test's file — `jit::blocker_counts`'s headline
+    /// metric, the same number for every test in one file since the compile
+    /// it comes from is file-wide, not per-test. `Some(None)` (rendered as
+    /// JSON `null`) when `--all` ran but the JIT engine itself failed to
+    /// initialize for this file (#684 R3) — distinct from `Some(Some(0))`, a
+    /// file that is genuinely fully inside the lowered subset; the old code
+    /// collapsed the two onto the same `0`.
+    pub jit_blockers: Option<Option<usize>>,
+    /// `dmc test --jit --json --all` only (#684): every recorded refusal
+    /// site in this test's file, cascades included — what this field (named
+    /// `jit_refusals`) reported before R2 split the count in three. Same
+    /// `Some(None)`-is-`null` convention as `jit_blockers`.
+    pub jit_sites: Option<Option<usize>>,
+    /// `dmc test --jit --json --all` only (#684 R2): how many of `jit_sites`
+    /// are cascades of an earlier root rather than root blockers of their
+    /// own. Same `Some(None)`-is-`null` convention as `jit_blockers`.
+    pub jit_cascades: Option<Option<usize>>,
+    /// `dmc test --jit --json --all` only (#684): the multiset of refusal
+    /// classes among the NON-cascade sites (R2), as a pre-encoded JSON object
+    /// (`classes_object`) mapping a `jit-*` code — or `jit::JIT_ERROR_CLASS_KEY`
+    /// for a `jit-error` (R3) — to how many times it fired in this file.
+    /// Plain `Option`, not the `null` tri-state above: a JIT-init failure has
+    /// no per-code breakdown to report, so the field is simply absent then.
+    pub jit_classes: Option<String>,
+    /// `dmc test --jit --json --all` only (#684 fixup, F3): whether a root
+    /// `jit-error` (the #480 defect class, not a cascade) aborted collection
+    /// before every item in this file was walked, making `jit_blockers` /
+    /// `jit_sites` / `jit_cascades` above a FLOOR rather than the file's true
+    /// depth — 21 of 66 blocked files in the `examples/` corpus as of this
+    /// fixup, several at `jit_sites: 1`. Fixing such a defect makes the
+    /// file's depth RISE, which is progress, not a regression; a diff
+    /// consumer (`tools/jit_depth.py`) must read a truncated→untruncated
+    /// transition as its own category, never as an increase. Same
+    /// `Some(None)`-is-`null` tri-state as `jit_blockers` et al. (R3) — a
+    /// file whose JIT engine failed to initialize has no truncation verdict
+    /// either. Serialized as `"truncated"`, not `"jit_truncated"` — every
+    /// other field on this line the JIT contributes is already namespaced by
+    /// sitting under `--jit`.
+    pub jit_truncated: Option<Option<bool>>,
 }
 
 impl TestResult {
@@ -254,6 +359,11 @@ impl TestResult {
         if let Some(m) = &self.message { o.str("message", m); }
         if let Some(j) = self.jit { o.str("jit", j.as_str()); }
         if let Some(m) = &self.jit_message { o.str("jit_message", m); }
+        o.opt_num("jit_blockers", self.jit_blockers);
+        o.opt_num("jit_sites", self.jit_sites);
+        o.opt_num("jit_cascades", self.jit_cascades);
+        if let Some(c) = &self.jit_classes { o.raw("jit_classes", c); }
+        o.opt_bool("truncated", self.jit_truncated);
         o.finish()
     }
 }
@@ -270,11 +380,53 @@ pub struct Summary {
     /// `dmc test` only: the human summary line's tally, as data.
     pub passed: Option<usize>,
     pub failed: Option<usize>,
+    /// `dmc test` only: how many `test_*` functions were discovered and run,
+    /// across every file under the given path — `passed + failed` in the
+    /// common case, but not always: a file-level failure (resolution, type
+    /// check) that struck before any test ran counts into `failed` without
+    /// counting into `tests_ran` (#599), so `tests_ran:0` is how a consumer
+    /// tells "nothing was verified" apart from "every discovered test failed"
+    /// when both would otherwise report `passed:0`.
+    pub tests_ran: Option<usize>,
     /// `dmc test --jit` only: the parity counters.
     pub jit_ran: Option<usize>,
     pub jit_skipped: Option<usize>,
     /// Top-level items seen, for the commands that count them. `None` elsewhere.
     pub items: Option<usize>,
+    /// `dmc jit --json --all` only (#684): how many refusal sites
+    /// `compile_program_collect` recorded across the whole program — cascades
+    /// included (R2's `jit::BlockerCounts::sites`).
+    pub refusals: Option<usize>,
+    /// `dmc jit --json --all` only (#684 R2): the number of DISTINCT root
+    /// blockers among `refusals` (`jit::BlockerCounts::blockers`) — the
+    /// headline number; `refusals` and `cascades` are the secondary ones.
+    pub blockers: Option<usize>,
+    /// `dmc jit --json --all` only (#684 R2): how many of `refusals` are
+    /// cascades of an earlier root rather than root blockers of their own
+    /// (`jit::BlockerCounts::cascades`).
+    pub cascades: Option<usize>,
+    /// `dmc jit --json --all` only (#684): the multiset of refusal classes
+    /// among the NON-cascade sites (R2), as a pre-encoded JSON object
+    /// (`classes_object`).
+    pub classes: Option<String>,
+    /// `dmc jit --json --all` only (#684 fixup, F3): whether a root
+    /// `jit-error` aborted collection before every item was walked, making
+    /// `refusals`/`blockers`/`cascades` above a FLOOR (`jit::BlockerCounts::
+    /// truncated`). Plain `Option<bool>`, not a `--jit --json --all` per-file
+    /// tri-state: `jit` always has a successfully constructed `Jit` by the
+    /// time `--all` collection runs (a `Jit::new()` failure exits before
+    /// then), so there is no "unmeasurable" case to distinguish here.
+    pub truncated: Option<bool>,
+    /// `dmc test --jit --json --all` only (#684): how many files in the run
+    /// have at least one recorded root blocker — the human line's `F` in
+    /// `blocker depth: F files, D blockers`. A file whose JIT engine failed
+    /// to initialize (R3) is not counted here — its depth was never measured.
+    pub blocker_files: Option<usize>,
+    /// `dmc test --jit --json --all` only (#684 R2): the sum of every
+    /// measured file's `jit_blockers` — the human line's `D`. Named for the
+    /// blockers metric now, though the field itself is unchanged in shape
+    /// from before R2 (only what it sums changed, from raw sites to roots).
+    pub blocker_sites: Option<usize>,
     pub exit: i32,
 }
 
@@ -289,9 +441,17 @@ impl Summary {
         o.num("warnings", self.warnings as u64);
         if let Some(p) = self.passed { o.num("passed", p as u64); }
         if let Some(f) = self.failed { o.num("failed", f as u64); }
+        if let Some(t) = self.tests_ran { o.num("tests_ran", t as u64); }
         if let Some(r) = self.jit_ran { o.num("jit_ran", r as u64); }
         if let Some(s) = self.jit_skipped { o.num("jit_skipped", s as u64); }
         if let Some(i) = self.items { o.num("items", i as u64); }
+        if let Some(r) = self.refusals { o.num("refusals", r as u64); }
+        if let Some(b) = self.blockers { o.num("blockers", b as u64); }
+        if let Some(c) = self.cascades { o.num("cascades", c as u64); }
+        if let Some(c) = &self.classes { o.raw("classes", c); }
+        if let Some(t) = self.truncated { o.bool("truncated", t); }
+        if let Some(f) = self.blocker_files { o.num("blocker_files", f as u64); }
+        if let Some(s) = self.blocker_sites { o.num("blocker_sites", s as u64); }
         // `dmc` exits 0 or 1; clamp anyway so a stray negative can never be
         // encoded as an enormous positive.
         o.num("exit", self.exit.max(0) as u64);
@@ -310,9 +470,17 @@ pub struct Emitter {
     warnings: usize,
     passed: Option<usize>,
     failed: Option<usize>,
+    tests_ran: Option<usize>,
     jit_ran: Option<usize>,
     jit_skipped: Option<usize>,
     items: Option<usize>,
+    refusals: Option<usize>,
+    blockers: Option<usize>,
+    cascades: Option<usize>,
+    classes: Option<String>,
+    truncated: Option<bool>,
+    blocker_files: Option<usize>,
+    blocker_sites: Option<usize>,
 }
 
 impl Emitter {
@@ -323,9 +491,17 @@ impl Emitter {
             warnings: 0,
             passed: None,
             failed: None,
+            tests_ran: None,
             jit_ran: None,
             jit_skipped: None,
             items: None,
+            refusals: None,
+            blockers: None,
+            cascades: None,
+            classes: None,
+            truncated: None,
+            blocker_files: None,
+            blocker_sites: None,
         }
     }
 
@@ -354,10 +530,42 @@ impl Emitter {
         self.failed = Some(failed);
     }
 
+    /// `dmc test`: how many `test_*` functions were discovered and run,
+    /// across the whole path — distinct from `passed`/`failed` because a
+    /// file-level failure can inflate `failed` without any test having run
+    /// (#599).
+    pub fn set_tests_ran(&mut self, tests_ran: usize) {
+        self.tests_ran = Some(tests_ran);
+    }
+
     /// `dmc test --jit`: the same two numbers the human parity note prints.
     pub fn set_jit_parity(&mut self, ran: usize, skipped: usize) {
         self.jit_ran = Some(ran);
         self.jit_skipped = Some(skipped);
+    }
+
+    /// `dmc jit --json --all` (#684, R2): the three headline numbers
+    /// (`jit::BlockerCounts`) and the per-class breakdown among non-cascade
+    /// sites that `compile_program_collect` found, plus (F3) whether a root
+    /// `jit-error` truncated collection before those counts were final.
+    pub fn set_jit_all(
+        &mut self, sites: usize, blockers: usize, cascades: usize, classes: String, truncated: bool,
+    ) {
+        self.refusals = Some(sites);
+        self.blockers = Some(blockers);
+        self.cascades = Some(cascades);
+        self.classes = Some(classes);
+        self.truncated = Some(truncated);
+    }
+
+    /// `dmc test --jit --json --all` (#684, R2): the blocker-depth aggregate —
+    /// how many files have at least one recorded root blocker, and the total
+    /// blocker count across every measured file — the same two numbers the
+    /// human line's `blocker depth: F files, D blockers` prints. A file whose
+    /// JIT engine failed to initialize (R3) contributes to neither.
+    pub fn set_blocker_depth(&mut self, files: usize, blockers: usize) {
+        self.blocker_files = Some(files);
+        self.blocker_sites = Some(blockers);
     }
 
     /// Write the summary and hand back the exit code, unchanged, for the caller
@@ -369,9 +577,17 @@ impl Emitter {
             warnings: self.warnings,
             passed: self.passed,
             failed: self.failed,
+            tests_ran: self.tests_ran,
             jit_ran: self.jit_ran,
             jit_skipped: self.jit_skipped,
             items: self.items,
+            refusals: self.refusals,
+            blockers: self.blockers,
+            cascades: self.cascades,
+            classes: self.classes,
+            truncated: self.truncated,
+            blocker_files: self.blocker_files,
+            blocker_sites: self.blocker_sites,
             exit,
         };
         eprintln!("{}", s.to_json());
@@ -413,9 +629,17 @@ pub fn out_of_band_fatal(msg: &str) -> ! {
             warnings: 0,
             passed: None,
             failed: None,
+            tests_ran: None,
             jit_ran: None,
             jit_skipped: None,
             items: None,
+            refusals: None,
+            blockers: None,
+            cascades: None,
+            classes: None,
+            truncated: None,
+            blocker_files: None,
+            blocker_sites: None,
             exit: 1,
         };
         eprintln!("{}", s.to_json());
@@ -483,6 +707,42 @@ impl Obj {
     fn raw(&mut self, key: &str, json: &str) {
         self.sep();
         write!(self.buf, "{}:{}", escape(key), json).unwrap();
+    }
+
+    /// The literal JSON `null` — used only for the #684 R3 tri-state fields
+    /// (`jit_blockers`/`jit_sites`/`jit_cascades`): present-but-unmeasurable
+    /// (the JIT engine itself failed to initialize for this file), distinct
+    /// from both "absent" (no `--all`) and "present and zero" (a file with no
+    /// blockers at all).
+    fn null(&mut self, key: &str) {
+        self.sep();
+        write!(self.buf, "{}:null", escape(key)).unwrap();
+    }
+
+    /// `Some(Some(n))` writes `key:n`; `Some(None)` writes `key:null`
+    /// (`Obj::null`); `None` omits the field entirely.
+    fn opt_num(&mut self, key: &str, value: Option<Option<usize>>) {
+        match value {
+            Some(Some(n)) => self.num(key, n as u64),
+            Some(None) => self.null(key),
+            None => {}
+        }
+    }
+
+    fn bool(&mut self, key: &str, value: bool) {
+        self.sep();
+        write!(self.buf, "{}:{}", escape(key), value).unwrap();
+    }
+
+    /// The `bool` sibling of `opt_num`'s tri-state (#684 fixup, F3's
+    /// `truncated`): `Some(Some(b))` writes `key:true`/`key:false`;
+    /// `Some(None)` writes `key:null`; `None` omits the field entirely.
+    fn opt_bool(&mut self, key: &str, value: Option<Option<bool>>) {
+        match value {
+            Some(Some(b)) => self.bool(key, b),
+            Some(None) => self.null(key),
+            None => {}
+        }
     }
 
     fn finish(mut self) -> String {

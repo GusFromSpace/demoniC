@@ -1,0 +1,7 @@
+# Probe 59 (mid) — SPEC §6.7: one arm of the import diamond. Holds the leaf's
+# `pub model Point` as a field of its own `pub model`, which is the cross-file
+# type position the merge's AST-level type rewrite exists for.
+use "p59_multifile_point.dmc"
+pub model Boxed { p: Point, tag: i64 }
+pub fn boxed(x: i64, y: i64) -> Boxed { Boxed { p: mk(x, y), tag: 1 } }
+fn main() -> nil { print("Run OK") nil }

@@ -64,17 +64,34 @@ but only 1 KiB of the 1 KiB --forge budget is free
 Omit a flag and that arena is unbounded. What each backend meters:
 
 - **`dmc run`** meters both arenas. The interpreter has no bump pointer, so
-  the budget is byte accounting over the explicit `vault.*` and `forge.*`
-  constructors, charged at the interpreter's f64 per element. Both meters
-  are **monotonic**: the interpreter reclaims nothing, so nothing gives
-  budget back — a `forge { … }` block does *not* rewind the Forge meter on
-  exit (§3), because its tensors stay alive and its value escapes as the
-  block's result. Implicit intermediates (`let C = A @ B`) and the Stream
-  arena (`forge.kv` / `stream.kv`, bounded by its own `capacity` — §9) are
-  not charged.
-- **`dmc jit`** honors `--forge` against the real bump allocator: the
-  budget caps the bytes the arena may commit, and an allocation that does
-  not fit reports the same message with the same numbers, minus the source
+  the budget is byte accounting charged wherever a tensor is materialized —
+  an explicit `vault.*`/`forge.*` constructor, an implicit intermediate (a
+  matmul or dotted-op result, a tensor literal, a transpose, a copying
+  slice, a reshape), a builtin's fresh result (`softmax`, `sum_along`,
+  `argmax`, `rms_norm`, `embed`, `diag`, an `as` cast, `.split`, a `@cast`
+  overlay field, a non-KV `<-` concat), a `!` parameter's copy-in or a
+  `let !y = x` bare-identifier's private copy, or an `@grad` pass's
+  activations and published gradients — at that tensor's DECLARED element
+  width, not the interpreter's f64 storage width. A `!` parameter's
+  copy-OUT is not a materialization and is not charged: it writes back into
+  the buffer the caller already owns, which both backends already charged.
+  A fresh STRING is charged the same way, at its UTF-8 byte length, wherever
+  one materializes — a builtin's result (`to_str`, `read_file`, …), `+`'s
+  concatenation arm, an `as str` cast, and
+  `.trim`/`.upper`/`.lower`/`.replace`/`.split`/`.lines` (`.split` and
+  `.lines` charge every piece of the list they return, not just the list).
+  A `!` parameter's or `let !y = x`'s private copy is the one place a string
+  is DIFFERENT from a tensor: a `str` is a pointer on the JIT
+  (`docs/SPEC.md §3.1`, Scalar types), so that binding copies a pointer
+  there, not the string's bytes, and requests 0 B for it — charging the
+  copy's length here would charge a copy the JIT never makes, so it is
+  excluded.
+  The Stream arena (`forge.kv` / `stream.kv`, bounded by its own `capacity`
+  — §9) is not charged, by design.
+- **`dmc jit`** honors `--forge` against the cumulative requested bytes the
+  bump allocator has ever been asked for — not against the bytes
+  physically committed — and an allocation that does not fit reports
+  the same message with the same numbers, minus the source
   location — the JIT's allocator is a runtime callback and has no span to
   point at:
 
@@ -83,20 +100,82 @@ Omit a flag and that arena is unbounded. What each backend meters:
   only 1 KiB of the 1 KiB --forge budget is free
   ```
 
-  `forge.restore(mark)` rewinds the bump cursor so the memory is reused,
-  but it does **not** return committed bytes to the budget — matching the
-  interpreter's monotonic meter.
-
   `--vault` is **rejected**
   under `dmc jit` rather than ignored — the JIT lowers `vault.*` and
   `forge.*` into that one Forge arena, so there is no Vault region to size.
   Use `dmc run` when you want a Vault budget.
 
-The two backends are **not** interchangeable for a given budget. The
-interpreter stores tensor elements as f64 and the JIT as f32, and the JIT
-materializes intermediates the interpreter does not, so the same program
-can fit under `dmc run --forge=N` and exhaust under `dmc jit --forge=N`,
-or the reverse. Size each backend against its own measurements.
+Both meters are **hierarchical, not monotonic**. A meter's `used` rises
+when an allocation is charged to it and falls only when a budget it carved
+is reaped, or when
+the compiler reclaims a temporary it inserted itself: reaping a carve
+credits the carve's whole extent — spent and unspent alike — to the meter
+it was carved from, and **a compiler temporary released by the compiler
+returns its charge on both backends** — the `@grad` epilogue's rewind after
+`.fwd_bwd`, and the matching rewind at the exit of a forward-only `@grad
+fn` entry, are the two such scopes today. Both are invisible to the
+program: the user never asked for those bytes and cannot name them, and
+neither scope rewinds an explicit constructor the program can still name
+(a computed tensor that escapes the same way is still rewound today): an
+explicit `vault.*`/`forge.*` constructor written inside either body keeps
+its charge, because the tensor it built can escape — into a model field,
+through a `!` parameter, into a module-level `let !` — and stay live after
+the rewind. **Nothing else returns budget.** `forge.restore(mark)` rewinds
+the bump cursor so the memory is reused and returns nothing to the meter, on
+both backends. An undeclared `forge { … }` block carves nothing and returns
+nothing (§3): a block is not a way to fit more into a budget than the
+program actually holds live.
+
+Both backends meter **requested** bytes; the JIT's chunk commitment is an
+allocator detail that asks the meter for the allocation's own need before it
+commits, and is not itself the meter. A chunk is sized from that need —
+aligned, never from what is left of `--forge` — and the bytes a chunk
+physically commits are compared against nothing: the refusal decision and
+the "free" figure in an exhaustion message are both read off the
+requested-byte meter alone.
+
+The two backends are **not** interchangeable for a given budget. Both now
+charge every materialized tensor, intermediates included, at its declared
+element width, and both return a compiler temporary's charge at the same
+two scopes — but the interpreter's real storage is still f64 where the
+JIT's is f32, and the two carry different, independently-filed
+over-charges (the JIT's chunk alignment; its per-rebind copy for `let y = x`,
+which the interpreter makes on the Rust heap and does not meter; the JIT's
+per-string charge, below; and the JIT's Forge
+materialization of a model literal and of a `?`-propagated `(T, Err)`
+tuple — 64 B per value, measured by the budget acceptance program, which
+`dmc run` builds outside any arena), so the
+same program can still fit under `dmc run --forge=N` and
+exhaust under `dmc jit --forge=N`, or the reverse. Two systematic
+differences remain, both measured rather than estimated: `--forge` covers a
+`vault.*` constructor under `dmc jit` (one arena) but not under `dmc run`
+(two), and the scratch a backward pass takes INSIDE one VJP rule — a
+matmul's transposes, the buffer an accumulating `+=` produces — differs
+between the two backward implementations, so only the adjoints a pass
+*publishes* are a set they agree on. Size each backend against its own
+measurements.
+
+The two backends' string minimums agree up to a per-string residual. The
+JIT's forge string layout is `[len: i64][bytes]`, so every fresh string —
+the `+` result included — costs `dmc jit` an extra 8-byte header and then
+rounds up to the 64-byte SIMD alignment (§1.2); the JIT also charges every
+STRING LITERAL occurrence as its own materialization, which `dmc run` never
+does (a bare literal is not *produced* by anything). `"lit" + to_str(f32)`
+costs 9 B under `dmc run` (3 B for `to_str`'s builtin result, 6 B for the
+concat) and 192 B under `dmc jit` (three forge strings — `"lit"`,
+`to_str`'s result, and the concat — each header-plus-content rounded up to
+64 B). `let !s = ""  for i in 0..1000 { s = s + "x" }` costs `dmc run`
+500 500 B (1+2+…+1000, the exact cumulative byte length of each concat
+result) and `dmc jit` 604 224 B. The 604 224 is exact, not estimated:
+Σ align_up₆₄(n + 8) for n = 1..1000 — the 1000 concat results, each an
+8-byte header plus its `n`-byte content — is 540 160, and the 1001 literal
+allocations (the loop's 1000 `"x"`s plus the initial `""`) each round up to
+the one-chunk minimum, 64 B, for another 1001 × 64 = 64 064. Neither the
+header nor the literal-materialization charge is chased to zero; they sit
+beside the chunk alignment and the per-rebind copy in the over-charge list
+above. A `let`-bound arena constructor is no longer among them: `let t =
+forge.ones[…]` was charged twice on the JIT and once on the interpreter,
+and the JIT now charges it once, like the block form.
 
 Under `dmc test --jit`, every test gets the whole budget: the interpreter
 is rebuilt per test and the JIT's arena is reset alongside it. A test that
@@ -250,6 +329,91 @@ arena. Vault data reaching a write site through an alias, a `!`
 parameter, or a model field is not yet tracked (those need the arena
 tag to travel with the *type*, which is a spec-level change).
 
+### 3.2 Budgets
+
+*(Implemented on both backends; see the end of this section.)* A **budget** is a host-lifetime handle on a region of Forge, carved from a
+parent budget and bounded by the parent's free capacity at the time of the
+carve. `forge.root` names the process-wide root budget that `--forge`
+sizes. Four operations:
+
+```
+forge.carve(parent: Budget, bytes: i64) -> Budget   # carve a child, checked against the parent's free capacity
+forge.zeros[f32, [N]]                               # charged to the entered budget
+forge.zeros[f32, [N]] in b                          # charged to `b` instead, an explicit override
+forge.reap(b: Budget) -> nil                        # release `b`'s region; credit its whole extent to its parent
+forge.enter(b) { ... }                              # push `b` as the entered budget for the block
+```
+
+`forge.enter(b) { ... }` has a lexical **attribution** extent and a
+host-controlled **lifetime**: the entered-budget register it pushes is
+per-invocation state, restored on every exit edge — normal exit, `return`,
+`break`, `continue`, and `?` (an early return, the fifth edge) — and not
+carried across a host call or a scheduler yield, both being returns out of
+demoniC code. Nothing is reaped when the block exits; `b` outlives it. Only
+allocation is ambient — `forge.carve` and `forge.reap` name their budget
+argument directly.
+
+A `Budget` is an opaque descriptor — one machine word, no arithmetic, no
+ordering, no literal, not a tensor and not a model. Assignment copies the
+descriptor, and both copies name the *same* budget, so §4's CoW does not
+apply. A `Budget` may be stored in a model field, held in a `[Tenant; N]`,
+and returned from a fn; no `!` marks one anywhere.
+
+**Refusals, and the runtime errors:**
+
+- A `forge.carve` past the parent's free capacity is a **runtime refusal**
+  (`budget-carve`), at the carve. Not check-time: `--forge` is a runtime
+  flag, so no static parent capacity exists for `dmc check` to read.
+- A `forge.reap` with a live child is a **runtime refusal**
+  (`budget-reap`), at the reap.
+- **Well-formedness stays check-time**: a `Budget`-typed first argument to
+  `forge.carve`, an integral second, and a non-positive `bytes` *literal*
+  are ordinary type errors — the one static slice of the two rules above
+  that a checker with no arena state can still decide.
+- `budget-arena` — one check-time class, two instances, always "an
+  allocation whose bytes no budget can own, written as though a budget
+  owned them": **(i)** `forge.kv` / `stream.kv` inside a budgeted extent —
+  Stream is not a region a `forge.reap` can release (§9); **(ii)**
+  `vault.<ctor>[…] in b` — a budget is a region of Forge, so `b` cannot own
+  vault-charged bytes. The complement is not a refusal, and it is the line
+  that lets a tenant's weights work: `vault.<ctor>[…]` with **no** `in b`,
+  inside `forge.enter(b) { … }`, charges the **root** on both backends and
+  therefore survives `forge.reap(b)`. Its *arguments* do not — a shape
+  expression or a fill is ordinary code in the entered extent, charged to
+  `b` and invalid after the reap.
+- A stale budget handle — naming a budget already reaped — is a
+  **runtime error**, at carve, reap, enter, or `in b`. Never a check-time
+  refusal: a `Budget` in a model field puts the reap and the use in
+  different functions by design.
+
+**Invalidity.** Every value allocated in `b` is **invalid after
+`reap(b)`** — the same status a tensor already has after `forge.restore`
+(§1.1). The language tracks no reference into a budget's bytes, so nothing
+checks this: the host is expected to exit the tenant's processes before
+reaping, and a value the host designates to survive a reap is *copied*
+into the parent's budget and charged there, the original left
+unreachable.
+
+All four operations are built, on both backends: `Budget` is a real type,
+`forge.root` names entry 0, `forge.carve` and `forge.reap` move the meter,
+and `forge.enter(b) { … }` and `... in b` push the entered budget — the
+first charging allocations inside a lexical extent, the second overriding
+it for one constructor. A program that never carves runs on entry 0 and
+behaves exactly as it did before any of this, which is the compatibility
+gate each step held to. The acceptance program that asserts §1.1's
+hierarchical rule end to end is `examples/tenant_budgets.dmc`: every budget
+in it is carved at exactly what the code inside it needs, so each figure is
+a refusal boundary bisected on both backends, and the refused half of each
+section — which aborts rather than returning `false`, and so cannot live in
+an example — is pinned in `tools/jit_probes.py`, with the two-sided bracket
+in `compiler/tests/budgets_acceptance.rs`.
+
+One property the acceptance program does **not** discharge, and which a host
+embedding owes its own test: a budget entered either side of a HOST call is
+unobservable from inside the language today — `dmc run` refuses to call an
+`extern fn`, and `dmc jit`'s never re-enters demoniC — so the entered-budget
+register has no host boundary here to survive.
+
 ---
 
 ## 4. Copy-on-Write
@@ -360,13 +524,20 @@ distinction matters and will be enforced by the runtime.
 ## 7. What does not exist
 
 To make the absence explicit, the following are **not features** of
-demoniC and never will be:
+demoniC and never will be, except where a bullet below names its own
+exception:
 
 - A garbage collector of any kind.
 - Reference counting (`Rc`, `Arc`, `shared_ptr`).
 - Weak references.
 - Finalizers, destructors, `Drop`, RAII.
-- A free function. `forge.reset()` is the only reclamation primitive.
+- A free function in the general sense. `forge.reset()` is a reclamation
+  primitive; so is `forge.reap(b)` *(§3.2)*, which releases a carved
+  budget's region and credits its whole
+  extent to the meter it was carved from *because* it releases it; so,
+  once implemented, is `release(kv)` *(specified, not yet implemented —
+  an undefined identifier today; §9)*. No other reclamation primitive
+  exists.
 - Thread-local heaps. The Vault is shared; the Forge is per-worker
   (§8).
 

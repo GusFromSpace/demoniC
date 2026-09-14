@@ -7,8 +7,9 @@
 //! surface. The lowerable set is *not* enumerated here on purpose: it moves, and
 //! a hand-maintained list rots (this doc claimed "no tensors, no match, no for"
 //! long after all three lowered — the #408 stale-doc finding). For the authoritative,
-//! reproducible map run `python3 tools/jit_surface.py`; for the design rationale
-//! see `docs/design/DERIVED_SUITE.md §4`. Sketch as of that enumeration:
+//! reproducible map run `python3 tools/jit_surface.py`; the rationale is to
+//! derive the set from behavior rather than hand-list it. Sketch as of that
+//! enumeration:
 //!
 //!   - scalars: i32/i64/f32/f64/bool/nil — arithmetic, comparison, logical,
 //!     bitwise, casts, unary `-`/`!`, if/else + match as expressions, while/for
@@ -50,7 +51,7 @@ static JIT_CODEGEN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 
 // ─── Diagnostics ─────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JitError {
     pub msg: String,
     pub line: usize,
@@ -105,6 +106,10 @@ pub enum Refusal {
     /// A top-level item form the JIT does not lower.
     Item,
     /// A multi-file `use` import. The JIT is single-file (#15 slice 1).
+    // Stale as of #661 (the multi-file merge landing): multi-file programs now
+    // lower through the merge pass (merge.rs) and this code only fires when
+    // that merge itself refuses. Left as-is here — this doc, DIAGNOSTICS.md
+    // §5.2, and the roadmap entry for it are rewritten together in slice 4 (#663).
     Import,
     /// An `extern` declaration form.
     Extern,
@@ -316,12 +321,14 @@ enum ScalarKind {
     ///
     /// Zero-extension makes the unsigned kinds non-negative i64s, so the signed
     /// `sdiv`/`srem`/`sshr`/`icmp` the lowering already emits ARE the unsigned
-    /// operations — no unsigned instruction set is needed. `u64` has no variant
-    /// here: it stays `I64` (see `interp::IW`), where the 64-bit wrap is
-    /// bit-identical and the i64 backing has no room for the top half of the
-    /// unsigned range. `int8` shares `I8` and `int4` is `I4` (SPEC §3.1's
-    /// packed signed 8-/4-bit types).
-    I8, I16, I4, U8, U16, U32,
+    /// operations for `U8`/`U16`/`U32` — no unsigned instruction set is needed
+    /// there. `U64` (#597) breaks that trick: its machine width already IS its
+    /// arithmetic width (nothing to zero-extend from), so its pattern can be a
+    /// genuinely negative `i64` (the top bit set) and the lowering picks the
+    /// unsigned instruction (`udiv`/`urem`/`ushr`/unsigned `icmp`) explicitly
+    /// wherever `is_signed_int()` is false — see `lower_binop`. `int8` shares
+    /// `I8` and `int4` is `I4` (SPEC §3.1's packed signed 8-/4-bit types).
+    I8, I16, I4, U64, U8, U16, U32,
     /// A maybe-nil i64 — the result of `map_get`, which is dynamically typed
     /// (`Unknown`) and returns `nil` on a missing key in the interpreter (#300.4).
     /// Packed into an I128: high bit = present flag, low 64 bits = the value.
@@ -344,15 +351,18 @@ impl ScalarKind {
             ScalarKind::Bool => cl::I8,
             ScalarKind::Nil  => cl::I8,
             ScalarKind::OptI64 => cl::I128,
-            // #544: masked, i64-backed (see the variant docs).
-            ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
+            // #544: masked, i64-backed (see the variant docs). #597: `U64` is
+            // i64-backed too, but unmasked — its machine width IS its
+            // arithmetic width, so it is not `is_masked_int` (below).
+            ScalarKind::U64
+            | ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
             | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32 => cl::I64,
         }
     }
 
     fn is_int(self) -> bool {
         matches!(self, ScalarKind::I32 | ScalarKind::I64
-            | ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
+            | ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4 | ScalarKind::U64
             | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32)
     }
     fn is_float(self) -> bool {
@@ -380,11 +390,50 @@ impl ScalarKind {
     fn bits(self) -> u8 {
         match self {
             ScalarKind::I32 | ScalarKind::F32 => 32,
-            ScalarKind::I64 | ScalarKind::F64 => 64,
+            ScalarKind::I64 | ScalarKind::F64 | ScalarKind::U64 => 64,
             ScalarKind::Bool | ScalarKind::Nil => 8,
             ScalarKind::OptI64 => 128,
             ScalarKind::I8 | ScalarKind::I16 | ScalarKind::I4
             | ScalarKind::U8 | ScalarKind::U16 | ScalarKind::U32 => 64,
+        }
+    }
+
+    /// STORAGE width of a tensor element of this kind, in bytes — the lane a
+    /// `Tensor[T, …]` element occupies in the arena, which is the width `T`
+    /// names and NOT the register the value computes in. The two differ for
+    /// every masked narrow kind: a `u8` element is one byte in memory and a
+    /// 64-bit register in flight. Keeping the two separate is #552's lesson
+    /// generalized — a load at the compute width over a narrower buffer reads
+    /// past the element, and a store at it scribbles on the next one.
+    fn store_bytes(self) -> i64 {
+        match self {
+            ScalarKind::Bool | ScalarKind::Nil
+            | ScalarKind::I8 | ScalarKind::U8 | ScalarKind::I4 => 1,
+            ScalarKind::I16 | ScalarKind::U16 => 2,
+            ScalarKind::I32 | ScalarKind::U32 | ScalarKind::F32 => 4,
+            // `U64` (#597/#643) is a full-width kind, not a masked narrow one:
+            // its storage lane IS its machine word, so it lands here with
+            // `I64` rather than needing a mask on the way in and out.
+            ScalarKind::I64 | ScalarKind::U64 | ScalarKind::F64 => 8,
+            ScalarKind::OptI64 => 16,
+        }
+    }
+
+    /// The Cranelift type of that storage lane — what a tensor element load
+    /// reads and a store writes, before the extend/truncate that moves it to
+    /// and from `cl()`. Equal to `cl()` for every kind whose storage width is
+    /// its machine width.
+    fn store_cl(self) -> ClType {
+        match self {
+            ScalarKind::F32 => cl::F32,
+            ScalarKind::F64 => cl::F64,
+            ScalarKind::OptI64 => cl::I128,
+            _ => match self.store_bytes() {
+                1 => cl::I8,
+                2 => cl::I16,
+                4 => cl::I32,
+                _ => cl::I64,
+            },
         }
     }
 
@@ -425,6 +474,7 @@ impl ScalarKind {
             ScalarKind::I8  => "i8",
             ScalarKind::I16 => "i16",
             ScalarKind::I4  => "int4",
+            ScalarKind::U64 => "u64",
             ScalarKind::U8  => "u8",
             ScalarKind::U16 => "u16",
             ScalarKind::U32 => "u32",
@@ -432,19 +482,97 @@ impl ScalarKind {
     }
 }
 
-/// The `ScalarKind` a fixed-width integer scalar type lowers to (#544). The
-/// mirror of `interp::scalar_int_width` — the two tables must agree or the
-/// backends wrap at different widths. `u64` maps to `I64`: the 64-bit wrap is
-/// bit-identical and neither backend can hold the top half of the u64 range.
+/// The `ScalarKind` a fixed-width integer scalar type lowers to (#544; `u64`
+/// given its own kind by #597). The mirror of `interp::scalar_int_width` — the
+/// two tables must agree or the backends wrap at different widths. `u64` now
+/// maps to its own `U64` kind rather than sharing `I64`: the storage is still
+/// one `cl::I64` slot (no wider machine word exists), but the kind now records
+/// that the pattern is read unsigned by `lower_binop`'s `/ % >>` and ordering
+/// comparisons.
 fn narrow_scalar_kind(s: &ScalarType) -> Option<ScalarKind> {
     Some(match s {
         ScalarType::I8 | ScalarType::Int8 => ScalarKind::I8,
         ScalarType::I16 => ScalarKind::I16,
         ScalarType::Int4 => ScalarKind::I4,
+        ScalarType::U64 => ScalarKind::U64,
         ScalarType::U8  => ScalarKind::U8,
         ScalarType::U16 => ScalarKind::U16,
         ScalarType::U32 => ScalarKind::U32,
-        ScalarType::U64 => ScalarKind::I64,
+        _ => return None,
+    })
+}
+
+/// The `ScalarKind` a **tensor element type** lowers to (#274/#571/#632) —
+/// the one table every element-type site keys off, so the four hand-copied
+/// `match`es that used to answer this question cannot drift apart again.
+///
+/// The integer rows are exactly the interpreter's `int_type_name_width`:
+/// `u8`/`u16`/`u32` are the zero-extended masked kinds, `i8`/`i16` (and
+/// `int8`, SPEC §3.1's packed signed 8-bit type) the sign-extended ones, and
+/// `u64` gets its own `U64` kind. `u64` USED to share `I64` here, on the
+/// reasoning that `interp::IW` had no `U64` and the 64-bit wrap is
+/// bit-identical either way. #643 falsified that: it added `IW::U64` and made
+/// `/ % >>` and the ordering comparisons read the pattern unsigned, so the
+/// two kinds now differ above 2^63 even though the bits and the storage lane
+/// (one 8-byte slot — no wider machine word exists) are identical. Sharing
+/// `I64` would silently give a `Tensor[u64, …]` element signed division.
+/// `bf16`/`f16`/`tf32` stay f32-backed, the #179 no-op convention. `int4` is
+/// deliberately absent: 4 bits is not a storage lane, so a tensor of it is
+/// still refused rather than silently widened.
+fn tensor_elem_kind(s: &ScalarType) -> Option<ScalarKind> {
+    Some(match s {
+        ScalarType::F32 | ScalarType::Bf16 | ScalarType::F16 | ScalarType::Tf32
+            => ScalarKind::F32,
+        ScalarType::F64 => ScalarKind::F64,
+        ScalarType::Bool => ScalarKind::Bool,
+        ScalarType::I64 => ScalarKind::I64,
+        ScalarType::U64 => ScalarKind::U64,
+        ScalarType::I32 => ScalarKind::I32,
+        ScalarType::U32 => ScalarKind::U32,
+        ScalarType::I16 => ScalarKind::I16,
+        ScalarType::U16 => ScalarKind::U16,
+        ScalarType::I8 | ScalarType::Int8 => ScalarKind::I8,
+        ScalarType::U8 => ScalarKind::U8,
+        _ => return None,
+    })
+}
+
+/// The element width an integer elementwise op computes at, given its two
+/// operand widths — the mirror of `interp::IW::join`, and the reason `u8_t .+
+/// [1, 2, 3]` wraps at 8 bits on both backends. The NARROWER width wins,
+/// regardless of which side it is on. The checker does NOT forbid two
+/// differently-named narrow kinds meeting — `u8 .+ i16`, `u8 .+ u32`, and
+/// `u32 .+ i32` all pass `--check` and reach this fall-through, matched by six
+/// probes in `tensor_elem_types_632.rs`. `I64` never wins a join against a
+/// named narrow kind: it is what an untyped integer literal (or a literal
+/// tensor built from them) is tagged before SPEC §3.1 has it adopt the other
+/// operand's type, so it only ever meets a narrow kind, never IS one. At EQUAL
+/// width the two kinds are otherwise unordered, so the join ties to `a` — the
+/// LEFT operand — which is why `u32 .+ i32` and `i32 .+ u32` compute at
+/// different (same-width) kinds and can disagree on sign.
+fn elem_kind_join(a: ScalarKind, b: ScalarKind) -> ScalarKind {
+    if a == b { return a; }
+    if a == ScalarKind::I64 { return b; }
+    if b == ScalarKind::I64 { return a; }
+    if a.int_bits() <= b.int_bits() { a } else { b }
+}
+
+/// `tensor_elem_kind` keyed by the spelling an arena constructor names it with
+/// (`forge.zeros[u8, [N]]`) — the JIT twin of `interp::arena_ctor_dtype`. The
+/// two tables are asserted equal element-by-element in `elem_kind_tables_agree`.
+fn tensor_elem_kind_by_name(name: &str) -> Option<ScalarKind> {
+    Some(match name {
+        "f32" | "bf16" | "f16" | "tf32" => ScalarKind::F32,
+        "f64" => ScalarKind::F64,
+        "bool" => ScalarKind::Bool,
+        "i64" => ScalarKind::I64,
+        "u64" => ScalarKind::U64,
+        "i32" => ScalarKind::I32,
+        "u32" => ScalarKind::U32,
+        "i16" => ScalarKind::I16,
+        "u16" => ScalarKind::U16,
+        "i8" | "int8" => ScalarKind::I8,
+        "u8" => ScalarKind::U8,
         _ => return None,
     })
 }
@@ -465,9 +593,14 @@ fn mask_const_to_kind(n: i64, k: ScalarKind) -> i64 {
     }
 }
 
-/// Scalar integer types the JIT has no dedicated `ScalarKind` for, but which a
-/// `... as T` cast can still target (the result is an i64-backed scalar holding
-/// the wrapped/narrowed value, exactly as the interpreter represents them).
+/// Scalar integer types an `... as T` cast targets by going through
+/// `lower_narrow_int_cast` rather than the generic `coerce_to` path (the
+/// result is an i64-backed scalar holding the wrapped/narrowed value, exactly
+/// as the interpreter represents them). `u64` (#597) has its own `ScalarKind`
+/// now, but still routes here: `lower_narrow_int_cast` has always needed a
+/// special case for it (unsigned-saturating float source, `MIN..MAX` int
+/// reinterpretation otherwise), and it now tags the result `ScalarKind::U64`
+/// via `narrow_scalar_kind` instead of falling back to `I64`.
 fn scalar_int_is_narrow(s: &ScalarType) -> bool {
     matches!(s,
         ScalarType::I8 | ScalarType::I16 | ScalarType::U8 | ScalarType::U16
@@ -536,8 +669,8 @@ fn scalar_from_ast(ty: &Type) -> Result<ScalarKind, JitError> {
             other if narrow_scalar_kind(other).is_some() =>
                 Ok(narrow_scalar_kind(other).unwrap()),
             other => unsupported_msg(&span, Refusal::TypeForm, format!(
-                "scalar type `{:?}` is not lowered by the JIT; use `dmc run` for full semantics",
-                other,
+                "scalar type `{}` is not lowered by the JIT; use `dmc run` for full semantics",
+                crate::fmt::scalar_type_str(other),
             )),
         },
         _ => unsupported(&span, Refusal::TypeForm, "a non-scalar type where the JIT needs a scalar"),
@@ -560,8 +693,11 @@ impl TensorTy {
         self.shape.iter().try_fold(1i64, |acc, &d| acc.checked_mul(d))
             .expect("tensor element count overflows i64 (shape too large)")
     }
-    fn nbytes(&self) -> i64 { self.nelems() * (self.elem.bits() as i64 / 8) }
-    fn elem_bytes(&self) -> i64 { self.elem.bits() as i64 / 8 }
+    fn nbytes(&self) -> i64 { self.nelems() * self.elem_bytes() }
+    /// The element's STORAGE width, not its machine width: a `Tensor[u8, …]`
+    /// element is one byte even though the value computes in a 64-bit
+    /// register (`ScalarKind::store_bytes`).
+    fn elem_bytes(&self) -> i64 { self.elem.store_bytes() }
 
     fn render(&self) -> String {
         let s: Vec<String> = self.shape.iter().map(|d| d.to_string()).collect();
@@ -784,6 +920,15 @@ enum TyKind {
     /// layout does not vary with the element types. A 1-tuple is never
     /// constructed: `(T)` is transparently `T`, matching both backends.
     Tuple(Vec<TyKind>),
+    /// #674 slice 3c (the arena-budget design's §2.2, §3.1): a host-
+    /// lifetime budget handle — the packed descriptor `(generation << 20) | index`,
+    /// one opaque i64, no arithmetic, no ordering, no literal. A DIFFERENT
+    /// representation from `TyKind::Model`'s forge-allocated-pointer
+    /// convention (`types.rs::TyType::Budget` is its checker-side sibling) —
+    /// a `Budget` value is never dereferenced, so it must not fall into the
+    /// generic `Type::Named` → `Model` mapping the way an unrecognized
+    /// nominal type otherwise would (`ty_from_ast`, `lower_ty_for_model`).
+    Budget,
 }
 
 impl TyKind {
@@ -811,6 +956,7 @@ impl TyKind {
                 let es: Vec<String> = els.iter().map(|e| e.render()).collect();
                 format!("({})", es.join(", "))
             }
+            TyKind::Budget => "Budget".to_string(),
         }
     }
     fn as_scalar(&self) -> Option<ScalarKind> {
@@ -839,6 +985,7 @@ impl TyKind {
             TyKind::Enum(_)   => cl::I64,  // #350: enums are i64 ordinals
             TyKind::Fn(_, _)         => cl::I64, // function pointers are i64 code pointers
             TyKind::Tuple(_)  => cl::I64,  // tuples are i64 pointers to slot arrays
+            TyKind::Budget    => cl::I64, // #674 slice 3c: one opaque packed descriptor word
         }
     }
     fn is_tensor(&self) -> bool { matches!(self, TyKind::Tensor(_)) }
@@ -847,6 +994,8 @@ impl TyKind {
     /// opaque in both backends, so every str operation must miss it.
     fn is_port(&self) -> bool { matches!(self, TyKind::Port(_)) }
     fn is_map(&self) -> bool { matches!(self, TyKind::Map) }
+    /// #674 slice 3c: a host-lifetime `Budget` handle (§2.2).
+    fn is_budget(&self) -> bool { matches!(self, TyKind::Budget) }
 }
 
 /// #578: is `ty` a type this backend can put in a C ABI signature?
@@ -923,6 +1072,93 @@ fn process_symbol_present(name: &str) -> Option<bool> {
 #[cfg(not(unix))]
 fn process_symbol_present(_name: &str) -> Option<bool> { None }
 
+/// Pre-resolve a top-level `type` alias (SPEC.md §6.6) to its target,
+/// chasing a chain of aliases (`type A = B  type B = u8`). Unlike `enumify`
+/// below, this must run *before* `ty_from_ast`/`lower_ty_for_model`, not
+/// after: those functions have no representation for "this Model name was
+/// actually a `Tensor[f32,[768]]`" to recover post hoc, only for "this Model
+/// name was actually an enum" (an enum value stays a bare i64 ordinal either
+/// way).
+///
+/// **Recursive**, mirroring `check.rs::resolve_type`: an alias is transparent
+/// wherever it is written, not only in the outermost position. `Tensor[E,[3]]`
+/// with `type E = f32` becomes `Tensor[f32,[3]]`, `(Byte, i64)` becomes
+/// `(u8, i64)`, and the same holds inside `View`/`KV`/`fn(..)->..`/`[T; N]`/
+/// `*T`. A shallow (outermost-only) rewrite left those nested names to be read
+/// as unknown model names further down, which is how an alias in a nested
+/// position produced a `jit-conversion` or a bare `jit-error` instead of
+/// compiling.
+///
+/// **Total on the alias table**: a name that *is* a top-level alias either
+/// resolves to its target or is refused here as `Refusal::TypeForm`
+/// (`jit-type-form`) at the use site's span — it never escapes as a
+/// `Type::Named` for the "unknown model" path to misread. That path reports a
+/// compiler defect (`jit-error`, #480), which is the wrong signal for "this
+/// program is valid per SPEC, the JIT just doesn't lower this alias form".
+/// Refused today: a *shape-generic* alias (`type Batch[B] = Tensor[f32,[B,8]]`),
+/// because substituting its shape arguments at the use site is separate work;
+/// and an arg-count mismatch, which the checker reports properly anyway.
+/// A `Type::Named` that is not in the alias table (a model, an enum, `any`,
+/// `Map`, `Port`) is returned untouched — this function only speaks for
+/// aliases.
+///
+/// The `depth` bound stops a cyclic chain (`type A = B  type B = A`): each
+/// alias *expansion* costs one, so a chain longer than the table has to have
+/// repeated a name. The checker already refuses a recursive alias
+/// (`check.rs::resolve_type_alias`), so this is a defensive cap for when the
+/// JIT runs ahead of/without that check, not the primary guard.
+fn resolve_alias_ty(ty: &Type, aliases: &HashMap<String, TypeAlias>) -> Result<Type, JitError> {
+    resolve_alias_ty_at(ty, aliases, 0)
+}
+
+fn resolve_alias_ty_at(
+    ty: &Type,
+    aliases: &HashMap<String, TypeAlias>,
+    depth: usize,
+) -> Result<Type, JitError> {
+    if depth > aliases.len() {
+        return unsupported(&type_span(ty), Refusal::TypeForm,
+            "a recursive `type` alias chain");
+    }
+    let rec = |t: &Type| resolve_alias_ty_at(t, aliases, depth);
+    Ok(match ty {
+        Type::Scalar(..) | Type::Mesh(..) => ty.clone(),
+        Type::Tensor(inner, sh, sp) =>
+            Type::Tensor(Box::new(rec(inner)?), sh.clone(), sp.clone()),
+        Type::View(inner, sh, sp) =>
+            Type::View(Box::new(rec(inner)?), sh.clone(), sp.clone()),
+        Type::KV(inner, sh, sp) =>
+            Type::KV(Box::new(rec(inner)?), sh.clone(), sp.clone()),
+        Type::Fn(args, ret, sp) => Type::Fn(
+            args.iter().map(rec).collect::<Result<Vec<_>, _>>()?,
+            Box::new(rec(ret)?), sp.clone()),
+        Type::Tuple(els, sp) =>
+            Type::Tuple(els.iter().map(rec).collect::<Result<Vec<_>, _>>()?, sp.clone()),
+        Type::Array(inner, n, sp) =>
+            Type::Array(Box::new(rec(inner)?), n.clone(), sp.clone()),
+        Type::RawPtr(inner, sp) => Type::RawPtr(Box::new(rec(inner)?), sp.clone()),
+        Type::Named { name, args, span } => match aliases.get(name) {
+            // Not an alias — a model, an enum, `any`, `Map`, `Port`. Leave it
+            // to the type-building site that knows about those.
+            None => ty.clone(),
+            Some(alias) if alias.shape_params.is_empty() && args.is_empty() =>
+                resolve_alias_ty_at(&alias.ty, aliases, depth + 1)?,
+            Some(alias) if !alias.shape_params.is_empty() =>
+                return unsupported_msg(span, Refusal::TypeForm, format!(
+                    "a shape-generic `type` alias (`{}[{}]`) in a type position — \
+                     the JIT does not substitute its shape arguments; \
+                     use `dmc run` for full semantics",
+                    name,
+                    alias.shape_params.iter().map(|p| p.name.as_str())
+                        .collect::<Vec<_>>().join(", "))),
+            Some(_) => return unsupported_msg(span, Refusal::TypeForm, format!(
+                "`type` alias `{}` written with {} shape argument(s) but declared \
+                 with none; use `dmc run` for full semantics",
+                name, args.len())),
+        },
+    })
+}
+
 /// #350: post-resolve enum-named types. `ty_from_ast` / `lower_ty_for_model`
 /// have no view of the enum registry, so an enum-named type (`l: Light`) comes
 /// back as `TyKind::Model("Light", [])`. Rewrite any such name that is actually
@@ -964,15 +1200,15 @@ struct EnumLayout {
 /// `env` resolves shape parameters (e.g., `Tensor[f32, [M, K]]`) to their
 /// concrete dimensions at the call site. Pass an empty env when no shape
 /// parameters are in scope.
-fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError> {
+fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>, consts: ConstDims<'_>) -> Result<TyKind, JitError> {
     match ty {
         // `(A, B)` — a tuple type. The parser also builds a 1-element Tuple
         // for plain parenthesised grouping, so `(T)` must stay transparently
         // `T`; both backends agree on that (interp unwraps 1-tuples too).
-        Type::Tuple(els, _) if els.len() == 1 => ty_from_ast(&els[0], env),
+        Type::Tuple(els, _) if els.len() == 1 => ty_from_ast(&els[0], env, consts),
         Type::Tuple(els, _) => {
             let mut out = Vec::with_capacity(els.len());
-            for e in els { out.push(ty_from_ast(e, env)?); }
+            for e in els { out.push(ty_from_ast(e, env, consts)?); }
             Ok(TyKind::Tuple(out))
         }
         Type::Scalar(ScalarType::Str, _) => Ok(TyKind::Str),
@@ -981,7 +1217,7 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
             // Trit element — packed ternary weight; must be exactly 2-D.
             if matches!(inner.as_ref(), Type::Scalar(ScalarType::Trit, _)) {
                 let dims: Vec<i64> = shape.elems.iter().map(|d| {
-                    resolve_shape_elem(d, env, span)
+                    resolve_shape_elem(d, env, consts, span)
                 }).collect::<Result<_, _>>()?;
                 if dims.len() != 2 {
                     return unsupported(span, Refusal::Rank,
@@ -989,30 +1225,27 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                 }
                 return Ok(TyKind::TritTensor(TritTensorTy { k: dims[0], n: dims[1] }));
             }
+            // #274/#632: the element kind comes from the one shared table
+            // (`tensor_elem_kind`), which mirrors the interpreter's — bf16/f16/
+            // tf32 are f32-backed (#179/#237's no-op convention), every
+            // byte-aligned integer width is its own storage lane, and the
+            // load/store/offset core is width-generic (`tensor_byte_offset`
+            // scales by `elem_bytes`, `tensor_load_elem` reads `store_cl` and
+            // widens). Float-math ops (matmul, softmax, …) stay f32-only.
             let elem = match inner.as_ref() {
-                Type::Scalar(s, _) => match s {
-                    ScalarType::F32 => ScalarKind::F32,
-                    // bf16/f16/tf32 compute as f32 (#179/#237 no-op convention),
-                    // so an annotated `Tensor[bf16, ..]` binding is f32-backed —
-                    // matches the constructor path (lower_arena_alloc).
-                    ScalarType::Bf16 | ScalarType::F16 | ScalarType::Tf32 => ScalarKind::F32,
-                    // #274: integer-element tensors (token ids, index/gather
-                    // data). The load/store/offset core is width-generic
-                    // (tensor_byte_offset uses elem_bytes; tensor_load_elem loads
-                    // at elem.cl()); float-math ops (sum/matmul/…) stay f32-only.
-                    ScalarType::I64 | ScalarType::U64 => ScalarKind::I64,
-                    ScalarType::I32 | ScalarType::U32 => ScalarKind::I32,
-                    other => return unsupported_msg(span, Refusal::ElementType, format!(
-                        "tensor element type `{:?}` is not lowered (f32/bf16/i64/i32 only); \
+                Type::Scalar(s, _) => match tensor_elem_kind(s) {
+                    Some(k) => k,
+                    None => return unsupported_msg(span, Refusal::ElementType, format!(
+                        "tensor element type `{}` is not lowered; \
                          use `dmc run` for full semantics",
-                        other,
+                        crate::fmt::scalar_type_str(s),
                     )),
                 },
                 _ => return err(span, "tensor element must be a scalar"),
             };
             let mut dims: Vec<i64> = Vec::with_capacity(shape.elems.len());
             for d in &shape.elems {
-                let val = resolve_shape_elem(d, env, span)?;
+                let val = resolve_shape_elem(d, env, consts, span)?;
                 if val <= 0 {
                     return err(span, format!("tensor dim must be > 0, got {}", val));
                 }
@@ -1043,7 +1276,7 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                         stream_axis = Some(i);
                     }
                     _ => {
-                        let val = resolve_shape_elem(d, env, span)?;
+                        let val = resolve_shape_elem(d, env, consts, span)?;
                         if val <= 0 {
                             return err(span, format!("KV dim must be > 0, got {}", val));
                         }
@@ -1060,7 +1293,29 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
         Type::RawPtr(_, _) => Ok(TyKind::Scalar(ScalarKind::I64)),
         Type::Named { name, span, .. } if name == "any" => unsupported(span, Refusal::TypeForm,
             "`any`-typed values (they are dynamically typed)"),
-        Type::Named { name, .. } if name == "Map" => Ok(TyKind::Map),
+        // #695: `map` (lowercase) is the spelling `types.rs`'s checker special-
+        // cases as `TyType::Map` (its own `Display` renders the variant back
+        // as lowercase `"map"` too), so a signature written `t: map`
+        // (`examples/demonic_lexer.dmc`, `lispy_vm.dmc`) is what `dmc run`
+        // actually treats as a map. This arm fell through to the generic
+        // `Named` case below, which read `map` as an unknown model name
+        // (`TyKind::Model("map", [])`) — not a Map at all — so
+        // `map_get`/`map_set`'s `is_map()` check failed with the exact "must
+        // be a Map, got `map`" wording #695 reported.
+        //
+        // `Map` (capitalized) is recognized here too, and deliberately so —
+        // NOT because `--check` singles it out the way it does `map`. #723
+        // (filed during this PR's review) found that `resolve_type` leaves
+        // ANY undeclared `Named` type unresolved and the checker accepts it
+        // regardless of spelling — `t: Map`, `t: map`, and `t: Zorkmid` alike
+        // all pass `--check` (`check_tests.rs` ~1402 pins that `map` is NOT
+        // actually mapped to `TyType::Map`). That means a real program can
+        // and does write `t: Map` and have it run on both backends; refusing
+        // it here would be a JIT regression on live code, not a correction.
+        // #723 tracks the checker defect (silently accepting an undeclared
+        // type name) as its own bug — this arm's job is only to keep the JIT
+        // agreeing with `dmc run` on both spellings it is handed today.
+        Type::Named { name, .. } if name == "map" || name == "Map" => Ok(TyKind::Map),
         // `Port[python]` / bare `Port` (SPEC §3.11) — an open port's handle.
         // SPEC says a handle "may be passed, returned, and closed explicitly",
         // so it has to be writable in a signature; the runtime name in the
@@ -1068,26 +1323,55 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
         // shared registry does, from the handle text).
         Type::Named { name, .. } if name == "Port" =>
             Ok(TyKind::Port(crate::ports::port_type_lang(ty))),
-        Type::Named { name, args, .. } => Ok(TyKind::Model(name.clone(), type_named_dims(args, env))),
+        // `Err` (SPEC §3.9): by convention `nil` on success, a `str` message on
+        // failure — never a user model, even though it parses as one. Give it
+        // the SAME representation an ordinary `str` gets: an i64 forge-string
+        // pointer where a NULL pointer IS `nil` (the convention `dmc_str_eq`/
+        // `dmc_str_concat`/`s == nil` already implement for `Port`'s "no
+        // handle" and a decode's "no error", per the comment at `s == nil`
+        // lowering). Before this arm, `Err` fell into the generic `Named` case
+        // below and became `TyKind::Model("Err", [])` — a model the JIT never
+        // builds, so every `(T, Err)` conversion refused (#568's `jit-conversion`
+        // gap this closes).
+        //
+        // `Err` is a convention and not a reserved word, so this arm steps
+        // aside for a program that declares a `model Err` of its own: there
+        // `Err` names that model, and falling through to the generic `Named`
+        // case below lowers it exactly as it did before this arm existed.
+        //
+        // #622 put alias resolution UPSTREAM of this function — every caller
+        // runs `resolve_alias_ty` before handing a `Type` here — so a `type E =
+        // Err` arrives already rewritten to `Named { name: "Err" }` and takes
+        // this arm. That is the intended order: resolve the alias first, then
+        // read the target's representation.
+        Type::Named { name, .. } if name == "Err" && !err_is_user_model() => Ok(TyKind::Str),
+        // #674: `Budget` is reserved
+        // (`check.rs::is_reserved_type_name`) so a real `model Budget` can
+        // never exist to fall through to below — this arm just has to run
+        // before the generic `Named` case turns the name into a bogus
+        // `TyKind::Model("Budget", [])`, a forge-pointer kind `Budget`'s own
+        // codegen (`forge.carve`/`forge.reap`) never produces.
+        Type::Named { name, .. } if name == "Budget" => Ok(TyKind::Budget),
+        Type::Named { name, args, .. } => Ok(TyKind::Model(name.clone(), type_named_dims(args, env, consts))),
         // `[KV[T, [.., ~, ..]]; N]` — a fixed-size array of KV cache pointers.
         // The element type may be bf16 (quantized weights); map to f32 internally
         // since KV data in the JIT is always f32-typed for compute correctness.
         Type::Array(inner, count_expr, span) => {
             // `[ModelName; N]` -- a fixed-size array of model instance pointers.
             if let Type::Named { name, args, .. } = inner.as_ref() {
-                let n = resolve_shape_expr(count_expr, env, span)?;
+                let n = resolve_shape_expr(count_expr, env, consts, span)?;
                 if n <= 0 {
                     return err(span, format!("model array size must be > 0, got {}", n));
                 }
-                return Ok(TyKind::ModelArray(name.clone(), n, type_named_dims(args, env)));
+                return Ok(TyKind::ModelArray(name.clone(), n, type_named_dims(args, env, consts)));
             }
-            let kv_ty_raw = ty_from_ast(inner, env).or_else(|_| {
+            let kv_ty_raw = ty_from_ast(inner, env, consts).or_else(|_| {
                 // Accept bf16 KV by substituting f32 (JIT handles bf16 @cast as no-op).
                 if let Type::KV(elem, shape, kspan) = inner.as_ref() {
                     if matches!(elem.as_ref(), Type::Scalar(ScalarType::Bf16, _)
                                              | Type::Scalar(ScalarType::F16, _)) {
                         let f32_elem = Box::new(Type::Scalar(ScalarType::F32, kspan.clone()));
-                        return ty_from_ast(&Type::KV(f32_elem, shape.clone(), kspan.clone()), env);
+                        return ty_from_ast(&Type::KV(f32_elem, shape.clone(), kspan.clone()), env, consts);
                     }
                 }
                 unsupported(span, Refusal::TypeForm,
@@ -1098,7 +1382,7 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
                 _ => return unsupported(span, Refusal::TypeForm,
                         "an array type other than `[KV[...]; N]` or `[ModelName; N]`"),
             };
-            let n = resolve_shape_expr(count_expr, env, span)?;
+            let n = resolve_shape_expr(count_expr, env, consts, span)?;
             if n <= 0 {
                 return err(span, format!("KV array size must be > 0, got {}", n));
             }
@@ -1107,9 +1391,9 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
         // `fn(T1, T2) -> R` — first-class function pointer, represented as i64.
         Type::Fn(param_tys, ret_ty, _) => {
             let params = param_tys.iter()
-                .map(|p| ty_from_ast(p, env))
+                .map(|p| ty_from_ast(p, env, consts))
                 .collect::<Result<Vec<_>, _>>()?;
-            let ret = ty_from_ast(ret_ty, env)?;
+            let ret = ty_from_ast(ret_ty, env, consts)?;
             Ok(TyKind::Fn(params, Box::new(ret)))
         }
         _ => unsupported(&type_span(ty), Refusal::TypeForm,
@@ -1120,7 +1404,7 @@ fn ty_from_ast(ty: &Type, env: &HashMap<String, i64>) -> Result<TyKind, JitError
 /// Lower an AST `Type` to `TyKind` for use in model field declarations.
 /// All scalars map to their corresponding `ScalarKind`; named types (model
 /// references) and other pointer-sized types map to `I64`.
-fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Result<TyKind, JitError> {
+fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, consts: ConstDims<'_>, _span: &Span) -> Result<TyKind, JitError> {
     match ty {
         Type::Scalar(s, _) => {
             let sk = match s {
@@ -1139,26 +1423,31 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
         }
         Type::Named { name, span, .. } if name == "any" => unsupported(span, Refusal::TypeForm,
             "`any`-typed model fields (they are dynamically typed)"),
-        Type::Named { name, args, .. } => Ok(TyKind::Model(name.clone(), type_named_dims(args, env))),
+        // `Err` field (SPEC §3.9) — same nilable-str representation as a
+        // top-level `Err` (see `ty_from_ast`), not a model. Same escape hatch
+        // for a program that declares its own `model Err`, and the same #622
+        // ordering: the field's `Type` has already been through
+        // `resolve_alias_ty`, so an alias of `Err` reaches this arm as `Err`.
+        Type::Named { name, .. } if name == "Err" && !err_is_user_model() => Ok(TyKind::Str),
+        // #674 slice 3c: see `ty_from_ast`'s identical arm — a model field
+        // typed `Budget` (`model Tenant { budget: Budget, … }`, the arena-budget
+        // design's §2.2's `[Tenant; N]` example) must get the opaque-descriptor kind,
+        // not the generic forge-pointer `Model` fallback below.
+        Type::Named { name, .. } if name == "Budget" => Ok(TyKind::Budget),
+        Type::Named { name, args, .. } => Ok(TyKind::Model(name.clone(), type_named_dims(args, env, consts))),
         Type::Tensor(inner, shape, tspan) => {
-            // Map the element type to the nearest representable ScalarKind.
+            // Map the element type to its `ScalarKind` (`tensor_elem_kind`).
             // The JIT treats @cast(bf16) and @cast(f16) as no-ops (compute in
-            // f32); sub-i64 integer types are widened to i32 since that is the
-            // smallest integer ScalarKind the JIT supports for tensor indexing.
+            // f32); `bf16` fields take the native 2-byte weight path below.
             let elem = match inner.as_ref() {
                 Type::Scalar(s, _) => match s {
-                    // Native JIT scalar kinds — exact mapping.
-                    ScalarType::F32  => ScalarKind::F32,
-                    ScalarType::F64  => ScalarKind::F64,
-                    ScalarType::I64  => ScalarKind::I64,
-                    ScalarType::U64  => ScalarKind::I64,
-                    ScalarType::I32  => ScalarKind::I32,
-                    ScalarType::U32  => ScalarKind::I32,
                     // #324: a bf16 model FIELD is a read-only weight stored at
                     // native 2-byte width (Bf16Tensor) — feeds the bf16-direct
                     // matmul kernel, upconverts on any other use. Scoped to
                     // fields here (NOT ty_from_ast) so f32-backed bf16 *activation*
-                    // locals (`let !h: Tensor[bf16,..]`) are unaffected.
+                    // locals (`let !h: Tensor[bf16,..]`) are unaffected. Must be
+                    // matched BEFORE the `tensor_elem_kind` fallback below, which
+                    // would otherwise fold bf16 into the f32-backed convention.
                     ScalarType::Bf16 => {
                         // Resolve dims; if any is symbolic/dynamic (unbound block
                         // param, wildcard), fall back to an opaque i64 pointer —
@@ -1166,7 +1455,7 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
                         // time, exactly like the f32 tensor path below.
                         let mut dims: Vec<i64> = Vec::with_capacity(shape.elems.len());
                         for d in &shape.elems {
-                            match resolve_shape_elem(d, env, tspan) {
+                            match resolve_shape_elem(d, env, consts, tspan) {
                                 Ok(v) if v > 0 => dims.push(v),
                                 _ => return Ok(TyKind::Scalar(ScalarKind::I64)),
                             }
@@ -1176,34 +1465,34 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
                         }
                         return Ok(TyKind::Bf16Tensor(Bf16TensorTy { shape: dims }));
                     }
-                    // f16/tf32 fields keep the f32-backed convention for now.
-                    ScalarType::F16 | ScalarType::Tf32 => ScalarKind::F32,
-                    // Bool has its own ScalarKind (cl=I8); keep it so a bool
-                    // tensor FIELD matches a `forge.uninit[bool, …]` value
-                    // (ty_from_ast lowers bool → ScalarKind::Bool). Widening to
-                    // i32 here made `model M { mask: Tensor[bool, …] }` reject
-                    // its own constructor. (#273 follow-up.)
-                    ScalarType::Bool => ScalarKind::Bool,
-                    // Sub-byte / narrow integer types — widen to i32.
-                    ScalarType::I8  | ScalarType::I16 |
-                    ScalarType::U8  | ScalarType::U16 |
-                    ScalarType::Int4 | ScalarType::Int8 |
-                    ScalarType::Fp8E4M3 | ScalarType::Fp8E5M2 => ScalarKind::I32,
-                    // Trit — packed ternary; must be 2-D.
+                    // Trit — packed ternary; must be 2-D. Also matched first:
+                    // it has no `ScalarKind` lane at all.
                     ScalarType::Trit => {
                         let dims: Vec<i64> = shape.elems.iter().map(|d| {
-                            resolve_shape_elem(d, env, tspan)
+                            resolve_shape_elem(d, env, consts, tspan)
                         }).collect::<Result<_, _>>().unwrap_or_default();
                         if dims.len() != 2 {
                             return Ok(TyKind::Scalar(ScalarKind::I64));
                         }
                         return Ok(TyKind::TritTensor(TritTensorTy { k: dims[0], n: dims[1] }));
                     }
-                    // Str/Nil in a tensor element position is nonsensical;
-                    // fall through to the opaque-i64 path below.
-                    _ => {
-                        return Ok(TyKind::Scalar(ScalarKind::I64));
-                    }
+                    // Everything else with a tensor storage lane — f32/f64,
+                    // bool, i64, and every narrow integer width including
+                    // u64 — routes through `tensor_elem_kind` (#667): the
+                    // ONE element-kind table, the same one a local tensor and
+                    // a `forge.*` constructor read. A model-field tensor used
+                    // to hand-roll its own copy of this table here, and it had
+                    // drifted (`u64` still mapped to `ScalarKind::I64`), so a
+                    // struct literal holding a `Tensor[u64, …]` refused to
+                    // convert into its own field's type even though the local
+                    // form of the same tensor lowered fine. `f16`/`tf32` fold
+                    // into `F32` here via that table, same as before.
+                    // `int4`/the fp8 kinds and `Str`/`Nil` have no lane and
+                    // fall to the opaque-i64 pointer convention.
+                    other => match tensor_elem_kind(other) {
+                        Some(k) => k,
+                        None => return Ok(TyKind::Scalar(ScalarKind::I64)),
+                    },
                 },
                 _ => {
                     return Ok(TyKind::Scalar(ScalarKind::I64));
@@ -1215,7 +1504,7 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
             // paths continue to work.
             let mut dims: Vec<i64> = Vec::with_capacity(shape.elems.len());
             for d in &shape.elems {
-                match resolve_shape_elem(d, env, tspan) {
+                match resolve_shape_elem(d, env, consts, tspan) {
                     Ok(v) if v > 0 => dims.push(v),
                     _ => return Ok(TyKind::Scalar(ScalarKind::I64)),
                 }
@@ -1230,7 +1519,7 @@ fn lower_ty_for_model(ty: &Type, env: &HashMap<String, i64>, _span: &Span) -> Re
         // array lowering (ModelArray / KvArray) so the field is a typed array
         // pointer, not an opaque i64 (which broke both the store and indexed
         // load `model.layers[i]`). (#273 follow-up.)
-        Type::Array(..) => ty_from_ast(ty, env),
+        Type::Array(..) => ty_from_ast(ty, env, consts),
         _ => Ok(TyKind::Scalar(ScalarKind::I64)),
     }
 }
@@ -1286,13 +1575,101 @@ fn const_int_axis(e: &Expr) -> Option<i64> {
     }
 }
 
+/// What a top-level `let NAME = <literal>` module constant (#268) means when
+/// its name appears in a shape position.
+///
+/// A module constant IS a legal shape dimension: the checker's
+/// `SymDim::from_expr` (shape.rs) treats a bare ident in a shape position as an
+/// opaque symbolic var regardless of what it names, so it never distinguishes
+/// "shape parameter" from "module constant", and the interpreter resolves
+/// either the same way off the one environment chain. The JIT's shape resolver
+/// only ever consulted the per-function `shape_env` (bound from a fn's
+/// bracketed generics), so a module constant used as a dimension in a
+/// *non-generic* fn's signature or body had no binding to be found under and
+/// misreported "unbound shape parameter" — a defect, not a gap
+/// (DIAGNOSTICS.md §3, `jit-error`).
+///
+/// Each constant is folded to its verdict once, by `const_dim_table` in
+/// `compile_program`'s pre-pass, so the answer does not depend on where in the
+/// file the `let` sits — the same order-independence `SymDim::from_expr` gets
+/// for free by never evaluating the name at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ConstDim {
+    /// An integer constant. Zero and negative fold like any other integer —
+    /// `const_int_axis` sees through a unary `-` on purpose, since an `axis`
+    /// argument may be `-1` — because whether an EXTENT is usable is a verdict
+    /// on the dimension the constant lands in, not on this leaf: `[A + Z]`
+    /// with `let Z = 0` and `let A = 5` is a fine `[5]`. `resolve_shape_expr`
+    /// passes that verdict on the folded value.
+    Dim(i64),
+    /// A float or bool constant. Not a dimension in any backend.
+    NotAnInt,
+    /// #712: a local `let !` (mutable) binding. Even a literal initializer
+    /// does not make it foldable — JIT-compiled code may write through it
+    /// before a later shape use, so treating the initial value as the
+    /// dimension would silently diverge from a program that mutates it
+    /// first. Refused, naming the binding — never as a fallback to a
+    /// same-named module constant it shadows.
+    LocalMutable,
+    /// #712: a name currently in scope (a value parameter, a loop or `for`
+    /// index, an enum-payload binding, or a non-mutating `let` whose
+    /// initializer this pass could not fold to an integer outright — a
+    /// call, a field read, a tensor literal, ...) that is NOT a compile-time
+    /// integer. `scope_const_dims` supplies this as the default verdict for
+    /// every such name so a shape use of it resolves to a classed refusal
+    /// instead of falling through to the bare #480-class "unbound shape
+    /// parameter" `jit-error`.
+    LocalUnfoldable,
+}
+
+/// The module constants an identifier may fall back to AT THE SITE BEING
+/// LOWERED — already filtered by the caller for the names its own scope binds
+/// (a local, a loop variable, a value parameter, a model's or a template's
+/// shape parameter). Each of those shadows a same-named module constant,
+/// exactly as it does for every other name, so a shadowed name must resolve
+/// the way it did before module constants were admitted here at all.
+///
+/// `None` in a RUNTIME expression position — a slice bound, an index
+/// expression, a scalar use. There a bare ident keeps the #268 path, which
+/// carries the constant's *declared width* and honours the enclosing scope.
+/// Folding it to a dimension there is what let a shadowed constant reach a
+/// runtime slice bound (a silent run/JIT divergence, regressing #511) and made
+/// a narrow-width constant lose its width in scalar arithmetic (narrowing
+/// #268).
+type ConstDims<'a> = Option<&'a HashMap<String, ConstDim>>;
+
+/// Fold every module constant once into its shape-position verdict.
+fn const_dim_table(global_consts: &HashMap<String, Expr>) -> HashMap<String, ConstDim> {
+    global_consts.iter().map(|(name, init)| {
+        let verdict = match const_int_axis(init) {
+            Some(v) => ConstDim::Dim(v),
+            None => ConstDim::NotAnInt,
+        };
+        (name.clone(), verdict)
+    }).collect()
+}
+
+/// The entries of `table` whose names the enclosing scope does NOT bind. The
+/// caller owns the scope test, because only it knows what is in scope where —
+/// `resolve_shape_expr` sees a name, not a scope.
+fn visible_const_dims(
+    table: &HashMap<String, ConstDim>,
+    is_bound: impl Fn(&str) -> bool,
+) -> HashMap<String, ConstDim> {
+    table.iter()
+        .filter(|(name, _)| !is_bound(name))
+        .map(|(name, d)| (name.clone(), *d))
+        .collect()
+}
+
 fn resolve_shape_elem(
     d: &ShapeElem,
     env: &HashMap<String, i64>,
+    consts: ConstDims<'_>,
     span: &Span,
 ) -> Result<i64, JitError> {
     match d {
-        ShapeElem::Expr(e) => resolve_shape_expr(e, env, span),
+        ShapeElem::Expr(e) => resolve_shape_expr(e, env, consts, span),
         ShapeElem::Wildcard(_) | ShapeElem::Streaming(_) | ShapeElem::Spread(_) => {
             unsupported(span, Refusal::DynamicShape,
                 "a non-concrete dimension (`~`, `..`, `?`)")
@@ -1300,33 +1677,264 @@ fn resolve_shape_elem(
     }
 }
 
+/// A shape dimension: the expression folded, then judged as a whole rather
+/// than at a leaf. Judging the leaf refused `[A + Z]` for `let Z = 0` although
+/// the dimension is a perfectly good 5, while `[0 - 3]` — which passes no
+/// constant leaf at all — went unjudged to the allocator, which reports a
+/// `[-3]` tensor as needing 17179869184.0 GiB.
+///
+/// Zero is NOT refused: a zero-length tensor is a legal value on both backends
+/// (#258 — `mean(forge.zeros[f32, [0]])` is NaN under `run` and the JIT
+/// alike), so the only extent the JIT has no meaning for is a negative one.
+///
+/// A slice bound is NOT a dimension — `t[0..3]` starts at 0 — so those sites
+/// call `fold_shape_expr` directly.
 fn resolve_shape_expr(
     e: &Expr,
     env: &HashMap<String, i64>,
+    consts: ConstDims<'_>,
+    span: &Span,
+) -> Result<i64, JitError> {
+    let v = fold_shape_expr(e, env, consts, span)?;
+    if v >= 0 { return Ok(v); }
+    // Name the constant when the dimension IS one, so that case keeps a
+    // message pointing at the declaration.
+    match e {
+        Expr::Ident(name, ispan) if !env.contains_key(name) => unsupported_msg(
+            ispan, Refusal::TypeForm, format!(
+                "`{}` is {}, and a shape dimension cannot be \
+                 negative; use `dmc run` for full semantics", name, v)),
+        _ => unsupported_msg(span, Refusal::TypeForm, format!(
+            "a shape dimension cannot be negative, and this one is {}; \
+             use `dmc run` for full semantics", v)),
+    }
+}
+
+/// Fold a shape expression to its integer value. Zero and negative values fold
+/// like any other — `resolve_shape_expr` judges the result.
+fn fold_shape_expr(
+    e: &Expr,
+    env: &HashMap<String, i64>,
+    consts: ConstDims<'_>,
     span: &Span,
 ) -> Result<i64, JitError> {
     match e {
         Expr::Literal(Literal::Int(n, _), _) => Ok(*n),
-        Expr::Ident(name, ispan) => env.get(name).copied().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("unbound shape parameter `{}`", name),
-            line: ispan.line, col: ispan.col,
-        }),
+        Expr::Ident(name, ispan) => {
+            // A bound shape parameter always wins: it is the fn's own binding
+            // of the name, and it shadows a module constant the same way a
+            // local does.
+            if let Some(v) = env.get(name) { return Ok(*v); }
+            // Otherwise fall back to a module constant — but only in a
+            // type-level shape position, and only for a name the caller has
+            // already ruled out of its own scope (see `ConstDims`).
+            match consts.and_then(|t| t.get(name)) {
+                Some(ConstDim::Dim(v)) => Ok(*v),
+                // #718 rework (R3): worded origin-neutrally — a MODULE
+                // constant's own float/bool literal answered this arm before
+                // #712, and #712's `fold_local_let_dim` now also answers it
+                // for a LOCAL `let`'s float/bool literal (`let H = 4.0`), so
+                // the message can no longer assume "module constant" without
+                // mislabeling the local case.
+                Some(ConstDim::NotAnInt) => unsupported_msg(ispan, Refusal::TypeForm, format!(
+                    "`{}` is not an integer, so it cannot size a shape; \
+                     use `dmc run` for full semantics", name)),
+                // #712: a local `let !` — mutable, so never foldable, even
+                // when the initializer is a literal.
+                //
+                // #718 rework (R2): `DynamicShape`, not `TypeForm` — the fact
+                // is "not statically known" (DIAGNOSTICS.md §5.2's
+                // `jit-dynamic-shape` row), the same fact the sibling arms
+                // below and `resolve_shape_elem` already carry that class
+                // for. `TypeForm` stays reserved for a value that IS known
+                // and simply isn't an integer (`NotAnInt`, just below).
+                Some(ConstDim::LocalMutable) => unsupported_msg(ispan, Refusal::DynamicShape, format!(
+                    "`{}` is a mutable (`let !`) binding, and a mutable binding cannot \
+                     size a shape; use `dmc run` for full semantics", name)),
+                // #712: a name in scope whose value isn't known at lowering
+                // time — a value parameter, a loop/`for` index, an
+                // enum-payload binding, or a `let` whose initializer needs a
+                // runtime value. Named and classed, never the bare
+                // #480-class "unbound shape parameter" below.
+                //
+                // #718 rework (R2): `DynamicShape`, for the same reason as
+                // `LocalMutable` just above.
+                Some(ConstDim::LocalUnfoldable) => unsupported_msg(ispan, Refusal::DynamicShape, format!(
+                    "`{}` is not known until the function runs (a parameter, a loop \
+                     variable, or a `let` whose value isn't foldable), so it cannot \
+                     size a shape; use `dmc run` for full semantics", name)),
+                None => Err(JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("unbound shape parameter `{}`", name),
+                    line: ispan.line, col: ispan.col,
+                }),
+            }
+        }
+        // #718 rework (R4): `(expr)` parses as a 1-element tuple (the same
+        // surface `interp.rs`'s `eval_expr` unwraps transparently, ~line
+        // 5520), so `let H = (2 + 3) * 4` was refused even though the PR's
+        // "foldable expressions of literals" claim says it shouldn't be —
+        // nothing upstream of here rewrites a parenthesized expression into
+        // its inner one. Unwrap it the same way `run` does before judging
+        // what is inside.
+        Expr::Tuple(elems, _) if elems.len() == 1 => fold_shape_expr(&elems[0], env, consts, span),
         Expr::BinOp { op, lhs, rhs, .. } => {
-            let l = resolve_shape_expr(lhs, env, span)?;
-            let r = resolve_shape_expr(rhs, env, span)?;
+            let l = fold_shape_expr(lhs, env, consts, span)?;
+            let r = fold_shape_expr(rhs, env, consts, span)?;
             match op {
-                BinOp::Add => Ok(l + r),
-                BinOp::Sub => Ok(l - r),
-                BinOp::Mul => Ok(l * r),
-                BinOp::Div if r != 0 => Ok(l / r),
+                // #737 (second review of #718): routed through
+                // `interp::int_arith` (at `IW::I64`, this fold's own width) so
+                // one function owns the wrap/div-by-zero rule for both
+                // backends: a bare `l + r`/`l * r` here panics on debug-build
+                // i64 overflow instead of wrapping like `dmc run` does, and a
+                // hand-rolled `Div if r != 0` guard answers `4 / 0`
+                // differently from `int_arith`'s div-by-zero-is-0 (#208).
+                // `fold_shape_expr_at_width` already made this call for a
+                // narrower width; this arm is the `i64` twin of that.
+                //
+                // #737 (the arm the routing left behind): `Mod` folds here
+                // too. SPEC.md §3.1 defines `/` and `%` by zero in ONE
+                // sentence — "integer division and modulo by zero are `0`
+                // (total, never a trap)" — so a fold that answers `4 / 0`
+                // with the 0 `dmc run` gives, while declining `7 % 0`
+                // outright (`jit-dynamic-shape`, no dimension at all), is
+                // still two rules for one sentence. `int_arith` already owns
+                // `Mod` at every width, including the `MIN % -1` overflow
+                // error, so folding it here is the same call, not a second
+                // rule. `MIN / -1` and `MIN % -1` return `Err` and become the
+                // classed refusal below — the only arithmetic SPEC gives no
+                // value for.
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod =>
+                    crate::interp::int_arith(op.clone(), l, r, crate::interp::IW::I64)
+                        .map_err(|e| unsupported_err(span, Refusal::DynamicShape, e.to_string())),
                 _ => unsupported_msg(span, Refusal::DynamicShape, format!(
-                    "a shape expression using `{:?}` (the JIT folds `+ - * /` only); \
+                    "a shape expression using `{:?}` (the JIT folds `+ - * / %` only); \
                      use `dmc run` for full semantics", op,
                 )),
             }
         }
         _ => unsupported(span, Refusal::DynamicShape,
                 "a shape element that is not a literal int, ident, or arithmetic"),
+    }
+}
+
+/// The concrete integer WIDTH a local `let`'s (unannotated) initializer
+/// implies, from the type suffix on its literal leaves — the same subset
+/// `fold_shape_expr` folds (a literal, a 1-element tuple, or `+ - * / %` over
+/// these). Mirrors `check.rs`'s literal-type-adoption rule (SPEC.md §3.1)
+/// far enough to name the same width `dmc run` would give the whole
+/// initializer, without re-running full type inference:
+///
+/// - A literal with no suffix contributes no width (`Ok(None)`) — the
+///   untyped case, which stays i64 (`concretize`'s default with no `let`
+///   annotation).
+/// - A literal WITH a suffix names that width outright.
+/// - Two leaves that each name a width must agree — a real mismatch
+///   (`200u8 + 1i32`) is a type error `check.rs` already catches elsewhere;
+///   this pass declines to guess which side wins (`Err(())`) rather than
+///   fold a program that doesn't type-check.
+///
+/// An `Ident` (a shape parameter or another const) contributes no width of
+/// its own: `ConstDim` records only a folded VALUE, never a width, so a name
+/// used inside the arithmetic keeps today's untyped (i64) fold — narrower
+/// than full correctness for a chain of narrow-width lets, but every #718
+/// review row is a single self-contained literal expression, and guessing
+/// wrong here is worse than falling back to the existing i64 fold.
+fn shape_dim_literal_width(e: &Expr) -> Result<Option<ScalarKind>, ()> {
+    match e {
+        Expr::Literal(Literal::Int(_, sfx), _) =>
+            Ok(sfx.as_ref().and_then(scalar_kind_of_int_suffix)),
+        Expr::Tuple(elems, _) if elems.len() == 1 => shape_dim_literal_width(&elems[0]),
+        Expr::BinOp { op, lhs, rhs, .. }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) =>
+        {
+            match (shape_dim_literal_width(lhs)?, shape_dim_literal_width(rhs)?) {
+                (Some(a), Some(b)) if a == b => Ok(Some(a)),
+                (Some(a), None) | (None, Some(a)) => Ok(Some(a)),
+                (None, None) => Ok(None),
+                (Some(_), Some(_)) => Err(()),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// True when every literal LEAF of `e` — walking the same `+ - * / %` and
+/// 1-element grouping-tuple shapes `fold_shape_expr`/`shape_dim_literal_width`
+/// walk — is a float or bool literal. Used by `fold_local_let_dim` (#718
+/// review) to give a float/bool-leaved ARITHMETIC initializer the same
+/// `ConstDim::NotAnInt` verdict a bare float/bool literal already gets: `let
+/// H = 4.0 + 1.0` is exactly as known-not-an-integer at fold time as `let H =
+/// 4.0` is, even though the initializer is a `BinOp`, not a `Literal`. An
+/// initializer that mixes in an int literal, a name, a call, or anything else
+/// is left to the ordinary fold path (`false` here), which already resolves
+/// the honest verdict for those (a real type mismatch is `check.rs`'s to
+/// catch, not this pass's to guess at).
+fn is_float_or_bool_leaved(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Literal::Float(..), _) | Expr::Literal(Literal::Bool(..), _) => true,
+        Expr::Tuple(elems, _) if elems.len() == 1 => is_float_or_bool_leaved(&elems[0]),
+        Expr::BinOp { op, lhs, rhs, .. }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) =>
+        {
+            is_float_or_bool_leaved(lhs) && is_float_or_bool_leaved(rhs)
+        }
+        _ => false,
+    }
+}
+
+/// The `interp::IW` a `ScalarKind` names — the two tables must agree, or
+/// #718's in-width shape-dimension fold and `dmc run` would wrap the same
+/// source width differently. Only ever called on a kind
+/// `scalar_kind_of_int_suffix` produced, which is always an integer one.
+fn scalar_kind_to_iw(k: ScalarKind) -> crate::interp::IW {
+    use crate::interp::IW;
+    match k {
+        ScalarKind::I64 => IW::I64,
+        ScalarKind::I32 => IW::I32,
+        ScalarKind::I16 => IW::I16,
+        ScalarKind::I8  => IW::I8,
+        ScalarKind::I4  => IW::I4,
+        ScalarKind::U64 => IW::U64,
+        ScalarKind::U32 => IW::U32,
+        ScalarKind::U16 => IW::U16,
+        ScalarKind::U8  => IW::U8,
+        _ => IW::I64,
+    }
+}
+
+/// #718 rework (R1): `fold_shape_expr`, but wrapping at a concrete non-`i64`
+/// integer width `w` exactly the way `dmc run`'s `int_arith` does — reusing
+/// that function directly (now `pub(crate)`) rather than re-deriving the
+/// wrap rule a second time. `record_local_const_dim` calls this instead of
+/// `fold_shape_expr` whenever the binding's own width (an explicit
+/// annotation, or its literals' shared suffix) is narrower than `i64`:
+/// folding `4294967295u32 + 7u32` in bare `i64` gives 4294967296 — a "shape"
+/// the allocator reads as 32 GiB — where both backends agree the u32 SCALAR
+/// wraps to 6.
+fn fold_shape_expr_at_width(
+    e: &Expr,
+    env: &HashMap<String, i64>,
+    consts: ConstDims<'_>,
+    span: &Span,
+    w: crate::interp::IW,
+) -> Result<i64, JitError> {
+    match e {
+        Expr::Literal(Literal::Int(n, _), _) => Ok(w.wrap(*n)),
+        Expr::Tuple(elems, _) if elems.len() == 1 =>
+            fold_shape_expr_at_width(&elems[0], env, consts, span, w),
+        Expr::BinOp { op, lhs, rhs, .. }
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) =>
+        {
+            let l = fold_shape_expr_at_width(lhs, env, consts, span, w)?;
+            let r = fold_shape_expr_at_width(rhs, env, consts, span, w)?;
+            crate::interp::int_arith(op.clone(), l, r, w)
+                .map_err(|e| unsupported_err(span, Refusal::DynamicShape, e.to_string()))
+        }
+        // An ident (env/const — never itself narrower than i64, see
+        // `shape_dim_literal_width`'s doc) or anything else `fold_shape_expr`
+        // already judges: fold it the old way, then wrap the result into `w`
+        // so a later use through this binding still sees the narrow value.
+        _ => fold_shape_expr(e, env, consts, span).map(|v| w.wrap(v)),
     }
 }
 
@@ -1437,6 +2045,144 @@ fn item_enum_decl(item: &Item) -> Option<&crate::ast::EnumDecl> {
     }
 }
 
+/// The name a top-level item declares, unwrapping `pub` and directive
+/// wrappers. `None` for the item forms that declare nothing nameable — a `use`,
+/// a top-level arena block, a destructuring `let`.
+///
+/// Used to look a merged item's declaring file out of the merge's map
+/// (the whole-program merge's own rule), so a refusal raised while lowering an
+/// imported item reports the file it was written in.
+fn item_decl_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Fn(f) => Some(f.name.clone()),
+        Item::ExternFn(e) => Some(e.name.clone()),
+        Item::Model(m) => Some(m.name.clone()),
+        Item::TypeAlias(t) => Some(t.name.clone()),
+        Item::Enum(e) => Some(e.name.clone()),
+        Item::Let(l) => match &l.pattern {
+            Pattern::Ident(name, _) => Some(name.clone()),
+            _ => None,
+        },
+        Item::Pub(inner) => item_decl_name(inner),
+        Item::Directive { inner, .. } => item_decl_name(inner),
+        Item::Arena(_) | Item::Use(_) => None,
+    }
+}
+
+/// Every identifier-shaped token in `msg` that contains a `$`.
+///
+/// The lexer admits `[A-Za-z_\x80-\xFF][A-Za-z0-9_\x80-\xFF]*!?` and nothing
+/// else, so a `$` in a name can only have been put there by the compiler — by
+/// the merge's `<stem>$<name>` prefix, or by the JIT's own `$fwd_bwd` /
+/// `$d0_d1` manglings. Scanning for the escape rather than for a known message
+/// shape is what makes the demangle independent of how any one diagnostic is
+/// worded.
+/// A byte that can appear inside a merged/mangled identifier — shared between
+/// `merged_tokens` (which scans for these to find a token's extent) and
+/// `replace_word` (which uses the same test to tell a whole-token match from
+/// one that is only a substring of a longer identifier).
+fn is_merge_word_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
+}
+
+fn merged_tokens(msg: &str) -> Vec<String> {
+    let b = msg.as_bytes();
+    let is_word = is_merge_word_byte;
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if !is_word(b[i]) || b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && is_word(b[i]) {
+            i += 1;
+        }
+        let tok = &msg[start..i];
+        if tok.contains('$') && !out.iter().any(|t| t == tok) {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+/// Replace whole-token occurrences of `tok` in `haystack` with `replacement`,
+/// where "whole token" is bounded by `is_merge_word_byte` the same way
+/// `merged_tokens` finds a token's extent in the first place.
+///
+/// Plain `str::replace` has no notion of a boundary: `demangle` calling it on
+/// `tok = "a$b"` would also rewrite the `a$b` inside the unrelated, longer
+/// identifier `xa$b`, corrupting a name the user never asked to have touched.
+/// Anchoring on a byte that is not itself part of an identifier — start/end
+/// of string count, since there is nothing on that side to be a continuation
+/// of — is what `merged_tokens`' own extraction already relies on; this reuses
+/// the same test for the replacement side of the same problem.
+fn replace_word(haystack: &str, tok: &str, replacement: &str) -> String {
+    if tok.is_empty() {
+        return haystack.to_string();
+    }
+    let h = haystack.as_bytes();
+    let t = tok.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(h.len());
+    let mut i = 0;
+    while i < h.len() {
+        let end = i + t.len();
+        if end <= h.len() && &h[i..end] == t {
+            let before_ok = i == 0 || !is_merge_word_byte(h[i - 1]);
+            let after_ok = end == h.len() || !is_merge_word_byte(h[end]);
+            if before_ok && after_ok {
+                out.extend_from_slice(replacement.as_bytes());
+                i = end;
+                continue;
+            }
+        }
+        out.push(h[i]);
+        i += 1;
+    }
+    // Every substitution lands between two bytes `is_merge_word_byte` calls
+    // non-word (or an end of the string), and a UTF-8 continuation byte is
+    // always word (`>= 0x80`), so no cut ever falls inside a multi-byte
+    // character — the byte vector stays valid UTF-8 throughout.
+    String::from_utf8(out).expect("replace_word: input and replacement are both valid UTF-8")
+}
+
+/// The `ModelDecl` of an item (unwrapping `pub`/directive wrappers), or None.
+fn item_model_decl(item: &Item) -> Option<&crate::ast::ModelDecl> {
+    match item {
+        Item::Model(m) => Some(m),
+        Item::Pub(inner) => item_model_decl(inner),
+        Item::Directive { inner, .. } => item_model_decl(inner),
+        _ => None,
+    }
+}
+
+thread_local! {
+    /// Whether the program being compiled declares a `model Err` of its own.
+    ///
+    /// `Err` is a convention, not a keyword: SPEC.md §3.9 spells the error
+    /// half of a `(T, Err)` pair `Err`, and `ty_from_ast` gives that spelling
+    /// the nilable-`str` representation — but nothing in the language reserves
+    /// the NAME, and `check.rs` accepts `model Err { … }` like any other
+    /// model. Without this flag such a program hit the `Err`-is-a-`str` arm
+    /// and refused ("field access on non-model type") where it used to lower
+    /// as an ordinary model. Set once per `compile_program`, read by
+    /// `ty_from_ast`/`lower_ty_for_model`, which are free functions reached
+    /// from ~20 call sites with no compiler state in hand.
+    ///
+    /// Whether the checker should reserve `Err` instead is a spec question,
+    /// and not one the JIT gets to answer by refusing programs the checker
+    /// accepts.
+    static ERR_IS_USER_MODEL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True when the program under compilation declares its own `model Err`, in
+/// which case `Err` in a signature means that model and not SPEC §3.9's
+/// nilable-`str` error half.
+fn err_is_user_model() -> bool {
+    ERR_IS_USER_MODEL.with(|f| f.get())
+}
+
 fn item_span(item: &Item) -> Span {
     match item {
         Item::Fn(f) => f.span.clone(),
@@ -1512,19 +2258,358 @@ pub(crate) const JIT_BUILTINS: &[&str] = &[
     "attn", "rope", "attn_gqa", "embed",
     // Elementwise activations (scalar or same-shape tensor).
     "relu", "sigmoid", "tanh", "gelu", "silu", "elu", "mish",
-    // typed-print symbols (registered, resolved via the normal call path)
+    // typed-print symbols (registered, resolved via the normal call path).
+    // #597: `print_u64` is registered as a runtime symbol but is NOT listed
+    // here — `print(x)` reaches it internally; a program cannot call it.
     "print_i64", "print_f64", "print_bool", "print_nil",
-    // HashMap builtins.
-    "map_new", "map_get", "map_set", "map_contains",
+    // HashMap builtins. `map` is `map_new`'s alias (SPEC.md's Map-type
+    // paragraph); #695 found it missing from the JIT's dispatch (only
+    // `map_new` was recognized), which refused any program using the
+    // `map()` spelling as `jit-unknown-fn` before it ever reached `map_get`.
+    "map", "map_new", "map_get", "map_set", "map_contains",
     // Process ports (PORTS.md §7.1) — same registry as the interpreter.
     "port_open", "port_call", "port_close",
     // Tensor copy mode (PORTS.md §3.2) — same wire format as the interpreter.
     "port_tensor_encode", "port_tensor_decode",
+    // File I/O (STDLIB.md ~§3.10), lowered as host calls. `read_bytes` is
+    // deliberately absent: its `Tensor[i64,[N]]` result needs a runtime-extent
+    // tensor, and the JIT has one (`TyKind::DynTensor`) — but it's reachable
+    // only from KV reads (`kv_materialize`) and isn't plumbed for an
+    // i64-element host-call result, so `read_bytes` stays `dmc run`-only
+    // until it is, and refuses `jit-unknown-fn`.
+    "read_file", "write_file", "append_file", "file_exists",
     // Terminal / timing builtins (parity with the interpreter).
     "chr", "sleep_ms", "flush",
     // Stringification — sugar for `x as str`, sharing its formatters.
     "to_str", "to_string",
 ];
+
+/// One refusal recorded by `Jit::compile_program_collect` (#684, `dmc jit
+/// --json --all`). Wraps the same `JitError` `compile_program` would have
+/// returned at that site — `error.kind`/`error.refusal` carry the
+/// defect-vs-refusal distinction and the class exactly as they always have —
+/// plus the things collect mode adds: which file the refusal belongs to
+/// (`Jit::attribute`'s job on the single-refusal path, done the same way
+/// here), the name of the top-level item it belongs to, and (#684 R2)
+/// whether it is a cascade of an earlier site rather than a root blocker.
+pub struct CollectedRefusal {
+    pub error: JitError,
+    pub file: Option<std::path::PathBuf>,
+    pub item: String,
+    /// `Some(i)` when this refusal is a *cascade*: a later item failed only
+    /// because it referenced (by name) an item that had already refused —
+    /// `i` is the index, in collection order, of that ultimate ROOT site
+    /// (propagated transitively through a chain of callers, never an
+    /// intermediate cascade's own index). `None` for a root blocker: a
+    /// refusal that is not explained by an earlier one in this run.
+    pub cascade_of: Option<usize>,
+}
+
+/// #684 R2: a `jit-error` (#480 defect, no `code`) carries no `Refusal`
+/// class, so a `classes`/`jit_classes` frequency map needs a fallback key for
+/// it. This is that key, and it is deliberately the *kind*'s string form
+/// (`diag::Kind::JitError.as_str()`, asserted equal to this constant in
+/// `diag_tests.rs`) rather than a fabricated `code` — no collected line ever
+/// carries `"code":"jit-error"`, but every `jit-error` line carries
+/// `"kind":"jit-error"`, and that is what a consumer of `classes` is really
+/// switching on here (DIAGNOSTICS.md §5.5).
+pub const JIT_ERROR_CLASS_KEY: &str = "jit-error";
+
+/// #696 R2/R3: the shared marker substring (everything after the name) of
+/// the message raised at a body's READ or WRITE of an already-refused
+/// top-level `let` (`lower_ident`'s and the assignment lowering's top-level-
+/// `let` fallbacks) — one constant so those two call sites and
+/// `cascade_candidate_name`'s recognizer just below can never drift apart.
+const TOP_LEVEL_LET_REFUSAL_MARKER: &str = "is a top-level `let`; the JIT has no globals for it";
+
+/// The message itself: `name` as the FIRST backtick-quoted token (so
+/// `cascade_candidate_name` extracts exactly the `let`'s own name), followed
+/// by `TOP_LEVEL_LET_REFUSAL_MARKER`.
+fn top_level_let_refusal_msg(name: &str) -> String {
+    format!("`{}` {}; use `dmc run` for full semantics", name, TOP_LEVEL_LET_REFUSAL_MARKER)
+}
+
+/// #724: the marker substring for a body's READ or WRITE of an imported
+/// module's PRIVATE top-level `let` — a name `merge.rs` never rewrote for
+/// this file because it never put it in this file's reference scope in the
+/// first place (`FileScope` is built from a file's own declarations plus
+/// only the *`pub`* declarations of what it imports). Distinct from
+/// `TOP_LEVEL_LET_REFUSAL_MARKER` on purpose: that marker is for a body's
+/// read of a `let` this SAME merge already refused at its own declaration
+/// (a str constant, a computed initializer, a `let !`); this one is for a
+/// `let` that lowers just fine in its OWN file and is refused only at the
+/// importer's boundary crossing, so the two must never be recognized as the
+/// same cascade shape by `cascade_candidate_name`.
+const IMPORTED_PRIVATE_LET_MARKER: &str = "is a private top-level `let` of an imported module";
+
+/// The message for that refusal. `module` is a display name for the
+/// declaring FILE — its stem, e.g. `util.dmc` → `util` — never a filesystem
+/// path (every other JIT message that names a file goes through `--json`'s
+/// `file` field rather than embedding a path in prose) and never a
+/// `merge.rs`-internal key (see `imported_private_let_module`'s doc: a
+/// merge-prefix collision can make that key `sub$leaf$3`, which is exactly
+/// what this must never print). `None` when more than one file could be the
+/// real declarant and naming either would be a guess (same doc) — the "in
+/// `X`" clause and the parenthetical are dropped entirely rather than
+/// guessing, not filled with a placeholder.
+///
+/// SPEC.md §6.7 permits only `pub fn`/`pub model`/`pub type` to cross a
+/// module boundary; a `let`, `pub` or not, never does — a constant crosses
+/// as a `pub fn` accessor. A private `let` reaching an importer's scope at
+/// all is therefore already a spec violation (#724 tracks the checker half,
+/// which is expected to close this off before the JIT ever sees it); this
+/// message is the JIT's own refusal of the same leak. The constant may well
+/// be a compile-time literal #268's own-file path would happily fold — that
+/// is exactly why this is a deliberate refusal and not a lowering: reading
+/// `global_consts` for it here would make the JIT MORE permissive than the
+/// spec, and would do so silently.
+fn imported_private_let_refusal_msg(name: &str, module: Option<&str>) -> String {
+    match module {
+        Some(module) => format!(
+            "`{}` {} (`{}`); SPEC.md §6.7 exports only `pub fn`/`pub model`/`pub type` — \
+             a `let` never crosses a module boundary, `pub` or not. Add a `pub fn` accessor \
+             in `{}`; use `dmc run` for full semantics",
+            name, IMPORTED_PRIVATE_LET_MARKER, module, module
+        ),
+        None => format!(
+            "`{}` {}; SPEC.md §6.7 exports only `pub fn`/`pub model`/`pub type` — \
+             a `let` never crosses a module boundary, `pub` or not. Add a `pub fn` accessor \
+             in the declaring module; use `dmc run` for full semantics",
+            name, IMPORTED_PRIVATE_LET_MARKER
+        ),
+    }
+}
+
+/// #755: the marker substring for a call site RE-SURFACING a model method's
+/// own stored declare-time refusal (`Jit::model_method_errors`). Every such
+/// call site names the SAME underlying cause — one method's signature never
+/// declared — so, like `TOP_LEVEL_LET_REFUSAL_MARKER`'s repeated reads of one
+/// refused `let`, every one of them is a CASCADE of the single root recorded
+/// once for the model at Pass 1 (D3, #755 rework), not an independent
+/// blocker of its own.
+///
+/// Applied only to the COPY handed back at a call site
+/// (`lower_model_method_call`'s re-surface site) — never to the value stored
+/// in `model_method_errors` itself, which stays the plain, honest message a
+/// free fn with the identical problem gets (and is what the recorded ROOT's
+/// own diagnostic displays). Wrapping only the copy keeps `` `View`, say ``
+/// wording intact behind the marker, so a reader who reaches the call site's
+/// message still finds the true reason, not merely a pointer back to the
+/// model.
+const MODEL_METHOD_CALL_REFUSAL_MARKER: &str = "has a method that never declared";
+
+/// The message for a re-surfaced model-method call, per
+/// `MODEL_METHOD_CALL_REFUSAL_MARKER`'s doc: `model` as the FIRST
+/// backtick-quoted token (so `cascade_candidate_name` extracts exactly the
+/// model's own item name — the same name Pass 1 records as the cascade root
+/// under), the marker, then the method's TRUE stored reason verbatim.
+fn model_method_call_refusal_msg(model: &str, stored_msg: &str) -> String {
+    format!("`{}` {}: {}", model, MODEL_METHOD_CALL_REFUSAL_MARKER, stored_msg)
+}
+
+/// #724: is `name` — a bare identifier that resolved to nothing above it in
+/// `lower_ident` (no local, no shape parameter, no fn, no `global_consts`
+/// literal) and that is not itself a same-file top-level `let`
+/// (`top_level_let_names.contains(name)`, checked by the caller first) — the
+/// un-prefixed SOURCE spelling of a top-level `let` `merge.rs` prefixed
+/// because some OTHER file declared it privately?
+///
+/// A top-level `let` is never `pub`-exportable (`pub let` is a hard error,
+/// SPEC.md §6.7) and is never given a further mangling suffix the way a
+/// `@grad fn` or a template instantiation is, so its every merged form is
+/// either bare (single-file — nothing to import, so no leak is possible) or
+/// `<prefix>$<name>` for exactly one trailing `$name` (multi-file — every
+/// top-level `let` is prefixed unconditionally, `merge.rs`'s rename rule).
+/// Splitting on the LAST `$` therefore recovers the un-prefixed SOURCE name
+/// exactly, without consulting the merge at all — no user identifier can
+/// itself contain `$` (the lexer admits none), so the segment after the
+/// last `$` is always the whole, unmangled name and never a fragment of the
+/// prefix that precedes it.
+///
+/// The PREFIX half of that same split is a different matter, and is NOT
+/// what the source name's half is: `merge.rs`'s `file_prefixes` gives a
+/// unique stem (`util$`) only when no other file's sanitized stem collides;
+/// when two do, the prefix becomes a `$`-joined relative path (`sub$leaf$`)
+/// and, if paths still collide after that, a further `$<index>$`
+/// disambiguator on top (`a_b$util$0$`) — so "everything before the last
+/// `$`" can itself contain any number of `$`, and is a merge-internal key,
+/// never a display-ready module name (`Jit::demangle` would scan straight
+/// through it looking for another `$` to split on). This function therefore
+/// never returns that prefix: it resolves every candidate's FULL merged
+/// name against `decl_files` — the same file map `Jit::decl_file_of` reads
+/// off `Jit::merge` — and hands back the real declaring FILE instead.
+///
+/// If `name` were itself in `top_level_let_names` — a same-file reference,
+/// always rewritten to the merged spelling by `merge.rs`'s own-declarations
+/// scope pass, whether prefixed or not — the caller's preceding
+/// `top_level_let_names.contains(name)` check would already have returned.
+/// Reaching here with a match therefore means the reference was NEVER
+/// rewritten, which `merge.rs`'s `FileScope` only ever does for a `pub`
+/// declaration of an import (`FileScope`'s own doc: "its own declarations,
+/// the `pub` declarations of the files it imports") — so a match here can
+/// only be a private import leak (#724), never a same-file case this helper
+/// might otherwise double-handle.
+///
+/// `None` when `name` names nothing the merge declared at all, the
+/// genuinely uncoded case that keeps raising the plain `jit error`.
+/// `Some(None)` when more than one FILE declares a top-level `let name` —
+/// two different modules each privately declaring a private `CAP`, both
+/// imported by one caller that never qualifies either. This bare,
+/// never-rewritten reference carries no information about which one `dmc
+/// run`'s own resolution order would actually reach, so naming either here
+/// would be a guess — measured wrong once already (the alphabetically
+/// first module named, while `dmc run` in fact resolved the other); the
+/// caller drops the "in `X`" clause instead. `Some(Some(file))` when
+/// exactly one file resolves — the one real case this can name with
+/// confidence.
+fn imported_private_let_module(
+    decl_files: Option<&HashMap<String, std::path::PathBuf>>,
+    top_level_let_names: &HashSet<String>,
+    name: &str,
+) -> Option<Option<std::path::PathBuf>> {
+    let is_candidate = |merged: &&String| {
+        merged.rsplit_once('$').is_some_and(|(_, source)| source == name)
+    };
+    if !top_level_let_names.iter().any(|m| is_candidate(&m)) {
+        return None;
+    }
+    let mut files: Vec<std::path::PathBuf> = top_level_let_names
+        .iter()
+        .filter(is_candidate)
+        .filter_map(|merged| decl_files.and_then(|m| m.get(merged)).cloned())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    let mut files = files.into_iter();
+    match (files.next(), files.next()) {
+        (Some(f), None) => Some(Some(f)),
+        _ => Some(None),
+    }
+}
+
+/// A display name for a declaring file, for `imported_private_let_refusal_msg`
+/// — the file's stem (`util.dmc` → `util`), matching what a unique,
+/// uncollided merge prefix already looked like before this existed. Never
+/// the file's full path (no absolute path belongs in a prose message; the
+/// `--json` `file` field carries that) and never a merge-internal key (the
+/// whole reason `imported_private_let_module` resolves a FILE instead of
+/// reading the merge prefix as a string).
+fn declaring_file_display_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// #684 R1/R2: is `e` one of the refusal shapes that name something ELSE by a
+/// single backtick-quoted identifier — `jit-unknown-fn`'s "unknown function
+/// `X`" (`Refusal::UnknownFn`; the `.method()` message shares the class and,
+/// per the fixup below, is resolved through the enum that owns the named
+/// method too), the fwd_bwd-entry `jit-error`'s "`X` is not a `@grad
+/// fn` (no ... entry)" (`lower_fwd_bwd_destructure` /
+/// `ad_lower_fwd_bwd_destructure`), (#696 R2) a body's read/write of an
+/// already-refused top-level `let` (`top_level_let_refusal_msg`, above), or
+/// (#724) a body's read/write of an imported module's private top-level
+/// `let` (`imported_private_let_refusal_msg`) — deliberately given the same
+/// shape as its `TOP_LEVEL_LET_REFUSAL_MARKER` sibling (`name` as the first
+/// backtick-quoted token) so `record_refusal` can give N reads of one leaked
+/// import the same 1-root-plus-(N−1)-cascades treatment #696 R2 already gives
+/// N reads of an already-refused same-file `let`? If `X` is the name of an
+/// item that already refused in this run, the refusal is a *cascade* of that
+/// item's root site rather than a root site of its own (R2(a)/(b), #696 R2)
+/// — this only extracts the candidate text; the caller
+/// (`Jit::resolve_cascade_root`) resolves it against `refused_items`.
+fn cascade_candidate_name(e: &JitError) -> Option<&str> {
+    let is_candidate = matches!(e.refusal, Some(Refusal::UnknownFn))
+        || (e.kind == JitErrorKind::Error && e.msg.contains("is not a `@grad fn` (no "))
+        || (e.refusal == Some(Refusal::Item) && e.msg.contains(TOP_LEVEL_LET_REFUSAL_MARKER))
+        || (e.refusal == Some(Refusal::Item) && e.msg.contains(IMPORTED_PRIVATE_LET_MARKER))
+        // #755: a re-surfaced model-method call — the stored error keeps its
+        // OWN class (`jit-type-form` for a `View` param, say), never `Item`,
+        // so this arm is not class-gated like the two `let` markers above.
+        || e.msg.contains(MODEL_METHOD_CALL_REFUSAL_MARKER);
+    if !is_candidate { return None; }
+    let start = e.msg.find('`')? + 1;
+    let rest = &e.msg[start..];
+    let end = rest.find('`')?;
+    Some(&rest[..end])
+}
+
+/// #684 R2: the three headline numbers one collect-mode run gives a corpus —
+/// shared by `dmc jit --json --all`'s whole-program summary and `dmc test
+/// --jit --json --all`'s per-file fields, computed the same way in both
+/// places so the two commands can never quietly disagree about a file they
+/// both report on.
+pub struct BlockerCounts {
+    /// Every recorded site — cascades and roots alike. What `refusals.len()`
+    /// always was before this PR.
+    pub sites: usize,
+    /// Distinct root blockers: the number of distinct `(code, message)`
+    /// pairs among the NON-cascade sites, the message compared VERBATIM (a
+    /// fixup dropped the earlier pass that blanked every backtick-quoted
+    /// identifier before comparing — that conflated independent gaps that
+    /// merely share a message template, e.g. `` unknown function `isclose` ``
+    /// and `` unknown function `clamp` `` in the same file, into one blocker;
+    /// two calls to two different missing builtins are two blockers). The
+    /// headline metric (R2) — `char_demo.dmc`'s depth 13 and `gradcheck.dmc`'s
+    /// 28 were one gap apiece, repeated per item; this counts that gap once,
+    /// identically whether the message is blanked or not, because those two
+    /// files' repeated gap is the exact same message at every site, not
+    /// merely the same template with a different name in it.
+    pub blockers: usize,
+    /// How many sites are cascades of an earlier root (`cascade_of` is
+    /// `Some`) rather than root blockers of their own.
+    pub cascades: usize,
+    /// `code` (or, for a `jit-error`, `JIT_ERROR_CLASS_KEY`) → how many
+    /// NON-cascade sites carried it. A secondary, per-site (not deduplicated)
+    /// count — `blockers` above is the deduplicated one.
+    pub classes: std::collections::BTreeMap<&'static str, u64>,
+    /// #684 fixup (F3), corrected (#684 rework 3): did collection end
+    /// because a root `jit-error` (the #480 defect class, not a cascade)
+    /// aborted it with work still undone, rather than because every item was
+    /// walked? When `true`, `sites`/`blockers`/`cascades` above are a FLOOR
+    /// on the file's true depth, not the depth itself — whatever lies past
+    /// the aborting item was never collected.
+    ///
+    /// Set explicitly by `Jit::compile_program_collect` at the point it
+    /// returns early, never inferred after the fact from the shape of
+    /// `refusals` alone — "the last recorded site is a non-cascade
+    /// `jit-error`" does NOT by itself say whether work remained: a program
+    /// whose very last top-level item (nothing left in `metas`,
+    /// `self.pending`, or `self.pending_lambdas` at the point of the abort)
+    /// is the one that trips such a defect has walked every item, and must
+    /// report `false` — every item walked, one of them a defect, nothing
+    /// left uncollected. The earlier revision conflated the two: it read
+    /// `true` off "last recorded site is a root `jit-error`" regardless of
+    /// where in collection that site fell, so this exact "abort on the last
+    /// item" case reported `true` (a floor) for a file that was, in fact,
+    /// fully measured.
+    pub truncated: bool,
+}
+
+/// `truncated` is `Jit::compile_program_collect`'s own verdict (see
+/// `BlockerCounts::truncated` above) — this fn cannot recompute it from
+/// `refusals` alone, because "the last recorded site is a non-cascade
+/// `jit-error`" is consistent with either answer: whether anything was left
+/// unwalked depends on WHERE in collection that site fell, which only the
+/// caller (mid-loop, with `metas`/`self.pending`/`self.pending_lambdas` in
+/// hand) can know.
+pub fn blocker_counts(refusals: &[CollectedRefusal], truncated: bool) -> BlockerCounts {
+    let mut cascades = 0usize;
+    let mut roots: std::collections::BTreeSet<(&'static str, &str)> =
+        std::collections::BTreeSet::new();
+    let mut classes: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    for r in refusals {
+        if r.cascade_of.is_some() {
+            cascades += 1;
+            continue;
+        }
+        let code = r.error.refusal.map(|c| c.code()).unwrap_or(JIT_ERROR_CLASS_KEY);
+        *classes.entry(code).or_insert(0) += 1;
+        roots.insert((code, r.error.msg.as_str()));
+    }
+    BlockerCounts { sites: refusals.len(), blockers: roots.len(), cascades, classes, truncated }
+}
 
 pub struct Jit {
     module: JITModule,
@@ -1566,14 +2651,117 @@ pub struct Jit {
     /// #267: a model's field *AST* types, kept so a param-shaped field can be
     /// re-resolved against concrete type args at access time.
     model_field_asts: HashMap<String, Vec<(String, Type)>>,
+    /// #634: a model's declared method names, in order — for EVERY model, not
+    /// only the ones whose methods are declared. The call-site rewrite
+    /// (`lower_postfix`'s `Call` arm) needs the shape-generic ones too, so that
+    /// `b.fill!()` on a `Buf[N]` refuses by naming the model as shape-generic
+    /// instead of falling through to the str-method arm and naming `str`.
+    model_methods: HashMap<String, Vec<String>>,
+    /// #747: the true reason a specific method's OWN synthesized decl
+    /// (`method_fn_decl`, keyed by its mangled `mangle_method_name(model,
+    /// method)`) failed to register in pass 1 — a param or return type the
+    /// JIT does not lower in a signature (`View`, say), unrelated to any
+    /// shape bracket. Recorded so the model's OTHER methods still register
+    /// (one method's bad signature no longer takes its siblings down with
+    /// it — the per-method loop in `collect_fns`'s `Item::Model` arm catches
+    /// and continues instead of `?`-propagating out of the whole model), and
+    /// so `lower_model_method_call`'s catch-all "no template, no declared
+    /// fn" arm can re-surface THIS stored error instead of guessing: before
+    /// this fix, that arm assumed the only reachable case was a bracket
+    /// written on a method that declares none, which is false for a
+    /// bracket-LESS call whose method's OWN `method_fn_decl` never finished
+    /// declaring, for a reason that has nothing to do with a bracket. Never
+    /// consulted for a method that DID declare (key absent), so the
+    /// original "shape bracket it does not declare" wording is untouched
+    /// for the case it actually describes.
+    ///
+    /// #755: paired with the file the method was DECLARED in (captured from
+    /// `current_decl_file` at the moment this entry is inserted, in the
+    /// `Item::Model` arm above). A bracket-less call re-surfacing this error
+    /// from a DIFFERENT file's body would otherwise inherit `attribute()`'s
+    /// `current_decl_file` for the CALLING body instead — the declaration's
+    /// own line/col with the caller's file is a location that names the
+    /// wrong file entirely on a merged, multi-file build. Restored onto
+    /// `Translator::current_decl_file` at the re-surface site in
+    /// `lower_model_method_call` before the error is returned, so it is
+    /// already correct by the time `attribute()` reads it back out.
+    model_method_errors: HashMap<String, (JitError, Option<std::path::PathBuf>)>,
     /// #268: top-level `let NAME = <literal>` constants (the SPEC §4.5 enum
     /// discriminant idiom). Stored as the initializer expr and re-lowered at each
     /// bare-ident reference. Only compile-time-constant initializers are admitted;
     /// anything else still errors as an unsupported top-level binding.
     global_consts: HashMap<String, Expr>,
+    /// #696: every top-level `let NAME = <...>` name, literal or not, `!`-
+    /// mutable or not — `global_consts`'s superset. Populated by the same
+    /// `collect_global_const` pre-pass, as its second out-param. Consulted by
+    /// `lower_ident`'s final fallback AND the assignment lowering's unknown-
+    /// binding fallback (R3), to tell an actual top-level `let` (whose
+    /// declare-time refusal, `collect_fns`'s `Item::Let` arm, already named
+    /// it `jit-item`) apart from every OTHER name that reaches either
+    /// fallback for an unrelated reason (an unhandled builtin-namespace
+    /// construct like `forge.identity[...]`, say) — which must keep raising
+    /// the uncoded `jit-error` it always has, rather than being misclassified
+    /// under a code whose DIAGNOSTICS.md §5.2 meaning ("a top-level item
+    /// form") does not describe it.
+    top_level_let_names: HashSet<String>,
+    /// #695: mangled names of every top-level fn (a plain fn under its own
+    /// name, or a non-generic model method under `M$$method` — `declare_fn`
+    /// is the one place this set is populated, and it declares both) whose
+    /// `-> T` return type was OMITTED in source. `declare_fn` builds such a
+    /// fn's signature as returning nothing (`TyKind::Scalar(Nil)`) regardless
+    /// of what its body's tail expression actually produces — the JIT has no
+    /// return-type inference, so this is the only signature it can build
+    /// without one, and `lower_return`'s matching Nil-declared arm evaluates
+    /// and discards the value on purpose (this is correct and load-bearing for
+    /// a fn called only for effect, e.g. `main`'s trailing `print(...)`).
+    ///
+    /// The gap is a caller that treats such a call's result as something to
+    /// keep: the bound value is a bare `nil`, not whatever the callee's body
+    /// actually returned, and using it downstream produced an uncoded
+    /// `jit-error` (#695) instead of a located refusal. #720's review found
+    /// the original fix refused every binding unconditionally — including a
+    /// callee that genuinely returns nothing, which is not a bug at all
+    /// (`fn side(v: i64) { print(v) }` really does answer `nil`, on both
+    /// backends). `lower_let` no longer refuses anything here: it records,
+    /// in `omitted_ret_provenance`, which name (if any) a binding was bound
+    /// from — and `map_get`/`map_set`/`map_contains` (`lower_call`'s
+    /// `omitted_ret_arg_refusal`) are where the located `jit-signature`
+    /// refusal actually fires, exactly when a value that traces back to a
+    /// call in this set is used somewhere that needs it to be a real `Map`
+    /// instead of `nil`. Binding or discarding the result and never doing
+    /// that is legal — matching `dmc run`, since the checker only ever lets
+    /// an omitted-return fn's body actually disagree with "returns nil" when
+    /// the body produces a `Map` (#723 is the checker defect that hole is
+    /// filed under).
+    ///
+    /// `declare_fn` is the EAGER population site (a plain fn or a non-generic
+    /// method's own entry, declared once in pass 1). #717's gap review found
+    /// a second, LAZY one is required too: a shape-generic model method is
+    /// declared per-instantiation, on demand, via `declare_template_signature`
+    /// rather than `declare_fn` — `lower_model_method_call` inserts that
+    /// instantiation's mangled name here itself, at the one site its `tmpl`
+    /// and its mangled name are both already in hand, the moment its own
+    /// `-> T` is missing. Without that second site, `resolve_direct_call_name`
+    /// resolving such a method's mangled name (its own, separate #717 half)
+    /// would still find nothing to record provenance under.
+    omitted_ret_fns: HashSet<String>,
+    /// Each module constant's verdict as a shape dimension, folded once by
+    /// `const_dim_table` in `compile_program`'s pre-pass — the order-independent
+    /// lookup table `resolve_shape_expr` falls back to in a type-level shape
+    /// position. Derived from `global_consts`, never a substitute for it: the
+    /// scalar (#268) path still re-lowers the initializer, with its declared
+    /// width, at every value-position reference.
+    const_dims: HashMap<String, ConstDim>,
     /// Deferred lambda bodies accumulated during function-body lowering.
     /// Drained after each top-level function is compiled (before finalize).
     pending_lambdas: Vec<FnMeta>,
+    /// `compile_program_collect` only (#684 R2): every top-level item name
+    /// that has refused so far in this collect-mode run, mapped to the index
+    /// (in collection order) of its ROOT site — its own index for a root
+    /// blocker, or the root it cascades from when the item's own recorded
+    /// refusal was itself a cascade. Reset at the start of each collect-mode
+    /// call; unused (and left empty) by `compile_program`/`compile_program_inner`.
+    refused_items: HashMap<String, usize>,
     /// Counter for generating unique lambda names (`__lambda_N`).
     lambda_counter: usize,
     /// #350: top-level C-like enums — name → ordered variant names (mirrors
@@ -1581,6 +2769,16 @@ pub struct Jit {
     /// `compile_program` so fn signatures, `let` annotations, and `match`
     /// scrutinees can resolve an enum-named type and its variant ordinals.
     enums: HashMap<String, Vec<String>>,
+    /// Top-level `type` aliases (SPEC.md §6.6) — name → declaration. Populated
+    /// up front in `compile_program`, mirroring `enums`, so any `Type::Named`
+    /// naming an alias resolves through it wherever the JIT builds a `TyKind`
+    /// (signatures, `let` annotations, model fields, enum payload fields,
+    /// lambda and extern signatures, `forge.zeros[..]`, casts, the `@grad fn`
+    /// loss type) instead of being mistaken for a model name. A name in this
+    /// table never escapes as a `Type::Named`: `resolve_alias_ty` either
+    /// resolves it — recursively, including nested positions — or refuses it
+    /// as `jit-type-form`.
+    aliases: HashMap<String, TypeAlias>,
     /// #350 Part 2b: payload-carrying enums — name → tagged-union layout. Only
     /// enums with ≥1 payload variant appear here; tag-only enums (#336/Part 1)
     /// stay bare-ordinal i64 values and are absent. A value of a payload enum is
@@ -1603,6 +2801,31 @@ pub struct Jit {
     /// unqualified and puts the trade on the command line, where a consumer
     /// can read it (`NUMERICS.md §2.2`).
     blas: bool,
+
+    /// The merge this program came out of (the whole-program merge that
+    /// stitches multiple files' ASTs into one), when
+    /// it came out of one. `None` for `selftest.rs`, which generates its
+    /// programs in memory and has no resolver to merge from.
+    ///
+    /// The merge gives a dependency's private items a `<stem>$<name>` prefix so
+    /// two files' `fn helper`s cannot land on one key in `fns`. That is a name
+    /// no user wrote, and every diagnostic in this file that quotes a declared
+    /// name reads it straight off the merged AST. `MergedProgram`'s two
+    /// accessors are the way back — to the source spelling, and to the file
+    /// that declared it — and they are consulted only when a `JitError` is on
+    /// its way out, so nothing on the compile path pays for them.
+    ///
+    /// Held behind an `Arc` because the caller keeps the same value: it is
+    /// `merged.program` that `compile_program` is handed.
+    merge: Option<std::sync::Arc<crate::merge::MergedProgram>>,
+    /// Which file's declaration is being compiled right now. Set per top-level
+    /// item and per function body; read only when a `JitError` leaves.
+    current_decl_file: Option<std::path::PathBuf>,
+    /// The file the last error to leave this `Jit` belongs to. `main.rs` reads
+    /// it after a failed `compile_program` / `run_*` to stamp `--json`'s
+    /// `file`. This is `JitError`'s missing field (design §5.2) kept one level
+    /// out rather than added to a struct built at a hundred-odd sites.
+    error_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1738,6 +2961,7 @@ impl Jit {
         let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         // Builtins exposed to demoniC source by symbol name.
         builder.symbol("print_i64", builtin_print_i64 as *const u8);
+        builder.symbol("print_u64", builtin_print_u64 as *const u8);
         builder.symbol("print_f64", builtin_print_f64 as *const u8);
         builder.symbol("print_bool", builtin_print_bool as *const u8);
         builder.symbol("print_nil", builtin_print_nil as *const u8);
@@ -1769,8 +2993,23 @@ impl Jit {
         builder.symbol("__dmc_grad_epilogue", grad_call_epilogue as *const u8);
         // Forge arena allocator + snapshot/restore (internal — invoked by tensor lowering).
         builder.symbol("__dmc_forge_alloc", forge_alloc as *const u8);
+        // #674: the root-routing allocator a
+        // VAULT-spelled constructor's own buffer goes through.
+        builder.symbol("__dmc_forge_alloc_root", forge_alloc_root as *const u8);
         builder.symbol("__dmc_forge_snapshot", forge_snapshot as *const u8);
         builder.symbol("__dmc_forge_restore", forge_restore as *const u8);
+        // #614/PR#779: the `InternalMark` pair backing the JIT-emitted
+        // rewind at a forward-only `@grad fn` entry (mirrors how
+        // `grad_call_prologue`/`grad_call_epilogue` already use these for
+        // `fwd_bwd` — see `InternalMark`'s doc comment).
+        builder.symbol("__dmc_forge_snapshot_internal", forge_snapshot_internal as *const u8);
+        builder.symbol("__dmc_forge_restore_internal", forge_restore_internal as *const u8);
+        // #674 slice 3c: the budget table's runtime calls.
+        builder.symbol("__dmc_budget_carve", dmc_budget_carve as *const u8);
+        builder.symbol("__dmc_budget_reap", dmc_budget_reap as *const u8);
+        // #674 slice 3d: the entered-budget register's push/pop.
+        builder.symbol("__dmc_budget_enter", dmc_budget_enter as *const u8);
+        builder.symbol("__dmc_budget_exit", dmc_budget_exit as *const u8);
         builder.symbol("__dmc_print_tensor_1d_f32", print_tensor_1d_f32 as *const u8);
         builder.symbol("__dmc_print_tensor_2d_f32", print_tensor_2d_f32 as *const u8);
         // String runtime functions.
@@ -1780,6 +3019,8 @@ impl Jit {
         builder.symbol("__dmc_str_eq",           dmc_str_eq           as *const u8);
         builder.symbol("__dmc_str_concat",       dmc_str_concat       as *const u8);
         builder.symbol("__dmc_str_from_int",     dmc_str_from_int     as *const u8);
+        // #597: `u64`'s own `n as str` — see `dmc_str_from_uint`.
+        builder.symbol("__dmc_str_from_uint",    dmc_str_from_uint    as *const u8);
         builder.symbol("__dmc_str_from_f64",     dmc_str_from_f64     as *const u8);
         builder.symbol("__dmc_str_from_bool",    dmc_str_from_bool    as *const u8);
         builder.symbol("__dmc_str_starts_with",  dmc_str_starts_with  as *const u8);
@@ -1788,6 +3029,7 @@ impl Jit {
         builder.symbol("__dmc_flush",            dmc_flush            as *const u8);
         builder.symbol("__dmc_match_trap",       dmc_match_trap       as *const u8);
         builder.symbol("__dmc_nil_trap",         dmc_nil_trap         as *const u8);
+        builder.symbol("__dmc_binop_nil_trap",   dmc_binop_nil_trap   as *const u8);
         builder.symbol("__dmc_print_str",        dmc_print_str        as *const u8);
         // Process ports (PORTS.md §7.1) — the protocol itself is in crate::ports.
         builder.symbol("__dmc_port_render", dmc_port_render as *const u8);
@@ -1797,11 +3039,17 @@ impl Jit {
         builder.symbol("__dmc_port_close", dmc_port_close as *const u8);
         builder.symbol("__dmc_port_tensor_encode", dmc_port_tensor_encode as *const u8);
         builder.symbol("__dmc_port_tensor_decode", dmc_port_tensor_decode as *const u8);
+        // File I/O (STDLIB.md ~§3.10) as host calls.
+        builder.symbol("__dmc_read_file",   dmc_read_file   as *const u8);
+        builder.symbol("__dmc_write_file",  dmc_write_file  as *const u8);
+        builder.symbol("__dmc_append_file", dmc_append_file as *const u8);
+        builder.symbol("__dmc_file_exists", dmc_file_exists as *const u8);
         // HashMap runtime functions.
         builder.symbol("__dmc_map_new",      dmc_map_new      as *const u8);
         builder.symbol("__dmc_map_get",      dmc_map_get      as *const u8);
         builder.symbol("__dmc_map_set",      dmc_map_set      as *const u8);
         builder.symbol("__dmc_map_contains", dmc_map_contains as *const u8);
+        builder.symbol("__dmc_map_len",      dmc_map_len      as *const u8);
         // vault.load / vault.load_npz — raw binary and NPZ weight loading.
         builder.symbol("__dmc_vault_load_raw", dmc_vault_load_raw as *const u8);
         builder.symbol("__dmc_vault_load_npz", dmc_vault_load_npz as *const u8);
@@ -1853,14 +3101,148 @@ impl Jit {
             model_layouts: HashMap::new(),
             model_shape_params: HashMap::new(),
             model_field_asts: HashMap::new(),
+            model_methods: HashMap::new(),
+            model_method_errors: HashMap::new(),
             global_consts: HashMap::new(),
+            top_level_let_names: HashSet::new(),
+            omitted_ret_fns: HashSet::new(),
+            const_dims: HashMap::new(),
             pending_lambdas: Vec::new(),
+            refused_items: HashMap::new(),
             lambda_counter: 0,
             enums: HashMap::new(),
+            aliases: HashMap::new(),
             enum_payload_layouts: HashMap::new(),
             gpu: false,
             blas: false,
+            merge: None,
+            current_decl_file: None,
+            error_file: None,
         })
+    }
+
+    /// Hand the JIT the merge its program came out of (the whole-program
+    /// merge that stitches multiple files' ASTs into one).
+    ///
+    /// Call it before `compile_program` on any program built by
+    /// `merge::merge_program`. Without it the JIT still compiles the merged
+    /// program correctly — the merge is read on the diagnostic path only — but
+    /// a refusal inside an imported item would quote the merged name and blame
+    /// the entry file.
+    pub fn set_merge(&mut self, m: std::sync::Arc<crate::merge::MergedProgram>) {
+        self.merge = Some(m);
+    }
+
+    /// The file the last error to leave this `Jit` was raised in, when the
+    /// merge said which. `None` means "the file on the command line", which is
+    /// what a single-file program and an un-merged caller both want.
+    pub fn error_file(&self) -> Option<&std::path::Path> {
+        self.error_file.as_deref()
+    }
+
+    /// The declaring file of a merged name, tolerating the manglings the JIT
+    /// layers on top of the merge's own prefix — `$fwd_bwd` for a `@grad` fn's
+    /// backward entry, `$d0_d1` for a monomorphization — by dropping one
+    /// trailing `$`-segment at a time until the map answers.
+    ///
+    /// `util$helper` answers directly; `util$helper$fwd_bwd` answers after one
+    /// step; `helper$3_4` answers after one step as `helper`. A name the merge
+    /// never declared answers `None`, and the caller falls back to the file on
+    /// the command line.
+    fn decl_file_of(&self, name: &str) -> Option<std::path::PathBuf> {
+        let m = self.merge.as_ref()?;
+        let mut n = name;
+        loop {
+            if let Some(p) = m.declaring_file(n) {
+                return Some(p.to_path_buf());
+            }
+            match n.rfind('$') {
+                Some(i) => n = &n[..i],
+                None => return None,
+            }
+        }
+    }
+
+    /// The declaring file of a top-level item, by the name it declares.
+    fn decl_file_of_item(&self, item: &Item) -> Option<std::path::PathBuf> {
+        item_decl_name(item).and_then(|n| self.decl_file_of(&n))
+    }
+
+    /// Put the source spelling back into a message the merge's prefixes leaked
+    /// into, and record which file the failure belongs to.
+    ///
+    /// Every `JitError` that leaves `compile_program`, `run_main` and
+    /// `run_test_fn` goes through here, so this is one place rather than a
+    /// rewrite of every message that interpolates a name. (`run_main_scalar` is
+    /// `selftest.rs`'s alone — it runs generated programs that have no resolver
+    /// to merge from, so both maps are empty there and this would be a no-op.)
+    /// That matters beyond tidiness: the messages that quote a declared name
+    /// are not a closed set — `unknown function`, `duplicate function`, the
+    /// model and enum diagnostics, and whatever the next one is — and a rule
+    /// enforced at the exit cannot be forgotten by the site that adds one.
+    fn attribute(&mut self, mut e: JitError) -> JitError {
+        self.error_file = self.current_decl_file.clone();
+        // `demangle` runs before the merge guard, not after: its merge-prefix
+        // loop is itself gated on `self.merge.is_some()` internally, but its
+        // trailing `$$` → `.` method-symbol substitution
+        // (`demangle_method_symbols`) is not, and must not be — a single-file
+        // program has no merge and still declares `M$$method` (#634), so a
+        // message quoting one must read back to `M.method` there too. Calling
+        // `demangle` here unconditionally is what makes that true; calling it
+        // only past the merge guard below left the single-file case never
+        // demangled at all (harmless only because no single-file message
+        // happened to quote a mangled method symbol yet).
+        e.msg = self.demangle(&e.msg);
+        if self.merge.is_none() {
+            return e;
+        }
+        if self.error_file.is_none() {
+            // No item in flight (a module-level failure): fall back to the
+            // first merged name the message mentions.
+            self.error_file = merged_tokens(&e.msg).into_iter().find_map(|t| self.decl_file_of(&t));
+        }
+        e
+    }
+
+    /// Replace every merged name in `msg` with the name the user wrote.
+    ///
+    /// A merged name is an identifier containing `$`, which no user identifier
+    /// can (the lexer admits no `$` at all), so the scan cannot rewrite a name
+    /// someone actually typed. A token the merge did not produce — a
+    /// monomorphization's `f$3_4`, a `@grad` fn's `f$fwd_bwd` — is left alone
+    /// unless the merge prefixed its stem, in which case only the prefix comes
+    /// off and the JIT's own mangling stays: `util$helper$fwd_bwd` reads back
+    /// as `helper$fwd_bwd`, which is what that entry point is called.
+    fn demangle(&self, msg: &str) -> String {
+        let mut out = msg.to_string();
+        if let Some(m) = self.merge.as_ref() {
+            for tok in merged_tokens(msg) {
+                let mut stem = tok.as_str();
+                loop {
+                    // `source_name` hands back its argument for a name the merge
+                    // left bare, so "it differs" *is* "the merge renamed it": a
+                    // prefixed name can never equal the name it was built from.
+                    let src = m.source_name(stem);
+                    if src != stem {
+                        let replacement = format!("{}{}", src, &tok[stem.len()..]);
+                        out = replace_word(&out, &tok, &replacement);
+                        break;
+                    }
+                    match stem.rfind('$') {
+                        Some(i) => stem = &stem[..i],
+                        None => break,
+                    }
+                }
+            }
+        }
+        // #634: a model method's own symbol reads back as the dot form that was
+        // written (`util$Buf$$fill!` → `Buf$$fill!` above → `Buf.fill!` here).
+        // Outside the merge-prefix loop above deliberately, and reachable for a
+        // single-file program too: `attribute` (this method's only caller)
+        // calls `demangle` before its own merge guard, specifically so that a
+        // single-file program — which has no merge and still declares
+        // `M$$method` — gets this substitution on a message that quotes one.
+        demangle_method_symbols(&out, &self.model_shape_params)
     }
 
     /// #326: enable GPU lowering for the bf16 decode GEMV (`--gpu`). Present only
@@ -1901,11 +3283,410 @@ impl Jit {
 
     /// Compile every fn item in `program`. Other top-level items (let, model,
     /// arena, type alias, use, directive, pub) are walked transparently for
-    /// fn extraction; non-fn items are rejected with a diagnostic.
+    /// fn extraction; non-fn items other than type aliases are rejected with
+    /// a diagnostic.
     pub fn compile_program(&mut self, program: &Program) -> Result<(), JitError> {
+        self.current_decl_file = None;
+        self.error_file = None;
+        match self.compile_program_inner(program) {
+            Ok(()) => {
+                // Nothing is in flight once the compile is done, so a later
+                // `run_*` failure must not inherit the last item's file.
+                self.current_decl_file = None;
+                Ok(())
+            }
+            Err(e) => Err(self.attribute(e)),
+        }
+    }
+
+    /// Collect mode (#684, `dmc jit --json --all`): report every refusal in
+    /// `program` instead of stopping at the first. Mirrors
+    /// `compile_program_inner`'s four passes item by item, but where that
+    /// function propagates the first `Err` with `?`, this records it and
+    /// moves on to the next top-level item — a refusal skips only the item
+    /// that raised it, not the rest of the program. A later item that calls
+    /// the skipped one refuses in its own right (typically `jit-unknown-fn`,
+    /// since the callee was never declared) — that is a second, legitimate
+    /// site, not noise, and is exactly what design §684 calls "another site".
+    ///
+    /// A `jit-error` (`JitErrorKind::Error`, the #480 defect class — a bug,
+    /// not a gap) still **aborts**: it is recorded as the last entry and
+    /// collection stops right there, the same as `compile_program` stopping
+    /// on one.
+    ///
+    /// Never calls `finalize_definitions` and never runs anything. The
+    /// backend's unit of compilation is one `JITModule` shared by every item
+    /// (`self.module`/`self.ctx`/`self.builder_ctx`): a refused item's
+    /// `FuncId` — declared just above the refusal, or mid-declaration when
+    /// the refusal is the declaration itself — is left declared but never
+    /// defined, which `finalize_definitions` does not accept. Every
+    /// successfully-lowered item still gets a fully defined function in the
+    /// module; there is simply nothing that ever asks the module to link and
+    /// run. Do not call `run_main` / `run_test_fn` on a `Jit` after this.
+    /// Returns the collected sites alongside `truncated` (#684 fixup F3,
+    /// corrected in rework 3): `true` when collection returned early with
+    /// work still undone — set explicitly at each early-return site below
+    /// from that site's own loop state (`metas`/`self.pending`/
+    /// `self.pending_lambdas`), never inferred afterward from the shape of
+    /// `refusals` (see `BlockerCounts::truncated`'s doc comment for why that
+    /// inference is unsound). The pre-Pass-2 passes below (payload layouts,
+    /// extern fn declarations, Pass 1's own fn-declare loop) return `true`
+    /// unconditionally on an early exit: none of them has even started Pass
+    /// 2 (defining any fn body) yet, so every fn in the program — whichever
+    /// side of the failing item it falls on — is still unwalked. That is
+    /// unconditional, not approximate: `metas` is fixed for a whole
+    /// `compile_program_collect` call, and none of the pre-Pass-2 passes below
+    /// can walk the items Pass 2 would have. `register_builtins`'s own
+    /// failure is the exception even among these: it runs after Pass 1 has
+    /// fully completed, so `metas` is already final there, and `truncated` is
+    /// exactly `!metas.is_empty()`.
+    pub fn compile_program_collect(&mut self, program: &Program) -> (Vec<CollectedRefusal>, bool) {
+        self.current_decl_file = None;
+        self.error_file = None;
+        self.refused_items.clear();
+        let mut refusals: Vec<CollectedRefusal> = Vec::new();
+
+        // ── Infallible pre-passes (verbatim order of `compile_program_inner`) ──
+        for item in &program.items {
+            collect_alias_item(item, &mut self.aliases);
+        }
+        let err_model = program.items.iter().any(
+            |it| item_model_decl(it).is_some_and(|m| m.name == "Err"));
+        ERR_IS_USER_MODEL.with(|f| f.set(err_model));
+        for item in &program.items {
+            if let Some(e) = item_enum_decl(item) {
+                self.enums.insert(
+                    e.name.clone(),
+                    e.variants.iter().map(|v| v.name.clone()).collect(),
+                );
+            }
+        }
+        for item in &program.items {
+            collect_global_const(item, &mut self.global_consts, &mut self.top_level_let_names);
+        }
+        self.const_dims = const_dim_table(&self.global_consts);
+
+        // Payload-carrying enum layouts, one enum at a time.
+        for item in &program.items {
+            if let Some(e) = item_enum_decl(item) {
+                if !e.variants.iter().any(|v| !v.fields.is_empty()) { continue; }
+                self.current_decl_file = self.decl_file_of_item(item);
+                if let Err(err) = self.build_enum_payload_layout(e) {
+                    let name = item_decl_name(item).unwrap_or_else(|| "<enum>".to_string());
+                    // Pass 2 (fn bodies) hasn't started — always a floor.
+                    if self.record_refusal(&mut refusals, err, name) { return (refusals, true); }
+                }
+            }
+        }
+        self.current_decl_file = None;
+
+        // Pass 0: extern fn declarations, one item at a time.
+        for item in &program.items {
+            self.current_decl_file = self.decl_file_of_item(item);
+            if let Err(err) = self.declare_extern_fn_item(item, false) {
+                // `declare_one_extern_fn` can lower a trampoline body (when a
+                // symbol was pre-registered via `register_extern_symbol`)
+                // before failing; reset the per-function scratch state the
+                // same way a refused body does below, so a half-built
+                // trampoline never bleeds into the next item's IR.
+                self.ctx = Context::new();
+                self.builder_ctx = FunctionBuilderContext::new();
+                let name = item_decl_name(item).unwrap_or_else(|| "<extern fn>".to_string());
+                // Pass 2 (fn bodies) hasn't started — always a floor.
+                if self.record_refusal(&mut refusals, err, name) { return (refusals, true); }
+            }
+        }
+        self.current_decl_file = None;
+
+        // Pass 1: declare every fn, one top-level item at a time.
+        let mut metas: Vec<FnMeta> = Vec::new();
+        for item in &program.items {
+            self.current_decl_file = self.decl_file_of_item(item);
+            if let Err(err) = self.collect_fns(item, &mut metas) {
+                // A `@grad fn` can declare its forward half cleanly
+                // (`declare_grad_fn`'s `self.fns.insert` via `declare_fn`)
+                // before its `fwd_bwd` half refuses. Discarding the pushed
+                // `fwd` meta here used to leave that `self.fns` entry
+                // permanently undefined: a caller resolves the name, the
+                // forward half's own body (and whatever blocker it holds)
+                // is never compiled, and no site is ever reported for it
+                // (#684 R1). Keep whatever was already pushed to `metas` —
+                // Pass 2 below defines it like any other fn and reports its
+                // own refusal, if any, as its own site.
+                let name = item_decl_name(item).unwrap_or_else(|| "<item>".to_string());
+                // Pass 2 (fn bodies) hasn't started — always a floor.
+                if self.record_refusal(&mut refusals, err, name) { return (refusals, true); }
+            }
+            // D3 (#755): record EVERY one of a model's own declare-time
+            // method refusals as its own ROOT here — not just the first
+            // broken method in member order — whether or not the broken
+            // method is ever called. `current_decl_file` is still this
+            // item's own file (set just above, untouched by `collect_fns`'s
+            // `Item::Model` arm), so `record_refusal`'s `attribute()` call
+            // stamps the right file without any extra work. This also
+            // enters the model's name into `self.refused_items`, which is
+            // what lets a later call site's re-surfaced copy
+            // (`model_method_call_refusal_msg`'s marker) resolve to THIS
+            // site as `cascade_of` instead of registering as its own
+            // independent, unattributed blocker (the bug this rework
+            // fixes). A model with two broken methods now gets two roots
+            // here — one per method — instead of the first silently
+            // eclipsing the second.
+            for (model, e, _) in self.model_method_errors_for_item(item) {
+                // `model_method_errors` (read by `model_method_errors_for_item`
+                // above) is populated only from the `Err(e) if e.kind ==
+                // JitErrorKind::Unsupported` arm in `collect_fns`'s
+                // `Item::Model` case — a genuine `JitErrorKind::Error` defect
+                // propagates via `?` instead and never reaches this map. The
+                // `record_refusal` call below discards its own bool return
+                // (which distinguishes a defect from a plain refusal)
+                // unconditionally; that is only safe because of this
+                // coupling, so pin it here rather than let a future change
+                // to the `Item::Model` arm silently break it.
+                debug_assert!(e.kind == JitErrorKind::Unsupported,
+                    "model_method_errors must store only Unsupported refusals");
+                self.record_refusal(&mut refusals, e, model);
+            }
+        }
+        self.current_decl_file = None;
+
+        if let Err(err) = self.register_builtins() {
+            // Not a function of the source program — a hard stop either way,
+            // so the defect/refusal distinction doesn't matter here. Pass 1
+            // has fully completed by this point (`metas` is final) and Pass 2
+            // has not started, so whether work remained is exactly whether
+            // there was anything in `metas` to define.
+            self.record_refusal(&mut refusals, err, "<builtins>".to_string());
+            return (refusals, !metas.is_empty());
+        }
+
+        // Pass 2: define each declared fn's body, one at a time.
+        for (meta_idx, meta) in metas.iter().enumerate() {
+            let lambdas_before = self.pending_lambdas.len();
+            if let Err(err) = self.define_fn(meta) {
+                // Do NOT truncate `self.pending` here (#684 R1): a call in
+                // this body may have already run `instantiate_template`,
+                // which both records the mangled name in `self.fns` (so a
+                // sibling caller resolves to it) and queues its body in
+                // `self.pending`. Truncating the queue while leaving the
+                // `self.fns` entry in place orphans that monomorphization —
+                // it is never defined, never re-enqueued (a later caller's
+                // `instantiate_template` sees the `self.fns` entry and short
+                // circuits), and its own blocker is silently dropped. Letting
+                // it drain in Pass 3/4 below reports it as its own site.
+                // `pending_lambdas` carries no such module-visible name, so
+                // truncating it back is safe.
+                self.pending_lambdas.truncate(lambdas_before);
+                self.ctx = Context::new();
+                self.builder_ctx = FunctionBuilderContext::new();
+                if self.record_refusal(&mut refusals, err, meta.name.clone()) {
+                    // #684 fixup, corrected (rework 3): the reviewer's probe
+                    // — `main` then a refusing `last()` — lands here. `meta`
+                    // is the LAST of `metas` exactly when `meta_idx + 1 ==
+                    // metas.len()`; combined with both queues empty, every
+                    // item really was walked, so this is `false`, not the
+                    // unconditional `true` the earlier revision inferred
+                    // from "last recorded site is a non-cascade `jit-error`"
+                    // alone.
+                    let truncated = meta_idx + 1 < metas.len()
+                        || !self.pending.is_empty()
+                        || !self.pending_lambdas.is_empty();
+                    return (refusals, truncated);
+                }
+            }
+        }
+
+        // Pass 3/4: drain monomorphizations and lambda bodies to fixpoint,
+        // recording and skipping any that refuse instead of stopping there.
+        loop {
+            if self.pending_lambdas.is_empty() && self.pending.is_empty() { break; }
+            while let Some(meta) = self.pending_lambdas.pop() {
+                // See Pass 2 above: `self.pending` is never truncated on a
+                // refusal here either, for the same reason (#684 R1).
+                if let Err(err) = self.define_fn(&meta) {
+                    self.ctx = Context::new();
+                    self.builder_ctx = FunctionBuilderContext::new();
+                    if self.record_refusal(&mut refusals, err, meta.name.clone()) {
+                        // Pass 1/2 are both already fully complete by the
+                        // time Pass 3/4 runs at all, so `metas` is exhausted
+                        // no matter what — the only work that can remain is
+                        // whatever these two queues still hold at this exact
+                        // point (after the pop above and any truncation just
+                        // done).
+                        let truncated = !self.pending.is_empty() || !self.pending_lambdas.is_empty();
+                        return (refusals, truncated);
+                    }
+                }
+            }
+            while let Some(p) = self.pending.pop() {
+                match self.declare_monomorph(&p) {
+                    Err(err) => {
+                        if self.record_refusal(&mut refusals, err, p.mangled_name.clone()) {
+                            let truncated = !self.pending.is_empty() || !self.pending_lambdas.is_empty();
+                            return (refusals, truncated);
+                        }
+                    }
+                    Ok(meta) => {
+                        let lambdas_before = self.pending_lambdas.len();
+                        if let Err(err) = self.define_fn(&meta) {
+                            // Same #684 R1 reasoning as Pass 2: `self.pending`
+                            // stays un-truncated so an orphaned monomorph
+                            // (queued by an `instantiate_template` call inside
+                            // this body) still drains and reports its own
+                            // site instead of being resolved-but-never-defined.
+                            self.pending_lambdas.truncate(lambdas_before);
+                            self.ctx = Context::new();
+                            self.builder_ctx = FunctionBuilderContext::new();
+                            if self.record_refusal(&mut refusals, err, meta.name.clone()) {
+                                let truncated = !self.pending.is_empty() || !self.pending_lambdas.is_empty();
+                                return (refusals, truncated);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.current_decl_file = None;
+        (refusals, false)
+    }
+
+    /// Resolve a `cascade_candidate_name` extraction against `refused_items`,
+    /// trying the name itself first and, for a `.method()` extraction, also
+    /// the enum that owns a variant of that name (#684 fixup, F2).
+    ///
+    /// `F.Named(str)`'s `str` payload refuses the whole enum as `jit-item`
+    /// (root, item `F`); a caller that goes on to reference `F.Named(...)`
+    /// — construction, `Shape.Circle(2.0)`'s form — finds
+    /// `enum_payload_layouts` has no entry for `F` (its layout was never
+    /// built) and falls through the qualified-construction intercept into
+    /// generic call lowering, which reports the callee as an unresolved
+    /// `.Named()` method (jit.rs's generic Field+Call fallback). Before this
+    /// fix, `cascade_candidate_name` extracted `.Named()` and looked THAT UP
+    /// in `refused_items` — which holds item names (`F`), never a variant or
+    /// method name — so it never matched, and every such caller counted as
+    /// its own root blocker instead of a cascade of `F`'s one root.
+    ///
+    /// `self.enums` (name → ordered variant names) is populated for every
+    /// enum up front, before payload layouts are built, so it still has `F →
+    /// ["Named"]` even though `F`'s layout build failed — it is the one
+    /// place left that still knows which enum a bare variant name belongs
+    /// to.
+    /// #755 D3, follow-up: every one of `item`'s OWN methods that failed to
+    /// declare in Pass 1 (`model_method_errors`), each as `(model name, its
+    /// stored error, the file it was declared in)` — empty for a non-model
+    /// item, or a model none of whose methods refused. A model with TWO
+    /// broken methods (two `View` params, say) must surface TWO roots, not
+    /// one; the earlier `first_model_method_error` stopped at the first
+    /// match in member order, so `--all`'s completeness contract
+    /// (`truncated:false` meaning "nothing more to see") was violated for
+    /// the second and any later broken method — silently dropped, never a
+    /// root, never a cascade target for its own call sites.
+    fn model_method_errors_for_item(&self, item: &Item)
+        -> Vec<(String, JitError, Option<std::path::PathBuf>)>
+    {
+        let Some(m) = item_model_decl(item) else { return Vec::new() };
+        let mut out = Vec::new();
+        for member in &m.members {
+            let ModelMember::Method(f) = member else { continue };
+            let key = mangle_method_name(&m.name, &f.name);
+            if let Some((e, decl_file)) = self.model_method_errors.get(&key) {
+                out.push((m.name.clone(), e.clone(), decl_file.clone()));
+            }
+        }
+        out
+    }
+
+    /// The first of `item`'s OWN broken methods, for the plain-mode Pass-1
+    /// loop (`compile_program_inner`) below: that loop hard-stops on the
+    /// first one it sees regardless, so which one is first does not change
+    /// the outcome — unlike `--all` collection, which must see every one of
+    /// them (`model_method_errors_for_item`, above).
+    fn first_model_method_error(&self, item: &Item)
+        -> Option<(String, JitError, Option<std::path::PathBuf>)>
+    {
+        self.model_method_errors_for_item(item).into_iter().next()
+    }
+
+    fn resolve_cascade_root(&self, name: &str) -> Option<usize> {
+        if let Some(&i) = self.refused_items.get(name) { return Some(i); }
+        let variant = name.strip_prefix('.')?.strip_suffix("()")?;
+        let owner = self.enums.iter()
+            .find(|(_, variants)| variants.iter().any(|v| v == variant))?.0;
+        self.refused_items.get(owner).copied()
+    }
+
+    /// Record one refusal from collect mode, attributing it the same way a
+    /// single `compile_program` failure is (`Jit::attribute`: demangle +
+    /// `error_file`). Returns `true` when the caller must stop collecting — a
+    /// `jit-error` defect (#480), never a plain refusal — UNLESS (#684 R2(b))
+    /// it is a cascade: the fwd_bwd-entry `jit-error` this collect mode
+    /// itself manufactures whenever a `@grad fn` a caller destructures via
+    /// `.fwd_bwd(...)` was skipped earlier in this same run. That is not a
+    /// defect in the program, only in what collect mode has declared so far,
+    /// so it is recorded like any other cascade and collection continues.
+    fn record_refusal(&mut self, out: &mut Vec<CollectedRefusal>, e: JitError, item: String) -> bool {
+        let this_index = out.len();
+        let candidate = cascade_candidate_name(&e).map(|s| s.to_string());
+        let cascade_of = candidate.as_deref().and_then(|name| self.resolve_cascade_root(name));
+        // #724: `IMPORTED_PRIVATE_LET_MARKER`'s `let` lowers fine in its own
+        // file (unlike `TOP_LEVEL_LET_REFUSAL_MARKER`'s, always refused at
+        // Pass 1 under its own name, which is what gives every OTHER cascade
+        // shape here a root for free before any cascade's `record_refusal`
+        // ever runs) — so a leaked import has no declare-time refusal to be
+        // a root under its own name. Without this, the first importer to
+        // leak-read it would register only under ITS OWN item name (below),
+        // and a second, unrelated importer reading the same leaked name
+        // would find no root to resolve against — counting as an
+        // independent blocker instead of this one's cascade. A no-op for
+        // every other cascade shape: their root is already recorded by the
+        // time any cascade of it reaches here, so `or_insert` changes
+        // nothing for them.
+        let is_leaked_import = cascade_of.is_none() && e.msg.contains(IMPORTED_PRIVATE_LET_MARKER);
+        let is_defect = e.kind == JitErrorKind::Error;
+        let e = self.attribute(e);
+        let file = self.error_file.clone();
+        out.push(CollectedRefusal { error: e, file, item: item.clone(), cascade_of });
+        // Whether this item's own recorded refusal is a root or itself a
+        // cascade, remember the ROOT it traces to — never this entry's own
+        // index when it is a cascade — so a later caller of THIS item points
+        // straight at the ultimate root instead of at an intermediate link.
+        self.refused_items.entry(item).or_insert(cascade_of.unwrap_or(this_index));
+        if is_leaked_import {
+            if let Some(name) = candidate {
+                self.refused_items.entry(name).or_insert(this_index);
+            }
+        }
+        is_defect && cascade_of.is_none()
+    }
+
+    fn compile_program_inner(&mut self, program: &Program) -> Result<(), JitError> {
         let __timing = std::env::var("DMC_JIT_TIMING").is_ok();
         JIT_CODEGEN_NS.store(0, std::sync::atomic::Ordering::Relaxed);
         let __t_total = std::time::Instant::now();
+
+        // Collect top-level `type` aliases (SPEC.md §6.6) up front, mirroring
+        // the enum pass just below, so every fn signature, model field,
+        // `forge.zeros[..]`, and cast lowered further down can resolve an
+        // alias name to its target via `resolve_alias_ty` before the target
+        // is (mis)read as an unknown model name.
+        for item in &program.items {
+            collect_alias_item(item, &mut self.aliases);
+        }
+
+        // Does this program declare a `model Err` of its own? Answered before
+        // anything is lowered, because `ty_from_ast` consults it from the very
+        // first signature it sees — and unconditionally, so a previous
+        // program compiled on this thread cannot leave the flag set. `Err` is
+        // SPEC §3.9's error-half convention, not a reserved name; when a
+        // program takes the name for a model, that model wins.
+        //
+        // Sits after the alias pass so the two agree on what `Err` means: an
+        // alias of `Err` resolves to `Err` and then reads this flag, rather
+        // than resolving against a table that is not yet populated.
+        let err_model = program.items.iter().any(
+            |it| item_model_decl(it).is_some_and(|m| m.name == "Err"));
+        ERR_IS_USER_MODEL.with(|f| f.set(err_model));
 
         // #350: collect C-like enums (name → ordered variants) up front, so fn
         // signatures, `let` annotations, and `match` scrutinees lowered below can
@@ -1921,51 +3702,36 @@ impl Jit {
                 );
             }
         }
+        // Pre-register every top-level `let NAME = <literal>` module constant
+        // (#268) before any fn signature or model field is declared below, so
+        // a use as a shape dimension resolves regardless of where the `let`
+        // sits in the file — the same order-independence `SymDim::from_expr`
+        // (shape.rs) gets for free by never evaluating the name at all. Mirrors
+        // the enum pre-pass just above; `collect_fns`'s own `Item::Let` arm
+        // still runs later and just re-inserts the same entry.
+        //
+        // `const_dims` is the folded lookup table `resolve_shape_expr` consults
+        // as a FALLBACK (see `ConstDim`). Nothing here is seeded into any fn's
+        // `shape_env`: a shape env holds a fn's own shape parameters and
+        // nothing else, which is what keeps a module constant out of every
+        // runtime expression position.
+        for item in &program.items {
+            collect_global_const(item, &mut self.global_consts, &mut self.top_level_let_names);
+        }
+        self.const_dims = const_dim_table(&self.global_consts);
         // #350 Part 2b: build the tagged-union layout for any enum with a
         // payload-carrying variant. A value of such an enum is an i64 pointer to
         // a forge region `[tag, slots…]` (one slot per variant-field, no
         // sharing). v1 supports scalar payload fields; a non-scalar field
         // (tensor/string/model) routes the program cleanly out of the JIT subset.
-        let payload_env: HashMap<String, i64> = HashMap::new();
+        // (`build_enum_payload_layout` below; extracted so collect mode, #684,
+        // can build one enum's layout at a time and continue past a refusing
+        // one instead of aborting the whole compile.)
         for item in &program.items {
             if let Some(e) = item_enum_decl(item) {
                 if !e.variants.iter().any(|v| !v.fields.is_empty()) { continue; }
-                let mut variant_off: HashMap<String, i64> = HashMap::new();
-                let mut variant_tys: HashMap<String, Vec<TyKind>> = HashMap::new();
-                let mut slot = 1i64; // slot 0 is the tag
-                for v in &e.variants {
-                    if v.fields.is_empty() { continue; }
-                    let mut tys = Vec::with_capacity(v.fields.len());
-                    for t in &v.fields {
-                        // v1 supports the scalar kinds the JIT slot maps exactly,
-                        // guaranteeing interp/JIT parity: i32/i64/f32/f64/bool,
-                        // plus (#544) the fixed-width integer kinds, which are
-                        // masked i64-backed values the slot round-trips as-is.
-                        // Anything else (str/nil — which `lower_ty_for_model`
-                        // would silently collapse to an opaque i64 —
-                        // exotic-float scalars, tensors, models) routes the
-                        // program cleanly out of the JIT subset.
-                        let storable = matches!(t, Type::Scalar(
-                            ScalarType::I32 | ScalarType::I64
-                            | ScalarType::F32 | ScalarType::F64
-                            | ScalarType::Bool, _))
-                            || matches!(t, Type::Scalar(s, _)
-                                if narrow_scalar_kind(s).is_some());
-                        if !storable {
-                            return unsupported(&v.span, Refusal::Item, &format!(
-                                "a non-scalar payload field in enum variant `{}.{}` \
-                                 (payload fields must be a fixed-width int, f32/f64 or bool)",
-                                e.name, v.name));
-                        }
-                        let k = enumify(lower_ty_for_model(t, &payload_env, &v.span)?, &self.enums);
-                        tys.push(k);
-                    }
-                    variant_off.insert(v.name.clone(), slot);
-                    slot += v.fields.len() as i64;
-                    variant_tys.insert(v.name.clone(), tys);
-                }
-                self.enum_payload_layouts.insert(e.name.clone(),
-                    EnumLayout { n_slots: slot, variant_off, variant_tys });
+                self.current_decl_file = self.decl_file_of_item(item);
+                self.build_enum_payload_layout(e)?;
             }
         }
 
@@ -1977,8 +3743,29 @@ impl Jit {
         // as templates for later on-demand instantiation.
         let mut metas: Vec<FnMeta> = Vec::new();
         for item in &program.items {
+            // Which file this item was written in, so a refusal raised while
+            // collecting it reports that file and not the entry (design §5.2).
+            // `None` on the un-merged path, and the caller then falls back to
+            // the file on the command line — today's behavior, unchanged.
+            self.current_decl_file = self.decl_file_of_item(item);
             self.collect_fns(item, &mut metas)?;
+            // D3 (#755): plain mode is all-or-nothing, same as it always
+            // was for a free fn's own declare-time refusal — #747/D1's
+            // per-method isolation above exists so a model's OTHER methods
+            // still register and so `--all` can report each site honestly,
+            // not so a method that never compiles can sit in a program
+            // `dmc jit` accepts. Hard-stop here, unconditionally, whether or
+            // not the broken method is ever called.
+            if let Some((_, e, decl_file)) = self.first_model_method_error(item) {
+                self.current_decl_file = decl_file;
+                return Err(e);
+            }
         }
+        // Nothing is "in flight" for a builtin — it belongs to no source
+        // file — so a refusal it raises must fall back to the command-line
+        // file rather than inheriting whichever file Pass 1's loop last set
+        // (#661 review finding 1).
+        self.current_decl_file = None;
         self.register_builtins()?;
 
         // Pass 2: define each declared fn. Bodies may discover template
@@ -2025,6 +3812,57 @@ impl Jit {
                       codegen, 100.0 * codegen / total,
                       finalize, 100.0 * finalize / total);
         }
+        Ok(())
+    }
+
+    /// Build one enum's tagged-union payload layout (see the `compile_program_inner`
+    /// call site comment for the encoding). Extracted out of that loop so
+    /// collect mode (#684, `compile_program_collect` below) can build each
+    /// enum's layout independently and record a refusal for one bad payload
+    /// field without losing every other enum's layout in the same program.
+    fn build_enum_payload_layout(&mut self, e: &crate::ast::EnumDecl) -> Result<(), JitError> {
+        let payload_env: HashMap<String, i64> = HashMap::new();
+        let mut variant_off: HashMap<String, i64> = HashMap::new();
+        let mut variant_tys: HashMap<String, Vec<TyKind>> = HashMap::new();
+        let mut slot = 1i64; // slot 0 is the tag
+        for v in &e.variants {
+            if v.fields.is_empty() { continue; }
+            let mut tys = Vec::with_capacity(v.fields.len());
+            for t in &v.fields {
+                // A payload field's written type is a type-building
+                // site too (SPEC.md §6.6): resolve an alias before the
+                // storable-kind test, so `type Byte = u8` in a payload
+                // is judged (and laid out) as `u8`.
+                let t = &resolve_alias_ty(t, &self.aliases)?;
+                // v1 supports the scalar kinds the JIT slot maps exactly,
+                // guaranteeing interp/JIT parity: i32/i64/f32/f64/bool,
+                // plus (#544) the fixed-width integer kinds, which are
+                // masked i64-backed values the slot round-trips as-is.
+                // Anything else (str/nil — which `lower_ty_for_model`
+                // would silently collapse to an opaque i64 —
+                // exotic-float scalars, tensors, models) routes the
+                // program cleanly out of the JIT subset.
+                let storable = matches!(t, Type::Scalar(
+                    ScalarType::I32 | ScalarType::I64
+                    | ScalarType::F32 | ScalarType::F64
+                    | ScalarType::Bool, _))
+                    || matches!(t, Type::Scalar(s, _)
+                        if narrow_scalar_kind(s).is_some());
+                if !storable {
+                    return unsupported(&v.span, Refusal::Item, &format!(
+                        "a non-scalar payload field in enum variant `{}.{}` \
+                         (payload fields must be a fixed-width int, f32/f64 or bool)",
+                        e.name, v.name));
+                }
+                let k = enumify(lower_ty_for_model(t, &payload_env, None, &v.span)?, &self.enums);
+                tys.push(k);
+            }
+            variant_off.insert(v.name.clone(), slot);
+            slot += v.fields.len() as i64;
+            variant_tys.insert(v.name.clone(), tys);
+        }
+        self.enum_payload_layouts.insert(e.name.clone(),
+            EnumLayout { n_slots: slot, variant_off, variant_tys });
         Ok(())
     }
 
@@ -2075,6 +3913,11 @@ impl Jit {
 
     fn declare_extern_fns(&mut self, program: &Program) -> Result<(), JitError> {
         for item in &program.items {
+            // Which file this item was written in, so a refusal raised while
+            // declaring it reports that file and not whatever the enum-layout
+            // pre-pass (just above, in `compile_program_inner`) last left in
+            // `current_decl_file` (design §5.2; #661 review finding 1).
+            self.current_decl_file = self.decl_file_of_item(item);
             self.declare_extern_fn_item(item, false)?;
         }
         Ok(())
@@ -2118,6 +3961,11 @@ impl Jit {
         }
 
         let empty_env: HashMap<String, i64> = HashMap::new();
+        // A module constant (#268) may spell a dimension here; the `extern fn`'s
+        // own parameter names shadow one of the same name.
+        let consts = visible_const_dims(&self.const_dims,
+            |n| e.params.iter().any(|p| p.name == n));
+        let consts = Some(&consts);
         let mut sig = self.module.make_signature();
         let mut params: Vec<(String, TyKind, Span)> = Vec::new();
 
@@ -2126,8 +3974,12 @@ impl Jit {
                 msg: format!("extern fn `{}` param `{}` has no type annotation", e.name, p.name),
                 line: p.span.line, col: p.span.col,
             })?;
+            // An alias is transparent at the extern ABI boundary too (SPEC.md
+            // §6.6) — resolve before the ABI check, so `type CInt = i32` is
+            // judged as `i32` rather than as an unknown named type.
+            let ast_ty = &resolve_alias_ty(ast_ty, &self.aliases)?;
             check_extern_abi_ty(ast_ty, &p.span, &e.name, Some(&p.name))?;
-            let ty = ty_from_ast(ast_ty, &empty_env)?;
+            let ty = ty_from_ast(ast_ty, &empty_env, consts)?;
             sig.params.push(AbiParam::new(ty.cl()));
             params.push((p.name.clone(), ty, p.span.clone()));
         }
@@ -2135,8 +3987,9 @@ impl Jit {
         let ret = match &e.ret_type {
             None => TyKind::Scalar(ScalarKind::Nil),
             Some(t) => {
+                let t = &resolve_alias_ty(t, &self.aliases)?;
                 check_extern_abi_ty(t, &e.span, &e.name, None)?;
-                ty_from_ast(t, &empty_env)?
+                ty_from_ast(t, &empty_env, consts)?
             }
         };
         if !matches!(ret, TyKind::Scalar(ScalarKind::Nil)) {
@@ -2293,24 +4146,126 @@ impl Jit {
                 let mut fields = Vec::new();
                 let mut field_asts = Vec::new();
                 let empty_env = HashMap::new();
+                // A module constant (#268) is a legal dimension on a field type.
+                // The model's OWN shape params are deliberately not: they are
+                // re-resolved per instantiation below, so one of them sharing a
+                // constant's name must stay the opaque i64 it has always been.
+                let consts = visible_const_dims(&self.const_dims,
+                    |n| m.shape_params.iter().any(|p| p.name == n));
                 for member in &m.members {
                     if let ModelMember::Field { name, ty, span, .. } = member {
-                        let fty = enumify(lower_ty_for_model(ty, &empty_env, span)?, &self.enums);
+                        // A scalar/tensor-alias field type is transparent
+                        // (SPEC.md §6.6): resolve it before lowering, so
+                        // `x: Role` lays out the same as `x: u8` would. The
+                        // const-dim table then applies to the shape
+                        // expressions inside the *resolved* type.
+                        let ty = resolve_alias_ty(ty, &self.aliases)?;
+                        let fty = enumify(
+                            lower_ty_for_model(&ty, &empty_env, Some(&consts), span)?, &self.enums);
                         fields.push((name.clone(), fty));
-                        field_asts.push((name.clone(), ty.clone()));
+                        field_asts.push((name.clone(), ty));
                     }
-                    // Methods: skip for now (handled as top-level functions).
                 }
                 self.model_layouts.insert(m.name.clone(), fields);
                 self.model_field_asts.insert(m.name.clone(), field_asts);
                 self.model_shape_params.insert(
                     m.name.clone(),
                     m.shape_params.iter().map(|p| p.name.clone()).collect());
+                // #634: every method name, generic model or not — the call-site
+                // rewrite needs the shape-generic ones to refuse by naming the
+                // model rather than falling through to the str-method arm.
+                self.model_methods.insert(
+                    m.name.clone(),
+                    m.members.iter().filter_map(|mem| match mem {
+                        ModelMember::Method(f) => Some(f.name.clone()),
+                        _ => None,
+                    }).collect());
+                // A method on a model with no shape parameters is declared as
+                // an ordinary free function `M$$method` whose first parameter
+                // is the receiver. Declared HERE, in pass 1, so a body's
+                // self-call resolves in pass 2 (p12's recursion is the case
+                // that would otherwise not).
+                //
+                // Slice 2: a method that carries a bracket — the model's, its
+                // own, or both — takes the SAME route one step later.
+                // `method_fn_decl` gives it a non-empty `shape_params`, so
+                // `Item::Fn`'s arm below files it as a **template** instead of
+                // declaring it, and `lower_model_method_call` instantiates it
+                // once per distinct shape tuple seen at a call site, through
+                // the `pending` worklist every free template already uses. No
+                // second mechanism, and the `self.templates` key stays the
+                // bracket-free `M$$method` — a string no user identifier can
+                // spell, so it can never be reached by name from `lower_call`.
+                // #747: one method's `?` used to propagate straight out of
+                // this whole `Item::Model` arm, which silently took every
+                // LATER sibling method down with it too — a method the JIT
+                // can lower fine never got a chance to register just because
+                // an earlier, unrelated method's own signature (a `View`
+                // param, say) does not lower. Caught per-method instead, and
+                // recorded under that method's own mangled name so a later
+                // call site can re-surface the TRUE reason (see
+                // `model_method_errors`'s doc) rather than
+                // `lower_model_method_call` inventing one. This mirrors how a
+                // shape-generic free fn already behaves: its body is not
+                // even looked at until a call site instantiates it, so an
+                // unsupported construct inside one that is never called
+                // never surfaces either — a method that never registers and
+                // is never called is, likewise, simply never reached.
+                //
+                // #755 rework: the catch above must not catch EVERY error —
+                // only a `JitErrorKind::Unsupported` (a deliberate refusal,
+                // #747's `View` param) is a case where isolating one method
+                // from its siblings is the right call. A `JitErrorKind::Error`
+                // — a real defect, e.g. two `bump!` methods on one model
+                // colliding as `declare_fn`'s "duplicate function `B$$bump!`"
+                // — is a bug in the program, not a gap in the JIT, and must
+                // still stop the whole compile the way any other declare-time
+                // defect does; swallowing it here (as this catch used to)
+                // silently turned a hard compile error into `status: ok`.
+                // The declaring file is captured alongside the stored refusal
+                // (`self.current_decl_file`, set by the Pass-1 loop just above
+                // this `Item::Model` arm for the model itself) so a later
+                // call site's re-surfaced error can restore `error_file` to
+                // where the method was actually declared instead of
+                // inheriting whichever file the CALLING body happens to be
+                // in (design §5.2; see `lower_model_method_call`'s re-surface
+                // site and the `current_decl_file` field this writes back
+                // into on `Translator`).
+                for member in &m.members {
+                    let ModelMember::Method(f) = member else { continue };
+                    let synth = method_fn_decl(m, f);
+                    match self.collect_fns(&Item::Fn(synth), out) {
+                        Ok(()) => {}
+                        Err(e) if e.kind == JitErrorKind::Unsupported => {
+                            self.model_method_errors.insert(
+                                mangle_method_name(&m.name, &f.name),
+                                (e, self.current_decl_file.clone()),
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 Ok(())
             }
-            Item::TypeAlias(t) => unsupported(&t.span, Refusal::Item, "`type` aliases at top level"),
+            // A `type` alias is a transparent typedef, not a code-gen item
+            // (SPEC.md §6.6): already collected into `self.aliases` above,
+            // so every `Type::Named` naming it resolves through
+            // `resolve_alias_ty` at each JIT type-building site instead of
+            // the declaration itself being refused.
+            Item::TypeAlias(_) => Ok(()),
             Item::Enum(_) => Ok(()), // enums are compile-time metadata (no fns)
-            Item::Arena(a) => unsupported(&a.span, Refusal::Item, "arena blocks as items"),
+            // #612 made `vault`/`forge`/`stream` blocks lower everywhere they
+            // are *executed* — expression position and statement position
+            // alike. What is left here is the item form only, and it stays
+            // refused because #611 is an open spec question, not a lowering
+            // gap: a top-level arena block type-checks and is never executed
+            // by the interpreter, so there is no reference behaviour to match.
+            // The message says which half is refused, so a reader of
+            // "arena blocks as items" does not conclude the construct is
+            // unsupported wholesale.
+            Item::Arena(a) => unsupported(&a.span, Refusal::Item,
+                "a top-level arena block as an item (arena blocks in expression \
+                 and statement position do lower; only the item form is refused)"),
             Item::Use(u)   => unsupported(&u.span, Refusal::Import, "`use` imports (single-file only)"),
         }
     }
@@ -2337,7 +4292,15 @@ impl Jit {
                 "`@grad fn` with no `!` (mut) parameter has nothing to differentiate \
                  (see the spec on `@grad`)");
         }
-        if !matches!(&f.ret_type, Some(Type::Scalar(ScalarType::F32, _))) {
+        // The loss type is written, so it can be written through an alias
+        // (`type Loss = f32`, SPEC.md §6.6). Resolve before the f32 test —
+        // otherwise a program the JIT can lower perfectly well is reported as
+        // a compiler defect (`jit-error`) for a purely syntactic reason.
+        let resolved_ret = match &f.ret_type {
+            Some(t) => Some(resolve_alias_ty(t, &self.aliases)?),
+            None => None,
+        };
+        if !matches!(&resolved_ret, Some(Type::Scalar(ScalarType::F32, _))) {
             return err(&f.span,
                 "JIT slice 6 supports `@grad fn` returning a scalar `f32` loss only");
         }
@@ -2378,41 +4341,61 @@ impl Jit {
         mangled_name: &str,
         grad_mode: GradMode,
     ) -> Result<FnMeta, JitError> {
+        // A module constant (#268) is a legal shape dimension in a non-generic
+        // fn's signature too. It is offered to the type lowering as a FALLBACK
+        // and never merged into `shape_env`: `shape_env` is what the body's
+        // Translator resolves idents against, and a constant reaching *that*
+        // is what turns a runtime slice bound or a narrow-width scalar into a
+        // silent divergence. A value parameter, or one of this fn's own shape
+        // parameters, shadows a same-named constant.
+        let consts = visible_const_dims(&self.const_dims, |n| {
+            f.params.iter().any(|p| p.name == n)
+                || f.shape_params.iter().any(|sp| sp.name == n)
+        });
+        let consts = Some(&consts);
         let mut params = Vec::with_capacity(f.params.len());
         let mut mut_param_idxs = Vec::new();
         let mut sig = self.module.make_signature();
+        // #634: no `is_self` guard here any more. `method_fn_decl` replaces the
+        // receiver slot with an ordinary typed parameter before a method ever
+        // reaches this function, so the old `Refusal::Signature` refusal for
+        // "`self` parameters" was dead the moment slice 1 landed — and leaving
+        // it would have been a trap that fires only for a path declaring a
+        // method AST directly, which is exactly the path a later slice adds.
         for (idx, p) in f.params.iter().enumerate() {
-            if p.is_self {
-                return unsupported(&p.span, Refusal::Signature, "`self` parameters");
-            }
             if p.mutating {
-                // Only meaningful inside a `@grad fn`; outside, a mut tensor
-                // param has no gradient target and we don't yet write back.
-                if grad_mode == GradMode::None {
-                    return unsupported(&p.span, Refusal::Signature,
-                        "`!` mutating parameters outside `@grad fn`");
-                }
                 mut_param_idxs.push(idx);
             }
             let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("parameter `{}` needs a type annotation in the JIT", p.name),
                 line: p.span.line, col: p.span.col,
             })?;
-            let ty = enumify(ty_from_ast(ty_ast, shape_env)?, &self.enums);
+            let ty_ast = resolve_alias_ty(ty_ast, &self.aliases)?;
+            let ty = enumify(ty_from_ast(&ty_ast, shape_env, consts)?, &self.enums);
             if matches!(ty, TyKind::Scalar(ScalarKind::Nil)) {
                 return unsupported(&p.span, Refusal::TypeForm, "`nil` parameters");
             }
-            if p.mutating && !ty.is_tensor() {
-                return unsupported(&p.span, Refusal::Grad,
-                    "a non-tensor `!` parameter on a `@grad fn`");
+            if p.mutating {
+                if grad_mode == GradMode::None {
+                    check_mut_param_ty(&ty, p)?;
+                } else if !ty.is_tensor() {
+                    return unsupported(&p.span, Refusal::Grad,
+                        "a non-tensor `!` parameter on a `@grad fn`");
+                }
             }
             sig.params.push(AbiParam::new(ty.cl()));
             params.push((p.name.clone(), ty, p.span.clone()));
         }
         let ret = match &f.ret_type {
-            Some(t) => enumify(ty_from_ast(t, shape_env)?, &self.enums),
+            Some(t) => enumify(
+                ty_from_ast(&resolve_alias_ty(t, &self.aliases)?, shape_env, consts)?, &self.enums),
             None    => TyKind::Scalar(ScalarKind::Nil),
         };
+        if f.ret_type.is_none() {
+            // #695: record that this fn's Nil signature is an assumption, not
+            // a declared fact — see the field doc on `omitted_ret_fns`.
+            self.omitted_ret_fns.insert(mangled_name.to_string());
+        }
         if !matches!(ret, TyKind::Scalar(ScalarKind::Nil)) {
             sig.returns.push(AbiParam::new(ret.cl()));
         }
@@ -2458,8 +4441,12 @@ impl Jit {
         // builtins (printers, sum, len) are lowered specially in
         // `lower_call` so they don't appear here — only true runtime
         // symbols with scalar-only signatures live in `self.fns`.
-        let builtins: [(&str, &[ScalarKind], Option<ScalarKind>); 4] = [
+        let builtins: [(&str, &[ScalarKind], Option<ScalarKind>); 5] = [
             ("print_i64",  &[ScalarKind::I64],  None),
+            // #597: `u64`'s pattern can be a negative `i64` (top bit set), so
+            // it needs its own runtime formatter rather than sharing
+            // `print_i64` — see `builtin_print_u64`.
+            ("print_u64",  &[ScalarKind::U64],  None),
             ("print_f64",  &[ScalarKind::F64],  None),
             ("print_bool", &[ScalarKind::Bool], None),
             ("print_nil",  &[],                 None),
@@ -2503,6 +4490,25 @@ impl Jit {
             ret: TyKind::Scalar(ScalarKind::I64),
             mut_param_idxs: vec![],
         });
+        // #674: its root-routing twin, for the ONE emit-site distinction a
+        // vault-spelled constructor needs. Same signature, same linkage; only
+        // the entry it charges differs.
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(cl::I64));
+        sig.returns.push(AbiParam::new(cl::I64));
+        sig.call_conv = CallConv::SystemV;
+        let id = self.module
+            .declare_function("__dmc_forge_alloc_root", Linkage::Import, &sig)
+            .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                msg: format!("declare forge_alloc_root: {}", e), line: 0, col: 0,
+            })?;
+        self.fns.insert("__dmc_forge_alloc_root".to_string(), FnEntry {
+            id, sig,
+            params: vec![("bytes".to_string(), TyKind::Scalar(ScalarKind::I64),
+                Span { line: 0, col: 0, start: 0, end: 0 })],
+            ret: TyKind::Scalar(ScalarKind::I64),
+            mut_param_idxs: vec![],
+        });
         // forge.snapshot() -> i64  /  forge.restore(mark: i64) -> nil
         {
             let mut sig = self.module.make_signature();
@@ -2527,6 +4533,116 @@ impl Jit {
                     msg: format!("declare forge_restore: {}", e), line: 0, col: 0,
                 })?;
             self.fns.insert("__dmc_forge_restore".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_forge_snapshot_internal() -> i64 / __dmc_forge_restore_internal(mark: i64)
+        // #614/PR#779: the forward-only `@grad fn` entry's own compiler-
+        // inserted rewind (see the `fwd_only_scope` block below) uses these
+        // instead of the two just above, so its activations return their
+        // charge the same way `grad_call_epilogue` already does for `fwd_bwd`.
+        {
+            let mut sig = self.module.make_signature();
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_forge_snapshot_internal", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("declare forge_snapshot_internal: {}", e), line: 0, col: 0,
+                })?;
+            self.fns.insert("__dmc_forge_snapshot_internal".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_forge_restore_internal", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("declare forge_restore_internal: {}", e), line: 0, col: 0,
+                })?;
+            self.fns.insert("__dmc_forge_restore_internal".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // #674 slice 3c: __dmc_budget_carve(parent: i64, bytes: i64, line: i64, col: i64) -> i64
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_budget_carve", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("declare budget_carve: {}", e), line: 0, col: 0,
+                })?;
+            self.fns.insert("__dmc_budget_carve".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Budget, mut_param_idxs: vec![],
+            });
+        }
+        // #674 slice 3c: __dmc_budget_reap(b: i64, line: i64, col: i64) -> nil
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_budget_reap", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("declare budget_reap: {}", e), line: 0, col: 0,
+                })?;
+            self.fns.insert("__dmc_budget_reap".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // #674 slice 3d: __dmc_budget_enter(b: i64, line: i64, col: i64) -> i64
+        // — validates the handle (a reaped one is a located `budget-stale`,
+        // the same `resolve_budget` every other budget op goes through),
+        // sets `CURRENT_BUDGET` and RETURNS the index it displaced. That
+        // return value is the whole exit-edge mechanism: it is an ordinary
+        // Cranelift value defined in a block that dominates the entire
+        // extent, so every edge out of the extent — normal, `return`,
+        // `break`, `continue`, `?` — can hand it straight back to
+        // `__dmc_budget_exit` with no shadow stack at run time.
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_budget_enter", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("declare budget_enter: {}", e), line: 0, col: 0,
+                })?;
+            // `ret` is a plain `i64`, NOT `TyKind::Budget`: what comes back
+            // is a table INDEX for `__dmc_budget_exit` to restore, not a
+            // packed `(gen << 20) | index` descriptor a program could hold.
+            // Nothing dispatches on this entry's `ret` — `emit_budget_enter`
+            // calls it directly — but recording it as a `Budget` would be a
+            // lie waiting for the first caller that does.
+            self.fns.insert("__dmc_budget_enter".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // #674 slice 3d: __dmc_budget_exit(prev_index: i64) -> nil
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_budget_exit", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("declare budget_exit: {}", e), line: 0, col: 0,
+                })?;
+            self.fns.insert("__dmc_budget_exit".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
@@ -2811,6 +4927,21 @@ impl Jit {
                 id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
             });
         }
+        // __dmc_str_from_uint(n: i64) -> i64 (forge string pointer). #597: the
+        // same i64 register as `__dmc_str_from_int`, but formatted as the
+        // unsigned `u64` its `n` bits name — see `dmc_str_from_uint`.
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_str_from_uint", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_str_from_uint: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_str_from_uint".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Str, mut_param_idxs: vec![],
+            });
+        }
         // __dmc_str_from_f64(x: f64) -> i64 (forge string pointer)
         {
             let mut sig = self.module.make_signature();
@@ -2931,6 +5062,53 @@ impl Jit {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
         }
+        // File I/O (STDLIB.md ~§3.10): `read_file`/`write_file`/`append_file`
+        // each return an i64 forge pointer to the 2-slot `(value, Err)` tuple
+        // `forge_pair` builds; `file_exists` returns a bare i64 0/1 bool.
+        // __dmc_read_file(path: i64, line: i64, col: i64) -> i64
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_read_file", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_read_file: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_read_file".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_write_file(path: i64, content: i64, line: i64, col: i64) -> i64
+        // __dmc_append_file(path: i64, content: i64, line: i64, col: i64) -> i64
+        for name in ["__dmc_write_file", "__dmc_append_file"] {
+            let mut sig = self.module.make_signature();
+            for _ in 0..4 { sig.params.push(AbiParam::new(cl::I64)); }
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function(name, Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare {}: {}", name, e), line: 0, col: 0 })?;
+            self.fns.insert(name.to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_file_exists(path: i64, line: i64, col: i64) -> i64 (0/1 bool)
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_file_exists", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_file_exists: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_file_exists".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Bool), mut_param_idxs: vec![],
+            });
+        }
         // Tensor copy mode (PORTS.md §3.2). Both take the dtype code, the rank
         // and a forge-materialized i64 shape array; `encode` hands back a forge
         // string (the envelope), `decode` a 2-slot `(tensor, Err)` tuple.
@@ -2987,9 +5165,12 @@ impl Jit {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
-        // __dmc_match_trap() -> ! (prints "no arm matched" + exit 1)
+        // __dmc_match_trap(line: i64, col: i64) -> ! (routes through
+        // `out_of_band_fatal`, located — #866)
         {
             let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_match_trap", Linkage::Import, &sig)
@@ -2998,14 +5179,38 @@ impl Jit {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
-        // __dmc_nil_trap() -> ! (nil used where a value is required; exit 1) — #300.4
+        // __dmc_nil_trap(line: i64, col: i64) -> ! (nil used where a value is
+        // required; routes through `out_of_band_fatal`, located — #300.4/#866)
         {
             let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
             sig.call_conv = CallConv::SystemV;
             let id = self.module
                 .declare_function("__dmc_nil_trap", Linkage::Import, &sig)
                 .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_nil_trap: {}", e), line: 0, col: 0 })?;
             self.fns.insert("__dmc_nil_trap".to_string(), FnEntry {
+                id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_binop_nil_trap(msg_ptr: i64, msg_len: i64, line: i64, col: i64) -> !
+        // #480/#767: `scalar_binop`'s located counterpart to `__dmc_nil_trap` —
+        // every operator other than `==`/`!=` that decodes an absent `map_get`
+        // result (`OptI64`, present-bit clear) still has to trap, but the
+        // message and its `line:col` are baked in at compile time (the op and
+        // both operands' static kinds are always known then) rather than
+        // reusing one fixed, unlocated string.
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_binop_nil_trap", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_binop_nil_trap: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_binop_nil_trap".to_string(), FnEntry {
                 id, sig, params: vec![], ret: TyKind::Scalar(ScalarKind::Nil), mut_param_idxs: vec![],
             });
         }
@@ -3087,6 +5292,23 @@ impl Jit {
                 params: vec![
                     ("map_ptr".to_string(), TyKind::Map, Span { line: 0, col: 0, start: 0, end: 0 }),
                     ("key_str".to_string(), TyKind::Str, Span { line: 0, col: 0, start: 0, end: 0 }),
+                ],
+                ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
+            });
+        }
+        // __dmc_map_len(map_ptr: i64) -> i64 (#751: len(m) on a map is its entry count)
+        {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(cl::I64));
+            sig.returns.push(AbiParam::new(cl::I64));
+            sig.call_conv = CallConv::SystemV;
+            let id = self.module
+                .declare_function("__dmc_map_len", Linkage::Import, &sig)
+                .map_err(|e| JitError { kind: JitErrorKind::Error, refusal: None, msg: format!("declare __dmc_map_len: {}", e), line: 0, col: 0 })?;
+            self.fns.insert("__dmc_map_len".to_string(), FnEntry {
+                id, sig,
+                params: vec![
+                    ("map_ptr".to_string(), TyKind::Map, Span { line: 0, col: 0, start: 0, end: 0 }),
                 ],
                 ret: TyKind::Scalar(ScalarKind::I64), mut_param_idxs: vec![],
             });
@@ -3383,6 +5605,13 @@ impl Jit {
     }
 
     fn define_fn(&mut self, meta: &FnMeta) -> Result<(), JitError> {
+        // A body's refusals belong to the file the body was written in — which
+        // is not the entry file once the merge has concatenated several
+        // (design §5.2). A monomorphization or a `@grad` backward entry keeps
+        // its template's file: `decl_file_of` drops the JIT's own `$` suffixes.
+        if let Some(f) = self.decl_file_of(&meta.name) {
+            self.current_decl_file = Some(f);
+        }
         self.ctx.func.signature = meta.sig.clone();
         self.ctx.func.name = UserFuncName::user(0, meta.id.as_u32());
 
@@ -3398,19 +5627,32 @@ impl Jit {
             fns: &mut self.fns,
             templates: &self.templates,
             pending: &mut self.pending,
+            fn_name: meta.name.clone(),
             grad_schemas: &self.grad_schemas,
             model_layouts: &self.model_layouts,
             model_shape_params: &self.model_shape_params,
             model_field_asts: &self.model_field_asts,
+            model_methods: &self.model_methods,
+            model_method_errors: &self.model_method_errors,
+            current_decl_file: &mut self.current_decl_file,
             global_consts: &self.global_consts,
+            top_level_let_names: &self.top_level_let_names,
+            omitted_ret_fns: &mut self.omitted_ret_fns,
+            decl_files: self.merge.as_ref().map(|m| &m.decl_files),
+            const_dims: &self.const_dims,
             enums: &self.enums,
+            aliases: &self.aliases,
             enum_payload_layouts: &self.enum_payload_layouts,
             pending_lambdas: &mut self.pending_lambdas,
             lambda_counter: &mut self.lambda_counter,
             locals: HashMap::new(),
             local_tys: HashMap::new(),
+            local_const_dims: HashMap::new(),
             field_aliases: HashSet::new(),
+            omitted_ret_provenance: HashMap::new(),
             mut_param_out: Vec::new(),
+            local_str_hint: collect_nil_str_hint_vars(&meta.body),
+            mut_ptr_params: HashSet::new(),
             ret: meta.ret.clone(),
             gpu: self.gpu,
             blas: self.blas,
@@ -3419,6 +5661,7 @@ impl Jit {
             float_lit_hint: None,
             gpu_defer_pending: false,
             loop_stack: Vec::new(),
+            budget_stack: Vec::new(),
             shape_env: meta.shape_env.clone(),
             block_filled: false,
             ad: if matches!(meta.grad_mode, GradMode::FwdBwd | GradMode::FwdBwdBwd) {
@@ -3524,6 +5767,20 @@ impl Jit {
             }
         }
 
+        // The other half of the `!` convention: a model or `KV` parameter is
+        // the caller's pointer, so element writes and appends already land in
+        // the caller's value and there is nothing to copy out. A whole-binding
+        // rebind is the exception — see `mut_ptr_params`. Recorded for every
+        // entry, `$fwd_bwd` included: neither representation is a gradient
+        // target, so the `@grad` exemption above does not apply here.
+        for &mi in &meta.mut_param_idxs {
+            let i = mi + user_params_start;
+            let (name, ty, _) = &meta.params[i];
+            if matches!(ty, TyKind::Model(_, _) | TyKind::KV(_)) {
+                tr.mut_ptr_params.insert(name.clone());
+            }
+        }
+
         // ── Restore captured variables from env array ────────────────────────
         // For lambdas with captures, __env holds a pointer to a flat i64 array.
         // Load each capture and bind it as a local before the user body runs.
@@ -3597,10 +5854,17 @@ impl Jit {
             // activation lifetime: its return value is a scalar (in a
             // register), so everything it allocated can be reclaimed at exit.
             // Gated on a scalar return so an ordinary fn is never wrapped.
+            //
+            // #614/PR#779: this rewind is compiler-inserted, over the same
+            // kind of implicit intermediate `grad_call_epilogue` reclaims
+            // after `fwd_bwd` — so it uses the `InternalMark` pair
+            // (`__dmc_forge_snapshot_internal`/`__dmc_forge_restore_internal`),
+            // not the user-facing `forge.snapshot`/`forge.restore` `Mark`
+            // that #614 made monotonic. See `InternalMark`'s doc comment.
             let fwd_only_scope = meta.grad_mode == GradMode::Forward
                 && matches!(meta.ret, TyKind::Scalar(k) if k != ScalarKind::Nil);
             let mark_v = if fwd_only_scope {
-                Some(tr.call_import0("__dmc_forge_snapshot"))
+                Some(tr.call_import0("__dmc_forge_snapshot_internal"))
             } else { None };
             let tail_val = tr.lower_block_value(&meta.body)?;
             if !tr.is_filled() {
@@ -3625,7 +5889,7 @@ impl Jit {
                         let v = tr.coerce_to(v, &k, want, &rspan)?;
                         tr.tuple_elem_spans = None;
                         if let Some(mark_v) = mark_v {
-                            tr.call_import1("__dmc_forge_restore", mark_v);
+                            tr.call_import1("__dmc_forge_restore_internal", mark_v);
                         }
                         tr.ret_val(v);
                     }
@@ -3662,6 +5926,13 @@ impl Jit {
     /// `nil` test passes iff it runs to completion. The program must already be
     /// compiled (and finalized).
     pub fn run_test_fn(&mut self, name: &str) -> Result<bool, JitError> {
+        match self.run_test_fn_inner(name) {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.attribute(e)),
+        }
+    }
+
+    fn run_test_fn_inner(&mut self, name: &str) -> Result<bool, JitError> {
         let meta = self.fns.get(name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("no `fn {}()` to JIT-execute", name), line: 0, col: 0,
         })?.clone();
@@ -3684,6 +5955,13 @@ impl Jit {
     }
 
     pub fn run_main(&mut self) -> Result<i64, JitError> {
+        match self.run_main_inner() {
+            Ok(v) => Ok(v),
+            Err(e) => Err(self.attribute(e)),
+        }
+    }
+
+    fn run_main_inner(&mut self) -> Result<i64, JitError> {
         let meta = self.fns.get("main").ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "no `fn main()` to JIT-execute".into(), line: 0, col: 0,
         })?.clone();
@@ -3709,10 +5987,12 @@ impl Jit {
                 Ok(unsafe { f() } as i64)
             }
             // #544: a masked narrow kind returns in an i64 register already
-            // holding the wrapped, sign-/zero-extended value.
+            // holding the wrapped, sign-/zero-extended value. #597: `U64`
+            // returns the same way — the register already holds its pattern.
             TyKind::Scalar(ScalarKind::I8) | TyKind::Scalar(ScalarKind::I16)
             | TyKind::Scalar(ScalarKind::I4) | TyKind::Scalar(ScalarKind::U8)
-            | TyKind::Scalar(ScalarKind::U16) | TyKind::Scalar(ScalarKind::U32) => {
+            | TyKind::Scalar(ScalarKind::U16) | TyKind::Scalar(ScalarKind::U32)
+            | TyKind::Scalar(ScalarKind::U64) => {
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
                 Ok(unsafe { f() })
             }
@@ -3813,6 +6093,14 @@ impl Jit {
                 let f: unsafe extern "C" fn() -> i64 = unsafe { mem::transmute(ptr) };
                 Ok(unsafe { f() })
             }
+            // #674 slice 3c: a `Budget` is a host-lifetime handle into a
+            // per-process table, matching the other handle kinds refused
+            // just above (`Port`) — nothing on the far side of the JIT
+            // boundary could resolve it back into a table index anyway.
+            TyKind::Budget => Err(JitError { kind: JitErrorKind::Error, refusal: None,
+                msg: "main returning a Budget is not supported (a handle does not outlive its run)".into(),
+                line: 0, col: 0,
+            }),
         }
     }
 
@@ -3987,6 +6275,20 @@ fn as_tensor_split_call(e: &Expr) -> Option<(&Expr, &Expr, Option<&Expr>)> {
     Some((recv, n, axis))
 }
 
+/// A direct call to a bare name — `name(args...)`, not `recv.method(args...)`
+/// or a call through a value. The bare-name half of
+/// `Translator::resolve_direct_call_name` (#695, widened by the #720 review's
+/// F3) — kept as a free function (no `Translator` needed) since recognizing
+/// the AST shape itself never depends on scope.
+fn as_plain_call(e: &Expr) -> Option<(&str, &[CallArg])> {
+    if let Expr::Postfix { expr, op: PostfixOp::Call(args), .. } = e {
+        if let Expr::Ident(name, _) = expr.as_ref() {
+            return Some((name.as_str(), args));
+        }
+    }
+    None
+}
+
 /// Detect `ident.fwd_bwd(args)` / `ident.fwd_bwd_bwd(args)` — the autodiff
 /// source surface. Returns the `@grad fn` name, the method, and the call args.
 fn as_fwd_bwd_call(e: &Expr) -> Option<(&str, &str, &[CallArg])> {
@@ -4019,7 +6321,7 @@ fn as_fwd_bwd_call(e: &Expr) -> Option<(&str, &str, &[CallArg])> {
 /// with capacity unknown — each slot is filled later by `arr[i] = forge.kv(...)`.
 /// Returns None if `e` isn't a `KV[...]` expression. (#273 follow-up: per-layer
 /// KV-cache staging arrays in a real transformer port.)
-fn kv_ctor_elem_ty(e: &Expr, env: &HashMap<String, i64>, span: &Span)
+fn kv_ctor_elem_ty(e: &Expr, env: &HashMap<String, i64>, consts: ConstDims<'_>, span: &Span)
     -> Option<Result<KvTy, JitError>>
 {
     let targs: Vec<&Expr> = match e {
@@ -4055,7 +6357,7 @@ fn kv_ctor_elem_ty(e: &Expr, env: &HashMap<String, i64>, span: &Span)
             }
             stream_axis = Some(i);
         } else {
-            match resolve_shape_expr(el, env, span) {
+            match resolve_shape_expr(el, env, consts, span) {
                 Ok(v) if v > 0 => dims.push(v),
                 Ok(v) => return Some(err(span, format!("`KV[...]` dim must be > 0, got {}", v))),
                 Err(e) => return Some(Err(e)),
@@ -4084,17 +6386,17 @@ fn model_ctor_base_name(e: &Expr) -> Option<&str> {
 /// #267: resolve expressions to concrete dimension values, best-effort — a
 /// non-constant / unbound arg is dropped. Captures a parameterized model's
 /// concrete type args at the point of construction.
-fn resolve_dim_exprs<'a>(exprs: impl Iterator<Item = &'a Expr>, env: &HashMap<String, i64>) -> Vec<i64> {
+fn resolve_dim_exprs<'a>(exprs: impl Iterator<Item = &'a Expr>, env: &HashMap<String, i64>, consts: ConstDims<'_>) -> Vec<i64> {
     let sp = Span { line: 0, col: 0, start: 0, end: 0 };
-    exprs.filter_map(|e| resolve_shape_expr(e, env, &sp).ok()).collect()
+    exprs.filter_map(|e| resolve_shape_expr(e, env, consts, &sp).ok()).collect()
 }
 
 /// #267: concrete type-arg dims from a `Type::Named`'s args (`Bar[4]` → `[4]`).
-fn type_named_dims(args: &[TypeArg], env: &HashMap<String, i64>) -> Vec<i64> {
+fn type_named_dims(args: &[TypeArg], env: &HashMap<String, i64>, consts: ConstDims<'_>) -> Vec<i64> {
     let sp = Span { line: 0, col: 0, start: 0, end: 0 };
     args.iter().filter_map(|a| match a {
-        TypeArg::Expr(e) => resolve_shape_expr(e, env, &sp).ok(),
-        TypeArg::Named { value, .. } => resolve_shape_expr(value, env, &sp).ok(),
+        TypeArg::Expr(e) => resolve_shape_expr(e, env, consts, &sp).ok(),
+        TypeArg::Named { value, .. } => resolve_shape_expr(value, env, consts, &sp).ok(),
         // A bare type-name arg (`Attn[D]`, where D is a shape param) parses as a
         // Type::Named, not an Expr — resolve it via the env so a *nested*
         // parameterized model field (`attn: Attn[H_q, D, ..]`) keeps its args.
@@ -4104,18 +6406,64 @@ fn type_named_dims(args: &[TypeArg], env: &HashMap<String, i64>) -> Vec<i64> {
     }).collect()
 }
 
+/// #706: does a model field's declared type reach outside itself for a
+/// dimension — i.e. does it mention one of the model's OWN shape params
+/// (`N` in `model M[N] { t: Tensor[i64,[N]] }`)? Walks the same shape-
+/// expression forms `fold_shape_expr` folds (literal, ident, `+ - * /`),
+/// checked against `Tensor`/`View`/`KV` alike since all three carry a
+/// `ShapeSpec` the same way — a `View[i64,[N]]` or `KV[i64,[N]]` field
+/// reaching for a shape param is exactly as opaque as a `Tensor` one.
+///
+/// Deliberately does NOT look inside a nested model's own type args (`attn:
+/// Attn[N]`) — that used to be a separate arm here, but it was redundant
+/// with this guard's own recursion at the call site: a type-arg-less nested
+/// field loads as `Model("Attn", [])`, and the *next* field access into it
+/// (`m.attn.something`) runs this same guard again against `Attn`'s own
+/// shape params. That either refuses at the nested field that actually
+/// mentions a param — with a message naming that field and model, a better-
+/// located refusal than blaming the outer field — or, if nothing nested
+/// mentions a param, keeps lowering correctly. Refusing at the outer field
+/// too was strictly over-eager: it caught cases the inner recursion already
+/// covers, and it wrongly caught nested fields that never reach for a
+/// param at all (e.g. `model Attn[N] { v: i64 }`).
+fn field_ty_mentions_params(ty: &Type, params: &[String]) -> bool {
+    fn idents_in(e: &Expr, out: &mut Vec<String>) {
+        match e {
+            Expr::Ident(name, _) => out.push(name.clone()),
+            Expr::BinOp { lhs, rhs, .. } => {
+                idents_in(lhs, out);
+                idents_in(rhs, out);
+            }
+            _ => {}
+        }
+    }
+    let expr_mentions = |e: &Expr| {
+        let mut ids = Vec::new();
+        idents_in(e, &mut ids);
+        ids.iter().any(|n| params.iter().any(|p| p == n))
+    };
+    match ty {
+        Type::Tensor(_, shape, _) | Type::View(_, shape, _) | Type::KV(_, shape, _) =>
+            shape.elems.iter().any(|d| match d {
+                ShapeElem::Expr(e) => expr_mentions(e),
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
 /// #267: concrete type-arg dims from a constructor element expr (`Bar[4]`) —
 /// an Index/BracketArgs postfix over the model ident.
-fn model_ctor_dims(e: &Expr, env: &HashMap<String, i64>) -> Vec<i64> {
+fn model_ctor_dims(e: &Expr, env: &HashMap<String, i64>, consts: ConstDims<'_>) -> Vec<i64> {
     match e {
         Expr::Postfix { op: PostfixOp::Index(idxs), .. } =>
             resolve_dim_exprs(idxs.iter().filter_map(|el| match el {
-                IndexElem::Expr(x) => Some(x), _ => None }), env),
+                IndexElem::Expr(x) => Some(x), _ => None }), env, consts),
         Expr::Postfix { op: PostfixOp::BracketArgs(args), .. } =>
             resolve_dim_exprs(args.iter().filter_map(|a| match a {
                 CallArg::Positional(x) => Some(x),
                 CallArg::Named { value, .. } => Some(value),
-                _ => None }), env),
+                _ => None }), env, consts),
         _ => Vec::new(),
     }
 }
@@ -4134,6 +6482,58 @@ fn is_const_literal_expr(e: &Expr) -> bool {
     }
 }
 
+/// Register `item` into `consts` and/or `names` if it is (or wraps) a
+/// top-level `let NAME = ...`, walking through `pub` and directive wrappers
+/// the way `Jit::collect_fns` does. One walk, two out-params (#696 R5) —
+/// this used to be two separate functions (`collect_global_const`,
+/// `collect_top_level_let_names`) walking the exact same items with the
+/// exact same wrapper-matching arms, called back-to-back at both call sites;
+/// folding them means a future `Item::` wrapper (a third kind of directive,
+/// say) can't be added to one arm's match and missed in the other's.
+///
+/// `names` gets EVERY top-level `let`'s name — literal or not, `!`-mutable or
+/// not — so `lower_ident`'s and the assignment lowering's fallbacks can tell
+/// "this name IS a top-level `let`, just not one #268 lowers" (raises
+/// `jit-item`) apart from "this name was never a top-level `let` at all" (a
+/// builtin like `forge`, or any other name the JIT has no other binding for;
+/// keeps raising the uncoded `jit-error` it always has).
+///
+/// `consts` gets only the admission test's SUBSET — a non-`!`-mutable `let`
+/// whose initializer is a compile-time literal (#268, the §4.5
+/// enum-discriminant idiom; the same test `Jit::collect_fns`'s `Item::Let`
+/// arm applies at declare time, so a would-be constant that fails it there
+/// gets `collect_fns`'s own `jit-item` diagnostic instead) — for that
+/// narrower set only, `names` and `consts` share a key.
+fn collect_global_const(item: &Item, consts: &mut HashMap<String, Expr>, names: &mut HashSet<String>) {
+    match item {
+        Item::Let(l) => {
+            if let Pattern::Ident(name, _) = &l.pattern {
+                names.insert(name.clone());
+                if !l.mutating && !l.is_mut && is_const_literal_expr(&l.value) {
+                    consts.insert(name.clone(), l.value.clone());
+                }
+            }
+        }
+        Item::Pub(inner) => collect_global_const(inner, consts, names),
+        Item::Directive { inner, .. } => collect_global_const(inner, consts, names),
+        _ => {}
+    }
+}
+
+/// Register `item` into `aliases` if it is (or wraps) a top-level `type`
+/// alias (SPEC.md §6.6). Walks through `pub`/directive wrappers the way
+/// `collect_fns` does. Hoisted out of `compile_program_inner` (a nested `fn`
+/// there originally) so collect mode (#684, `Jit::compile_program_collect`)
+/// can run the identical pre-pass without duplicating it.
+fn collect_alias_item(item: &Item, aliases: &mut HashMap<String, TypeAlias>) {
+    match item {
+        Item::TypeAlias(t) => { aliases.insert(t.name.clone(), t.clone()); }
+        Item::Directive { inner, .. } => collect_alias_item(inner, aliases),
+        Item::Pub(inner) => collect_alias_item(inner, aliases),
+        _ => {}
+    }
+}
+
 fn is_aliasing_place_expr(e: &Expr) -> bool {
     match e {
         Expr::Ident(..) => true,
@@ -4141,8 +6541,324 @@ fn is_aliasing_place_expr(e: &Expr) -> bool {
         // A sub-tensor row view (`grid[0]`) aliases the parent's storage. When
         // the index instead yields a scalar, the copy is a no-op (scalars never
         // alias), so this is safe to apply uniformly to index reads.
-        Expr::Postfix { op: PostfixOp::Index(_), .. } => true,
+        //
+        // #640: EXCEPT an arena constructor. `forge.ones[f32, [N]]` parses as
+        // `Postfix{Index}` over the `forge.ones` receiver, so this arm used to
+        // call a FRESH allocation a place expression and snapshot it — landing
+        // the tensor twice for every `let t = forge.ones[…]`, `M { w: ctor }`
+        // and `(ctor, …)` in flat position — a double-allocation trap flagged
+        // early in review. A constructor names no storage that outlives the
+        // expression, so there is nothing to alias and nothing to protect a
+        // later write from. The predicate is `ast::is_arena_ctor_spine` (#674)
+        // — the one definition of "is this an arena-constructor spine", so a
+        // change to the spelling stays a single-site change. A row view OF a constructor
+        // (`forge.ones[f32, [2, 4]][0]`) is not a spine (its base is the
+        // `Index`, not `forge.ones`) and keeps copying.
+        Expr::Postfix { op: PostfixOp::Index(_), .. } => !is_arena_ctor_spine(e),
+        // `<ctor> in b` (#674 slice 3d) is the same non-aliasing shape as an
+        // un-overridden arena constructor above: `Expr::AllocIn` always
+        // wraps a constructor, never a place, so a flat `let t = <ctor> in
+        // b` must not be snapshotted either. Spelled out rather than left to
+        // the catch-all below so a future arm added there cannot silently
+        // start copying it.
+        Expr::AllocIn { .. } => false,
         Expr::Tuple(elems, _) if elems.len() == 1 => is_aliasing_place_expr(&elems[0]),
+        _ => false,
+    }
+}
+
+/// Spans of untyped `let !x = nil` (or `let mut x = nil`) bindings in `body`
+/// that this function later reassigns a string to — the mutable-`Err`-
+/// accumulator idiom (SPEC.md §3.9, worked at §5.1: `let !err = nil` then
+/// `err = "…"`). See the `Translator::local_str_hint` field doc for why this
+/// makes the binding representable at all in the JIT (it stays
+/// `TyKind::Scalar(Nil)` — one 8-bit zero, no room for a pointer — unless
+/// this scan says otherwise).
+///
+/// The result is keyed by the `let`'s SPAN, not by the name it binds, and a
+/// binding qualifies only when all three of these hold:
+///
+///   1. the `let` is a direct statement of the function body — the outermost
+///      scope. The JIT's locals are a flat name → value map with no block
+///      scoping, so a binding promoted inside an `if` would stay visible
+///      after that `if` closed, where the interpreter has already restored
+///      the outer binding;
+///   2. the name is bound exactly ONCE in the whole function — no shadowing
+///      `let`, `for` pattern or `match` arm anywhere rebinds it. A shadowed
+///      name keeps refusing (`jit-conversion`) exactly as it did before this
+///      scan existed, rather than being promoted on a name match that cannot
+///      tell the two bindings apart;
+///   3. some assignment to that name is string-shaped
+///      (`expr_looks_str_shaped`).
+///
+/// (1) and (2) together are what "the same lexical scope" means here: the
+/// only binding of the name is the outermost one, so every assignment to
+/// that name necessarily targets it whatever block it is written in — which
+/// is why the assignment half can stay a flat walk of the whole body. It has
+/// to: an assignment inside a `while` runs both before and after the `let`
+/// that seeded it in execution order, so "the statements after this `let`"
+/// is not the right question to ask in the first place.
+fn collect_nil_str_hint_vars(body: &Block_) -> HashSet<(usize, usize)> {
+    let mut scan = HintScan::default();
+    scan.block(body, 0);
+    let HintScan { nil_lets, str_assigns, binds } = scan;
+    nil_lets
+        .into_iter()
+        .filter(|(name, _)| {
+            str_assigns.contains(name) && binds.get(name).copied() == Some(1)
+        })
+        .map(|(_, span)| span)
+        .collect()
+}
+
+/// Scratch state for `collect_nil_str_hint_vars`. `depth` is threaded as an
+/// argument rather than held here: only `nil_lets` cares about it, and only
+/// about whether it is 0.
+#[derive(Default)]
+struct HintScan {
+    /// Outermost-scope `let !x = nil` bindings: name → the `let`'s
+    /// `(span.start, span.end)`. A name recorded twice here is also counted
+    /// twice in `binds`, so it is filtered out either way.
+    nil_lets: HashMap<String, (usize, usize)>,
+    /// Names that some `x = "…"` / `x := "…"` assignment targets.
+    str_assigns: HashSet<String>,
+    /// How many times each name is BOUND anywhere in the body (any `let`,
+    /// `for` pattern or `match` arm). More than once means shadowing.
+    binds: HashMap<String, usize>,
+}
+
+impl HintScan {
+    /// Count every name a binding pattern introduces, at any depth.
+    fn bind_pattern(&mut self, p: &Pattern) {
+        match p {
+            Pattern::Ident(n, _) => *self.binds.entry(n.clone()).or_insert(0) += 1,
+            Pattern::Tuple(ps, _) => for q in ps { self.bind_pattern(q); },
+            Pattern::Bind(a, b, _) => { self.bind_pattern(a); self.bind_pattern(b); }
+            Pattern::EnumVariant { bindings, .. } =>
+                for q in bindings { self.bind_pattern(q); },
+            _ => {}
+        }
+    }
+
+    fn block(&mut self, body: &Block_, depth: usize) {
+        for stmt in &body.stmts {
+            self.stmt(stmt, depth);
+        }
+        if let Some(tail) = &body.tail_expr {
+            self.expr(tail, depth);
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Stmt, depth: usize) {
+        match stmt {
+            Stmt::Let(l) => {
+                self.bind_pattern(&l.pattern);
+                // Only an outermost-scope, untyped, mutable `let x = nil` is
+                // a promotion candidate (see the doc comment's rule 1).
+                if depth == 0 && (l.mutating || l.is_mut) && l.ty.is_none() {
+                    if let Pattern::Ident(name, _) = &l.pattern {
+                        if matches!(&l.value, Expr::Nil(_)) {
+                            self.nil_lets
+                                .insert(name.clone(), (l.span.start, l.span.end));
+                        }
+                    }
+                }
+                self.expr(&l.value, depth);
+            }
+            Stmt::Expr { lhs, assign, .. } => {
+                self.expr(lhs, depth);
+                if let Some((op, rhs)) = assign {
+                    if matches!(op, AssignOp::Eq | AssignOp::ColonEq) {
+                        if let Expr::Ident(name, _) = lhs {
+                            if expr_looks_str_shaped(rhs) {
+                                self.str_assigns.insert(name.clone());
+                            }
+                        }
+                    }
+                    self.expr(rhs, depth);
+                }
+            }
+            Stmt::If(ie) => self.ifexpr(ie, depth),
+            Stmt::Match(me) => {
+                self.expr(&me.scrutinee, depth);
+                for arm in &me.arms {
+                    self.bind_pattern(&arm.pattern);
+                    if let Some(g) = &arm.guard { self.expr(g, depth + 1); }
+                    self.expr(&arm.body, depth + 1);
+                }
+            }
+            Stmt::For { pattern, iter, body, .. } => {
+                self.bind_pattern(pattern);
+                self.expr(iter, depth);
+                self.block(body, depth + 1);
+            }
+            Stmt::While { cond, body, .. } => {
+                self.expr(cond, depth);
+                self.block(body, depth + 1);
+            }
+            Stmt::Loop { body, .. } => self.block(body, depth + 1),
+            Stmt::Stage { body, .. } => self.expr(body, depth + 1),
+            // A directive wraps a single statement without opening a scope,
+            // so `@some_directive let !err = nil` at the top of a fn is still
+            // an outermost-scope binding.
+            Stmt::Directive { inner, .. } => self.stmt(inner, depth),
+            Stmt::DirectiveBlock { body, .. } => self.block(body, depth + 1),
+            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Return { value, .. } => {
+                if let Some(v) = value { self.expr(v, depth); }
+            }
+        }
+    }
+
+    fn ifexpr(&mut self, ie: &IfExpr, depth: usize) {
+        self.expr(&ie.cond, depth);
+        self.block(&ie.then_branch, depth + 1);
+        match &ie.else_branch {
+            Some(ElseBranch::Block(b)) => self.block(b, depth + 1),
+            Some(ElseBranch::If(inner)) => self.ifexpr(inner, depth),
+            None => {}
+        }
+    }
+
+    /// Recurse into every expression form that can itself carry a statement,
+    /// a nested block, or a binding pattern — anywhere a shadowing `let`,
+    /// `for` pattern or `match` arm could be hiding (call arguments,
+    /// struct-literal field values, index/slice expressions, range
+    /// endpoints, `FnLit` bodies, and so on). This one walk feeds both
+    /// `binds` (rule 2: "bound exactly once") and the `nil_lets`/
+    /// `str_assigns` detection described above, but those two are only ever
+    /// *recorded* at the specific `Stmt::Let` / `Stmt::Expr` assignment
+    /// sites in `stmt()` — widening what this walk reaches cannot promote a
+    /// variable it wouldn't already have promoted, it can only discover MORE
+    /// shadowing binds (or more string assignments), which is exactly what
+    /// rule 2 needs.
+    ///
+    /// Unlike the assignment side, this must be exhaustive: a missed
+    /// shadowing `let` here is not "keeps refusing" (today's behavior for a
+    /// miss elsewhere) but a silent wrong answer — the outer `let !err = nil`
+    /// gets promoted to the nilable-str JIT local even though a nested,
+    /// distinct binding of the same name exists, and the two get conflated
+    /// into one local. So every `Expr` variant that can contain a `let`
+    /// (directly or via a nested block) needs an arm here, not just the ones
+    /// exercised by today's tests.
+    fn expr(&mut self, e: &Expr, depth: usize) {
+        match e {
+            Expr::Block(b) => self.block(b, depth + 1),
+            Expr::If(ie) => self.ifexpr(ie, depth),
+            Expr::Match(me) => {
+                self.expr(&me.scrutinee, depth);
+                for arm in &me.arms {
+                    self.bind_pattern(&arm.pattern);
+                    if let Some(g) = &arm.guard { self.expr(g, depth + 1); }
+                    self.expr(&arm.body, depth + 1);
+                }
+            }
+            Expr::ArenaBlock(a) => self.block(&a.body, depth + 1),
+            // #674 slice 3a: `forge.enter(b) { … }` is its own block scope,
+            // same reasoning as `ArenaBlock` above — a `let` inside can
+            // shadow an outer name. Missing this arm is exactly the "silent
+            // wrong answer" this walker's own doc comment warns about: a
+            // shadowing `let` inside a `BudgetBlock` would go undiscovered
+            // and get conflated with an outer binding of the same name.
+            Expr::BudgetBlock(bb) => {
+                self.expr(&bb.operand, depth);
+                self.block(&bb.body, depth + 1);
+            }
+            // #819: `<ctor> in b` (`Expr::AllocIn`) is the same shape as
+            // `BudgetBlock` above for this walker's purposes — its `budget`
+            // operand can itself be a `{ … }` block (§2.1 GRAMMAR.ebnf,
+            // `postfix_expr`'s `primary` alternative), so a shadowing `let`
+            // inside `forge.zeros[…] in { let !err = nil; … }` must be
+            // reachable here too. Recursing through `self.expr` on both
+            // operands (rather than a dedicated `self.block` call) is
+            // correct either way: `expr`'s own `Expr::Block` arm above
+            // already opens a fresh scope when the operand turns out to be
+            // block-shaped, exactly as it would for any other expression.
+            Expr::AllocIn { expr, budget, .. } => {
+                self.expr(expr, depth);
+                self.expr(budget, depth);
+            }
+            Expr::DirectiveBlock { body, .. } => self.block(body, depth + 1),
+            // A function literal's body is its own scope, same as a block —
+            // a `let` inside it can shadow an outer name without that
+            // outer's later assignment being what it looks like.
+            Expr::FnLit(f) => self.block(&f.body, depth + 1),
+            Expr::Tuple(es, _) | Expr::TensorLit(es, _) => {
+                for x in es { self.expr(x, depth); }
+            }
+            Expr::BinOp { lhs, rhs, .. } => {
+                self.expr(lhs, depth);
+                self.expr(rhs, depth);
+            }
+            Expr::UnOp { operand, .. } => self.expr(operand, depth),
+            Expr::Postfix { expr, op, .. } => {
+                self.expr(expr, depth);
+                self.postfix_op(op, depth);
+            }
+            Expr::Cast { expr, .. } => self.expr(expr, depth),
+            Expr::StructLit { type_args, fields, .. } => {
+                for x in type_args { self.expr(x, depth); }
+                for (_, v) in fields { self.expr(v, depth); }
+            }
+            Expr::Range { start, end, .. } => {
+                if let Some(x) = start { self.expr(x, depth); }
+                if let Some(x) = end { self.expr(x, depth); }
+            }
+            _ => {}
+        }
+    }
+
+    /// The expression-bearing parts of a postfix op — call/bracket-generic
+    /// arguments, index/slice sub-expressions, and constructor field values
+    /// — each of which can hold a shadowing `let` (most directly via a
+    /// block-valued argument like `f({ let !err = "…"; err })`).
+    fn postfix_op(&mut self, op: &PostfixOp, depth: usize) {
+        match op {
+            PostfixOp::Index(elems) => {
+                for elem in elems {
+                    match elem {
+                        IndexElem::FullSlice(_) => {}
+                        IndexElem::Slice { start, end, step, .. } => {
+                            if let Some(x) = start { self.expr(x, depth); }
+                            if let Some(x) = end { self.expr(x, depth); }
+                            if let Some(x) = step { self.expr(x, depth); }
+                        }
+                        IndexElem::Expr(x) => self.expr(x, depth),
+                    }
+                }
+            }
+            PostfixOp::Call(args) | PostfixOp::BracketArgs(args) => {
+                for a in args {
+                    match a {
+                        CallArg::Positional(x) => self.expr(x, depth),
+                        CallArg::Named { value, .. } => self.expr(value, depth),
+                        CallArg::Spread(_) => {}
+                    }
+                }
+            }
+            PostfixOp::Constructor(fields) => {
+                for (_, v) in fields { self.expr(v, depth); }
+            }
+            PostfixOp::Transpose | PostfixOp::Query | PostfixOp::Field(_) => {}
+        }
+    }
+}
+
+/// Whether `e` is, syntactically and without lowering it, "obviously" a
+/// string value — a string literal, or a `+` chain that bottoms out in one.
+/// Used only to decide `local_str_hint` membership (see above): a variable
+/// is promoted to the nilable-str representation only when a later
+/// assignment to it unambiguously looks like the `(T, Err)` idiom's error
+/// message, e.g. `err = "disk full"` or `err = "read " + path + " failed"`.
+/// Conservative on purpose — anything else (a fn call, a ternary-style
+/// `if`/`match` value, a plain identifier) returns `false` rather than guess,
+/// leaving that binding exactly as refused as it is today.
+fn expr_looks_str_shaped(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(Literal::Str(_), _) => true,
+        Expr::BinOp { op: BinOp::Add, lhs, rhs, .. } =>
+            expr_looks_str_shaped(lhs) || expr_looks_str_shaped(rhs),
+        Expr::Tuple(es, _) if es.len() == 1 => expr_looks_str_shaped(&es[0]),
         _ => false,
     }
 }
@@ -4183,13 +6899,171 @@ fn broadcast_out_shape(a: &[i64], b: &[i64], span: &Span) -> Result<Vec<i64>, Ji
     Ok(out)
 }
 
+/// The one place a dim unified out of an argument meets an already-bound one
+/// — the `Tensor`, `KV`, `KV`-array and model arms of `unify_param_type` all
+/// route through here, so a contradiction reads the same sentence whichever
+/// pair of arguments produced it. `interp.rs`'s `bind_shape_name` is the
+/// reference backend's twin of this function, down to its rule order: the
+/// uppercase gate runs first, before either binding or checking.
+///
+/// **Inference binds uppercase-initial names only** — `SPEC.md §3.10`, "for
+/// models and tensors alike". Before #733 the `Tensor` arm bound any ident, so
+/// `fn head[n](x: Tensor[i64,[n]])` called `head(a)` answered under `dmc jit`
+/// and was refused by `dmc run`; a lowercase-initial name is now left unbound
+/// and `instantiate_template`'s "could not infer shape parameter" catches it on
+/// both backends. A lowercase name is never inferred AND never checked against
+/// the argument, even when the CALL SITE spelled it explicitly (`head[4](a)`)
+/// and it is already in `bindings` when this runs: a spelled lowercase binding
+/// is taken as written, not verified — the same rule `bind_shape_name` applies
+/// by returning on a lowercase name before ever consulting `inferred`.
+///
+/// **It compares rather than overwriting or keeping the first.** The model arm
+/// used to be `bindings.entry(pn).or_insert(actual)` — first argument wins,
+/// later ones silently discarded — so `fn f[N](x: Buf[N], y: Buf[N])` called
+/// `f[4](a, b)` on a `Buf[4]` and a `Buf[8]` pinned `N = 4` and read `y.t[3]`
+/// off the larger buffer, a run-refuses / jit-answers divergence and an
+/// out-of-bounds read whenever the second buffer is the smaller one (#732).
+fn bind_or_check_shape_param(
+    name: &str,
+    actual: i64,
+    bindings: &mut HashMap<String, i64>,
+    span: &Span,
+) -> Result<(), JitError> {
+    if !name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return Ok(());
+    }
+    if let Some(prev) = bindings.get(name) {
+        if *prev != actual {
+            return err(span, format!(
+                "shape parameter `{}` would bind to {} but already bound to {}",
+                name, actual, prev,
+            ));
+        }
+        return Ok(());
+    }
+    bindings.insert(name.to_string(), actual);
+    Ok(())
+}
+
+/// Check (and, for a scalar model, bind) one model's shape type-args against
+/// an argument's own concrete dims, positionally — shared by the scalar
+/// `Model` arm and the `ModelArray` element arm of `unify_param_type`, since
+/// #812 established that a model array's bare elements are exactly as
+/// unsound as a bare scalar model argument, for the same reason.
+///
+/// `dims` is the argument's own resolved shape type-args (`TyKind::Model`'s
+/// or `TyKind::ModelArray`'s trailing `Vec<i64>`). `args` is the callee
+/// template PARAMETER's declared type-arg list (`Buf[N]`'s `[N]`, or a model
+/// array element's `Buf[N]`'s `[N]`) — read positionally against `dims`.
+///
+/// #810: a positional dim missing at `i` (`dims.get(i)` is `None`) means
+/// this argument carries no shape of its own to check `args[i]` against — a
+/// model value at run time is only the i64 pointer to its field arena, no
+/// header, so there is no runtime shape to fall back on checking instead.
+/// Refuse UNCONDITIONALLY here, regardless of whether the shape parameter
+/// happens to be bound already (an explicit bracket, or an earlier argument,
+/// can seed `bindings` before this argument is ever visited — reordering
+/// the very same unsound call must not change whether it is caught) and
+/// regardless of the parameter name's case (#733's uppercase-only convention
+/// is about free INFERENCE, not about an explicit bracket binding, which
+/// `instantiate_template` seeds without that filter — a lowercase shape
+/// param name is exactly as unbindable-from-nothing as an uppercase one).
+///
+/// `bind` gates whether a PRESENT dim (`dims.get(i)` is `Some`) also binds or
+/// checks the shape parameter it names, via `bind_or_check_shape_param` —
+/// true for the scalar `Model` arm, an existing and intentional inference
+/// source (#273/#733). False for the `ModelArray` arm: `dmc run` has never
+/// inferred (or checked) a shape parameter from a model ARRAY argument's
+/// element shape at all — `jit_shape_arg_inference_732_733.rs`'s
+/// `a_model_arrays_element_shape_arg_is_inferable_on_neither_backend` pins
+/// the interpreter's own refusal, "shape param `N` cannot be inferred from
+/// any argument". Passing `true` there would still be sound (a present dim
+/// really is the element's real shape), but it would hand the JIT a new
+/// inference power the interpreter deliberately doesn't have — answering
+/// where `dmc run` refuses is exactly the divergence #480 doctrine treats as
+/// its own kind of wrong answer, so this only ever refuses a bare element
+/// here and is silent on a present one, same as before #812.
+///
+/// Reviewer pass: the hint used to hardcode a fn `g` and a parameter `a`
+/// that generally do not exist in the program being compiled — worded like
+/// `check.rs`'s bare-generic-model hint in every OTHER respect, but not that
+/// one, so a caller named e.g. `caller` with a bare parameter `first` still
+/// read "declare the shape parameter on the function: `fn g[N](a: Buf[N])`",
+/// naming a function and a parameter neither one is. `fn_name` (the ENCLOSING
+/// fn currently being lowered — `Translator::fn_name`, set from `meta.name`
+/// at `define_fn`) and `param_name` (this call argument's own identifier, the
+/// caller's actual bare parameter in every fixture here) now feed the same
+/// slot the hardcoded strings used to occupy. `array_len` selects the
+/// rendered parameter type: `None` for the scalar `Model` arm (`{mname}[{pn}]`,
+/// e.g. `Buf[N]`), `Some(n)` for the `ModelArray` arm, which used to render
+/// that same bare scalar form even though the parameter it's suggesting is an
+/// array (`[Buf; 2]`, not `Buf`) — now `[{mname}[{pn}]; n]`, e.g. `[Buf[N]; 2]`.
+fn bind_or_refuse_model_shape_args(
+    mname: &str,
+    args: &[TypeArg],
+    dims: &[i64],
+    bind: bool,
+    bindings: &mut HashMap<String, i64>,
+    pspan: &Span,
+    call_span: &Span,
+    fn_name: &str,
+    param_name: &str,
+    array_len: Option<i64>,
+) -> Result<(), JitError> {
+    for (i, a) in args.iter().enumerate() {
+        let pn = match a {
+            TypeArg::Expr(e) | TypeArg::Named { value: e, .. } => match e.as_ref() {
+                Expr::Ident(pn, _) => pn.as_str(),
+                // A literal or shape arithmetic in the annotation is not a
+                // binding site, the same way it is not one in a `ShapeSpec`
+                // (`interp.rs`'s `bind_shape_ident_expr`).
+                _ => continue,
+            },
+            TypeArg::Type(Type::Named { name: pn, args: ta, .. }) if ta.is_empty() =>
+                pn.as_str(),
+            TypeArg::Type(_) => continue,
+        };
+        match dims.get(i).copied() {
+            Some(actual) if bind => bind_or_check_shape_param(pn, actual, bindings, pspan)?,
+            Some(_) => {}
+            None => {
+                let rendered_ty = match array_len {
+                    Some(n) => format!("[{mname}[{pn}]; {n}]"),
+                    None => format!("{mname}[{pn}]"),
+                };
+                let msg = format!(
+                    "a bare `{mname}` argument here carries no shape arguments, \
+                     so the JIT cannot check it against shape parameter `{pn}` \
+                     — declare the shape parameter on the function: \
+                     `fn {fn_name}[{pn}]({param_name}: {rendered_ty})`",
+                );
+                return unsupported_msg(call_span, Refusal::TypeForm, msg);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Unify the template parameter's declared AST type against a concrete
 /// argument's TyKind, binding shape parameters as a side effect.
+///
+/// `pspan` anchors ordinary type-mismatch errors at the callee's own
+/// parameter (the historical behavior). `call_span` anchors the #810/#812
+/// bare-model-argument refusal instead, at the call itself — that is where
+/// the caller wrote the value with no shape to check, and where the fix
+/// belongs, at the ENCLOSING fn's own declaration (named by `fn_name`) and
+/// its own bare parameter (named by `param_name`) — not at `f`'s
+/// already-correct declaration. `fn_name`/`param_name` are read only by the
+/// `Model`/`ModelArray` arms below, threaded through to
+/// `bind_or_refuse_model_shape_args`'s hint (see its doc comment).
 fn unify_param_type(
     param_ty: &Type,
     arg_ty: &TyKind,
     bindings: &mut HashMap<String, i64>,
     pspan: &Span,
+    call_span: &Span,
+    fn_name: &str,
+    param_name: &str,
 ) -> Result<(), JitError> {
     match (param_ty, arg_ty) {
         (Type::Scalar(s, _), TyKind::Scalar(sk)) => {
@@ -4209,22 +7083,15 @@ fn unify_param_type(
             Ok(())
         }
         (Type::Tensor(elem_ast, shape_ast, span), TyKind::Tensor(tt)) => {
-            // Map the declared element type the same way lower_ty_for_model does
-            // (bf16/f16/tf32 compute as f32; bool keeps its kind; sub-narrow ints
-            // widen to i32) so non-f32 tensor params like `Tensor[i64, [B,S]]`
-            // (input_ids) and `Tensor[bf16, …]` (weights) bind. (#273 follow-up.)
+            // Map the declared element type through the shared table, so a
+            // non-f32 tensor param like `Tensor[i64, [B,S]]` (input_ids),
+            // `Tensor[u8, [H,W]]` (a byte buffer) or `Tensor[bf16, …]`
+            // (weights) binds against the argument the caller actually built.
+            // (#273 follow-up; table shared as of #632.)
             let expected_elem = match elem_ast.as_ref() {
-                Type::Scalar(s, _) => match s {
-                    ScalarType::F32 => ScalarKind::F32,
-                    ScalarType::F64 => ScalarKind::F64,
-                    ScalarType::I64 | ScalarType::U64 => ScalarKind::I64,
-                    ScalarType::I32 | ScalarType::U32 => ScalarKind::I32,
-                    ScalarType::Bf16 | ScalarType::F16 | ScalarType::Tf32 => ScalarKind::F32,
-                    ScalarType::Bool => ScalarKind::Bool,
-                    ScalarType::I8 | ScalarType::I16 | ScalarType::U8 | ScalarType::U16
-                    | ScalarType::Int4 | ScalarType::Int8
-                    | ScalarType::Fp8E4M3 | ScalarType::Fp8E5M2 => ScalarKind::I32,
-                    _ => return unsupported(span, Refusal::ElementType,
+                Type::Scalar(s, _) => match tensor_elem_kind(s) {
+                    Some(k) => k,
+                    None => return unsupported(span, Refusal::ElementType,
                             "this tensor template element type"),
                 },
                 _ => return unsupported(span, Refusal::ElementType,
@@ -4258,16 +7125,7 @@ fn unify_param_type(
                         }
                     }
                     Expr::Ident(name, _) => {
-                        if let Some(prev) = bindings.get(name) {
-                            if *prev != actual {
-                                return err(span, format!(
-                                    "shape parameter `{}` would bind to {} but already bound to {}",
-                                    name, actual, prev,
-                                ));
-                            }
-                        } else {
-                            bindings.insert(name.clone(), actual);
-                        }
+                        bind_or_check_shape_param(name, actual, bindings, span)?;
                     }
                     _ => return err(span, format!(
                         "template shape element `{:?}` is not a literal or ident",
@@ -4314,16 +7172,167 @@ fn unify_param_type(
                                 }
                             }
                             Expr::Ident(name, _) => {
-                                if let Some(prev) = bindings.get(name) {
-                                    if *prev != actual {
-                                        return err(span, format!(
-                                            "shape parameter `{}` would bind to {} but already bound to {}",
-                                            name, actual, prev,
-                                        ));
-                                    }
-                                } else {
-                                    bindings.insert(name.clone(), actual);
+                                bind_or_check_shape_param(name, actual, bindings, span)?;
+                            }
+                            _ => return err(span, "KV template shape element is not a literal or ident"),
+                        }
+                    }
+                    _ => return err(span, "KV template shape elements must be `~`, literals, or idents"),
+                }
+            }
+            Ok(())
+        }
+        // #811: `v: View[u8,[N]]` unifying against a `Tensor` argument.
+        // SPEC.md §3.3 (~308): "`Tensor[T, S]` is a `View` with contiguous
+        // strides in the arena's natural layout (row-major). Slicing a
+        // `Tensor` yields a `View`." — `types.rs`'s `compatible_with` (#792
+        // rework) and `check.rs`'s `infer_call_shape_bindings` already accept
+        // a `Tensor`/`KV` argument for a `View`-typed parameter and bind its
+        // shape vars from it; this arm brings the JIT's own unification into
+        // line so `total(t)` (unbracketed, `N` inferred) and `total[4](t)`
+        // (explicit bracket — `instantiate_template` runs unification on
+        // every param regardless) both reach `declare_template_signature`
+        // instead of refusing here first.
+        //
+        // The JIT never represents a non-contiguous buffer as a runtime
+        // value at all: `lower_tensor_slice_read_copy` copies any
+        // non-contiguous slice into a fresh contiguous `TensorTy` before it
+        // becomes a value, and a strided step slice (`a:b:c`) already
+        // refuses upstream, at the slice expression itself, with the
+        // existing `Refusal::Slice` (`classify_index_static`) — before any
+        // value exists to reach here. So every `TyKind::Tensor` this arm
+        // ever sees is contiguous by construction, and a `View` parameter
+        // unifies against it exactly like a `Tensor` parameter does: same
+        // element-kind table, same per-dim literal/ident binding as the
+        // `Tensor` arm above.
+        (Type::View(elem_ast, shape_ast, span), TyKind::Tensor(tt)) => {
+            let expected_elem = match elem_ast.as_ref() {
+                Type::Scalar(s, _) => match tensor_elem_kind(s) {
+                    Some(k) => k,
+                    None => return unsupported(span, Refusal::ElementType,
+                            "this tensor template element type"),
+                },
+                _ => return unsupported(span, Refusal::ElementType,
+                        "a tensor template parameter with a non-scalar element type"),
+            };
+            if tt.elem != expected_elem {
+                return err(span, "element type mismatch in template instantiation");
+            }
+            if shape_ast.elems.len() != tt.shape.len() {
+                return err(span, format!(
+                    "rank mismatch: template expects {}, arg has {}",
+                    shape_ast.elems.len(), tt.shape.len(),
+                ));
+            }
+            for (i, d) in shape_ast.elems.iter().enumerate() {
+                let want = match d {
+                    ShapeElem::Expr(e) => e.as_ref(),
+                    _ => return err(span,
+                        "template shape elements must be literals or idents"),
+                };
+                let actual = tt.shape[i];
+                match want {
+                    Expr::Literal(Literal::Int(n, _), _) => {
+                        if *n != actual {
+                            return err(span, format!(
+                                "shape mismatch at dim {}: expected {}, got {}",
+                                i, n, actual,
+                            ));
+                        }
+                    }
+                    Expr::Ident(name, _) => {
+                        bind_or_check_shape_param(name, actual, bindings, span)?;
+                    }
+                    _ => return err(span, format!(
+                        "template shape element `{:?}` is not a literal or ident",
+                        want,
+                    )),
+                }
+            }
+            Ok(())
+        }
+        // #811: `v: View[f32,[N]]` unifying against a `KV` argument — SPEC.md
+        // §3.6 (~446): "A `KV[T, S]` is convertible to `View[T, S]` (with the
+        // current `~` value frozen as a concrete dimension) ... for any
+        // read-only operation. The conversion is free." Element-type checking
+        // mirrors the KV template arm above exactly. The shape loop does NOT
+        // reuse that arm's loop unchanged, though: there, the template's own
+        // declared type is ALSO a `KV`, so its shape spells `~` at the same
+        // position the argument's streaming axis is at, and the position
+        // match is all that arm ever needs — neither side ever binds a
+        // dimension AT the streaming axis. A `View` has no `~` syntax at all
+        // (SPEC.md §3.3 — a View is a frozen descriptor), so `v: View[f32,
+        // [N]]`'s shape spells a plain ident at that same full-shape
+        // position, and SPEC's "current `~` value frozen as a concrete
+        // dimension" means `N` binds to it.
+        //
+        // #811 rework: the streaming-axis dimension binds to `dmc run`'s
+        // RUNTIME `len` — the number of `<-` appends so far — not to the
+        // constructor's compile-time `cap`. An earlier version of this arm
+        // used `kv.cap` as a stand-in whenever it was known, reasoning that a
+        // `KV` built from a visible `forge.kv[...]` constructor at least
+        // fixes an upper bound; that reasoning was wrong; a `KV` filled to
+        // half its declared capacity is the NORMAL case (a streaming cache
+        // mid-fill), not an edge case, and `cap` is silently the wrong
+        // answer for it: `lenof(k)` on a capacity-4 KV with 2 appends reads 2
+        // under `dmc run` and 4 under the old `cap`-based JIT arm, and
+        // `dump(k)` prints the 2 real elements padded with 2 stale zeros
+        // instead of refusing. There is no per-value tracking of a KV's
+        // runtime length anywhere in this file (`KvTy::as_full_tensor`,
+        // consulted by `lower_index`'s KV arm to read `k[i]` at all, has the
+        // identical gap and already refuses a compile-time-unknown capacity
+        // for exactly this reason), so the honest answer at the streaming
+        // axis is to refuse UNCONDITIONALLY — known `cap` or not — with the
+        // same `Refusal::DynamicShape` class `lower_index` already uses for
+        // that unknown-capacity case. #480: a wrong answer that looks right
+        // on the common case is worse than a refusal.
+        (Type::View(elem_ast, shape_ast, span), TyKind::KV(kv)) => {
+            let expected_elem = match elem_ast.as_ref() {
+                Type::Scalar(ScalarType::F32, _) => ScalarKind::F32,
+                _ => return unsupported(span, Refusal::ElementType,
+                        "a KV template parameter whose element type is not `f32`"),
+            };
+            if kv.elem != expected_elem {
+                return err(span, "element type mismatch in KV template instantiation");
+            }
+            if shape_ast.elems.len() != kv.rank() {
+                return err(span, format!(
+                    "KV rank mismatch: template expects {}, arg has {}",
+                    shape_ast.elems.len(), kv.rank(),
+                ));
+            }
+            for (i, d) in shape_ast.elems.iter().enumerate() {
+                match d {
+                    ShapeElem::Streaming(_) => {
+                        if i != kv.stream_axis {
+                            return err(span, format!(
+                                "KV streaming axis mismatch: template `~` at dim {}, arg at dim {}",
+                                i, kv.stream_axis,
+                            ));
+                        }
+                    }
+                    ShapeElem::Expr(e) => {
+                        if i == kv.stream_axis {
+                            return unsupported(span, Refusal::DynamicShape,
+                                "a `View` parameter's streaming-axis dimension bound to a `KV` \
+                                 argument; that dimension is the stream's RUNTIME length, which \
+                                 the JIT has no way to read at compile time — the constructor's \
+                                 `capacity` is only an upper bound, and a `KV` filled to less \
+                                 than capacity (the normal case) would silently bind the wrong \
+                                 shape");
+                        }
+                        let actual = kv.dim_at(i);
+                        match e.as_ref() {
+                            Expr::Literal(Literal::Int(n, _), _) => {
+                                if *n != actual {
+                                    return err(span, format!(
+                                        "KV shape mismatch at dim {}: expected {}, got {}",
+                                        i, n, actual,
+                                    ));
                                 }
+                            }
+                            Expr::Ident(name, _) => {
+                                bind_or_check_shape_param(name, actual, bindings, span)?;
                             }
                             _ => return err(span, "KV template shape element is not a literal or ident"),
                         }
@@ -4335,24 +7344,36 @@ fn unify_param_type(
         }
         // Model param: `m: Transformer` (or parameterized `Foo[N]`). Bind any ident
         // type-args positionally from the model's concrete dims. (#273 follow-up.)
+        //
+        // The rule (`SPEC.md §3.10`): "an
+        // argument's own shape arguments bind the parameter's shape names".
+        // The arm existed but never fired for the spelling anyone writes: `N`
+        // in a TYPE position (`b: Buf[N]`) parses as `TypeArg::Type(Named {
+        // name: "N", args: [] })`, not `TypeArg::Expr(Ident("N"))`, and the
+        // old `TypeArg::Type(_) => continue` dropped it — so `cap(a)` on a
+        // `Buf[4]` was `jit error: could not infer shape parameter `N``
+        // while `dmc run` answered. `type_named_dims` already reads exactly
+        // that spelling in the forward direction (a bare type-name arg
+        // resolved through the env), which is why only this half was missing.
+        //
+        // #810: a BARE argument (`x: Buf`, `mdims` empty) against a
+        // shape-parameterized `x: Buf[N]` template parameter refuses
+        // unconditionally — see `bind_or_refuse_model_shape_args` — rather
+        // than only when `N` happened to already be bound by the time this
+        // argument was visited. `f[8](a, b)` with `a: Buf` a 4-element `Buf`
+        // used to bind N=8 from the bracket and check nothing against it, so
+        // the JIT read `a.t[7]` off the end of a 4-element tensor and
+        // returned a number where `dmc run`'s runtime contradiction check
+        // refuses.
         (Type::Named { name, args, .. }, TyKind::Model(mname, mdims)) => {
             if name != mname {
                 return err(pspan, format!(
                     "model arg mismatch: expected `{}`, got `{}`", name, mname));
             }
-            for (i, a) in args.iter().enumerate() {
-                let e = match a {
-                    TypeArg::Expr(e) => e,
-                    TypeArg::Named { value, .. } => value,
-                    TypeArg::Type(_) => continue,
-                };
-                if let Expr::Ident(pn, _) = e.as_ref() {
-                    if let Some(actual) = mdims.get(i).copied() {
-                        bindings.entry(pn.clone()).or_insert(actual);
-                    }
-                }
-            }
-            Ok(())
+            bind_or_refuse_model_shape_args(
+                mname, args, mdims, true, bindings, pspan, call_span,
+                fn_name, param_name, None,
+            )
         }
         // `[KV[...]; N]` array param (per-layer KV caches): bind shape params
         // from the element KV's shape, mirroring the scalar KV arm. (#273.)
@@ -4399,15 +7420,7 @@ fn unify_param_type(
                                 }
                             }
                             Expr::Ident(name, _) => {
-                                if let Some(prev) = bindings.get(name) {
-                                    if *prev != actual {
-                                        return err(span, format!(
-                                            "shape parameter `{}` would bind to {} but already bound to {}",
-                                            name, actual, prev));
-                                    }
-                                } else {
-                                    bindings.insert(name.clone(), actual);
-                                }
+                                bind_or_check_shape_param(name, actual, bindings, span)?;
                             }
                             _ => return err(span, "KV array template shape element is not a literal or ident"),
                         }
@@ -4417,10 +7430,24 @@ fn unify_param_type(
             }
             Ok(())
         }
-        // `[ModelName; N]` array param.
-        (Type::Array(inner, _, span), TyKind::ModelArray(mname, _, _)) => {
+        // `[ModelName; N]` array param. #812: this arm used to check only
+        // the model name, ignoring the element model's own shape entirely —
+        // a bare model-array element (`x: [Buf; 2]`, elem dims `[]`) forwarded
+        // to a shape-parameterized element (`arr: [Buf[N]; 2]`) checked
+        // nothing, the same unchecked-bare-model gap #810 fixed for a scalar
+        // model parameter. `arr[0].t[N - 1]` on a 4-element `Buf` packed
+        // alongside an 8-element sibling read out of bounds. Refuse the same
+        // way via the shared helper — with `bind: false`, since `dmc run`
+        // has never inferred a shape parameter from an array element's shape
+        // (see `bind_or_refuse_model_shape_args`'s doc), only from a scalar
+        // model argument's.
+        (Type::Array(inner, _, span), TyKind::ModelArray(mname, arr_len, elem_dims)) => {
             match inner.as_ref() {
-                Type::Named { name, .. } if name == mname => Ok(()),
+                Type::Named { name, args, .. } if name == mname =>
+                    bind_or_refuse_model_shape_args(
+                        mname, args, elem_dims, false, bindings, pspan, call_span,
+                        fn_name, param_name, Some(*arr_len),
+                    ),
                 Type::Named { name, .. } => err(span, format!(
                     "model array arg mismatch: expected `{}`, got `{}`", name, mname)),
                 _ => err(span, "model array template param must wrap a model name"),
@@ -4431,8 +7458,287 @@ fn unify_param_type(
             err(span, "scalar/tensor kind mismatch in template arg")
         }
         _ => unsupported(pspan, Refusal::TypeForm,
-                "a template parameter outside scalar / Tensor / KV"),
+                "a template parameter outside scalar / Tensor / View / KV"),
     }
+}
+
+/// The symbol a model method is declared under: `model M { fn clear!(!self) }`
+/// → `M$$clear!`.
+///
+/// The separator is **two** `$`, and that is load-bearing rather than
+/// decorative. `merge.rs:547` renames a private top-level fn to
+/// `<file-prefix>$<name>`, so a file `M.dmc` declaring an unrelated private
+/// `fn method(...)` merges to exactly `M$method` — the same string a single-`$`
+/// method mangling would hand model `M`'s method `method`, and both land in
+/// `Jit::fns`, one flat name map. Every merge-produced prefix is one `$`
+/// immediately followed by a bare user identifier, which contains no `$` at all
+/// (the lexer admits none), so two consecutive `$` never appear anywhere the
+/// merge writes: `M$$method` is unreachable by construction, not by convention.
+/// `jit_model_methods.rs`'s N2 case is the proof.
+fn mangle_method_name(model: &str, method: &str) -> String {
+    format!("{}$${}", model, method)
+}
+
+/// The shape-env key one of the **model's** shape parameters is bound under
+/// while a method's receiver slot is being typed — `model Buf[N]` → `Buf$$N`.
+///
+/// A method may declare a shape parameter that shadows one of its model's
+/// (`model Buf[N] { fn f![N](self, x: Tensor[i64, [N]]) }`), and `dmc run`
+/// resolves the body's bare `N` method-first: `sum(self.t) * 10 + N` on a
+/// `Buf[4]` called `f![2]` answers `42` — `self.t` is `[4]`, `N` is `2`. So the
+/// two are genuinely different bindings under one spelling, and exactly one of
+/// them — the receiver's — must survive the shadow, because it also decides the
+/// receiver's field shapes and the model half of the symbol. Binding it under a
+/// key containing `$$` puts it out of reach of both: the lexer admits no `$` in
+/// an identifier and every merge-produced name is one `$` followed by a bare
+/// identifier, so no shape name a program can write is ever this string.
+fn receiver_shape_key(model: &str, param: &str) -> String {
+    format!("{}$${}", model, param)
+}
+
+/// Render a `M$$method` symbol back to the dot form the user wrote
+/// (`Buf$$fill!` → `Buf.fill!`), for display in a diagnostic.
+///
+/// Applied per whole token, after `Jit::demangle`'s merge-prefix loop has
+/// already peeled any `<file-prefix>$` off the model half — the loop needs no
+/// change for that: `stem.rfind('$')` first lands mid-separator, `source_name`
+/// finds no match on the trailing-`$` remainder, and its own backoff tries one
+/// `$` further left, where the merge's real prefix boundary is. Two consecutive
+/// `$` are a spelling only this file writes (`mangle_method_name`), so the
+/// substitution cannot touch a merge-produced name.
+///
+/// **Slice 2.** One instantiation of a shape-generic model's method carries the
+/// model's mono suffix on the left half, behind a `$$` of its own —
+/// `Buf$$N4$$fill!` — and that reads back as the receiver type the user
+/// actually wrote: `Buf[4].fill!`. `render_mono_model` does that half, and only
+/// when the model's own declared shape-param names confirm the suffix is one; a
+/// method's OWN bracket suffix on the right half (`Buf$$N4$$blit!$SH2_SW3`) is
+/// left as the JIT spells it, the same as every other `$`-suffixed entry point
+/// (`loss$fwd_bwd`).
+///
+/// Splitting on `$$` therefore yields three segments for that symbol and two
+/// for every other, and the count alone says which is which: a model name never
+/// contains `$$` (the merge writes one `$` before a bare identifier and the
+/// lexer admits none at all), and a method's own bracket suffix takes a single
+/// `$`. So a third segment can only be the model's mono suffix.
+fn demangle_method_symbols(
+    msg: &str,
+    model_shape_params: &HashMap<String, Vec<String>>,
+) -> String {
+    let mut out = msg.to_string();
+    for tok in merged_tokens(msg) {
+        let segs: Vec<&str> = tok.split("$$").collect();
+        if segs.len() < 2 { continue }
+        let (head, mono, method) = if segs.len() >= 3 {
+            (segs[0], Some(segs[1]), segs[2..].join("$$"))
+        } else {
+            (segs[0], None, segs[1].to_string())
+        };
+        let shown = format!("{}.{}",
+            render_mono_model(head, mono, model_shape_params), method);
+        out = replace_word(&out, &tok, &shown);
+    }
+    out
+}
+
+/// `Buf` + `N4` → `Buf[4]`, and anything this cannot positively identify as a
+/// model instantiation left as the JIT spelled it.
+///
+/// The `$$` before the mono suffix already settles where the model name ends,
+/// so the split is not in question here the way it was under a single `$` — a
+/// model *named* `M4` under a merge prefix is `util$M4`, one `$`, and never
+/// reaches this function with a `mono`. What is still checked is that the
+/// suffix is a *shape* suffix at all: it must name every one of the model's
+/// declared shape params, in declaration order, each followed by digits.
+/// Anything else is left alone, so the worst case is a mono suffix unrendered,
+/// never a model name rewritten into a shape it never had.
+///
+/// A merge prefix ahead of the model name is left attached (`util$Buf` + `N4` →
+/// `util$Buf[4]`) — `Jit::demangle`'s loop is what removes those, and only when
+/// the merge says the name was renamed.
+fn render_mono_model(
+    head: &str,
+    mono: Option<&str>,
+    model_shape_params: &HashMap<String, Vec<String>>,
+) -> String {
+    let Some(suffix) = mono else { return head.to_string() };
+    let unrendered = || format!("{}$${}", head, suffix);
+    let model = head.rsplit('$').next().unwrap_or(head);
+    let Some(sps) = model_shape_params.get(model).filter(|s| !s.is_empty()) else {
+        return unrendered();
+    };
+    let pieces: Vec<&str> = suffix.split('_').collect();
+    if pieces.len() != sps.len() { return unrendered(); }
+    let mut dims: Vec<&str> = Vec::with_capacity(pieces.len());
+    for (piece, sp) in pieces.iter().zip(sps.iter()) {
+        let Some(rest) = piece.strip_prefix(sp.as_str()) else { return unrendered() };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            return unrendered();
+        }
+        dims.push(rest);
+    }
+    format!("{}[{}]", head, dims.join(", "))
+}
+
+/// The free function a model method is lowered as. Everything but the name
+/// and the receiver slot is the method's own declaration, carried verbatim.
+///
+/// The `self` slot becomes an ordinary first parameter named `self`, typed
+/// `Type::Named { name: M }`, with `mutating` copied off the receiver — so
+/// `!self` lands on `check_mut_param_ty`'s model branch and in
+/// `mut_ptr_params`, the pointer-aliasing path a `!` model parameter has taken
+/// since #637, and `self.n`/`self.t[i]`/`let !y = self.t` in the body lower
+/// through the paths a plain model binding already exercises. Nothing about
+/// `self` is special after this: the body sees an ordinary model-typed local.
+///
+/// `directives` come across verbatim — but today that copy is a no-op:
+/// `parser.rs`'s `parse_model_member` recognizes a method only by a leading
+/// `fn` token and calls `parse_fn_decl(Vec::new())`, so a directive on a
+/// model method (`@grad fn go(!self, ..)` inside `model S { }`) is a parse
+/// error at the `@`, before any `FnDecl` — let alone this one — exists to
+/// carry it. Verified directly: `@grad fn go(!self, x: f32) -> f32 { .. }`
+/// inside a model body fails both `--check` and `dmc run` with "expected
+/// field name, found At" at the `@`. The field is kept, carried verbatim
+/// rather than hardcoded empty, for the day the parser admits a directive
+/// here — at which point `@grad` should route to `declare_grad_fn` exactly
+/// as it would on a free fn, including its refusal of a non-tensor `!`
+/// parameter, with no change to this function.
+///
+/// The receiver parameter keeps the `self` slot's own span, so a refusal
+/// raised on it points at the `self` the user wrote.
+///
+/// **Slice 2.** For a model with a bracket the receiver's type is written with
+/// the model's shape params as its arguments — `Type::Named { Buf, [..] }`, not
+/// the bare `Buf` — and those params are prepended to the synthetic decl's
+/// `shape_params`, ahead of the method's own. That one change is what makes the
+/// generic case fall out of machinery that already exists: the decl now has a
+/// non-empty `shape_params`, so `collect_fns`' `Item::Fn` arm files it as a
+/// **template** rather than declaring it eagerly, and `ty_from_ast` resolving
+/// that type against an instantiation's shape env yields
+/// `TyKind::Model("Buf", [4])` — the receiver type every field read and store
+/// already re-resolves a param-shaped field against (#267). `SPEC.md §3.10`: a
+/// model's shape parameters "are in scope throughout its methods and bind from
+/// the instance"; here the instance is the concrete `type_args` the call site's
+/// receiver carries, and "in scope" is that shape env, verbatim.
+///
+/// The receiver's arguments are **not** spelled with the model's shape-param
+/// names, though, and that is the whole of the shadowing fix. A method may
+/// declare a shape param of its own that shadows one of the model's
+/// (`model Buf[N] { fn f![N](self, ..) }`), and in the body the method's wins —
+/// which is what `dmc run` does. Writing the receiver's type with the bare name
+/// `N` would make the *receiver* resolve at the method's value too, so a
+/// `Buf[4]` reached through `f![2]` would carry a `Buf[2]`'s field shapes and
+/// mangle to a `Buf[2]`'s symbol. The receiver slot is therefore written with
+/// `receiver_shape_key`'s reserved spelling (`Buf$$N`), which no user
+/// identifier and no merge-produced name can be, and which
+/// `lower_model_method_call` binds from the receiver's own `type_args` beside
+/// the shadowable names. One shape env still, two namespaces inside it.
+fn method_fn_decl(m: &ModelDecl, f: &FnDecl) -> FnDecl {
+    // `Buf[Buf$$N]`: the one place the instantiation's `{Buf$$N → 4}` binding
+    // gets applied to the receiver, and unshadowable by construction.
+    let self_args: Vec<TypeArg> = m.shape_params.iter()
+        .map(|sp| TypeArg::Expr(Box::new(Expr::Ident(
+            receiver_shape_key(&m.name, &sp.name), sp.span.clone()))))
+        .collect();
+    let params = f.params.iter().map(|p| {
+        if !p.is_self { return p.clone(); }
+        Param {
+            mutating: p.mutating,
+            is_self: false,
+            name: p.name.clone(),
+            ty: Some(Type::Named {
+                name: m.name.clone(),
+                args: self_args.clone(),
+                span: p.span.clone(),
+            }),
+            span: p.span.clone(),
+        }
+    }).collect();
+    // The model's params first, the method's own after: the same order
+    // `lower_model_method_call` binds them in (receiver `type_args`, then the
+    // call's own bracket) and the order the mangled name spells them.
+    let mut shape_params = m.shape_params.clone();
+    shape_params.extend(f.shape_params.iter().cloned());
+    FnDecl {
+        directives: f.directives.clone(),
+        name: mangle_method_name(&m.name, &f.name),
+        mutates_self: f.mutates_self,
+        shape_params,
+        params,
+        ret_type: f.ret_type.clone(),
+        body: f.body.clone(),
+        span: f.span.clone(),
+        module: f.module,
+    }
+}
+
+/// The symbol one **instantiation** of a shape-generic model's method is
+/// declared under: `model Buf[N]`'s `fill!`, reached through a `Buf[4]`
+/// receiver, is `Buf$$N4$$fill!`.
+///
+/// The model's own mono suffix goes on the model half — *left* of the method
+/// separator — so the separator still splits the symbol into "which model
+/// instantiation" and "which method". A method with a bracket of its own takes
+/// a second suffix on the method half (`Buf$$N4$$blit!$SH2_SW3`).
+///
+/// **The model half's mono separator is `$$`, not `$`, and that is the same
+/// unreachability argument the method separator rests on
+/// (`mangle_method_name`), applied one position left.** A single `$` was
+/// wrong here for the reason it was wrong there, one namespace over:
+/// `merge.rs:547` renames a private top-level **model** to
+/// `<file-prefix>$<name>`, so a file `A.dmc` declaring an unrelated private
+/// `model N4` merges to exactly `A$N4` — the identical string `model A[N]` at
+/// `N = 4` produced under a single-`$` mono suffix, and both then spell their
+/// method `f` `A$N4$$f` in `Jit::fns`, one flat name map. Measured before the
+/// fix: a two-file program `dmc run` answers `7008` for was refused
+/// `jit-conversion`, "cannot convert `A` to `N4`" — a legal program declined,
+/// naming a model the call site never mentions. Under `$$` they cannot meet:
+/// every merge-produced prefix is one `$` immediately followed by a bare user
+/// identifier, which contains no `$` at all (the lexer admits none), so two
+/// consecutive `$` never appear anywhere the merge writes, and no *model* name
+/// reaching this function can contain them either.
+///
+/// The method half keeps a single `$` before its own suffix and needs no
+/// change: it sits to the right of a `$$` the merge cannot write, so nothing
+/// the merge produces can ever be read as one.
+///
+/// One symbol per distinct `(model type_args, method bracket)` tuple, which is
+/// the whole point of the slice: #474 was a shape-generic method that silently
+/// never ran, and a shared body across two instantiations is the same failure
+/// one layer down — `p16` answers `8` and `16`, not `8` and `8`.
+///
+/// The two halves take **two** binding maps, not one. A method shape parameter
+/// that shadows a model one (`model Buf[N] { fn f![N](self, ..) }`) must not
+/// respell the model half: `Buf[4]` and `Buf[2]` receivers both called `f![2]`
+/// otherwise land on one symbol and one body, which is #474's failure with the
+/// shadow as its trigger. `Buf$$N4$$f!$N2` and `Buf$$N2$$f!$N2` are distinct.
+fn mangle_mono_method_name(
+    model: &str,
+    model_shape_params: &[String],
+    method: &str,
+    method_shape_params: &[String],
+    model_bindings: &HashMap<String, i64>,
+    method_bindings: &HashMap<String, i64>,
+) -> String {
+    fn suffix(
+        base: &str,
+        sep: &str,
+        params: &[String],
+        bindings: &HashMap<String, i64>,
+    ) -> String {
+        if params.is_empty() { return base.to_string(); }
+        let mut s = String::from(base);
+        s.push_str(sep);
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 { s.push('_'); }
+            s.push_str(&format!("{}{}", p, bindings.get(p).copied().unwrap_or(0)));
+        }
+        s
+    }
+    mangle_method_name(
+        &suffix(model, "$$", model_shape_params, model_bindings),
+        &suffix(method, "$", method_shape_params, method_bindings),
+    )
 }
 
 fn mangle_mono_name(
@@ -4451,14 +7757,91 @@ fn mangle_mono_name(
     s
 }
 
+/// Is `ty` a type the JIT can carry a `!` (mutating) parameter in, outside a
+/// `@grad fn`?
+///
+/// SPEC §3.4 makes a `!` parameter's writes visible to the caller. The JIT has
+/// exactly one convention for that, and it only reaches two representations:
+///
+/// - **Tensor** — copy-in at the call site, copy-out at every return of the
+///   callee, memcpy back into the caller's buffer after the call (`#249`,
+///   `#553`). This is what `interp.rs` does too: tensors are value copies
+///   there, and `apply_writebacks` is what makes the parameter alias.
+/// - **Model** and **KV** — already an i64 pointer to, respectively, the
+///   instance's forge-allocated field struct and the cache's header, so the
+///   callee's writes land in the caller's value with no copy at all.
+///   `interp.rs` matches on both: a `Value::Struct` is an `Rc<RefCell<..>>`
+///   the callee shares outright (which is why
+///   `mut_model_param_on_method_still_mutates_475` passes there with no
+///   writeback), and a KV append mutates the shared cache.
+///
+/// Everything else is refused rather than lowered wrong. A `!` **scalar** is
+/// the sharp one: the interpreter writes the callee's final value back into
+/// the caller's binding, and the JIT passes scalars by value with nowhere to
+/// put the result — so `fn bump(!a: i64) { a = a + 1 }` returns the right
+/// number and silently leaves the caller's `a` alone. That was live on the
+/// template path, where nothing checked: `dmc run` said 1111 and `dmc jit`
+/// said 1110 for the same program, with no diagnostic on either side.
+/// Refusing is the only honest answer until out-parameters exist. `str` is the
+/// same shape of mistake one representation over — the only mutation it admits
+/// is a rebind, and a rebound forge pointer never reaches the caller — and the
+/// remaining forms (maps, port handles, the array types, `DynTensor`) have no
+/// copy-out and no parity evidence, so they wait for a test rather than a
+/// guess.
+fn check_mut_param_ty(ty: &TyKind, p: &Param) -> Result<(), JitError> {
+    if ty.is_tensor() || matches!(ty, TyKind::Model(_, _) | TyKind::KV(_)) {
+        return Ok(());
+    }
+    unsupported_msg(&p.span, Refusal::Signature, format!(
+        "a `!` parameter of this type — outside `@grad fn` the JIT lowers `!` \
+         parameters of tensor type (copy-in/copy-out) and of model and `KV` \
+         type (the pointer aliases), and refuses the rest rather than drop the \
+         write-back `{}` would need",
+        p.name))
+}
+
+/// #811: rewrite a template PARAMETER's declared `View[T, S]` to `Tensor[T,
+/// S]` before it reaches the general `ty_from_ast` — the JIT has no runtime
+/// representation distinct from `TensorTy` for a View (see the doc comment
+/// on `unify_param_type`'s `Type::View` arms), so a shape-generic function's
+/// `v: View[u8, [N]]` parameter binds and lowers exactly like `Tensor[u8,
+/// [N]]` once `N` is resolved: same element-kind table, same shape, same
+/// pointer. Every other type passes through unchanged.
+///
+/// Deliberately scoped to `declare_template_signature`'s PARAMETER loop only
+/// — not folded into `ty_from_ast` itself, and not applied to a template's
+/// return type. `ty_from_ast` is also the ordinary (non-generic) `declare_fn`
+/// path's own type lowering, and whether an EAGER function's `View` param
+/// should ever lower is a separate, wider, still-open question: #747 (see
+/// `jit_model_methods.rs`'s `#747`/`#755` series) built an entire declare-time
+/// isolation/cascade mechanism using exactly that refusal as its "a method's
+/// own signature can't declare" test vehicle, and settled "no" on lowering it
+/// there. This issue (#811) is only about a shape-GENERIC function's `View`
+/// parameter binding its shape from a Tensor/KV argument — the call
+/// `total(t)` #808 already type-checks — so only the template-instantiation
+/// path this function serves gets the rewrite. A shape-generic MODEL's
+/// method (also filed as a template — `lower_model_method_call`'s other call
+/// site into this function) benefits the same way, which is why
+/// `jit_model_methods.rs`'s one shape-generic `View`-param test needed
+/// updating alongside this fix; every EAGER (non-generic) `View`-param case
+/// in that file is unaffected, because `declare_fn` never calls this rewrite.
+fn view_param_ty_for_template(ty: &Type) -> Type {
+    match ty {
+        Type::View(inner, shape, span) => Type::Tensor(inner.clone(), shape.clone(), span.clone()),
+        _ => ty.clone(),
+    }
+}
+
 /// Declare a template's specialized signature in the module under
 /// `mangled` and return the resulting FnEntry. Body is not lowered here.
 fn declare_template_signature(
     module: &mut JITModule,
     tmpl: &FnDecl,
     shape_env: &HashMap<String, i64>,
+    consts: ConstDims<'_>,
     mangled: &str,
     enums: &HashMap<String, Vec<String>>,
+    aliases: &HashMap<String, TypeAlias>,
 ) -> Result<FnEntry, JitError> {
     let mut sig = module.make_signature();
     let mut params: Vec<(String, TyKind, Span)> = Vec::with_capacity(tmpl.params.len());
@@ -4468,17 +7851,55 @@ fn declare_template_signature(
             msg: format!("template param `{}` needs a type annotation", p.name),
             line: p.span.line, col: p.span.col,
         })?;
-        let ty = enumify(ty_from_ast(ty_ast, shape_env)?, enums);
+        let alias_resolved_ty_ast = resolve_alias_ty(ty_ast, aliases)?;
+        // #811 rework: a MUTATING (`!`) View-spelled parameter must NOT take
+        // the View→Tensor rewrite below — see `view_param_ty_for_template`'s
+        // own doc comment for why the rewrite exists at all. The rewrite is
+        // sound for a READ: the JIT has no runtime representation for a View
+        // distinct from a contiguous Tensor, so `v[i]` lowers identically
+        // either way, and that is as far as SPEC.md §3.6's KV→View promise
+        // ("for any read-only operation") and the #808 `total(t)` case #811
+        // was filed for both ever go. It is not sound for a WRITE: once
+        // rewritten, `check_mut_param_ty` below grants the parameter
+        // ordinary Tensor `!` copy-in/copy-out semantics (SPEC.md §3.4.1),
+        // not a write straight through the descriptor a `!v: View[...]`
+        // caller is asking for — and for a slice or model-field-alias
+        // argument those two disagree with `dmc run`'s own answer:
+        // `bump(t[0:2])` with `v[0] = 99.0` inside leaves `t` untouched
+        // under `dmc run` but sets `t[0]` under the rewrite's Tensor
+        // copy-out, and `bump(g.heat)` similarly. Leaving the type
+        // unrewritten here sends a mutating View param through
+        // `ty_from_ast`'s own catch-all instead — the same `jit-type-form`
+        // ("this type in a signature") refusal an EAGER function's View
+        // param (mutating or not) already gets, since `declare_fn` never
+        // calls this rewrite at all (#747/#755's baseline). #480: a
+        // plausible-looking wrong answer is worse than that refusal.
+        let resolved_ty_ast = if p.mutating {
+            alias_resolved_ty_ast
+        } else {
+            view_param_ty_for_template(&alias_resolved_ty_ast)
+        };
+        let ty = enumify(ty_from_ast(&resolved_ty_ast, shape_env, consts)?, enums);
         if matches!(ty, TyKind::Scalar(ScalarKind::Nil)) {
             return unsupported(&p.span, Refusal::TypeForm, "`nil` parameters");
         }
         // #249: track `!` tensor params so the call site can copy-in/copy-out.
-        if p.mutating { mut_param_idxs.push(idx); }
+        // A template is never a `@grad fn` (shape-generic `@grad` is refused in
+        // `declare_grad_fn`), so the outside-`@grad` rule is the only one that
+        // applies — and it has to be applied *here* too. Before it was, a
+        // shape-generic `fn bump[N](!a: i64, …)` compiled and ran: the callee
+        // incremented its own copy, the caller's binding never moved, and the
+        // program printed a different number under `dmc jit` than under
+        // `dmc run` with no diagnostic on either side.
+        if p.mutating {
+            mut_param_idxs.push(idx);
+            check_mut_param_ty(&ty, p)?;
+        }
         sig.params.push(AbiParam::new(ty.cl()));
         params.push((p.name.clone(), ty, p.span.clone()));
     }
     let ret = match &tmpl.ret_type {
-        Some(t) => enumify(ty_from_ast(t, shape_env)?, enums),
+        Some(t) => enumify(ty_from_ast(&resolve_alias_ty(t, aliases)?, shape_env, consts)?, enums),
         None    => TyKind::Scalar(ScalarKind::Nil),
     };
     if !matches!(ret, TyKind::Scalar(ScalarKind::Nil)) {
@@ -4506,6 +7927,13 @@ struct Translator<'a> {
     fns: &'a mut HashMap<String, FnEntry>,
     templates: &'a HashMap<String, FnDecl>,
     pending: &'a mut Vec<PendingMono>,
+    /// The name of the fn whose body is currently being lowered — `meta.name`
+    /// at `define_fn` construction time. Read only by `lower_call`'s
+    /// bare-model-argument refusal (#810/#812) to name the ENCLOSING function
+    /// in its "declare the shape parameter on the function" hint, so the hint
+    /// names the caller that actually needs the fix rather than a hardcoded
+    /// placeholder (`jit.rs`'s `bind_or_refuse_model_shape_args`).
+    fn_name: String,
     /// Multi-param `@grad fn` schemas — maps `$fn$fwd_bwd` → [(param, ty)...].
     /// Shared with `Jit::grad_schemas`; used by `lower_fwd_bwd_destructure`.
     grad_schemas: &'a HashMap<String, Vec<(String, TyKind, usize)>>,
@@ -4517,12 +7945,65 @@ struct Translator<'a> {
     /// concrete type args during field-access lowering.
     model_shape_params: &'a HashMap<String, Vec<String>>,
     model_field_asts: &'a HashMap<String, Vec<(String, Type)>>,
+    /// #634: shared with `Jit` — every model's declared method names. Read by
+    /// `lower_postfix`'s `Call` arm to decide whether `recv.name(..)` is a model
+    /// method (rewrite to `M$$name(recv, ..)`), a method on a shape-generic
+    /// model (refuse, saying so), or neither (fall through unchanged).
+    model_methods: &'a HashMap<String, Vec<String>>,
+    /// #747: shared with `Jit::model_method_errors` — see that field's doc
+    /// comment. Consulted by `lower_model_method_call`'s catch-all arm to
+    /// re-surface a method's own true declare-time refusal instead of
+    /// blaming a shape bracket the call never wrote.
+    model_method_errors: &'a HashMap<String, (JitError, Option<std::path::PathBuf>)>,
+    /// #755: shared with `Jit::current_decl_file` — the SAME field
+    /// `Jit::attribute` reads to stamp a leaving `JitError`'s `error_file`.
+    /// `define_fn` (this `Translator`'s only constructor) sets it once, up
+    /// front, to the file the body being lowered right now was declared in —
+    /// correct for every error EXCEPT a re-surfaced `model_method_errors`
+    /// entry, whose true location is the METHOD's declaring file, not the
+    /// CALLER's. `lower_model_method_call`'s re-surface site overwrites this
+    /// with the stored decl file before returning that error; nothing else
+    /// runs between that write and `attribute()` reading it back (the error
+    /// propagates straight out via `?`), so the overwrite reaches `attribute`
+    /// intact.
+    current_decl_file: &'a mut Option<std::path::PathBuf>,
     /// #268: top-level module constants — shared with `Jit`. Consulted by
     /// `lower_ident` for a bare-ident reference that isn't a local/shape-param/fn.
     global_consts: &'a HashMap<String, Expr>,
+    /// #696: every top-level `let` name, literal or not — shared with
+    /// `Jit::top_level_let_names`. Consulted only by `lower_ident`'s final
+    /// fallback (see that field's own doc comment on `Jit`).
+    top_level_let_names: &'a HashSet<String>,
+    /// #695: shared with `Jit::omitted_ret_fns` — see that field's doc
+    /// comment. Consulted by `resolve_direct_call_name`'s callers
+    /// (`lower_let`, to record provenance, and `omitted_ret_arg_refusal`, to
+    /// decide whether a bad `map_get`/`map_set`/`map_contains` argument gets
+    /// the located refusal or the generic one).
+    ///
+    /// Mutable as of the #717 gap fix: `declare_fn` is not the only place a
+    /// fn's Nil signature is an omitted-return ASSUMPTION rather than a
+    /// declared fact — `lower_model_method_call` discovers the same thing
+    /// about a shape-generic model method's `tmpl`, per instantiation, and
+    /// records it here rather than duplicating a second such set.
+    omitted_ret_fns: &'a mut HashSet<String>,
+    /// #724: merged name → declaring file, shared with the merge's own
+    /// `MergedProgram::decl_files` (`Jit::decl_file_of` reads the same map
+    /// through `Jit::merge`). `None` when there is no merge at all
+    /// (single-file program) — `imported_private_let_module` never finds a
+    /// candidate there anyway, since a single-file `top_level_let_names` has
+    /// no `$`-prefixed entries to begin with.
+    decl_files: Option<&'a HashMap<String, std::path::PathBuf>>,
+    /// #268 *as a shape dimension*: each module constant's folded verdict,
+    /// shared with `Jit::const_dims`. Reached only through `scope_const_dims`,
+    /// which drops every name this body binds — a constant is a fallback in a
+    /// type-level shape position, never a binding in `shape_env`.
+    const_dims: &'a HashMap<String, ConstDim>,
     /// #350: top-level enums — shared with `Jit`. Resolves `Color.Red` values
     /// and bare-variant `match` patterns against the scrutinee's variant set.
     enums: &'a HashMap<String, Vec<String>>,
+    /// Top-level `type` aliases — shared with `Jit`. Resolved via
+    /// `resolve_alias_ty` at casts and `forge.zeros[..]`'s dtype arg.
+    aliases: &'a HashMap<String, TypeAlias>,
     /// #350 Part 2b: payload-enum tagged-union layouts — shared with `Jit`.
     /// Present only for enums with a payload variant; drives construction,
     /// tag-loads, and `match`-arm payload binding.
@@ -4533,6 +8014,18 @@ struct Translator<'a> {
     lambda_counter: &'a mut usize,
     locals: HashMap<String, Variable>,
     local_tys: HashMap<String, TyKind>,
+    /// #712: this function's non-mutating `let`s, folded to their
+    /// shape-dimension verdict at the point they are lowered — as foldable a
+    /// dimension source as a module constant (`const_dims`/`Jit::const_dims`),
+    /// consulted the same way through `scope_const_dims`. A `let !` folds to
+    /// `ConstDim::LocalMutable` instead of its literal value: mutability
+    /// means the dimension could silently go stale. Populated by
+    /// `record_local_const_dim`, which `lower_let` calls for every
+    /// non-destructuring `let`; cleared for a name by `shadow` (a `for`
+    /// index or enum-payload binding shadowing it) and rolled back wholesale
+    /// by `scope_exit` (a block's own `let`s do not outlive it) — the same
+    /// two places `locals`/`local_tys` are kept in lockstep for a shadow.
+    local_const_dims: HashMap<String, ConstDim>,
     /// #524: locals bound by `let !y = m.<tensor field>`. Per SPEC §3.4 such a
     /// binding is a LIVE ALIAS of the field, not a snapshot: the tensor pointer
     /// is shared with the field slot (so element writes already reach it), and
@@ -4541,6 +8034,21 @@ struct Translator<'a> {
     /// cleared by `declare_local`, so a later `let` shadowing the name drops
     /// the alias.
     field_aliases: HashSet<String>,
+    /// #720 review (F3): local name -> the mangled name of the direct call
+    /// (`omitted_ret_fns` member) it was bound from, e.g. `let dep =
+    /// dependency(7)` records `"dep" -> "dependency"`. `lower_let` populates
+    /// this opportunistically for every binding (harmless when never read);
+    /// `map_get`/`map_set`/`map_contains` consult it when their Map-typed
+    /// argument turns out to be `nil`, so a value that traces back to an
+    /// omitted-return-type call is refused as a located `jit-signature`
+    /// naming the callee, instead of the generic "must be a Map, got `nil`"
+    /// that sent #695's original report looking in the wrong place.
+    /// `lower_let` removes any existing entry for the bound name FIRST, on
+    /// every `let` regardless of what it binds — a shadowing `let` whose new
+    /// value has nothing to do with an omitted-return call (`let b = 42`
+    /// after an earlier `let b = dependency(..)`) must not leave a stale
+    /// entry for a later consumer to misattribute to the wrong callee.
+    omitted_ret_provenance: HashMap<String, String>,
     /// #553: this function's `!` tensor parameters, as (the PARAMETER's own
     /// Cranelift variable, the pointer it came in on, its tensor type). Drives
     /// `emit_mut_param_copy_out` at every return. Populated for the entries
@@ -4548,6 +8056,16 @@ struct Translator<'a> {
     /// entry of a `@grad fn` — and empty for every other function, `$fwd_bwd`
     /// included.
     mut_param_out: Vec<(Variable, Value, TensorTy)>,
+    /// The names of this function's `!` parameters that are passed as a bare
+    /// POINTER — model and `KV` — rather than copy-in/copy-out. Writes THROUGH
+    /// the pointer (`g.kind[i] = k`, `cache <- frame`) reach the caller by
+    /// construction; a whole-binding REBIND (`c = fresh`) does not, because the
+    /// pointer came in by value and the signature has no slot to hand a new one
+    /// back. `lower_expr_stmt` refuses that one form rather than lower a silent
+    /// disagreement with `dmc run`, which rebinds the caller's binding.
+    /// Cleared by `declare_local`, so a `let` shadowing the parameter's name
+    /// drops the restriction along with the parameter.
+    mut_ptr_params: HashSet<String>,
     ret: TyKind,
     /// #326: copied from `Jit::gpu` — route the m==1 bf16 decode GEMV to Metal.
     gpu: bool,
@@ -4567,7 +8085,7 @@ struct Translator<'a> {
     /// sibling is also a `gpu_defer_candidate` — tells the bf16-GPU batched
     /// fast path to emit the *deferred* call (commit without wait), keeping
     /// the GPU queue non-empty across back-to-back projections. Set per
-    /// statement by `lower_block_value`.
+    /// statement by `lower_block_body`.
     #[allow(dead_code)] // read only on macOS + `--features gpu`
     gpu_defer_hint: bool,
     /// #478 type-directed literal lowering: the scalar kind an *unsuffixed*
@@ -4576,7 +8094,7 @@ struct Translator<'a> {
     /// its context, including "the other operand at its use site"). Armed by
     /// `lower_if` / `lower_match_expr` from the sibling branch's static type
     /// and consumed — `take()`n — at the top of `lower_expr` and
-    /// `lower_block_value`, so it reaches exactly the value position it was
+    /// `lower_block_body`, so it reaches exactly the value position it was
     /// armed for and never leaks sideways. Only unsuffixed float literals
     /// consult it; everything else lowers as before, which is what keeps
     /// #209 (`let x: f64 = 0.1` stays f64) and #473 (a suffix decides the
@@ -4590,6 +8108,19 @@ struct Translator<'a> {
     /// emit a flush.
     gpu_defer_pending: bool,
     loop_stack: Vec<LoopFrame>,
+    /// #674: one entry per `forge.enter(b) {
+    /// … }` / `<ctor> in b` extent currently OPEN at this point of the
+    /// lowering, innermost last. Each holds the i64
+    /// `__dmc_budget_enter` returned — the index it displaced — which is
+    /// what `__dmc_budget_exit` takes to restore the OUTER budget.
+    ///
+    /// This is a LOWERING stack, not a run-time one: it exists so an edge
+    /// that leaves several extents at once (`return` out of two nested
+    /// `enter`s, `break` out of one inside a loop) emits one exit per extent
+    /// it actually leaves, innermost first. `LoopFrame::budget_depth`
+    /// records how deep it was when each loop opened, which is what tells a
+    /// `break` how many of these the jump escapes.
+    budget_stack: Vec<Value>,
     /// Shape parameter bindings from the enclosing fn's monomorphization.
     /// Empty for non-generic fns. Used to resolve idents in tensor type
     /// annotations on `let` bindings, casts, and tensor-typed locals.
@@ -4610,11 +8141,74 @@ struct Translator<'a> {
     /// leaves the element spans here; the tuple arm `take`s them, so only the
     /// outermost tuple uses them and nothing leaks into a later coercion.
     tuple_elem_spans: Option<Vec<Span>>,
+    /// JIT error propagation: `(start, end)` spans of the untyped `let !x =
+    /// nil` bindings that this function later reassigns a string to (`x =
+    /// "…"` or `x = "…" + …`) — the mutable-`Err`-accumulator idiom (SPEC.md
+    /// §3.9's "`Err` is `nil` on success and a `str`-tagged error value on
+    /// failure", worked in `let !err = nil` at §5.1). Computed once per
+    /// function by `collect_nil_str_hint_vars` before the body is lowered.
+    /// A `let` whose span is in this set binds as `TyKind::Str` (nil = NULL
+    /// pointer) instead of `TyKind::Scalar(Nil)` from the start, so the
+    /// later string assignment coerces (Str → Str) instead of hitting
+    /// `jit-conversion`'s "cannot convert `str` to `nil`" — the checker's own
+    /// `compatible_with` already proves nil-or-str is the only thing such a
+    /// binding can ever hold, so this is a representation choice, not a type
+    /// relaxation.
+    ///
+    /// Keyed by the `let`'s span and not by its NAME: `collect_nil_str_hint_
+    /// vars` promotes only an outermost-scope binding whose name nothing else
+    /// in the function rebinds (see its doc comment), because the JIT's
+    /// `locals` map has no block scoping and would otherwise let a promoted
+    /// inner binding shadow an outer one past the end of its block.
+    local_str_hint: HashSet<(usize, usize)>,
 }
 
 struct LoopFrame {
     header: Block,
     exit: Block,
+    /// #674 slice 3d: `budget_stack.len()` when this loop opened. A `break`
+    /// or `continue` leaves every budget extent entered SINCE that point and
+    /// none entered before it, so this is the floor
+    /// `emit_budget_exits_to_depth` unwinds down to — the difference between
+    /// `forge.enter(b) { for … { break } }` (leaves nothing; the extent
+    /// survives the loop) and `for … { forge.enter(b) { break } }` (leaves
+    /// one; a missed exit here mis-charges the rest of the loop to `b` with
+    /// no diagnostic).
+    budget_depth: usize,
+}
+
+/// #630: everything the name tables held where a lexical scope opened.
+/// Restoring it drops every binding the scope introduced and puts back every
+/// binding it shadowed.
+///
+/// `shadow`/`unshadow` do the same job for a region whose bound names are
+/// known before it is lowered — a match arm's payload, a `for` index. A block
+/// is not that: it may `let` any number of names, under a destructuring
+/// pattern, in a nested statement. So the scope is captured whole instead of
+/// enumerated, which is also why `field_aliases` (#524) travels with it: a
+/// `let` that shadows an alias clears the write-through, and the outer
+/// binding's write-through has to come back with the outer binding.
+///
+/// `omitted_ret_provenance` (#695/#720, this fix) travels with it for the
+/// same reason `field_aliases` does: it is keyed by bare source name, not by
+/// Cranelift `Variable`, so a nested block's `let` of an outer name — `let d
+/// = dep(7)` outside, `if true { let d = 5 … }` inside — calls `lower_let`,
+/// which unconditionally drops any existing entry for `d` before deciding
+/// whether to add its own. Without this, that drop reaches through the inner
+/// scope and erases the outer binding's provenance, so `map_get(d, ..)` after
+/// the block sees no entry and falls all the way to the uncoded `jit-error`
+/// instead of the located `jit-signature` refusal. Restoring the whole map on
+/// `scope_exit` puts the outer entry back exactly like `locals` — the inner
+/// `d` never existed as far as anything after the block can tell.
+struct LocalScope {
+    locals: HashMap<String, Variable>,
+    local_tys: HashMap<String, TyKind>,
+    field_aliases: HashSet<String>,
+    omitted_ret_provenance: HashMap<String, String>,
+    /// #712: travels with the scope for the same reason `field_aliases`
+    /// does — a `let` inside the scope that shadowed a constant's fold
+    /// verdict must give it back once the scope closes.
+    local_const_dims: HashMap<String, ConstDim>,
 }
 
 // ─── Reverse-mode autodiff (@grad) ───────────────────────────────────────
@@ -4819,21 +8413,25 @@ impl<'a> Translator<'a> {
         self.block_filled = true;
     }
 
-    /// Emit a clean "no arm matched" runtime error (print + exit 1), then a
+    /// Emit a clean "no arm matched" runtime error (routes through
+    /// `out_of_band_fatal`, located at `span`'s `line:col` — #866), then a
     /// trap to terminate the block. Replaces a bare SIGILL trap so a
     /// non-exhaustive `match` fails gracefully like the interpreter.
-    fn emit_match_trap(&mut self) {
+    fn emit_match_trap(&mut self, span: &Span) {
         let entry = self.fns.get("__dmc_match_trap")
             .expect("__dmc_match_trap not registered").clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-        self.builder.ins().call(func_ref, &[]);
+        let line_v = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col_v = self.builder.ins().iconst(cl::I64, span.col as i64);
+        self.builder.ins().call(func_ref, &[line_v, col_v]);
         self.trap_user(2);
     }
 
     /// Decode an OptI64 to a plain i64, trapping cleanly if it is nil (#300.4).
     /// Mirrors the interpreter raising a runtime error when a missing `map_get`
-    /// result is used as a value.
-    fn opt_unwrap_or_trap(&mut self, opt: Value) -> Value {
+    /// result is used as a value. Located at `span`'s `line:col` (#866), routed
+    /// through `out_of_band_fatal` like every other JIT runtime fatal.
+    fn opt_unwrap_or_trap(&mut self, opt: Value, span: &Span) -> Value {
         let present = self.opt_present(opt);
         let trap_blk = self.builder.create_block();
         let ok_blk = self.builder.create_block();
@@ -4842,28 +8440,208 @@ impl<'a> Translator<'a> {
         self.builder.seal_block(trap_blk);
         let entry = self.fns.get("__dmc_nil_trap").expect("__dmc_nil_trap not registered").clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
-        self.builder.ins().call(func_ref, &[]);
+        let line_v = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col_v = self.builder.ins().iconst(cl::I64, span.col as i64);
+        self.builder.ins().call(func_ref, &[line_v, col_v]);
         self.builder.ins().trap(cranelift::codegen::ir::TrapCode::user(2).unwrap());
         self.builder.switch_to_block(ok_blk);
         self.builder.seal_block(ok_blk);
         self.opt_value(opt)
     }
 
-    /// Lower a block used as an expression. Returns the tail value if the
-    /// block has one (and didn't terminate via `return` / `break`).
+    /// Like `opt_unwrap_or_trap`, but the trap carries `msg` and `span`'s
+    /// `line:col` instead of the fixed, unlocated `__dmc_nil_trap` string
+    /// (#480/#767). Used only by `scalar_binop`: `==`/`!=` against an absent
+    /// `map_get` result answer directly (no decode, no trap — see
+    /// `scalar_binop`'s own special-casing) and never reach this; every
+    /// other operator still decodes to use the payload and traps here when
+    /// it turns out absent, with `msg` matching the interpreter's own wording
+    /// for `op` (built by the caller — `opt_i64_binop_trap_msg`).
+    fn opt_unwrap_or_located_trap(&mut self, opt: Value, msg: String, span: &Span) -> Value {
+        let present = self.opt_present(opt);
+        let trap_blk = self.builder.create_block();
+        let ok_blk = self.builder.create_block();
+        self.builder.ins().brif(present, ok_blk, &[], trap_blk, &[]);
+        self.builder.switch_to_block(trap_blk);
+        self.builder.seal_block(trap_blk);
+        self.emit_binop_nil_trap(&msg, span);
+        self.builder.switch_to_block(ok_blk);
+        self.builder.seal_block(ok_blk);
+        // `emit_binop_nil_trap` ends `trap_blk` with a real trap via
+        // `trap_user`, which — unlike the raw `builder.ins().trap(..)` the
+        // sibling `opt_unwrap_or_trap` uses — also sets `self.block_filled`.
+        // `ok_blk` is a fresh, unterminated block (more codegen for the rest
+        // of the expression follows), so clear it exactly as `self.enter`
+        // would; leaving it set caused later code that checks `is_filled()`
+        // to skip emitting its own terminator, tripping the verifier.
+        self.block_filled = false;
+        self.opt_value(opt)
+    }
+
+    /// Like `opt_unwrap_or_located_trap`, but for the both-`OptI64` shape
+    /// (#865 rework of #767): `other` is the OTHER operand, also an
+    /// undecoded `OptI64` — its name in the trap message is a runtime
+    /// question (its own present bit), not something `scalar_binop` can
+    /// resolve statically the way it can for every other operand kind.
+    /// Checks `other`'s present bit only once `opt` has already proven
+    /// absent (inside `trap_blk`, so the ordinary present case pays nothing
+    /// extra), then hands both candidate messages plus that bit to
+    /// `emit_binop_nil_trap_dual` to select the correct one at runtime.
+    fn opt_unwrap_or_located_trap_dual(
+        &mut self,
+        opt: Value,
+        other: Value,
+        msg_if_other_absent: String,
+        msg_if_other_present: String,
+        span: &Span,
+    ) -> Value {
+        let present = self.opt_present(opt);
+        let trap_blk = self.builder.create_block();
+        let ok_blk = self.builder.create_block();
+        self.builder.ins().brif(present, ok_blk, &[], trap_blk, &[]);
+        self.builder.switch_to_block(trap_blk);
+        self.builder.seal_block(trap_blk);
+        let other_present = self.opt_present(other);
+        self.emit_binop_nil_trap_dual(
+            &msg_if_other_absent, &msg_if_other_present, other_present, span,
+        );
+        self.builder.switch_to_block(ok_blk);
+        self.builder.seal_block(ok_blk);
+        // Same bookkeeping as `opt_unwrap_or_located_trap` — see its own
+        // comment for why `block_filled` must be cleared here.
+        self.block_filled = false;
+        self.opt_value(opt)
+    }
+
+    /// Bake `msg`'s bytes into the module the same way a string literal is
+    /// (`lower_str_literal`'s `LEAKED_STRING_DATA`), returning its `(ptr,
+    /// len)` as raw `i64`s — shared by `emit_binop_nil_trap`'s single fixed
+    /// message and `emit_binop_nil_trap_dual`'s two candidate messages.
+    fn leak_str_ptr_len(&self, msg: &str) -> (i64, i64) {
+        let bytes: Vec<u8> = msg.as_bytes().to_vec();
+        let len = bytes.len() as i64;
+        let ptr = bytes.as_ptr() as i64;
+        LEAKED_STRING_DATA.lock().unwrap().push(bytes);
+        (ptr, len)
+    }
+
+    /// Emit the runtime call that prints `msg` at `span`'s `line:col` and
+    /// exits 1, then a trap to terminate the block (unreachable — the
+    /// runtime call itself never returns; the trap only satisfies the
+    /// verifier, exactly as `emit_match_trap` does for its own always-exits
+    /// call). `msg`'s bytes are baked into the module via `leak_str_ptr_len`:
+    /// every message passed here is fully determined at compile time by `op`
+    /// and the two operands' static kinds, so there is nothing to compute at
+    /// runtime but whether the trap fires at all.
+    fn emit_binop_nil_trap(&mut self, msg: &str, span: &Span) {
+        let (ptr, len) = self.leak_str_ptr_len(msg);
+        let entry = self.fns.get("__dmc_binop_nil_trap")
+            .expect("__dmc_binop_nil_trap not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let ptr_v = self.builder.ins().iconst(cl::I64, ptr);
+        let len_v = self.builder.ins().iconst(cl::I64, len);
+        let line_v = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col_v = self.builder.ins().iconst(cl::I64, span.col as i64);
+        self.builder.ins().call(func_ref, &[ptr_v, len_v, line_v, col_v]);
+        self.trap_user(2);
+    }
+
+    /// Like `emit_binop_nil_trap`, but for the both-`OptI64` shape (#865
+    /// rework of #767): when the OTHER operand is also an undecoded
+    /// `OptI64`, its name in the message ("nil" or "int") is not yet known
+    /// at compile time — it depends on THAT operand's own present bit, which
+    /// has not been checked (only `opt`'s has, and it just failed). Bakes
+    /// both candidate messages and selects the `(ptr, len)` pair at runtime
+    /// on `other_present` (the other operand's present bit, computed by the
+    /// caller — `opt_unwrap_or_located_trap_dual` — before calling here),
+    /// instead of guessing "nil" unconditionally the way
+    /// `interp_scalar_type_name(OptI64)` used to.
+    fn emit_binop_nil_trap_dual(
+        &mut self,
+        msg_if_other_absent: &str,
+        msg_if_other_present: &str,
+        other_present: Value,
+        span: &Span,
+    ) {
+        let (ptr_absent, len_absent) = self.leak_str_ptr_len(msg_if_other_absent);
+        let (ptr_present, len_present) = self.leak_str_ptr_len(msg_if_other_present);
+        let entry = self.fns.get("__dmc_binop_nil_trap")
+            .expect("__dmc_binop_nil_trap not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let ptr_absent_v = self.builder.ins().iconst(cl::I64, ptr_absent);
+        let len_absent_v = self.builder.ins().iconst(cl::I64, len_absent);
+        let ptr_present_v = self.builder.ins().iconst(cl::I64, ptr_present);
+        let len_present_v = self.builder.ins().iconst(cl::I64, len_present);
+        let ptr_v = self.builder.ins().select(other_present, ptr_present_v, ptr_absent_v);
+        let len_v = self.builder.ins().select(other_present, len_present_v, len_absent_v);
+        let line_v = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col_v = self.builder.ins().iconst(cl::I64, span.col as i64);
+        self.builder.ins().call(func_ref, &[ptr_v, len_v, line_v, col_v]);
+        self.trap_user(2);
+    }
+
+    /// A block, lowered as its own lexical scope — the JIT's counterpart to
+    /// `interp.rs`'s `eval_block`, which is `push_scope` + `eval_block_body` +
+    /// `pop_scope`. Every block that can yield a value is lowered through
+    /// here, so an `if` branch, a match arm's block, a directive block and a
+    /// `forge`/`vault`/`stream` arena block (#612) all take their scope from
+    /// this one place. The exceptions are the three loop bodies, which
+    /// yield nothing and are lowered statement-wise against their own CFG;
+    /// `lower_while` / `lower_loop` / `lower_for` open the same scope inline.
+    ///
+    /// #630: it did not exist. `self.locals` is one flat map for the whole
+    /// function, right for a `let` at function level and wrong for a `let`
+    /// inside a block: `let a = 1  let b = { let a = 2  a + 10 }  a + b`
+    /// answered 13 under `dmc run` and 14 under `dmc jit`, both exiting 0.
+    /// The #574 fix gave match arms and `for` indices their bookkeeping and
+    /// stopped there; the block itself is the same defect at a fourth site.
+    ///
+    /// The scope is restored on the error path too, so a refusal that a caller
+    /// recovers from cannot leave the name tables holding a dead block's
+    /// bindings.
+    fn lower_block_value(&mut self, b: &Block_) -> Result<Option<(Value, TyKind)>, JitError> {
+        let scope = self.scope_enter();
+        let out = self.lower_block_body(b);
+        self.scope_exit(scope);
+        out
+    }
+
+    /// The statements and value of `b`, lowered in the CURRENT scope — the
+    /// counterpart to `interp.rs`'s `eval_block_body`. Returns the tail value
+    /// if the block has one (and didn't terminate via `return` / `break`).
     ///
     /// When the block has no explicit `tail_expr`, the parser may have
     /// folded the trailing expression into `Stmt::If` (or `Stmt::Match`)
     /// because `if`/`match` are keyword-led. Treat such a final stmt as the
     /// block's value.
-    fn lower_block_value(&mut self, b: &Block_) -> Result<Option<(Value, TyKind)>, JitError> {
+    ///
+    /// An arena block is keyword-led for the same reason (`parse_block` sends
+    /// `vault`/`forge`/`stream` + `{` down the keyword-statement path), so
+    /// `forge { vault { 2 + 2 } }` is an outer block whose only statement is
+    /// the inner one — and the interpreter's `eval_block_body` yields exactly
+    /// this shape's value. Without the arms below the JIT dropped the value and
+    /// reported "arena block has no tail value" on a program `dmc run` answers.
+    /// That arm recurses through `lower_block_value`, not through this
+    /// function, so the arena block gets the same scope every other block gets.
+    ///
+    /// The interpreter's `deferred_last` defers every trailing `Stmt::Expr`
+    /// with no assignment, not only the arena-block spelling, so this function
+    /// does too. The other shape that reaches here is a semicolon-terminated
+    /// trailing statement — `let x = { let z = 1  5; }`, which the parser makes
+    /// a `Stmt::Expr` rather than a `tail_expr` — answered `5` under `dmc run`
+    /// and `jit error: block expression has no tail value` under `dmc jit`
+    /// while the arm was `ArenaBlock`-only. `Stmt::Stage` is the one form
+    /// `deferred_last` covers that this does not; it has no lowering at all yet
+    /// and is refused as a whole statement elsewhere.
+    fn lower_block_body(&mut self, b: &Block_) -> Result<Option<(Value, TyKind)>, JitError> {
         // #478: a block is value-transparent through its tail, but its
         // *statements* are not — take the hint now so nothing in the body
         // sees it, and re-arm it on the tail position below.
         let want = self.float_lit_hint.take();
         let last_is_value = b.tail_expr.is_none()
             && b.stmts.last().map(|s| matches!(s,
-                Stmt::If(_) | Stmt::Match(_) | Stmt::DirectiveBlock { .. })).unwrap_or(false);
+                Stmt::If(_) | Stmt::Match(_) | Stmt::DirectiveBlock { .. }
+                | Stmt::Expr { assign: None, .. })).unwrap_or(false);
         let body_len = if last_is_value { b.stmts.len() - 1 } else { b.stmts.len() };
         for (i, stmt) in b.stmts[..body_len].iter().enumerate() {
             // #326 dispatch pipelining: a run of adjacent candidate `let`s
@@ -4884,6 +8662,23 @@ impl<'a> Translator<'a> {
                     self.float_lit_hint = want;
                     return self.lower_match_expr(m).map(Some)
                 }
+                // #612: an arena block in tail position produces the enclosing
+                // block's value — and produces NO value when its own body has
+                // none, which is the `fn main() -> nil { forge { … } }` shape
+                // the corpus is written in. Both fall out of returning the
+                // inner `lower_block_value` unchanged.
+                Some(Stmt::Expr { lhs: Expr::ArenaBlock(a), assign: None, .. }) => {
+                    self.float_lit_hint = want;
+                    return self.lower_block_value(&a.body);
+                }
+                // #674 slice 3d: and a budget block in tail position, for the
+                // same reason and with the same "no value is a value" rule —
+                // `fn main() -> nil { forge.enter(b) { … } }` is the shape
+                // this slice's own probes are written in.
+                Some(Stmt::Expr { lhs: Expr::BudgetBlock(bb), assign: None, .. }) => {
+                    self.float_lit_hint = want;
+                    return self.lower_budget_block(bb);
+                }
                 // A directive block in tail position produces the block's value
                 // (e.g. an attention fn whose body ends in `@..@fuse { .. }`).
                 Some(Stmt::DirectiveBlock { directives, body, span }) => {
@@ -4899,6 +8694,15 @@ impl<'a> Translator<'a> {
                     }
                     return unsupported(span, Refusal::Directive,
                         "directive blocks in tail position (only @fuse, @deterministic, @cast are supported)");
+                }
+                // Any other trailing assignment-free `Stmt::Expr` — the
+                // semicolon-terminated tail, `{ let z = 1  5; }`. The arena
+                // arm above must stay ahead of this one: it recurses so an
+                // arena block with no body value yields `None` here rather
+                // than being lowered as a value.
+                Some(Stmt::Expr { lhs, assign: None, .. }) => {
+                    self.float_lit_hint = want;
+                    return self.lower_expr(lhs).map(Some);
                 }
                 _ => {}
             }
@@ -4984,6 +8788,77 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// #720 review (F3): resolve a call expression to the exact name its
+    /// callee will be looked up under — the same name `declare_fn` keyed
+    /// `omitted_ret_fns` by — far enough to cover the two shapes that
+    /// reach it, without redoing the shape-binding work `lower_call` /
+    /// `lower_model_method_call` do for the call itself.
+    ///
+    /// A bare `f(args)` resolves under `f`'s own source name, UNLESS `f`
+    /// names a LOCAL binding — a lambda, most often — which shadows a
+    /// same-named top-level fn exactly as `lower_call`'s own local-variable
+    /// check does; checking `self.locals` first is what keeps a local
+    /// closure from ever being confused for an unrelated top-level fn that
+    /// happens to share its name (F3b). `recv.method(args)` on a
+    /// NON-generic model resolves under `M$$method` (`mangle_method_name`),
+    /// the same mangled key `declare_fn` inserted a method's entry under —
+    /// `omitted_ret_fns` is otherwise unreachable for a method call, since
+    /// nothing about `recv.method(args)` is a bare `Ident` call (F3c).
+    ///
+    /// A shape-generic model's method (#717 gap, closed here) resolves too,
+    /// but only the narrow slice this arm's own shape already guarantees is
+    /// safe to compute without redoing `lower_model_method_call`'s work: the
+    /// callee matched here is `Field` directly under `Call` — no
+    /// `Index`/`BracketArgs` between them — so the call spells no bracket of
+    /// its own, meaning only the MODEL's shape params can be bound (from
+    /// `type_args`, already in hand from the receiver's own type — nothing
+    /// to lower) and the method must declare none of its own (checked via
+    /// the same `templates` entry `lower_model_method_call` reads) for that
+    /// binding to be the whole story. That is exactly `model_bindings` with
+    /// `method_bindings` empty, which is `mangle_mono_method_name` with an
+    /// empty method side — the identical mangled name `lower_model_method_call`
+    /// computes and instantiates under for this call shape. A method WITH its
+    /// own shape params, or a receiver whose `type_args` don't yet cover the
+    /// model's, resolves to `None` here exactly as before (that combination
+    /// keeps the gap it already had — `lower_model_method_call`'s own bracket
+    /// binding does more than this fn is willing to duplicate).
+    fn resolve_direct_call_name(&self, e: &Expr) -> Option<String> {
+        if let Some((name, _)) = as_plain_call(e) {
+            if self.locals.contains_key(name) {
+                return None;
+            }
+            return Some(name.to_string());
+        }
+        if let Expr::Postfix { expr, op: PostfixOp::Call(_), .. } = e {
+            if let Expr::Postfix { expr: recv, op: PostfixOp::Field(method), .. } = expr.as_ref() {
+                let (model, type_args) = self.model_ty_of_expr(recv)?;
+                let model_sps: Vec<String> = self.model_shape_params.get(&model)
+                    .cloned().unwrap_or_default();
+                if model_sps.is_empty() {
+                    return Some(mangle_method_name(&model, method));
+                }
+                if type_args.len() < model_sps.len() {
+                    return None;
+                }
+                let base = mangle_method_name(&model, method);
+                let tmpl = self.templates.get(&base)?;
+                let method_sps: Vec<String> = tmpl.shape_params.iter()
+                    .skip(model_sps.len()).map(|sp| sp.name.clone()).collect();
+                if !method_sps.is_empty() {
+                    return None;
+                }
+                let mut model_bindings: HashMap<String, i64> = HashMap::new();
+                for (sp, d) in model_sps.iter().zip(type_args.iter()) {
+                    model_bindings.insert(sp.clone(), *d);
+                }
+                return Some(mangle_mono_method_name(
+                    &model, &model_sps, method, &method_sps,
+                    &model_bindings, &HashMap::new()));
+            }
+        }
+        None
+    }
+
     fn lower_let(&mut self, l: &LetStmt) -> Result<(), JitError> {
         // `let (loss, dW) = f.fwd_bwd(W, x)` — the autodiff source surface
         // (and `f.fwd_bwd_bwd(...)` for second-order, on `@grad @grad` fns).
@@ -5007,6 +8882,48 @@ impl<'a> Translator<'a> {
             }
             _ => return unsupported(&l.span, Refusal::Pattern, "destructuring `let` patterns"),
         };
+        // #695 / #720 review (F3): `let x = f(...)` where `f` has no declared
+        // return type binds `name` to a bare `nil` regardless of what `f`'s
+        // body actually produces (`omitted_ret_fns`'s doc comment). That is
+        // CORRECT the moment `f`'s body genuinely is nil-only (`fn side(v:
+        // i64) { print(v) }`) — SPEC and `dmc run` agree `name` really is
+        // `nil` then, and refusing the `let` itself was a false positive
+        // (F3a). It is only a problem once something downstream treats
+        // `name` as whatever `f`'s body actually produced (a `Map`, in every
+        // reachable case — the checker already rejects any other body/
+        // declared-nil mismatch as a type error; #723 tracks its one hole).
+        // So this site does not refuse: it records provenance — which
+        // top-level call, if any, `name` was bound from — for
+        // `map_get`/`map_set`/`map_contains` to consult if `name` ever
+        // reaches one of them still `nil`. `resolve_direct_call_name`
+        // resolves `f` the same way the call itself will (a local binding of
+        // the same spelling shadows the top-level fn and is never confused
+        // for it — F3b; a model method resolves to its mangled `M$$method`
+        // symbol, the same key `declare_fn` inserted it under — F3c).
+        // Drop first, unconditionally: a `let` shadowing an earlier binding
+        // of the same name to an unrelated (non-omitted-return) value must
+        // not leave a stale entry behind for a later consumer to misblame.
+        //
+        // The provenance CHECK itself (`resolve_direct_call_name` +
+        // `omitted_ret_fns.contains`) is deliberately made AFTER `l.value` is
+        // lowered below, not here — #717's gap fix is what made the
+        // difference load-bearing. A plain fn or a non-generic method's
+        // `omitted_ret_fns` entry is populated eagerly, in pass 1, long
+        // before any `let` lowers, so checking before or after lowering the
+        // call used to make no difference. A shape-generic model method's
+        // entry is populated LAZILY — `lower_model_method_call` inserts it
+        // the moment its instantiation's `tmpl` is in hand, which happens
+        // exactly while `l.value` (the call itself) is lowered. Checking
+        // before that point always missed it, silently, no matter how
+        // correctly `resolve_direct_call_name` resolved the name.
+        self.omitted_ret_provenance.remove(&name);
+        // #712: record this `let`'s shape-dimension verdict before anything
+        // else — in particular before `lower_expr` below, which is the
+        // runtime lowering and touches no shape-position state, and before
+        // `declare_local`, which would otherwise make `name` look bound to
+        // ITSELF for the fold below in the (impossible, but not worth
+        // relying on evaluation order for) case that `l.value` names itself.
+        self.record_local_const_dim(&name, l);
         // #524: `let !y = m.<field>` where the field is a KV stream. The JIT
         // stores a `KV[...]` model field as an opaque i64 (`lower_ty_for_model`
         // has no KV case), so the binding cannot carry the live stream SPEC
@@ -5028,6 +8945,13 @@ impl<'a> Translator<'a> {
             }
         }
         let (val, ty) = self.lower_expr(&l.value)?;
+        // See the comment above `omitted_ret_provenance.remove` for why this
+        // check runs here, after `l.value` is lowered, and not before it.
+        if let Some(fname) = self.resolve_direct_call_name(&l.value) {
+            if self.omitted_ret_fns.contains(&fname) {
+                self.omitted_ret_provenance.insert(name.clone(), fname);
+            }
+        }
         // #524: SPEC §3.4 — `let !y = m.w` on a TENSOR model field binds a LIVE
         // ALIAS of the field, so it is the one place-expression bind that must
         // NOT snapshot. Narrow on purpose: the receiver has to be a model
@@ -5043,10 +8967,34 @@ impl<'a> Translator<'a> {
         // tensor so mutating `y` doesn't write through to `x`'s storage.
         let alias = is_aliasing_place_expr(&l.value) && !field_alias;
         if let Some(ann) = &l.ty {
-            let want = enumify(ty_from_ast(ann, &self.shape_env)?, self.enums);
+            // A `let` annotation is a type-building site like any other
+            // (SPEC.md §6.6): `let b: Byte = 12` must coerce to `u8`, not fail
+            // to convert `i64` to an unknown model named `Byte`. Resolve the
+            // alias first, then lower the resulting type with the module
+            // constants this scope leaves visible as dimensions.
+            let ann = &resolve_alias_ty(ann, self.aliases)?;
+            let want = enumify(
+                ty_from_ast(ann, &self.shape_env, Some(&self.scope_const_dims()))?, self.enums);
             let coerced = self.coerce_to(val, &ty, &want, &l.span)?;
             let bound = if alias { self.copy_tensor_value(coerced, &want) } else { coerced };
             self.declare_local(name.clone(), want, bound);
+        } else if matches!(ty, TyKind::Scalar(ScalarKind::Nil))
+            && matches!(&l.value, Expr::Nil(_))
+            && self.local_str_hint.contains(&(l.span.start, l.span.end))
+        {
+            // `let !err = nil` where this fn later does `err = "…"` —
+            // the mutable-`Err`-accumulator idiom (SPEC.md §3.9/§5.1). Bind
+            // with the nilable-str representation (NULL pointer = `nil`,
+            // `TyKind::Str` otherwise) from the start instead of the 1-byte
+            // `TyKind::Scalar(Nil)` the literal `nil` initializer would
+            // otherwise get, so the later string assignment is a same-kind
+            // store instead of a `jit-conversion` refusal. Safe because the
+            // checker's `TyType::compatible_with` (types.rs) already proves
+            // an untyped nil-initialized mutable binding can only ever hold
+            // `nil` or a `str` afterward — this changes which bit pattern
+            // represents `nil` in the slot, not what values are legal in it.
+            let zero_ptr = self.builder.ins().iconst(cl::I64, 0);
+            self.declare_local(name.clone(), TyKind::Str, zero_ptr);
         } else {
             let bound = if alias { self.copy_tensor_value(val, &ty) } else { val };
             self.declare_local(name.clone(), ty, bound);
@@ -5181,9 +9129,17 @@ impl<'a> Translator<'a> {
                 n, n, pats.len()));
         }
         let (ptr, recv_ty) = self.lower_expr(recv)?;
-        let t = recv_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("`.split` expects a tensor, got `{}`", recv_ty.render()),
-            line: span.line, col: span.col,
+        // #760: `fns.split[..]` where `fns` is a `map_get` result (`OptI64`)
+        // refuses classed, citing #721, not the uncoded `jit error` below.
+        let t = recv_ty.as_tensor().ok_or_else(|| {
+            if matches!(recv_ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "`.split` expects a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("`.split` expects a tensor, got `{}`", recv_ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         let ndim = t.rank();
         // axis defaults to -1; negative axes resolve from the end (numpy-style).
@@ -5261,8 +9217,12 @@ impl<'a> Translator<'a> {
         let v = self.builder.declare_var(ty.cl());
         self.builder.def_var(v, value);
         // #524: a fresh binding is never a field alias. Clearing here means a
-        // `let` that shadows an alias name drops the write-through.
+        // `let` that shadows an alias name drops the write-through. Same
+        // reasoning for the by-pointer `!` parameters: once the name is a
+        // fresh local it is no longer the caller's value, so rebinding it is
+        // an ordinary assignment again.
         self.field_aliases.remove(&name);
+        self.mut_ptr_params.remove(&name);
         self.locals.insert(name.clone(), v);
         self.local_tys.insert(name, ty);
     }
@@ -5291,6 +9251,66 @@ impl<'a> Translator<'a> {
         }
     }
 
+    /// #634 slice 2: `model_of_expr`'s answer **with the receiver's concrete
+    /// shape arguments** — the key a shape-generic model's method is
+    /// monomorphized on.
+    ///
+    /// Answers for exactly the receiver forms `model_of_expr` does, and `None`
+    /// wherever it does, so the set of calls that lower is unchanged by this
+    /// function; all it adds is the `type_args` the name alone drops. The args
+    /// come from the receiver's own static type, never from inference: q6
+    /// measures that the JIT cannot infer a shape argument from a model
+    /// argument, and q9 that the call cannot spell the model's bracket, so a
+    /// receiver whose type carries no arguments (`m: M` for `model M[N]`) has
+    /// no honest key and is refused at the call site rather than guessed at —
+    /// the same posture #706/#709 take one layer down, on a field read through
+    /// that same receiver.
+    ///
+    /// A nested-model receiver (`r.kernel.peek()`) re-resolves the field's AST
+    /// type against the OUTER instantiation before reading its args, mirroring
+    /// the field-read arm's #267 re-resolution: `model_layouts` was built with
+    /// an empty env, so a `kernel: Kernel[N]` field's `N` was dropped there and
+    /// reading the layout alone would hand back `Kernel[]` — a type-arg-less
+    /// receiver that refuses — for a receiver whose args are perfectly known.
+    fn model_ty_of_expr(&self, e: &Expr) -> Option<(String, Vec<i64>)> {
+        match e {
+            Expr::Ident(n, _) => match self.local_tys.get(n) {
+                Some(TyKind::Model(m, args)) => Some((m.clone(), args.clone())),
+                _ => None,
+            },
+            Expr::Postfix { expr, op: PostfixOp::Field(f), .. } => {
+                let (base, base_args) = self.model_ty_of_expr(expr)?;
+                let from_layout = self.model_layouts.get(&base)?
+                    .iter().find(|(n, _)| n == f)
+                    .and_then(|(_, t)| match t {
+                        TyKind::Model(m, a) => Some((m.clone(), a.clone())),
+                        _ => None,
+                    });
+                let (fmodel, fargs) = from_layout?;
+                if fargs.is_empty() && !base_args.is_empty() {
+                    let span = Span { line: 0, col: 0, start: 0, end: 0 };
+                    let resolved = match (self.model_shape_params.get(&base),
+                                          self.model_field_asts.get(&base)) {
+                        (Some(params), Some(fasts)) => {
+                            let env: HashMap<String, i64> = params.iter().cloned()
+                                .zip(base_args.iter().copied()).collect();
+                            fasts.iter().find(|(n, _)| n == f)
+                                .and_then(|(_, fast)| lower_ty_for_model(
+                                    fast, &env, Some(self.const_dims), &span).ok())
+                        }
+                        _ => None,
+                    };
+                    if let Some(TyKind::Model(m, a)) = resolved {
+                        return Some((m, a));
+                    }
+                }
+                Some((fmodel, fargs))
+            }
+            Expr::Tuple(elems, _) if elems.len() == 1 => self.model_ty_of_expr(&elems[0]),
+            _ => None,
+        }
+    }
+
     /// #524: `(model, field)` when `e` reads a field off a model instance whose
     /// type is statically known here. `Light.Red` (an enum value) and
     /// `grads.W` (a `@grad` bundle, which lives in a synthesized `grads$W`
@@ -5303,11 +9323,78 @@ impl<'a> Translator<'a> {
         Some((model, fname.clone()))
     }
 
+    /// Diagnostics-only widening of `model_of_expr`: the model a receiver
+    /// *looks like* it evaluates to, covering the two shapes `model_of_expr`
+    /// deliberately leaves as `None` (p22's `Index` into an array of models,
+    /// p23's call result) so `lower_call`'s fallback message can name the
+    /// model instead of reciting the str-method list at a receiver that was
+    /// never a string.
+    ///
+    /// This must never feed a lowering decision — only a message. Widening
+    /// `model_of_expr` itself would widen `lower_model_method_call`'s
+    /// predicate for *lowering* the call, which the design (`§4` slice 1)
+    /// deliberately keeps narrow: p22/p23 are refused because the corpus
+    /// census finds zero receivers of either shape, not because they cannot
+    /// be typed. This function answers the same question `model_of_expr`
+    /// does but purely for word choice, never in a path that emits code.
+    fn model_of_expr_diag_hint(&self, e: &Expr) -> Option<String> {
+        if let Some(m) = self.model_of_expr(e) {
+            return Some(m);
+        }
+        match e {
+            // `arr[i]` where `arr` is `[Model; N]`: the element is that model.
+            Expr::Postfix { expr: base, op: PostfixOp::Index(_), .. } => {
+                match self.model_of_expr_diag_hint_ty(base)? {
+                    TyKind::ModelArray(m, _, _) => Some(m),
+                    _ => None,
+                }
+            }
+            // `recv.method(..)` where `recv.method` is itself a model method
+            // whose declared return type is a model (p23: `m.bump!()` returns
+            // `M`, so `.bump!().bump!()`'s inner call is a model receiver), or
+            // a plain free fn returning a model (`mk().get()`: `mk()`'s return
+            // type is `M`).
+            Expr::Postfix { expr: callee, op: PostfixOp::Call(_), .. } => {
+                let ret = match callee.as_ref() {
+                    Expr::Ident(name, _) => self.fns.get(name).map(|entry| entry.ret.clone()),
+                    _ => self.model_of_expr_diag_hint_ty(callee),
+                }?;
+                match ret {
+                    TyKind::Model(m, _) => Some(m),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The full `TyKind` behind `model_of_expr_diag_hint`'s recursion —
+    /// separated out because the `Index`/`Call` arms above need the element
+    /// or return type, not just a model name, to keep going one level deeper.
+    /// Same diagnostics-only contract: never called from a lowering path.
+    fn model_of_expr_diag_hint_ty(&self, e: &Expr) -> Option<TyKind> {
+        match e {
+            Expr::Ident(n, _) => self.local_tys.get(n).cloned(),
+            Expr::Postfix { expr: recv, op: PostfixOp::Field(method), .. } => {
+                // Only the method-call shape is resolved here (a plain field
+                // read's type is already reachable through `model_of_expr`
+                // via `as_model_field` at the one call site that needs it).
+                let model = self.model_of_expr(recv)?;
+                if !self.model_methods.get(&model).is_some_and(|ms| ms.iter().any(|n| n == method)) {
+                    return None;
+                }
+                let mangled = mangle_method_name(&model, method);
+                self.fns.get(&mangled).map(|entry| entry.ret.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// #524: copy `src`'s elements into `dst`'s EXISTING storage (rather than
     /// into a fresh allocation), reading and writing at the tensor's own
     /// element width — a `let !y = m.w` alias may be an i64/f64/bool tensor.
     fn emit_typed_copy_into(&mut self, dst: Value, src: Value, t: &TensorTy) {
-        self.emit_memcpy_loop(dst, src, t.nelems(), t.elem.cl());
+        self.emit_memcpy_loop(dst, src, t.nelems(), t.elem.store_cl());
     }
 
     /// #553: a `!` tensor parameter is copy-in/copy-out — `lower_call` hands
@@ -5346,9 +9433,16 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(), JitError> {
         let Some((op, rhs)) = assign else {
-            // Expression evaluated for side effects.
-            let _ = self.lower_expr(lhs)?;
-            return Ok(());
+            // Expression evaluated for side effects. #612: statement position
+            // was NOT one of `lower_expr_effect`'s callers — those are the
+            // three match-arm bodies — so a block statement went to
+            // `lower_expr`, whose `Expr::Block` arm demands a tail value and
+            // failed a valueless `{ s = 7 }` with `jit error: block expression
+            // has no tail value`. Route the whole no-assign case through the
+            // effect path: for every non-block form it is the identical
+            // `lower_expr`-and-discard, and for a block — plain or arena — it
+            // is the difference between lowering and a spurious defect.
+            return self.lower_expr_effect(lhs);
         };
 
         // Indexed LHS: tensor element write `A[i] = x` or KV-array append `caches[i] <- frame`.
@@ -5363,19 +9457,260 @@ impl<'a> Translator<'a> {
             return unsupported(pspan, Refusal::AssignForm, "compound assignment to tensor elements");
         }
 
+        // Whole-field store `m.f = v` (#635): a `Postfix{Field}` target whose
+        // base is a model instance with a
+        // known layout. A SCALAR field, and now a NON-generic nested-model
+        // field, lower here. A tensor field still keeps refusing — rebinding
+        // its pointer needs a ruling (#650) — and so does a nested-model
+        // field whose model is shape-generic, whose shape-check gap is #800.
+        if let Expr::Postfix { expr: base, op: PostfixOp::Field(field_name), span: pspan } = lhs {
+            if self.as_model_field(lhs).is_some() {
+                // #685: `:=` is a shadow-rebind, not a write-through — the
+                // interpreter handles it only for `Expr::Ident`
+                // (`interp.rs`'s `ColonEq` arm); a field target falls to its
+                // `_ =>` no-op arm. Admitting it here would lower a store the
+                // reference backend never performs (`let !m = M{n:1}; m.n :=
+                // 7; print(m.n)` answers `1` on `dmc run`, and answered `7`
+                // here before this guard). Refuse it the same way the
+                // pre-slice-0 catch-all did.
+                if matches!(op, AssignOp::ColonEq) {
+                    return unsupported(
+                        pspan,
+                        Refusal::AssignForm,
+                        "`:=` has no field target — it shadow-rebinds a name, it does not write through one",
+                    );
+                }
+                if !matches!(op, AssignOp::Eq) {
+                    return unsupported(pspan, Refusal::AssignForm,
+                        "compound assignment to a model field");
+                }
+                let (base_val, base_ty) = self.lower_expr(base)?;
+                let TyKind::Model(model_name, type_args) = &base_ty else {
+                    return unsupported(pspan, Refusal::AssignForm,
+                        "assignment to a field of a non-model value");
+                };
+                let model_name = model_name.clone();
+                let type_args = type_args.clone();
+                let layout = self.model_layouts.get(model_name.as_str())
+                    .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+                        msg: format!("unknown model `{}`", model_name),
+                        line: span.line, col: span.col,
+                    })?.clone();
+                let (field_idx, mut field_ty) = layout.iter().enumerate()
+                    .find(|(_, (n, _))| n == field_name)
+                    .map(|(i, (_, t))| (i, t.clone()))
+                    .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+                        msg: format!("model `{}` has no field `{}`", model_name, field_name),
+                        line: span.line, col: span.col,
+                    })?;
+                // #267, mirrored from the field READ (`lower_postfix`'s `Field`
+                // arm): a param-shaped field must re-resolve from the
+                // receiver's own `type_args`, or a `Tensor[f32,[N]]`-shaped
+                // field is typed opaque i64 on the store side and something
+                // else on the read side.
+                if !type_args.is_empty() {
+                    let resolved = match (self.model_shape_params.get(&model_name),
+                                          self.model_field_asts.get(&model_name)) {
+                        (Some(params), Some(fasts)) => {
+                            let env: HashMap<String, i64> = params.iter().cloned()
+                                .zip(type_args.iter().copied()).collect();
+                            fasts.iter().find(|(n, _)| n == field_name)
+                                .and_then(|(_, fast)| lower_ty_for_model(
+                                    fast, &env, Some(self.const_dims), span).ok())
+                                .map(|t| enumify(t, self.enums))
+                        }
+                        _ => None,
+                    };
+                    if let Some(rt) = resolved { field_ty = rt; }
+                }
+                // A shape-generic model reached through a type-arg-less
+                // binding (e.g. `fn poke(!m: M)` for `model M[N]`) keeps the
+                // param-agnostic layout above unresolved: the `if
+                // !type_args.is_empty()` re-resolution just above never runs,
+                // so a param-shaped field (`t: Tensor[i64,[N]]`) is still
+                // typed opaque `Scalar(I64)` here — indistinguishable from a
+                // real scalar field, so it would fall into the `Scalar` arm
+                // below and lower a raw pointer store. Refuse the whole
+                // store on this receiver, scalar fields included: the guard
+                // is on what we know about the RECEIVER, not on the field's
+                // kind, and a genuinely scalar field through this same
+                // type-arg-less path is refused for the identical reason.
+                // Per-instantiation receivers (slice 2) are what removes it.
+                if type_args.is_empty() {
+                    if let Some(shape_params) = self.model_shape_params.get(&model_name) {
+                        if !shape_params.is_empty() {
+                            return unsupported_msg(
+                                pspan,
+                                Refusal::AssignForm,
+                                format!(
+                                    "assignment to field `{}` of `{}`: the receiver's shape \
+                                 arguments are not known here; write the receiver's type \
+                                 with its arguments (`m: M[4]`)",
+                                    field_name, model_name
+                                ),
+                            );
+                        }
+                    }
+                }
+                match &field_ty {
+                    // #635 slice 0: a scalar field's whole-value store.
+                    // #635 rework (D3): an enum-typed field lowers the same
+                    // way — the read path already decodes it as a raw i64
+                    // (`lower_postfix`'s `Field` arm, the `_` load case), and
+                    // `encode_for_slot`'s `_` arm is identity for `Enum`, so
+                    // no new encode/decode is needed, just admitting it here.
+                    TyKind::Scalar(_) | TyKind::Enum(_) => {
+                        let (rhs_val, rhs_ty) = self.lower_expr(rhs)?;
+                        let rhs_val = self.coerce_to(rhs_val, &rhs_ty, &field_ty, span)?;
+                        let store_val = self.encode_for_slot(rhs_val, &field_ty);
+                        let offset_val = self.builder.ins().iconst(cl::I64, (field_idx as i64) * 8);
+                        let field_ptr = self.builder.ins().iadd(base_val, offset_val);
+                        self.builder.ins().store(
+                            cranelift::codegen::ir::MemFlagsData::new(), store_val, field_ptr, 0);
+                        return Ok(());
+                    }
+                    // #683 follow-up: a **non-generic** nested-model field's
+                    // whole-value store. A model value already IS its i64
+                    // field-arena pointer (`lower_struct_lit`'s own field-init
+                    // store and the Field-read arm's `_` case both treat it
+                    // that way — "nested model pointers (i64)"), so this is
+                    // the same raw-pointer write those two sites already
+                    // perform, not a new representation. It matches `dmc
+                    // run`'s measured aliasing: `interp.rs`'s `(Eq,
+                    // Postfix{Field})` arm does `*slot = rval` where `rval` is
+                    // the same `Rc` clone a `let` binding already shares
+                    // (`SPEC.md §3.4`, q11) — `self.mode = m` makes the field
+                    // alias `m`'s storage, it does not copy it, on either
+                    // backend (measured: mutating `m` after the store is
+                    // visible through `self.mode` under `dmc run`).
+                    //
+                    // A **shape-generic** nested model keeps refusing: the
+                    // field READ re-resolves the field's type from the
+                    // *receiver's* `type_args` (`lower_postfix`'s `Field`
+                    // arm), so storing an instance shaped differently from
+                    // what the receiver's type_args declare would make a
+                    // later read misinterpret the stored buffer at the wrong
+                    // stride (q12 — that re-resolve rule at work). The
+                    // former citation here was #474, which is closed (the
+                    // ghost-method bug — unrelated); the live tracking issue
+                    // for this specific shape-check gap is #800.
+                    TyKind::Model(nested_name, _) => {
+                        let nested_is_shape_generic = self.model_shape_params
+                            .get(nested_name.as_str())
+                            .is_some_and(|params| !params.is_empty());
+                        if nested_is_shape_generic {
+                            return unsupported_msg(pspan, Refusal::AssignForm, format!(
+                                "assignment to field `{}` — `{}` is a shape-generic \
+                                 model and a nested-model field store is not \
+                                 shape-checked (#800); lowering it unchecked could make \
+                                 a later read misinterpret the stored buffer at the \
+                                 wrong stride", field_name, nested_name));
+                        }
+                        let (rhs_val, rhs_ty) = self.lower_expr(rhs)?;
+                        let rhs_val = self.coerce_to(rhs_val, &rhs_ty, &field_ty, span)?;
+                        let store_val = self.encode_for_slot(rhs_val, &field_ty);
+                        let offset_val = self.builder.ins().iconst(cl::I64, (field_idx as i64) * 8);
+                        let field_ptr = self.builder.ins().iadd(base_val, offset_val);
+                        self.builder.ins().store(
+                            cranelift::codegen::ir::MemFlagsData::new(), store_val, field_ptr, 0);
+                        return Ok(());
+                    }
+                    // Everything else (tensor, `str`, `KV`, `fn`, …): named
+                    // by its own kind, not blamed on #650 — #650 is the
+                    // ruling slice 3 needs for a TENSOR field's rebind
+                    // specifically (does a binding taken from the field
+                    // before the assignment see the new value?); a `str` or
+                    // `KV` field store has nothing to do with that question.
+                    _ => {
+                        return unsupported_msg(
+                            pspan,
+                            Refusal::AssignForm,
+                            format!(
+                                "assignment to field `{}`: a `{}`-typed field's store is not \
+                             lowered",
+                                field_name,
+                                field_ty.render()
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         let name = match lhs {
             Expr::Ident(n, _) => n.clone(),
             _ => return unsupported(span, Refusal::AssignForm, "assignment to non-identifier targets"),
         };
-        let var = *self.locals.get(&name).ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("assignment to unknown binding `{}`", name),
-            line: span.line, col: span.col,
+        // #696 R3: same class, same reason, as the read-site fallback in
+        // `lower_ident` — a top-level `let` (mutable or not; #268 never
+        // admits either into `self.locals`, only a real local/param is
+        // tracked there) has no lowering, so an assignment to one is a
+        // `jit-item` gap, not the uncoded `jit error` this used to raise
+        // unconditionally. Anything else unresolved here really is that
+        // uncoded defect (an assignment target the JIT never declared at
+        // all), so it keeps the plain message.
+        let var = *self.locals.get(&name).ok_or_else(|| {
+            if self.top_level_let_names.contains(&name) {
+                return unsupported_err(span, Refusal::Item, top_level_let_refusal_msg(&name));
+            }
+            // #724: the write-site sibling of the read-site check in
+            // `lower_ident` — same reasoning, same class, but defensive:
+            // unreachable today. Every reproduction of the checker leak
+            // this refuses (SPEC.md §6.7 — a bare reference to an imported
+            // module's private top-level `let`, reaching here unrewritten)
+            // has been a `for`-range endpoint (`for k in 0..(CAP + 1)`,
+            // #724's own repro); an assignment TARGET is never a `for`-range
+            // endpoint, so no known input reaches this arm. Kept as the
+            // write-site's own defense in depth against the same leak
+            // rather than deleted, on the chance the checker leak widens to
+            // cover an assignment target too — but not wired to any known
+            // input and not exercised by any test (PR #730's body says so).
+            if let Some(resolved) = imported_private_let_module(self.decl_files, self.top_level_let_names, &name) {
+                let module = resolved.as_deref().map(declaring_file_display_name);
+                return unsupported_err(span, Refusal::Item,
+                    imported_private_let_refusal_msg(&name, module.as_deref()));
+            }
+            JitError { kind: JitErrorKind::Error, refusal: None,
+                msg: format!("assignment to unknown binding `{}`", name),
+                line: span.line, col: span.col,
+            }
         })?;
         let ty = self.local_tys.get(&name).unwrap().clone();
         // `cache <- frame`: stream-append. Handled before coercion — the RHS is a
         // tensor frame, not a value to coerce into the KV binding type.
         if matches!(op, AssignOp::StreamArrow) {
             return self.lower_stream_append(var, &ty, &name, rhs, span);
+        }
+        // A `!` model / `KV` parameter REBOUND wholesale. The value is the
+        // caller's pointer, passed by value, and the signature has no slot to
+        // hand a different one back — so `def_var` here would move the callee's
+        // own name onto a fresh instance and leave the caller looking at the old
+        // one. `dmc run` rebinds the CALLER's binding (`apply_writebacks` on a
+        // bare-identifier argument), so lowering this would be a silent
+        // disagreement: for `fn replace(!c: C) { … c = fresh }` the interpreter
+        // answers 99 and an unguarded JIT answers 90.
+        //
+        // Copy-out-on-rebind is the fix, and it is not a small one: it needs
+        // either a hidden out-parameter per `!` pointer param threaded through
+        // both declaration sites, every return, and every call site (direct,
+        // monomorphized and `$fwd_bwd`), or an in-place memcpy of the fresh
+        // field struct over the incoming one — which would make the rebind
+        // visible through every alias of the old instance, where the
+        // interpreter's rebind is visible through exactly one binding. Either
+        // is its own change with its own parity evidence. Until then this is a
+        // refusal, and #650 is where the semantics get ruled on.
+        //
+        // Only the whole-binding form is refused. Writes THROUGH the pointer —
+        // `g.kind[i] = k`, `cache <- frame` (handled above) — are the reason
+        // this convention exists and lower unchanged.
+        if self.mut_ptr_params.contains(&name) {
+            return unsupported_msg(span, Refusal::AssignForm, format!(
+                "rebinding the `!` parameter `{}` — a `!` model or `KV` \
+                 parameter is the caller's pointer, and the callee has no way \
+                 to hand a different one back, so the caller would keep the \
+                 instance it passed in. Mutate through `{}` instead of \
+                 replacing it",
+                name, name));
         }
         // #524: `y` is a live alias of a model tensor field (`let !y = m.w`), so
         // every write through it reaches the FIELD (SPEC §3.4) — copy into the
@@ -5450,11 +9785,15 @@ impl<'a> Translator<'a> {
             (TyKind::Scalar(ScalarKind::Nil), None)
             | (TyKind::Scalar(ScalarKind::Nil), Some(Expr::Nil(_))) => {
                 self.emit_mut_param_copy_out();
+                // #674 slice 3d: `return` is one of B5's five exit edges, and
+                // it leaves EVERY budget extent open in this function.
+                self.emit_budget_exits_to_depth(0);
                 self.ret_void();
             }
             (TyKind::Scalar(ScalarKind::Nil), Some(e)) => {
                 let _ = self.lower_expr(e)?;
                 self.emit_mut_param_copy_out();
+                self.emit_budget_exits_to_depth(0);
                 self.ret_void();
             }
             (want, Some(e)) => {
@@ -5463,6 +9802,12 @@ impl<'a> Translator<'a> {
                 // #553: after the returned value is in hand, so the copy can
                 // never disturb an expression that reads the parameter.
                 self.emit_mut_param_copy_out();
+                // #674 slice 3d: after the returned expression is lowered —
+                // it is written INSIDE the extent, so its own allocations
+                // charge the entered budget, exactly as the interpreter
+                // charges them (`Expr::BudgetBlock`'s guard is still live
+                // while `eval_block` produces the returned value).
+                self.emit_budget_exits_to_depth(0);
                 self.ret_val(v);
             }
             (want, None) => return err(span, format!(
@@ -5486,7 +9831,13 @@ impl<'a> Translator<'a> {
         self.brif(c, body_block, exit);
 
         self.enter(body_block);
-        self.loop_stack.push(LoopFrame { header, exit });
+        self.loop_stack.push(LoopFrame { header, exit, budget_depth: self.budget_stack.len() });
+        // #630: the body is a block, so it is a lexical scope — the
+        // interpreter's `Stmt::While` arm runs it through `eval_block`. The
+        // statements are lowered here rather than through `lower_block_value`
+        // (a loop body yields nothing, and `break`/`continue` need this CFG),
+        // so the scope is opened here too.
+        let scope = self.scope_enter();
         for stmt in &body.stmts {
             self.lower_stmt(stmt)?;
             if self.is_filled() { break; }
@@ -5496,6 +9847,7 @@ impl<'a> Translator<'a> {
                 let _ = self.lower_expr(tail)?;
             }
         }
+        self.scope_exit(scope);
         if !self.is_filled() {
             self.jump(header, &[]);
         }
@@ -5516,7 +9868,9 @@ impl<'a> Translator<'a> {
 
         self.jump(header, &[]);
         self.enter(header);
-        self.loop_stack.push(LoopFrame { header, exit });
+        self.loop_stack.push(LoopFrame { header, exit, budget_depth: self.budget_stack.len() });
+        // #630: same scope as a `while` body — see `lower_while`.
+        let scope = self.scope_enter();
         for stmt in &body.stmts {
             self.lower_stmt(stmt)?;
             if self.is_filled() { break; }
@@ -5526,6 +9880,7 @@ impl<'a> Translator<'a> {
                 let _ = self.lower_expr(tail)?;
             }
         }
+        self.scope_exit(scope);
         if !self.is_filled() {
             self.jump(header, &[]);
         }
@@ -5580,7 +9935,7 @@ impl<'a> Translator<'a> {
             Pattern::Wildcard(_) => None,
             _ => return unsupported(span, Refusal::Pattern, "destructuring patterns in `for` loops"),
         };
-        let loop_shadow: Vec<(String, Option<Variable>, Option<TyKind>)> =
+        let loop_shadow: Vec<(String, Option<Variable>, Option<TyKind>, Option<ConstDim>)> =
             bound_name.iter().map(|n| self.shadow(n)).collect();
         if let Some(ref name) = bound_name {
             // Create a Cranelift variable for the body binding; we will
@@ -5621,7 +9976,13 @@ impl<'a> Translator<'a> {
             self.builder.def_var(bind_var, cur);
         }
         // `continue` jumps to `incr` (advance the iterator), not `header`.
-        self.loop_stack.push(LoopFrame { header: incr, exit });
+        self.loop_stack.push(LoopFrame { header: incr, exit, budget_depth: self.budget_stack.len() });
+        // #630: #574 scoped the loop INDEX (`loop_shadow`, above) but not the
+        // body's own `let`s — the body is a block and is its own scope, inside
+        // the index's. Opened here, after the index binding, so the body sees
+        // the index and a `let` of the same name inside the body shadows it
+        // for the rest of the body only.
+        let scope = self.scope_enter();
         for stmt in &body.stmts {
             self.lower_stmt(stmt)?;
             if self.is_filled() { break; }
@@ -5631,6 +9992,7 @@ impl<'a> Translator<'a> {
                 let _ = self.lower_expr(tail)?;
             }
         }
+        self.scope_exit(scope);
         // End of body falls into the increment block.
         if !self.is_filled() {
             self.jump(incr, &[]);
@@ -5779,22 +10141,60 @@ impl<'a> Translator<'a> {
     /// consulted at lowering time and knows nothing about which branch is
     /// taken (#574). The interpreter scopes all of these correctly; these two
     /// helpers are how the JIT catches up without growing a scope stack.
-    fn shadow(&mut self, name: &str) -> (String, Option<Variable>, Option<TyKind>) {
-        (name.to_string(),
+    fn shadow(&mut self, name: &str) -> (String, Option<Variable>, Option<TyKind>, Option<ConstDim>) {
+        let saved = (name.to_string(),
          self.locals.get(name).copied(),
-         self.local_tys.get(name).cloned())
+         self.local_tys.get(name).cloned(),
+         self.local_const_dims.get(name).copied());
+        // #712: the caller is about to rebind `name` to a runtime value (a
+        // `for` index, an enum-payload field) — never a compile-time fold —
+        // so any fold verdict this name carried from an outer `let` must not
+        // keep answering for it while the shadow is live. `unshadow` puts it
+        // back.
+        self.local_const_dims.remove(name);
+        saved
+    }
+
+    /// #630: open a lexical scope — record the name tables so `scope_exit` can
+    /// put them back. The counterpart of `interp.rs`'s `push_scope`.
+    #[must_use = "an opened scope must be closed with scope_exit"]
+    fn scope_enter(&self) -> LocalScope {
+        LocalScope {
+            locals: self.locals.clone(),
+            local_tys: self.local_tys.clone(),
+            field_aliases: self.field_aliases.clone(),
+            omitted_ret_provenance: self.omitted_ret_provenance.clone(),
+            local_const_dims: self.local_const_dims.clone(),
+        }
+    }
+
+    /// Close a lexical scope: every binding made inside it disappears and every
+    /// binding it shadowed is back. Cranelift variables are function-scoped and
+    /// are deliberately not reclaimed — only the *names* go out of scope, so a
+    /// write through an outer binding from inside the scope (`x = x + 1` on an
+    /// enclosing `let !x`) already reached the outer variable and stands.
+    fn scope_exit(&mut self, saved: LocalScope) {
+        self.locals = saved.locals;
+        self.local_tys = saved.local_tys;
+        self.field_aliases = saved.field_aliases;
+        self.omitted_ret_provenance = saved.omitted_ret_provenance;
+        self.local_const_dims = saved.local_const_dims;
     }
 
     /// Put back every binding a region displaced, in the order they were taken.
-    fn unshadow(&mut self, saved: Vec<(String, Option<Variable>, Option<TyKind>)>) {
-        for (name, var, ty) in saved {
+    fn unshadow(&mut self, saved: Vec<(String, Option<Variable>, Option<TyKind>, Option<ConstDim>)>) {
+        for (name, var, ty, const_dim) in saved {
             match var {
                 Some(v) => { self.locals.insert(name.clone(), v); }
                 None => { self.locals.remove(&name); }
             }
             match ty {
-                Some(t) => { self.local_tys.insert(name, t); }
+                Some(t) => { self.local_tys.insert(name.clone(), t); }
                 None => { self.local_tys.remove(&name); }
+            }
+            match const_dim {
+                Some(d) => { self.local_const_dims.insert(name, d); }
+                None => { self.local_const_dims.remove(&name); }
             }
         }
     }
@@ -5803,9 +10203,9 @@ impl<'a> Translator<'a> {
     /// caller must `unshadow` it once the arm body is lowered.
     #[must_use = "the displaced outer bindings must be restored with unshadow"]
     fn bind_enum_payload(&mut self, pat: &Pattern, scr_val: Value, scr_ty: &TyKind, span: &Span)
-        -> Result<Vec<(String, Option<Variable>, Option<TyKind>)>, JitError>
+        -> Result<Vec<(String, Option<Variable>, Option<TyKind>, Option<ConstDim>)>, JitError>
     {
-        let mut saved: Vec<(String, Option<Variable>, Option<TyKind>)> = Vec::new();
+        let mut saved: Vec<(String, Option<Variable>, Option<TyKind>, Option<ConstDim>)> = Vec::new();
         let enum_name = match scr_ty { TyKind::Enum(n) => n, _ => return Ok(saved) };
         let layout = match self.enum_payload_layouts.get(enum_name) {
             Some(l) => l.clone(), None => return Ok(saved),
@@ -5967,7 +10367,7 @@ impl<'a> Translator<'a> {
         // No arm matched at runtime — error cleanly like the interpreter (a
         // non-exhaustive match is not silently a no-op).
         if !self.is_filled() {
-            self.emit_match_trap();
+            self.emit_match_trap(&m.span);
         }
         self.enter(merge);
         self.builder.seal_block(merge);
@@ -6120,7 +10520,7 @@ impl<'a> Translator<'a> {
 
         // No arm matched at runtime — error cleanly (was a bare SIGILL trap).
         if !self.is_filled() {
-            self.emit_match_trap();
+            self.emit_match_trap(&m.span);
         }
 
         self.enter(merge);
@@ -6136,25 +10536,81 @@ impl<'a> Translator<'a> {
 
     /// Evaluate an expression for its side effects only; discard any value.
     /// Unlike `lower_expr`, block expressions without a tail value are accepted.
+    ///
+    /// An arena block is the same case: it is a lexical scope and nothing more
+    /// (see the `Expr::ArenaBlock` arm of `lower_expr`), so it discards the
+    /// same way a plain block does.
     fn lower_expr_effect(&mut self, e: &Expr) -> Result<(), JitError> {
         match e {
             Expr::Block(b) => { let _ = self.lower_block_value(b)?; Ok(()) }
+            Expr::ArenaBlock(a) => { let _ = self.lower_block_value(&a.body)?; Ok(()) }
+            // #674 slice 3d: a budget block is the same case — a valueless
+            // `forge.enter(b) { … }` in statement position (the corpus shape)
+            // must not be asked for a tail value, exactly as the arena
+            // block's own readiness checks require for the block it is
+            // modelled on.
+            Expr::BudgetBlock(bb) => { let _ = self.lower_budget_block(bb)?; Ok(()) }
             _ => { let _ = self.lower_expr(e)?; Ok(()) }
         }
     }
 
+    /// #674 slice 3d: emit `__dmc_budget_enter(b, line, col)` and return the
+    /// displaced index. Also the ONE place a stale handle is caught on this
+    /// backend — `resolve_budget` inside the callback, exactly as `carve`
+    /// and `reap` catch theirs.
+    fn emit_budget_enter(&mut self, b: Value, span: &Span) -> Value {
+        let entry = self.fns.get("__dmc_budget_enter")
+            .expect("__dmc_budget_enter not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[b, line, col]);
+        self.builder.inst_results(call)[0]
+    }
+
+    /// #674 slice 3d: emit `__dmc_budget_exit(prev)` — one exit edge's pop.
+    fn emit_budget_exit(&mut self, prev: Value) {
+        let entry = self.fns.get("__dmc_budget_exit")
+            .expect("__dmc_budget_exit not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        self.builder.ins().call(func_ref, &[prev]);
+    }
+
+    /// #674 slice 3d: this edge leaves every budget extent above `depth` —
+    /// pop them, innermost first, so the register lands on the budget that
+    /// was current at `depth`. `depth` is 0 for a `return` or a `?` early
+    /// return (an edge out of the function leaves them all) and the
+    /// enclosing loop's `budget_depth` for a `break`/`continue`.
+    ///
+    /// Leaves `budget_stack` itself alone: the extents are still lexically
+    /// open, and the block lowering that pushed them is what pops them. Only
+    /// the *emitted* exits belong to this edge.
+    fn emit_budget_exits_to_depth(&mut self, depth: usize) {
+        if self.budget_stack.len() <= depth { return; }
+        let prevs: Vec<Value> = self.budget_stack[depth..].iter().rev().copied().collect();
+        for prev in prevs {
+            self.emit_budget_exit(prev);
+        }
+    }
+
     fn lower_break(&mut self, span: &Span) -> Result<(), JitError> {
-        let exit = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+        let frame = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`break` outside of a loop".into(), line: span.line, col: span.col,
-        })?.exit;
+        })?;
+        let (exit, depth) = (frame.exit, frame.budget_depth);
+        // #674 slice 3d: `break` is one of B5's five exit edges.
+        self.emit_budget_exits_to_depth(depth);
         self.jump(exit, &[]);
         Ok(())
     }
 
     fn lower_continue(&mut self, span: &Span) -> Result<(), JitError> {
-        let header = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+        let frame = self.loop_stack.last().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "`continue` outside of a loop".into(), line: span.line, col: span.col,
-        })?.header;
+        })?;
+        let (header, depth) = (frame.header, frame.budget_depth);
+        // #674 slice 3d: `continue` is one of B5's five exit edges.
+        self.emit_budget_exits_to_depth(depth);
         self.jump(header, &[]);
         Ok(())
     }
@@ -6200,6 +10656,10 @@ impl<'a> Translator<'a> {
             }
             Expr::Postfix { expr, op, span } => self.lower_postfix(expr, op, span),
             Expr::Cast { expr, ty, span } => {
+                // A scalar/tensor-alias cast target is transparent (SPEC.md
+                // §6.6): resolve it first, so `x as Role` behaves exactly as
+                // `x as u8` would in every check below.
+                let ty = &resolve_alias_ty(ty, self.aliases)?;
                 // #262: a scalar cast to an exotic float (bf16/f16/tf32) is a
                 // no-op in the JIT — the same #179 convention as `@cast(bf16){…}`
                 // (these compute in f32). Keep the operand's value/kind rather
@@ -6219,21 +10679,23 @@ impl<'a> Translator<'a> {
                     }
                 }
                 // Narrow / unsigned integer scalar targets (#298-adjacent): the
-                // JIT has no distinct ScalarKind for i8/i16/u8/u16/u32/u64/int4/
-                // int8 — like the interpreter, a scalar narrow-int is just an
-                // i64 holding the wrapped/narrowed value. Compute that here so
+                // JIT has no distinct Cranelift TYPE for i8/i16/u8/u16/u32/u64/
+                // int4/int8 — like the interpreter, a scalar narrow-int is just
+                // an i64 holding the wrapped/narrowed value. Compute that here so
                 // `x as i8` works on the JIT instead of erroring in scalar_from_ast.
                 if let Type::Scalar(s, _) = ty {
                     if scalar_int_is_narrow(s) {
                         let r = self.lower_narrow_int_cast(v, &k, s, span)?;
                         // #544: the cast's RESULT carries the target's width, so
                         // what follows it wraps — SPEC §3.1's "the wrapped value
-                        // is the value". `u64` has no narrow kind and stays i64.
+                        // is the value". #597: `u64` now has its own kind here
+                        // too, so `unwrap_or` never actually fires for it.
                         let rk = narrow_scalar_kind(s).unwrap_or(ScalarKind::I64);
                         return Ok((r, TyKind::Scalar(rk)));
                     }
                 }
-                let target = enumify(ty_from_ast(ty, &self.shape_env)?, self.enums);
+                let target = enumify(
+                    ty_from_ast(ty, &self.shape_env, Some(&self.scope_const_dims()))?, self.enums);
                 let cv = self.coerce_to(v, &k, &target, span)?;
                 Ok((cv, target))
             }
@@ -6248,7 +10710,53 @@ impl<'a> Translator<'a> {
                 self.lower_match_expr(m)
             }
             Expr::FnLit(f) => self.lower_fn_lit(f),
-            Expr::ArenaBlock(a) => unsupported(&a.span, Refusal::Construct, "arena blocks as expressions"),
+            // `vault { … }` / `forge { … }` / `stream { … }` lower as the block
+            // they wrap, because that is all they are at run time on either
+            // backend — nothing about them needs its own runtime representation:
+            //
+            //   * arena selection is *check-time*. `check.rs`'s `arena_stack`
+            //     is the only consumer of the block's kind — it gates the
+            //     cross-arena write error (`MEMORY.md §3.1`, #442) for BOTH
+            //     backends, so the JIT has nothing left to re-check.
+            //   * nothing rewinds at the exit. `interp.rs`'s `Expr::ArenaBlock`
+            //     records (#400) that rewinding the Forge meter was tried and
+            //     reverted: it made the block a one-token bypass of `--forge`.
+            //     The JIT's `ForgeArena` is a single never-reset region, so a
+            //     scope-only lowering is exact parity — and a rewinding one
+            //     would dangle every tensor that escapes the block, which
+            //     `dmc run` lets escape and then lets the program WRITE to.
+            //   * the block does not redirect explicit constructors either:
+            //     `charge_to` (`interp.rs`) keys on the constructor's base
+            //     name, so `forge.ones[…]` inside `vault { }` charges Forge.
+            //
+            // Giving the JIT a real Vault region, a discriminant and a working
+            // `--vault` is slice 2; a block-exit rewind is slice 3 and is
+            // blocked on #614.
+            Expr::ArenaBlock(a) => {
+                self.float_lit_hint = want;
+                let v = self.lower_block_value(&a.body)?;
+                v.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "arena block has no tail value".into(),
+                    line: a.span.line, col: a.span.col,
+                })
+            }
+            // #674: the budget register's push/pop, on the arena block's own
+            // scope machinery plus one call at each end.
+            // See `lower_budget_block` for the exit-edge set.
+            Expr::BudgetBlock(bb) => {
+                self.float_lit_hint = want;
+                let v = self.lower_budget_block(bb)?;
+                v.ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "budget block has no tail value".into(),
+                    line: bb.span.line, col: bb.span.col,
+                })
+            }
+            // #674 slice 3d: `<ctor> in b` is the same register push held
+            // across exactly one constructor (B3) — see `lower_alloc_in`.
+            Expr::AllocIn { expr, budget, span } => {
+                self.float_lit_hint = want;
+                self.lower_alloc_in(expr, budget, span)
+            }
             Expr::DirectiveBlock { directives, body, span } => {
                 if directives.iter().any(|d| d.name == "fuse") {
                     return self.lower_fuse_block(body, span);
@@ -6534,7 +11042,7 @@ impl<'a> Translator<'a> {
 
         // #267: capture the concrete type args (`Bar[4]` → [4]) so param-shaped
         // field reads resolve against them.
-        let args = resolve_dim_exprs(type_args.iter(), &self.shape_env);
+        let args = resolve_dim_exprs(type_args.iter(), &self.shape_env, Some(&self.scope_const_dims()));
         Ok((ptr, TyKind::Model(name.to_string(), args)))
     }
 
@@ -6547,25 +11055,45 @@ impl<'a> Translator<'a> {
         let name = format!("__lambda_{}", *self.lambda_counter);
         *self.lambda_counter += 1;
 
-        let empty_env: HashMap<String, i64> = HashMap::new();
+        // A lambda is written INSIDE its enclosing function, so the shape
+        // parameters that function was monomorphized on are in scope in the
+        // lambda's signature and body exactly as they are in the enclosing
+        // body. Lowering the lambda against an empty env instead left those
+        // names unbound, and a module constant of the same name answered in
+        // their place through the fallback below — `fn outer[N](..)` called
+        // with a 2-long tensor allocated `N = 8` inside its lambda.
+        let outer_shape_env = self.shape_env.clone();
+        // The lambda's own params, and every local in scope where it is
+        // written, shadow a same-named module constant.
+        let consts = visible_const_dims(self.const_dims, |n| {
+            lit.params.iter().any(|p| p.name == n) || self.is_local_name(n)
+        });
+        let consts = Some(&consts);
         let mut params: Vec<(String, TyKind, Span)> = Vec::new();
         for p in &lit.params {
             let ty_ast = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("lambda param `{}` needs a type annotation in JIT", p.name),
                 line: lit.span.line, col: lit.span.col,
             })?;
-            let ty = enumify(ty_from_ast(ty_ast, &empty_env)?, self.enums);
+            // Lambda params/returns are type-building sites too (SPEC.md §6.6):
+            // resolve the alias, then lower against the enclosing shape env and
+            // the module constants this scope leaves visible.
+            let ty = enumify(
+                ty_from_ast(&resolve_alias_ty(ty_ast, self.aliases)?, &outer_shape_env, consts)?,
+                self.enums);
             params.push((p.name.clone(), ty, p.span.clone()));
         }
         let ret = match &lit.ret_type {
-            Some(rt) => enumify(ty_from_ast(rt, &empty_env)?, self.enums),
+            Some(rt) => enumify(
+                ty_from_ast(&resolve_alias_ty(rt, self.aliases)?, &outer_shape_env, consts)?,
+                self.enums),
             None => TyKind::Scalar(ScalarKind::Nil),
         };
 
         // ── Free-variable analysis (conservative snapshot) ──────────────────
         // Any name currently in scope that is NOT one of the lambda's own
         // declared params is a potential capture.
-        let param_names: std::collections::HashSet<&str> =
+        let param_names: HashSet<&str> =
             params.iter().map(|(n, _, _)| n.as_str()).collect();
         let mut captures: Vec<(String, TyKind)> = self.local_tys
             .iter()
@@ -6639,7 +11167,11 @@ impl<'a> Translator<'a> {
             body: lit.body.clone(),
             name: name.clone(),
             span: lit.span.clone(),
-            shape_env: HashMap::new(),
+            // The enclosing function's bound shape parameters, for the same
+            // reason the signature above resolves against them — the body is
+            // lexically inside it. (The named-fn trampoline below already
+            // carried `self.shape_env` across.)
+            shape_env: outer_shape_env,
             grad_mode: GradMode::None,
             mut_param_idxs: vec![],
             captures: captures.clone(),
@@ -6737,6 +11269,30 @@ impl<'a> Translator<'a> {
         // Exclude __dmc_ builtins (ABI mismatch) and template-only entries.
         if let Some(entry) = self.fns.get(name).cloned() {
             if !name.starts_with("__dmc_") {
+                // A function with a `!` parameter cannot become a first-class
+                // value. `TyKind::Fn` is built from the parameter TYPES alone
+                // and a `fn(T, T) -> R` carries no `!`, so `lower_indirect_call`
+                // — which has only that type to work from — builds its argument
+                // list with `coerce_to` and no copy-in/copy-out. Through a
+                // value, `f(t, t)` would then alias where the direct call
+                // isolates (#249), and the caller's tensor would keep whatever
+                // the callee left in it rather than the copy-back: `dmc run`
+                // answers 5 for that program and an unguarded JIT answers 55.
+                //
+                // Refused at the point the value is MADE rather than at the
+                // call, because that is the only place the `!` is still known;
+                // it also covers passing the function to a higher-order
+                // parameter, where there is no call site in this function at
+                // all. Calling `{name}` by name is unaffected. Whether the
+                // language should allow the binding at all is #650.
+                if !entry.mut_param_idxs.is_empty() {
+                    return unsupported_msg(span, Refusal::IndirectCall, format!(
+                        "`{}` as a first-class value — it has a `!` parameter, \
+                         and a `fn(..)` type carries no `!`, so an indirect \
+                         call could not copy the argument in and back out. \
+                         Call `{}` by name",
+                        name, name));
+                }
                 let trampoline_name = format!("__clos_{}", name);
                 // Declare the trampoline only once.
                 if !self.fns.contains_key(&trampoline_name) {
@@ -6819,6 +11375,64 @@ impl<'a> Translator<'a> {
         // literal this materializes an iconst/fconst, no globals needed.
         if let Some(init) = self.global_consts.get(name).cloned() {
             return self.lower_expr(&init);
+        }
+        // #696 R1: check.rs/interp.rs's well-known math constants
+        // (`pi`/`tau`/`e`/`inf`/`nan`) are compile-time literals, exactly like
+        // any other numeric constant (#268 above) — they need no global to
+        // bind to (a `f64const` immediate lowers them directly), so refusing
+        // them as `jit-item` was both the wrong code (they name no top-level
+        // item at all — DIAGNOSTICS.md §5.2's `jit-item` is "a top-level item
+        // form") and a false message ("the JIT has no globals to bind it to"
+        // on a value that needs no globals). Values match
+        // interp.rs's `lookup_ident` bit-for-bit: `std::f64::consts::{PI,TAU,E}`,
+        // `f64::{INFINITY,NAN}`.
+        if let Some(f) = match name {
+            "pi" => Some(std::f64::consts::PI),
+            "tau" => Some(std::f64::consts::TAU),
+            "e" => Some(std::f64::consts::E),
+            "inf" => Some(f64::INFINITY),
+            "nan" => Some(f64::NAN),
+            _ => None,
+        } {
+            return Ok((self.builder.ins().f64const(f), TyKind::Scalar(ScalarKind::F64)));
+        }
+        // #696: the one way a name can still reach here as a genuine
+        // `jit-item` gap rather than a defect: an actual top-level `let`
+        // whose initializer isn't a compile-time literal (a str constant like
+        // `PALETTE`, or a computed expression like `HP_A = exp(...)`; #268
+        // only ever populates `global_consts` from a literal), or one
+        // declared `let !` (mutable — #268 never admits those either). Its
+        // declare-time refusal (`collect_fns`'s `Item::Let` arm) already
+        // names this `jit-item` (DIAGNOSTICS.md §5.2: "a top-level item
+        // form"); this is the same class, at the read site instead of the
+        // declaration. The name is the FIRST backtick-quoted token in the
+        // message (not "top-level `let NAME`") so `cascade_candidate_name`
+        // can recognize a body's read of an already-refused top-level `let`
+        // as a cascade of that `let`'s own declare-time root instead of
+        // double-counting it as a second, independent blocker.
+        //
+        // Anything else that reaches here (a builtin-namespace token like
+        // `forge` used somewhere the JIT has no lowering for the surrounding
+        // construct, say) is NOT that shape, and must keep raising the plain
+        // uncoded `jit error` below — reclassifying it as `jit-item` would
+        // misdescribe it (it names no top-level item at all) and would bury
+        // a distinct, untriaged defect under this one's code.
+        if self.top_level_let_names.contains(name) {
+            return unsupported_msg(span, Refusal::Item, top_level_let_refusal_msg(name));
+        }
+        // #724: not a same-file top-level `let` (the check just above), but
+        // possibly the bare source name of one declared PRIVATELY in a module
+        // this file imports — `merge.rs` never puts a private declaration in
+        // an importer's reference scope, so the reference reached here
+        // unrewritten. Refuse it as the same `jit-item` class rather than the
+        // uncoded `jit error` below: the checker leaks this today (SPEC.md
+        // §6.7's `pub fn`-accessor rule; #724 tracks the checker fix
+        // separately), and the JIT must not be more permissive than the spec
+        // by lowering a leaked reference just because the constant happens to
+        // be a literal.
+        if let Some(resolved) = imported_private_let_module(self.decl_files, self.top_level_let_names, name) {
+            let module = resolved.as_deref().map(declaring_file_display_name);
+            return unsupported_msg(span, Refusal::Item, imported_private_let_refusal_msg(name, module.as_deref()));
         }
         err(span, format!("unknown binding `{}` (JIT has no globals)", name))
     }
@@ -6980,6 +11594,13 @@ impl<'a> Translator<'a> {
         let (c, ck) = self.lower_expr(&i.cond)?;
         let ck_sc = ck.as_scalar();
         if !ck_sc.map(|s| s.is_bool()).unwrap_or(false) {
+            // #760: `if fns { .. }` where `fns` is a `map_get` result
+            // (`OptI64`) — the interpreter runs this (a non-bool condition's
+            // `as_bool()` is `None`, silently taken as false, #300.4) —
+            // refuses classed, citing #721, not the uncoded `jit error` below.
+            if matches!(ck, TyKind::Scalar(ScalarKind::OptI64)) {
+                return Err(Self::opt_i64_refusal(&i.span, "if-condition must be `bool`, got `i64?`"));
+            }
             return err(&i.span, format!("if-condition must be `bool`, got `{}`", ck.render()));
         }
         let then_block = self.builder.create_block();
@@ -7100,22 +11721,154 @@ impl<'a> Translator<'a> {
         Ok(result)
     }
 
+    /// True if `name` is bound to a runtime value in this body — a parameter,
+    /// a `let`, or a loop variable. Such a name shadows a module constant, in a
+    /// shape position exactly as everywhere else.
+    fn is_local_name(&self, name: &str) -> bool {
+        self.locals.contains_key(name) || self.local_tys.contains_key(name)
+    }
+
+    /// The constants admissible as a dimension in a TYPE-LEVEL shape position
+    /// at this point in the body — module constants AND this function's own
+    /// literal `let`s (#712), both reached the same way, through the map this
+    /// returns. Rebuilt per site on purpose: the set of names the body binds
+    /// grows as it is lowered, so a `let` shadowing a constant takes effect
+    /// from that point on, the way it does in `run`.
+    ///
+    /// Every name currently in scope gets AN entry here, not just the
+    /// foldable ones: a value parameter, a loop/`for` index, an
+    /// enum-payload binding, or a non-mutating `let` this pass could not fold
+    /// defaults to `ConstDim::LocalUnfoldable` (a `let !` is recorded as
+    /// `LocalMutable` by `record_local_const_dim` instead), so a shape use of
+    /// it resolves to a classed refusal instead of falling through to the
+    /// bare #480-class "unbound shape parameter" `jit-error` — the defect
+    /// #712 reports. `local_const_dims` is applied AFTER the default and the
+    /// module-constant filter, so it always wins for a name it covers.
+    fn scope_const_dims(&self) -> HashMap<String, ConstDim> {
+        let mut table = visible_const_dims(self.const_dims, |n| self.is_local_name(n));
+        for name in self.locals.keys().chain(self.local_tys.keys()) {
+            table.entry(name.clone()).or_insert(ConstDim::LocalUnfoldable);
+        }
+        for (name, dim) in &self.local_const_dims {
+            table.insert(name.clone(), *dim);
+        }
+        table
+    }
+
+    /// #712: fold this non-mutating `let`'s initializer to its
+    /// shape-dimension verdict and record it in `local_const_dims`, so a
+    /// later dimension use of `name` in this scope resolves through
+    /// `scope_const_dims` exactly as a module constant would. Called by
+    /// `lower_let` for every plain (non-destructuring) `let`, BEFORE the name
+    /// is bound — the initializer is evaluated in the enclosing scope, so
+    /// `let W = H * 2` sees `H`'s own already-recorded verdict, not a
+    /// shadow-in-progress of `W` itself.
+    ///
+    /// A `let !` (mutable) is never foldable, whatever its initializer is:
+    /// JIT-compiled code may write through it before a later shape use, and
+    /// `run` never re-derives a shape from a mutation either. Anything else
+    /// `fold_shape_expr`/`fold_shape_expr_at_width` cannot fold outright (a
+    /// parameter read, a call, a field access, a tensor literal, an
+    /// unfoldable operator, a width mismatch between two literals, ...) is
+    /// `LocalUnfoldable` — the same verdict `scope_const_dims` already
+    /// defaults every in-scope name to, recorded explicitly here only so a
+    /// LATER shadowing `let` of the same name can be told apart from the
+    /// generic default once this one goes out of scope (see `scope_exit`).
+    ///
+    /// #718 rework: this used to fold every initializer in bare `i64`
+    /// regardless of the binding's own integer width (R1) — correct only for
+    /// an untyped literal or an explicit `i64`, and silently wrong at any
+    /// narrower width, since `dmc run` evaluates `+ - * /` at the binding's
+    /// declared width and wraps there. `fold_local_let_dim` below now folds
+    /// at that width. It also gives a float/bool literal initializer its own
+    /// `NotAnInt` verdict (R3) instead of routing it through the same
+    /// "not known until the function runs" message as a genuinely unfoldable
+    /// expression — a float/bool literal IS known at fold time, just not an
+    /// integer.
+    fn record_local_const_dim(&mut self, name: &str, l: &LetStmt) {
+        let verdict = if l.mutating { ConstDim::LocalMutable } else { self.fold_local_let_dim(l) };
+        self.local_const_dims.insert(name.to_string(), verdict);
+    }
+
+    /// The shape-dimension verdict for a non-mutating `let`'s initializer —
+    /// see `record_local_const_dim`'s doc for the `LocalMutable`/
+    /// `LocalUnfoldable` rules this composes with. Split out because folding
+    /// itself now branches on the binding's width (R1) before it can decide
+    /// which of `fold_shape_expr` or `fold_shape_expr_at_width` even applies.
+    fn fold_local_let_dim(&mut self, l: &LetStmt) -> ConstDim {
+        // R3 (#718 review): a float/bool literal initializer is known at fold
+        // time and known not to be an integer — distinct from
+        // `LocalUnfoldable` ("not known until the function runs"), which was
+        // wrong on both counts for `let H = 4.0`. `is_float_or_bool_leaved`
+        // extends this past a BARE literal to arithmetic over one: `let H =
+        // 4.0 + 1.0` (`dmc run` gives 5.0) was still falling through to
+        // `LocalUnfoldable` because the initializer is a `BinOp`, not a
+        // `Literal`, even though every leaf in it is a float.
+        if is_float_or_bool_leaved(&l.value) {
+            return ConstDim::NotAnInt;
+        }
+        let consts = self.scope_const_dims();
+        // R1: the width to fold at — an explicit integer annotation wins
+        // outright; otherwise every literal leaf in the initializer must
+        // share one suffix (`shape_dim_literal_width`), or none of them
+        // carry one at all, the untyped-int-literal case that already
+        // folds correctly in `i64`.
+        let width = match l.ty.as_ref() {
+            Some(Type::Scalar(st, _)) if scalar_kind_of_int_suffix(st).is_some() =>
+                scalar_kind_of_int_suffix(st),
+            _ => match shape_dim_literal_width(&l.value) {
+                Ok(k) => k,
+                // Two literals in the initializer name different widths — a
+                // real type error `check.rs` already catches elsewhere;
+                // decline to guess which one wins rather than fold a program
+                // that does not type-check.
+                Err(()) => return ConstDim::LocalUnfoldable,
+            },
+        };
+        let folded = match width {
+            None | Some(ScalarKind::I64) =>
+                fold_shape_expr(&l.value, &self.shape_env, Some(&consts), &l.span),
+            Some(k) => fold_shape_expr_at_width(
+                &l.value, &self.shape_env, Some(&consts), &l.span, scalar_kind_to_iw(k)),
+        };
+        match folded {
+            Ok(v) => ConstDim::Dim(v),
+            Err(_) => ConstDim::LocalUnfoldable,
+        }
+    }
+
     /// Read a bracketed shape literal (`[H, W]`, `[N]`, or `[[H, 1]]`'s
-    /// inner) into concrete dims, resolving shape params via `shape_env`.
-    fn const_dims(&self, shape_expr: &Expr, span: &Span) -> Result<Vec<i64>, JitError> {
+    /// inner) into concrete dims, resolving shape params via `shape_env` and
+    /// falling back to an unshadowed module constant — an allocation's
+    /// dtype-shape bracket is a type-level shape position.
+    fn shape_lit_dims(&self, shape_expr: &Expr, span: &Span) -> Result<Vec<i64>, JitError> {
+        let consts = self.scope_const_dims();
         match shape_expr {
             Expr::TensorLit(elems, _) => elems.iter()
-                .map(|e| resolve_shape_expr(e, &self.shape_env, span))
+                .map(|e| resolve_shape_expr(e, &self.shape_env, Some(&consts), span))
                 .collect(),
-            other => Ok(vec![resolve_shape_expr(other, &self.shape_env, span)?]),
+            other => Ok(vec![resolve_shape_expr(other, &self.shape_env, Some(&consts), span)?]),
         }
     }
 
     /// `forge.zeros[f32, [shape]]` / `.ones[...]` / `.uninit[...]` — allocate
     /// in the Forge arena. `zeros` fills with 0.0, `ones` with 1.0, `uninit`
     /// skips the fill entirely (contents unspecified). f32-only (slice surface).
+    /// `forge.zeros/ones/uninit[T, [shape]]` and its `vault.*` spelling.
+    ///
+    /// #674: `arena` is the constructor's
+    /// spelling — `"forge"` or `"vault"` — and it is the ONLY thing that
+    /// decides which table entry the buffer lands in. A `vault.*`
+    /// constructor charges the **root** even inside `forge.enter(b) { … }`,
+    /// so `forge.reap(b)` cannot free it; a `forge.*` one charges whatever
+    /// budget is entered. On `dmc run` the same split is `charge_arena`'s
+    /// Vault arm (a flat `vault_used` meter no budget owns) plus
+    /// `VaultTagGuard`; here the two spellings share one arena
+    /// (`MEMORY.md §1.1`), so the distinction has to be made at the emit
+    /// site. See `Jit::forge_alloc_root`.
     fn lower_arena_alloc(
         &mut self,
+        arena: &str,
         method: &str,
         idxs: &[IndexElem],
         span: &Span,
@@ -7139,14 +11892,14 @@ impl<'a> Translator<'a> {
                 let model_name = base.to_string();
                 // #267: capture the element model's concrete type args
                 // (`Bar[4]` → [4]) so param-shaped fields resolve on read.
-                let type_dims = model_ctor_dims(args[0], &self.shape_env);
-                let dims = self.const_dims(args[1], span)?;
+                let type_dims = model_ctor_dims(args[0], &self.shape_env, Some(&self.scope_const_dims()));
+                let dims = self.shape_lit_dims(args[1], span)?;
                 if dims.len() != 1 || dims[0] <= 0 {
                     return err(span, format!(
                         "`forge.{}[{}, [N]]` requires a 1D positive size", method, model_name));
                 }
                 let n = dims[0];
-                let out = self.forge_alloc(n * 8);
+                let out = self.arena_alloc_by_spelling(arena, n * 8);
                 if method != "uninit" {
                     self.fill_const(out, n * 2, 0.0);  // n i64 slots = 2n f32 words
                 }
@@ -7157,40 +11910,58 @@ impl<'a> Translator<'a> {
         // idiom for per-layer caches: `forge.uninit[KV[bf16,[B,H,~,D]], [L]]`.
         // Each slot is filled later by `arr[i] = forge.kv[...](capacity = ...)`.
         // (#273 follow-up.)
-        if let Some(kv_res) = kv_ctor_elem_ty(args[0], &self.shape_env, span) {
+        if let Some(kv_res) = kv_ctor_elem_ty(
+            args[0], &self.shape_env, Some(&self.scope_const_dims()), span) {
             let kv = kv_res?;
-            let dims = self.const_dims(args[1], span)?;
+            let dims = self.shape_lit_dims(args[1], span)?;
             if dims.len() != 1 || dims[0] <= 0 {
                 return err(span, format!(
                     "`forge.{}[KV[...], [N]]` requires a 1D positive size", method));
             }
             let n = dims[0];
-            let out = self.forge_alloc(n * 8);  // n i64 pointer slots
+            let out = self.arena_alloc_by_spelling(arena, n * 8);  // n i64 pointer slots
             if method != "uninit" {
                 self.fill_const(out, n * 2, 0.0);  // n i64 slots = 2n f32 words
             }
             return Ok((out, TyKind::KvArray(kv, n)));
         }
-        // #237: map the element type. bf16/f16/tf32 are computed as f32 in the JIT
-        // (the `@cast(bf16)` no-op convention, #179), so they allocate as f32.
-        let (elem, tname): (ScalarKind, &str) = match args[0] {
-            Expr::Ident(t, _) => {
-                let k = match t.as_str() {
-                    "f32" => ScalarKind::F32,
-                    "f64" => ScalarKind::F64,
-                    "i32" => ScalarKind::I32,
-                    "i64" => ScalarKind::I64,
-                    "bool" => ScalarKind::Bool,
-                    "bf16" | "f16" | "tf32" => ScalarKind::F32,
-                    _ => return unsupported_msg(span, Refusal::ElementType, format!(
+        // #237/#632/#622: map the element type to its storage kind.
+        //
+        // A scalar `type` alias is transparent here (SPEC §6.6), so
+        // `forge.zeros[Role, [N]]` allocates as `Role`'s underlying scalar
+        // type rather than being refused as an unrecognized dtype name. The
+        // alias path unwraps `Type::Scalar` straight into `tensor_elem_kind`
+        // and a bare dtype name goes through its name-keyed twin
+        // `tensor_elem_kind_by_name` — deliberately those two and no third
+        // spelling, because `elem_kind_tables_agree` pins them equal to each
+        // other and to the interpreter, and a hand-written `match` here would
+        // be outside that pin and free to drift.
+        //
+        // bf16/f16/tf32 are computed as f32 in the JIT (the `@cast(bf16)`
+        // no-op convention, #179), so they allocate as f32; every byte-aligned
+        // integer width allocates at its own width.
+        let elem: ScalarKind = match args[0] {
+            Expr::Ident(t, tspan) => {
+                let synthetic = Type::Named { name: t.clone(), args: vec![], span: tspan.clone() };
+                // `shown` is what the refusal names: an alias is reported by
+                // the scalar type it resolves to, so the message says which
+                // width was actually asked for.
+                let (kind, shown): (Option<ScalarKind>, String) =
+                    match resolve_alias_ty(&synthetic, self.aliases)? {
+                        Type::Scalar(s, _) =>
+                            (tensor_elem_kind(&s), crate::fmt::scalar_type_str(&s).to_string()),
+                        _ => (tensor_elem_kind_by_name(t.as_str()), t.clone()),
+                    };
+                match kind {
+                    Some(k) => k,
+                    None => return unsupported_msg(span, Refusal::ElementType, format!(
                             "`forge.{}`: element type `{}` is not lowered; \
-                             use `dmc run` for full semantics", method, t)),
-                };
-                (k, t.as_str())
+                             use `dmc run` for full semantics", method, shown)),
+                }
             }
             _ => return err(span, "tensor constructor element type must be a scalar type name"),
         };
-        let dims = self.const_dims(args[1], span)?;
+        let dims = self.shape_lit_dims(args[1], span)?;
         let ty = TensorTy { elem, shape: dims };
         // Guard an oversized shape: nelems()/nbytes() `.expect()`-panic on i64
         // overflow. Surface a located diagnostic instead of a raw Rust
@@ -7208,32 +11979,36 @@ impl<'a> Translator<'a> {
         if let Some(total) = crate::interp::total_system_memory_bytes() {
             let nbytes = ty.nbytes() as u64;
             if nbytes > total {
-                const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+                // #805/#829: `crate::arena::fmt_bytes` gives the same
+                // information as the old hardcoded-GiB formatting — same
+                // byte counts, auto-scaled units instead of always GiB —
+                // and picks up #805's truncate-at-a-unit-boundary fix for
+                // free, so this now matches the sibling arena/budget
+                // fatals' own sizing rather than hand-rolling its own.
                 return err(span, format!(
-                    "`forge.{}`: tensor shape {:?} needs {:.1} GiB but the system has {:.1} GiB of RAM",
-                    method, ty.shape, nbytes as f64 / GIB, total as f64 / GIB));
+                    "`forge.{}`: tensor shape {:?} needs {} but the system has {} of RAM",
+                    method, ty.shape,
+                    crate::arena::fmt_bytes(nbytes),
+                    crate::arena::fmt_bytes(total)));
             }
         }
-        let out = self.forge_alloc(ty.nbytes());
-        // The fill loop writes f32-width (32-bit) words, so it is only correct
-        // where the zero/one bit pattern matches at 32 bits. `uninit` never fills,
-        // so it works for any element type (this is what the bf16/bool transformer paths
-        // use); for other element types `zeros`/`ones` point at `uninit`.
+        let out = self.arena_alloc_by_spelling(arena, ty.nbytes());
+        // `uninit` never fills, so it is correct at any element width. `zeros`
+        // and `ones` write a pattern, and the pattern has to be written at the
+        // element's own width: #632 replaced the old "32-bit words only" rule,
+        // which refused `forge.zeros[u8, …]` outright and would have written
+        // four bytes per one-byte element if it hadn't.
         match method {
             "uninit" => {}
-            // #274: zero is all-zero bits at any width — fill the whole buffer as
-            // 32-bit zero words (nbytes/4). Scoped to the 32/64-bit numeric kinds
-            // (f32, incl. bf16-as-f32; i32; i64); `ones` still needs a per-width
-            // pattern, and sub-word kinds (bool) keep the explicit-uninit path.
-            "zeros" if matches!(elem, ScalarKind::F32 | ScalarKind::I32 | ScalarKind::I64) =>
-                self.fill_const(out, ty.nbytes() / 4, 0.0),
-            "zeros" => return unsupported_msg(span, Refusal::ElementType, format!(
-                "`forge.zeros[{}, ..]` (the JIT's zero-fill is 32-bit); \
-                 use `forge.uninit` and fill explicitly, or `dmc run`", tname)),
+            // Zero is all-zero bits at every width, so a buffer whose byte
+            // count is a whole number of 32-bit words still takes the wide
+            // fill — a quarter of the stores for an f32/i32/i64 tensor, and
+            // for a `u8` one whose length happens to be a multiple of four.
+            "zeros" if ty.nbytes() % 4 == 0 => self.fill_const(out, ty.nbytes() / 4, 0.0),
+            "zeros" => self.fill_elem_const(out, elem, ty.nelems(), 0.0),
+            // `ones` has a per-width pattern, so it always fills element-wise.
             "ones" if elem == ScalarKind::F32 => self.fill_const(out, ty.nelems(), 1.0),
-            "ones" => return unsupported_msg(span, Refusal::ElementType, format!(
-                "`forge.ones[{}, ..]` (the JIT fills `ones` for f32 only); \
-                 use `forge.uninit` and fill explicitly, or `dmc run`", tname)),
+            "ones" => self.fill_elem_const(out, elem, ty.nelems(), 1.0),
             _ => {}
         }
         Ok((out, TyKind::Tensor(ty)))
@@ -7254,8 +12029,9 @@ impl<'a> Translator<'a> {
         if dims.len() != 2 {
             return err(span, "`forge.trit` requires exactly 2 dimensions: `forge.trit[K, N]`");
         }
-        let k = resolve_shape_expr(dims[0], &self.shape_env, span)?;
-        let n = resolve_shape_expr(dims[1], &self.shape_env, span)?;
+        let trit_consts = self.scope_const_dims();
+        let k = resolve_shape_expr(dims[0], &self.shape_env, Some(&trit_consts), span)?;
+        let n = resolve_shape_expr(dims[1], &self.shape_env, Some(&trit_consts), span)?;
         if k <= 0 || n <= 0 {
             return err(span, format!("`forge.trit` dimensions must be > 0, got [{}, {}]", k, n));
         }
@@ -7306,7 +12082,7 @@ impl<'a> Translator<'a> {
                 }
                 stream_axis = Some(i);
             } else {
-                let v = resolve_shape_expr(e, &self.shape_env, span)?;
+                let v = resolve_shape_expr(e, &self.shape_env, Some(&self.scope_const_dims()), span)?;
                 if v <= 0 {
                     return err(span, format!("`forge.kv` dim must be > 0, got {}", v));
                 }
@@ -7326,7 +12102,7 @@ impl<'a> Translator<'a> {
             msg: "`forge.kv` requires a `capacity = N` argument".into(),
             line: span.line, col: span.col,
         })?;
-        let cap = resolve_shape_expr(cap_expr, &self.shape_env, span)?;
+        let cap = resolve_shape_expr(cap_expr, &self.shape_env, Some(&self.scope_const_dims()), span)?;
         if cap <= 0 {
             return err(span, format!("`forge.kv` capacity must be > 0, got {}", cap));
         }
@@ -7383,9 +12159,17 @@ impl<'a> Translator<'a> {
         span: &Span,
     ) -> Result<(), JitError> {
         let (src, src_ty) = self.lower_expr(rhs)?;
-        let st = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("`<-` requires a tensor on the right, got `{}`", src_ty.render()),
-            line: span.line, col: span.col,
+        // #760: `cache <- fns` where `fns` is a `map_get` result (`OptI64`)
+        // refuses classed, citing #721, not the uncoded `jit error` below.
+        let st = src_ty.as_tensor().ok_or_else(|| {
+            if matches!(src_ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "`<-` requires a tensor on the right, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("`<-` requires a tensor on the right, got `{}`", src_ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         // Element-type check: allow bf16-sourced frames into f32 KV caches since
         // the JIT maps bf16 @cast to f32 internally. Other mismatches are errors.
@@ -7819,7 +12603,7 @@ impl<'a> Translator<'a> {
         };
 
         // Resolve shape → TensorTy
-        let dims = self.const_dims(type_args[1], span)?;
+        let dims = self.shape_lit_dims(type_args[1], span)?;
         let numel: i64 = dims.iter().try_fold(1i64, |a, &d| a.checked_mul(d))
             .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None, msg: "vault.load: shape overflow".into(), line: span.line, col: span.col })?;
 
@@ -7900,7 +12684,7 @@ impl<'a> Translator<'a> {
         };
 
         // Resolve shape → TensorTy
-        let dims = self.const_dims(type_args[1], span)?;
+        let dims = self.shape_lit_dims(type_args[1], span)?;
         let numel: i64 = dims.iter().try_fold(1i64, |a, &d| a.checked_mul(d))
             .ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None, msg: "vault.load_npz: shape overflow".into(), line: span.line, col: span.col })?;
 
@@ -8096,6 +12880,8 @@ impl<'a> Translator<'a> {
                         "fuse-infeasible: bf16 tensor values are not supported inside @fuse"),
                     Some(TyKind::Enum(_)) => err(ispan,
                         "fuse-infeasible: enum values are not supported inside @fuse"),
+                    Some(TyKind::Budget) => err(ispan,
+                        "fuse-infeasible: a Budget handle has no elementwise form"),
                     None => err(ispan, format!("unknown identifier `{}`", name)),
                 }
             }
@@ -8191,7 +12977,7 @@ impl<'a> Translator<'a> {
             Some(x) => x,
             None => return err(span, "reshape: expected a shape list in brackets"),
         };
-        let dims = self.const_dims(shape_expr, span)?;
+        let dims = self.shape_lit_dims(shape_expr, span)?;
         let new = TensorTy { elem: old.elem, shape: dims };
         if new.nelems() != old.nelems() {
             return err(span, format!(
@@ -8229,6 +13015,370 @@ impl<'a> Translator<'a> {
         self.builder.seal_block(exit);
     }
 
+    /// Fill `n` consecutive elements at `out` with a constant, one element at
+    /// a time at the element type's STORAGE width — the width-generic twin of
+    /// `fill_const`, which writes f32 words and so can only express a pattern
+    /// that is correct at 32 bits. `forge.ones[u8, [N]]` needs a one-byte 1 in
+    /// every lane, not a 32-bit float in every fourth (#632).
+    fn fill_elem_const(&mut self, out: Value, elem: ScalarKind, n: i64, val: f64) {
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        let one = self.builder.ins().iconst(cl::I64, 1);
+        let cap = self.builder.ins().iconst(cl::I64, n);
+        let eb = self.builder.ins().iconst(cl::I64, elem.store_bytes());
+        let fv = match elem {
+            ScalarKind::F32 => self.builder.ins().f32const(val as f32),
+            ScalarKind::F64 => self.builder.ins().f64const(val),
+            _ => self.builder.ins().iconst(elem.store_cl(), val as i64),
+        };
+        let hdr = self.builder.create_block();
+        let body = self.builder.create_block();
+        let exit = self.builder.create_block();
+        self.builder.append_block_param(hdr, cl::I64);
+        self.jump(hdr, &[zero]);
+        self.enter(hdr);
+        let i = self.builder.block_params(hdr)[0];
+        let cont = self.builder.ins().icmp(IntCC::SignedLessThan, i, cap);
+        self.brif(cont, body, exit);
+        self.enter(body);
+        let off = self.builder.ins().imul(i, eb);
+        // `fv` is already at the storage width, so store it directly rather
+        // than through `tensor_store_elem_k` (which would mask a value it has
+        // no reason to and re-truncate an already-truncated one).
+        self.tensor_store_elem(out, off, fv);
+        let inext = self.builder.ins().iadd(i, one);
+        self.jump(hdr, &[inext]);
+        self.builder.seal_block(body);
+        self.builder.seal_block(hdr);
+        self.enter(exit);
+        self.builder.seal_block(exit);
+    }
+
+    /// #634: lower `recv.method(args)` as `M$$method(recv, args)` when `recv`
+    /// is a model this translator can type statically and `M` declares
+    /// `method`. `None` means "not a model method call" — the caller falls
+    /// through to its remaining interceptions unchanged.
+    ///
+    /// The receiver becomes the first positional argument, so everything a `!`
+    /// parameter already does happens for free: `!self` is a model parameter,
+    /// which `lower_call` passes as the bare i64 pointer to the instance's
+    /// field struct (`jit.rs`'s `!`-model note below), so a write through
+    /// `self` lands in the caller's instance — `f(m, m)` mutating one instance
+    /// through both names on both backends is the same property, and is what
+    /// p17 pins.
+    ///
+    /// Receivers `model_of_expr` cannot type answer `None` and keep refusing:
+    /// an `Index` (`arr[0].bump!()`, p22) and a call result
+    /// (`m.bump!().bump!()`, p23) are the two, and the corpus census in the
+    /// design finds zero of either. That is the same predicate keeping a
+    /// cross-file UFCS chain out, so widening it is not free.
+    ///
+    /// **Slice 2** adds the shape-generic receiver: `M$$method` is a template
+    /// then, and the symbol actually called is one *instantiation* of it,
+    /// `mangle_mono_method_name`'s `Buf$$N4$$fill!`, declared here the first
+    /// time a call site presents that shape tuple and enqueued on
+    /// `self.pending` — the same worklist `instantiate_template` uses for a free
+    /// template, and the same `declare_monomorph`/`define_fn` drain in passes
+    /// 3/4. Declaring into `self.fns` **before** pushing the pending entry is
+    /// what makes a recursive method resolve (p12's shape, one instantiation
+    /// deep).
+    ///
+    /// **Two shape environments, not one.** The receiver's `type_args` and the
+    /// call's own bracket are separate bindings that happen to share a
+    /// namespace, and a method shape param may *shadow* a model one:
+    /// `model Buf[N] { !t: Tensor[i64,[N]]  fn f![N](self, x: Tensor[i64,[N]]) }`
+    /// is legal, and `dmc run` resolves the body's bare `N` method-first —
+    /// `sum(self.t) * 10 + N` on a `Buf[4]` called `f![2]` answers `42`, because
+    /// `self.t` is `[4]` and `N` is `2`. Merging the two into one map let the
+    /// bracket overwrite the model's binding, and everything downstream of that
+    /// map then spoke about the wrong instantiation: the receiver's type
+    /// resolved to `Buf[2]`, its field to `[2]`, and the symbol to
+    /// `Buf$$N2$$f!$N2` for a `Buf[4]` receiver — so `Buf[4]` and `Buf[2]`
+    /// receivers called `f![2]` landed on **one** symbol and one body. That is
+    /// #474's failure with a shadow as its trigger, and it was silent: measured
+    /// before the fix, `sum(self.t)` on a `Buf[4]` at `f![2]` answered `4` under
+    /// `dmc run` and `2` under `dmc jit`.
+    ///
+    /// So: `model_bindings` resolves the receiver's type, its fields and the
+    /// model half of the symbol — through `receiver_shape_key`'s reserved
+    /// spelling, which nothing can shadow. `method_bindings` resolves the
+    /// method's own names and the method half. The body's env is the two
+    /// merged, method last, which *is* lexical shadowing and is what the
+    /// interpreter does. The unbound check below reads `method_bindings` alone,
+    /// so a shadowed name can no longer pre-satisfy it and answer an omitted
+    /// bracket with the wrong refusal.
+    fn lower_model_method_call(
+        &mut self,
+        callee: &Expr,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Option<Result<(Value, TyKind), JitError>> {
+        // Two callee shapes reach a method: `m.fill!(x)` — `Field` then `Call`
+        // — and `m.blit![2](x)`, where the method's OWN bracket parses as an
+        // `Index` (or `BracketArgs`, for the named `[K=2]` spelling) between
+        // them. The second is why a bracketed method call was `jit-indirect-call`
+        // before this slice: `lower_call`'s `Index` arm requires a bare `Ident`
+        // under the bracket and a method's receiver is never one.
+        //
+        // A bracket element is carried as `Option<&Expr>`: `None` is one that
+        // is not a shape *expression* at all — a slice, a `..`, a spread. It
+        // still occupies its positional slot, so the shape param it names is
+        // reported as spelled-but-not-a-dimension rather than as unspelled,
+        // which is the difference between two very different pieces of advice.
+        type BracketArg<'e> = (Option<String>, Option<&'e Expr>);
+        let (recv, method, bracket): (&Expr, &String, Vec<BracketArg<'_>>) = match callee {
+            Expr::Postfix { expr: recv, op: PostfixOp::Field(m), .. } =>
+                (recv.as_ref(), m, Vec::new()),
+            Expr::Postfix { expr: inner, op: op @ (PostfixOp::Index(_) | PostfixOp::BracketArgs(_)), .. } => {
+                let Expr::Postfix { expr: recv, op: PostfixOp::Field(m), .. } = inner.as_ref() else {
+                    return None;
+                };
+                let mut b: Vec<BracketArg<'_>> = Vec::new();
+                match op {
+                    PostfixOp::Index(elems) => for e in elems {
+                        match e {
+                            IndexElem::Expr(x) => b.push((None, Some(x))),
+                            // A slice or `..` in this position is not a shape
+                            // argument, and `dmc run` says so too — "shape
+                            // argument `SH` of `M.blit!` must be an integer,
+                            // got range". It binds nothing, and the refusal
+                            // below names it as spelled.
+                            _ => b.push((None, None)),
+                        }
+                    },
+                    PostfixOp::BracketArgs(bargs) => for a in bargs {
+                        match a {
+                            CallArg::Positional(e) => b.push((None, Some(e))),
+                            CallArg::Named { name, value, .. } => b.push((Some(name.clone()), Some(value))),
+                            CallArg::Spread(_) => b.push((None, None)),
+                        }
+                    },
+                    _ => unreachable!(),
+                }
+                (recv.as_ref(), m, b)
+            }
+            _ => return None,
+        };
+        let (model, type_args) = self.model_ty_of_expr(recv)?;
+        if !self.model_methods.get(&model).is_some_and(|ms| ms.iter().any(|n| n == method)) {
+            return None;
+        }
+        let model_sps: Vec<String> =
+            self.model_shape_params.get(&model).cloned().unwrap_or_default();
+
+        // The bracket-free, bracket-less case: a non-generic model's
+        // non-generic method, declared eagerly in pass 1 (slice 1). Nothing to
+        // instantiate.
+        let base = mangle_method_name(&model, method);
+        if model_sps.is_empty() && bracket.is_empty() && self.fns.contains_key(&base) {
+            return Some(self.lower_method_as_free_call(&base, recv, args, span));
+        }
+
+        let Some(tmpl) = self.templates.get(&base).cloned() else {
+            // #747: a bracket-LESS call reaches here too, whenever the
+            // method's own `method_fn_decl` never finished declaring in pass
+            // 1 — e.g. a `View` param, which the JIT does not yet accept in
+            // ANY signature (`declare_fn`'s `ty_from_ast` refuses it there,
+            // free fn or method alike). That failure has nothing to do with
+            // a shape bracket, so re-surface the TRUE stored reason instead
+            // of blaming one: `model_method_errors` carries whatever
+            // `declare_fn` actually said (its own class — `jit-type-form` for
+            // an unlowerable param type — and true wording), keyed by this
+            // same mangled `base`.
+            //
+            // #755: the stored error's line/col are the DECLARATION's own —
+            // correct as-is — but `current_decl_file` right now holds the
+            // CALLING body's file (set by `define_fn` before this Translator
+            // ever ran), not the file the method was actually declared in.
+            // Left alone, `Jit::attribute` stamps the re-surfaced error with
+            // the wrong file on a merged, multi-file build — the
+            // declaration's line/col under the caller's filename, which
+            // names a location that may not even exist there. Overwrite
+            // `current_decl_file` with the file captured alongside this
+            // entry before returning: nothing runs between here and
+            // `attribute` reading it back, since the error propagates
+            // straight out via `?`.
+            //
+            // The message is also rewound through
+            // `model_method_call_refusal_msg`, wrapping the true stored
+            // reason with the model's own name and
+            // `MODEL_METHOD_CALL_REFUSAL_MARKER` — every call site names the
+            // SAME underlying cause, and Pass 1 (`compile_program_inner`/
+            // `compile_program_collect`) records that cause ONCE, as a root
+            // at the model's OWN item, whether or not the method is ever
+            // called (D3, #755). Without this wrapper `cascade_candidate_name`
+            // has nothing to resolve, and collect mode counts every call
+            // site as its own independent, unattributed blocker instead of a
+            // cascade of that one root.
+            if let Some((e, decl_file)) = self.model_method_errors.get(&base) {
+                *self.current_decl_file = decl_file.clone();
+                let mut e = e.clone();
+                e.msg = model_method_call_refusal_msg(&model, &e.msg);
+                return Some(Err(e));
+            }
+            // No stored declare-time error and still no template: the method
+            // DID declare, so the only way to land here is a bracket on a
+            // method that declares no shape params of its own. `check.rs`
+            // already rejects that (q9: "`Buf.fill!` declares 0 shape
+            // parameter(s), got more bracket args"), so this is unreachable
+            // from a program that type-checks; refuse rather than silently
+            // drop the bracket if some path ever gets here.
+            return Some(unsupported_msg(span, Refusal::UnknownFn, format!(
+                "the `.{}()` method on model `{}` called with a shape bracket it \
+                 does not declare; use `dmc run` for full semantics", method, model)));
+        };
+        // The method's own shape params are whatever `method_fn_decl` appended
+        // after the model's.
+        let method_sps: Vec<String> = tmpl.shape_params.iter()
+            .skip(model_sps.len()).map(|sp| sp.name.clone()).collect();
+
+        // Bind the model's half from the receiver's own type. A receiver whose
+        // type carries no arguments (`fn f(m: M)` for `model M[N]`) is refused,
+        // not inferred — the same posture, class and wording #706/#709 take for
+        // a field read through that receiver, and for the same reason: there is
+        // no honest binding for `N` at that call, and inventing one is how #474
+        // silently ran the wrong body.
+        let mut model_bindings: HashMap<String, i64> = HashMap::new();
+        if !model_sps.is_empty() {
+            if type_args.len() < model_sps.len() {
+                return Some(unsupported_msg(span, Refusal::TypeForm, format!(
+                    "the `.{}()` method on `{}`: the receiver's shape arguments are \
+                     not known here; write the receiver's type with its arguments \
+                     (`m: {}[4]`)", method, model, model)));
+            }
+            for (sp, d) in model_sps.iter().zip(type_args.iter()) {
+                model_bindings.insert(sp.clone(), *d);
+            }
+        }
+        // Bind the method's own half from the call's bracket, into a map of its
+        // own. Deliberately NOT inferred from the ordinary arguments the way
+        // `instantiate_template` infers a free template's: the arguments are
+        // lowered inside `lower_call` below, and lowering them here to unify
+        // against would emit every argument's side effects twice. `dmc run` does
+        // infer, so the bracket-less spelling of such a call is a gap (refused,
+        // located) rather than a divergence.
+        let mut method_bindings: HashMap<String, i64> = HashMap::new();
+        // Shape params the call did put a bracket element against, whether or
+        // not that element named a compile-time dimension. The two failures
+        // want different advice: `.blit!(t)` has nothing written, while
+        // `.blit![k](t)` and `.blit![0..2](t)` wrote something that is not a
+        // dimension, and telling either user to "write it" is wrong for one.
+        let mut spelled: Vec<String> = Vec::new();
+        let mut pos = 0usize;
+        let consts_in_scope = self.scope_const_dims();
+        for (arg_name, e) in &bracket {
+            let sp_name = match arg_name {
+                Some(n) => {
+                    if !method_sps.iter().any(|sp| sp == n) {
+                        return Some(err(span, format!(
+                            "`{}` is not a shape parameter of `{}.{}`", n, model, method)));
+                    }
+                    n.clone()
+                }
+                None => match method_sps.get(pos) {
+                    Some(n) => { pos += 1; n.clone() }
+                    None => return Some(err(span, format!(
+                        "`{}.{}` declares {} shape parameter(s), got more bracket args",
+                        model, method, method_sps.len()))),
+                },
+            };
+            spelled.push(sp_name.clone());
+            // A bracket arg that does not resolve to a compile-time dim is
+            // skipped, exactly as `instantiate_template` skips one; the
+            // unbound check just below is what reports it.
+            if let Some(d) = e.and_then(|x| {
+                resolve_shape_expr(x, &self.shape_env, Some(&consts_in_scope), span).ok()
+            }) {
+                method_bindings.insert(sp_name, d);
+            }
+        }
+        // Only the method's own map: a model shape param the method shadows
+        // used to sit in here and pre-satisfy this check, so an omitted bracket
+        // fell through to instantiate at the *model's* value and then failed
+        // downstream on an argument type instead of being refused here.
+        if let Some(unbound) = method_sps.iter().find(|sp| !method_bindings.contains_key(*sp)) {
+            let msg = if spelled.iter().any(|s| s == unbound) {
+                format!(
+                    "the `.{}()` method on model `{}`: its own shape parameter `{}` is \
+                     not a compile-time dimension at the call; write a literal or a \
+                     module constant (`.{}[{}](..)`) or use `dmc run` for full semantics",
+                    method, model, unbound, method, unbound)
+            } else {
+                format!(
+                    "the `.{}()` method on model `{}`: its own shape parameter `{}` is \
+                     not spelled at the call and the JIT does not infer a method's \
+                     bracket from its arguments; write it (`.{}[{}](..)`) or use \
+                     `dmc run` for full semantics",
+                    method, model, unbound, method, unbound)
+            };
+            return Some(unsupported_msg(span, Refusal::UnknownFn, msg));
+        }
+
+        let mangled = mangle_mono_method_name(
+            &model, &model_sps, method, &method_sps, &model_bindings, &method_bindings);
+        if !self.fns.contains_key(&mangled) {
+            // The env the signature and the body both see. The model's names
+            // first and the method's over them — lexical shadowing, which is
+            // what `dmc run` does — plus the receiver slot's reserved keys,
+            // which the method's half cannot reach and so cannot respell.
+            let mut shape_env = model_bindings.clone();
+            shape_env.extend(method_bindings.iter().map(|(k, v)| (k.clone(), *v)));
+            for (sp, d) in model_sps.iter().zip(type_args.iter()) {
+                shape_env.insert(receiver_shape_key(&model, sp), *d);
+            }
+            // Same shadowing rule `instantiate_template` applies: a module
+            // constant may spell a dimension in this signature, but a param
+            // name or one of the template's own shape params wins.
+            let consts = visible_const_dims(self.const_dims, |n| {
+                tmpl.params.iter().any(|p| p.name == n)
+                    || tmpl.shape_params.iter().any(|sp| sp.name == n)
+            });
+            let sig = match declare_template_signature(
+                self.module, &tmpl, &shape_env, Some(&consts), &mangled,
+                self.enums, self.aliases) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            self.fns.insert(mangled.clone(), sig);
+            // #717 gap review (this fix): `declare_template_signature` builds
+            // an omitted `-> T` the same Nil-assuming way `declare_fn` does,
+            // but — unlike `declare_fn` — never recorded that assumption in
+            // `omitted_ret_fns`. A shape-generic model method with no
+            // declared return type (this instantiation's `tmpl`) was
+            // therefore invisible to the #695/#720 `map_get`/`map_set`/
+            // `map_contains` guard no matter what `resolve_direct_call_name`
+            // resolved it to: the name was never in the set the guard
+            // consults. Recorded here, at the one site an instantiation's
+            // mangled name and its template are both in hand together.
+            if tmpl.ret_type.is_none() {
+                self.omitted_ret_fns.insert(mangled.clone());
+            }
+            self.pending.push(PendingMono {
+                template_name: base,
+                shape_env,
+                mangled_name: mangled.clone(),
+                call_span: span.clone(),
+            });
+        }
+        Some(self.lower_method_as_free_call(&mangled, recv, args, span))
+    }
+
+    /// The receiver-first call every model method lowers to, once its symbol is
+    /// known: `M$$method(recv, args..)`. Split out only so the monomorphic and
+    /// the monomorphized paths cannot drift apart on argument order.
+    fn lower_method_as_free_call(
+        &mut self,
+        symbol: &str,
+        recv: &Expr,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Result<(Value, TyKind), JitError> {
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(CallArg::Positional(recv.clone()));
+        call_args.extend(args.iter().cloned());
+        let callee_ident = Expr::Ident(symbol.to_string(), span.clone());
+        self.lower_call(&callee_ident, &call_args, span)
+    }
+
     fn lower_postfix(
         &mut self,
         expr: &Expr,
@@ -8237,6 +13387,29 @@ impl<'a> Translator<'a> {
     ) -> Result<(Value, TyKind), JitError> {
         match op {
             PostfixOp::Call(args) => {
+                // #634: a genuine model
+                // method. `SPEC.md §4.12` lists it first among UFCS's
+                // exceptions — `instance.method(..)` "calls the method declared
+                // in the model body and is **never** rewritten as a
+                // free-function call" — so it arrives here as `Field` then
+                // `Call`, never desugared, and is lowered as the receiver-first
+                // free call `M$$method(recv, args..)` (or, on a shape-generic
+                // model, one instantiation of it: `Buf$$N4$$fill!`). A method
+                // with a bracket of its OWN arrives with an `Index` between the
+                // `Field` and the `Call`, which the same function takes.
+                //
+                // Placement is load-bearing. This runs BEFORE the payload-enum
+                // and `.starts_with` interceptions below, so a model that
+                // declares a `starts_with` method takes its own method and not
+                // the str builtin, and before `lower_call`, which both of those
+                // already short-circuit. It keys on `model_of_expr` answering
+                // `Some` — never on the chain's shape — because a CROSS-FILE
+                // UFCS call (#627) arrives in the identical `Field`-then-`Call`
+                // shape and must keep refusing: `model_of_expr` answers `None`
+                // for its non-model receiver, so it falls through untouched.
+                if let Some(r) = self.lower_model_method_call(expr, args, span) {
+                    return r;
+                }
                 // A `.fwd_bwd(...)` reaching here was not destructured.
                 if let Expr::Postfix { op: PostfixOp::Field(m), .. } = expr {
                     if m == "fwd_bwd" {
@@ -8298,6 +13471,18 @@ impl<'a> Translator<'a> {
                         }
                     }
                 }
+                // #674 slice 3c: `forge.carve(parent, bytes)` / `forge.reap(b)`
+                // now lower — they used to fall through to `lower_call`'s
+                // generic Field+Call arm and refuse `jit-unknown-fn` (3a).
+                // `forge.enter`/`in b` are NOT here: they keep that same 3a
+                // refusal until slice 3d wires the entered-budget register.
+                if let Expr::Postfix { expr: recv, op: PostfixOp::Field(method), .. } = expr {
+                    if let Expr::Ident(base, _) = recv.as_ref() {
+                        if base == "forge" && matches!(method.as_str(), "carve" | "reap") {
+                            return self.lower_forge_budget_call(method, args, span);
+                        }
+                    }
+                }
                 // String methods are dispatched as builtins, never rewritten to
                 // free calls (SPEC §4.12), so they arrive here as Field+Call and
                 // would otherwise read as an indirect call. Only `starts_with`
@@ -8322,7 +13507,10 @@ impl<'a> Translator<'a> {
                     if method == "zeros" || method == "ones" || method == "uninit" {
                         if let Expr::Ident(base, _) = inner.as_ref() {
                             if base == "forge" || base == "vault" {
-                                return self.lower_arena_alloc(method, idxs, span);
+                                // #674 slice 3d (§3.5): the spelling is passed
+                                // down — it decides the budget the buffer
+                                // lands in, not just the diagnostic text.
+                                return self.lower_arena_alloc(base, method, idxs, span);
                             }
                         }
                     }
@@ -8341,6 +13529,21 @@ impl<'a> Translator<'a> {
                 self.lower_index(expr, idxs, span)
             }
             PostfixOp::Field(field) => {
+                // #674 slice 3c: `forge.root` is entry 0 of the budget table
+                // — the packed descriptor `(gen << 20) | index` with
+                // `gen = 0, index = 0`, i.e. the constant `0` (§3.1). 3a
+                // reclassified the old uncoded `jit error: unknown binding
+                // `forge`` into a coded `jit-ineligible` "not yet
+                // implemented" refusal; this slice replaces that refusal
+                // with the lowering it always meant to be a placeholder for.
+                if field == "root" {
+                    if let Expr::Ident(base, _) = expr {
+                        if base == "forge" {
+                            let z = self.builder.ins().iconst(cl::I64, 0);
+                            return Ok((z, TyKind::Budget));
+                        }
+                    }
+                }
                 // Grad-struct field access: `grads.W` → look up `grads$W` local
                 // (synthesized by lower_fwd_bwd_destructure for multi-param @grad).
                 if let Expr::Ident(name, _) = expr {
@@ -8399,12 +13602,69 @@ impl<'a> Translator<'a> {
                                 let env: HashMap<String, i64> = params.iter().cloned()
                                     .zip(type_args.iter().copied()).collect();
                                 fasts.iter().find(|(n, _)| n == field)
-                                    .and_then(|(_, fast)| lower_ty_for_model(fast, &env, span).ok())
+                                    .and_then(|(_, fast)| lower_ty_for_model(
+                                        fast, &env, Some(self.const_dims), span).ok())
                                     .map(|t| enumify(t, self.enums))
                             }
                             _ => None,
                         };
                         if let Some(rt) = resolved { field_ty = rt; }
+                    } else if let Some(shape_params) = self.model_shape_params.get(&model_name) {
+                        // #706: the READ-side twin of #683's store guard
+                        // (`lower_expr_stmt`'s field-store arm). A
+                        // shape-generic model reached through a type-arg-less
+                        // receiver (`fn first(m: M)` for `model M[N]`) never
+                        // runs the re-resolution above, so a field whose
+                        // declared type reaches directly for one of `M`'s own
+                        // shape params — a `Tensor`/`View`/`KV` dimension —
+                        // is still the param-agnostic layout's best-effort
+                        // guess: a `Tensor[i64,[N]]` field collapsed to
+                        // opaque `Scalar(I64)` (`lower_ty_for_model`'s tensor
+                        // arm). Loading it as that placeholder mistypes a
+                        // tensor as `i64` — this issue's uncoded `jit error:
+                        // indexing requires a tensor or str, got i64` (#480
+                        // class). Refuse it as a located `jit-type-form`: the
+                        // field's WRITTEN type is one the JIT cannot build
+                        // without the receiver's shape args, the same class a
+                        // `Signature`/model-field type it cannot build
+                        // already uses (DIAGNOSTICS.md §5.2).
+                        //
+                        // A nested parameterized-model field (`attn: Attn[N]`)
+                        // is deliberately NOT flagged here — `field_ty_mentions
+                        // _params` no longer looks inside a `Type::Named`'s own
+                        // args. It resolves against the empty env to
+                        // `Model("Attn", [])` (`type_named_dims`'s `env.get`
+                        // miss) and keeps lowering; the *next* field access
+                        // into it (`m.attn.w`) runs this same guard again with
+                        // `Attn`'s own shape params, refusing there instead —
+                        // at whichever nested field actually mentions a
+                        // param, a better-located message than blaming the
+                        // outer field. A field whose type does not mention a
+                        // shape param — scalar (`n: i64`), a concretely-shaped
+                        // tensor (`Tensor[i64,[4]]`), or a nested model with
+                        // nothing param-shaped inside — resolved correctly
+                        // above with the empty env and keeps lowering below;
+                        // only slice 2's per-instantiation receiver — the one
+                        // keyed off the model's own shape args — removes this guard.
+                        if !shape_params.is_empty() {
+                            if let Some(fasts) = self.model_field_asts.get(&model_name) {
+                                if let Some((_, fast)) = fasts.iter().find(|(n, _)| n == field) {
+                                    if field_ty_mentions_params(fast, shape_params) {
+                                        return unsupported_msg(
+                                            span,
+                                            Refusal::TypeForm,
+                                            format!(
+                                                "field `{}` of `{}`: the receiver's shape \
+                                                 arguments are not known here; write the \
+                                                 receiver's type with its arguments \
+                                                 (`m: M[4]`)",
+                                                field, model_name
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     let offset = (field_idx as i64) * 8;
                     let offset_val = self.builder.ins().iconst(cl::I64, offset);
@@ -8439,7 +13699,7 @@ impl<'a> Translator<'a> {
             PostfixOp::BracketArgs(_) => unsupported(span, Refusal::Construct, "generic-style bracket args"),
             PostfixOp::Constructor(_) => unsupported(span, Refusal::Construct, "model constructor"),
             PostfixOp::Transpose => self.lower_transpose(expr, span),
-            PostfixOp::Query => unsupported(span, Refusal::Construct, "error propagation `?`"),
+            PostfixOp::Query => self.lower_query(expr, span),
         }
     }
 
@@ -8449,6 +13709,91 @@ impl<'a> Translator<'a> {
         args: &[CallArg],
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
+        // #708 (`SPEC.md §3.10`): `instance(x, ...)` desugars to
+        // `instance.forward(x, ...)` when the callee evaluates to a model
+        // instance declaring `forward`. The interpreter's desugar is
+        // value-directed (`interp.rs`'s `Value::Struct` arm dispatches on
+        // whatever the callee evaluated to, never on the callee's own
+        // syntax), so this reaches for the same breadth statically:
+        // `model_ty_of_expr` answers `Some` for an `Ident` receiver (`l(7)`)
+        // and equally for a field receiver (`o.inner(7)`) — anything
+        // `l.forward(7)` / `o.inner.forward(7)` already resolves through
+        // `lower_model_method_call`'s `recv` position, since that is exactly
+        // the function this hands off to. A call-result, literal, or
+        // element receiver (`mk()(7)`, `M{..}(7)`, `ms[0](7)`) is not covered
+        // — `model_ty_of_expr` answers `None` there by design (see its own
+        // doc comment) — and falls through to the ordinary indirect-call /
+        // unknown-fn refusals below, which name the model where they can.
+        //
+        // This check must run before the indirect-call check just below: a
+        // model binding's `TyKind` is never `Fn`, so the two never compete
+        // for the same callee, but a model that also happened to be
+        // `Fn`-typed would be a language change, not a JIT one, so the
+        // ordering does not rely on that fact staying true.
+        if let Some((model, _type_args)) = self.model_ty_of_expr(callee) {
+            if self.model_methods.get(&model).is_some_and(|ms| ms.iter().any(|m| m == "forward")) {
+                // #734: `--check` does not type the desugared call, so
+                // `m(7, 8)` on a `forward` that takes one argument passes
+                // `--check` and only fails at `dmc run`'s runtime arity
+                // check. Without a check of our own here, this call falls
+                // into the synthesized `.forward(..)` call below, through
+                // `lower_method_as_free_call` into `lower_call`'s generic
+                // "resolve callee" path, and out through the shared
+                // `arg_vals.len() != entry.params.len()` `err(..)` there —
+                // an uncoded `jit-error`, naming the mangled symbol
+                // (`Model$$forward`) rather than the model and `forward` the
+                // program actually wrote. Catch the mismatch here instead,
+                // as a located, classed `jit-unknown-fn` refusal — the same
+                // class the base commit already gives a model with no
+                // `forward` at all — so a type-clean-but-wrong-arity
+                // desugar refuses cleanly instead of erroring uncoded.
+                let base = mangle_method_name(&model, "forward");
+                let declared_params = self.fns.get(&base).map(|e| e.params.len())
+                    .or_else(|| self.templates.get(&base).map(|t| t.params.len()));
+                if let Some(want) = declared_params {
+                    // `want` counts `self`; the call supplies the receiver
+                    // implicitly (never as an explicit arg), so the
+                    // comparable count is `args.len() + 1`.
+                    let got = args.len() + 1;
+                    if got != want {
+                        return unsupported_msg(span, Refusal::UnknownFn, format!(
+                            "model `{}` instance called as a function, `m(..)`, \
+                             desugars to `.forward(..)` (SPEC.md §3.10), but \
+                             `{}.forward` takes {} argument(s) (including `self`) \
+                             and this call supplies {} (the receiver plus {} \
+                             explicit argument(s)) — `--check` does not type this \
+                             desugar (#734), so the mismatch is only caught here",
+                            model, model, want, got, args.len()));
+                    }
+                }
+                let synthetic = Expr::Postfix {
+                    expr: Box::new(callee.clone()),
+                    op: PostfixOp::Field("forward".to_string()),
+                    span: span.clone(),
+                };
+                if let Some(r) = self.lower_model_method_call(&synthetic, args, span) {
+                    return r;
+                }
+                // `model_methods` said `forward` exists but
+                // `lower_model_method_call`'s own (identical) guard still
+                // declined — unreachable in practice; fall through rather
+                // than silently drop the call.
+            } else {
+                // The model exists and was called as a function, but
+                // declares no `forward`. `dmc run` reaches this as a
+                // *runtime* error — `cannot call struct value (no
+                // `forward` method found)` — because `--check` does not
+                // catch it (SPEC §3.10's desugar is untyped there); the
+                // JIT needs its own located refusal for the same program
+                // rather than falling through to the generic "unknown
+                // function" message below, which would misname a real
+                // model instance as an unresolved identifier.
+                return unsupported_msg(span, Refusal::UnknownFn, format!(
+                    "model `{}` instance called as a function, `m(x)`, but \
+                     `{}` declares no `forward` method — SPEC.md §3.10's \
+                     desugar has nothing to rewrite to", model, model));
+            }
+        }
         // Indirect call: callee is a local variable with a `TyKind::Fn` type.
         // Handles both typed `fn(...)` locals and i64 pointers via explicit annotation.
         if let Expr::Ident(name, _) = callee {
@@ -8485,6 +13830,52 @@ impl<'a> Translator<'a> {
             Expr::Postfix { expr: inner, op, .. }
                 if matches!(op, PostfixOp::Index(_) | PostfixOp::BracketArgs(_)) =>
             {
+                // #708/#735: `m[3](7)` — a model instance indexed with a
+                // bracket, then called — and `ms[0](7)` — an element of a
+                // model array indexed, then called — both parse identically
+                // to a generic function's explicit-shape-args call
+                // (`f[4](..)`), which is what the code below this treats
+                // every such shape as. Before this check that generic path
+                // is what ran for both: `inner` resolved to the model's own
+                // binding name (`m` or `ms`), neither is a function, and the
+                // "unknown function" fallback further down named that
+                // binding — true of no function existing by that name,
+                // false of what the program actually wrote, which was a
+                // model instance or array, not an unresolved symbol.
+                //
+                // `m[3](7)` is not a spelling SPEC.md §3.10 gives meaning
+                // to: the interpreter does not dispatch `forward[3]` there
+                // either, it indexes `m` as if it had element type and
+                // prints `<opaque index(...)>` (#735, filed by this same
+                // review). `ms[0](7)` is the ordinary array-element-receiver
+                // case #708's field/tuple widening does not cover —
+                // `model_ty_of_expr` answers `None` for an `Index` receiver
+                // by design (see its doc comment) — so it refuses like any
+                // other element receiver, just with an honest message.
+                if let Expr::Ident(n, _) = inner.as_ref() {
+                    match self.local_tys.get(n.as_str()) {
+                        Some(TyKind::Model(model, _)) => {
+                            let model = model.clone();
+                            return unsupported_msg(span, Refusal::UnknownFn, format!(
+                                "model `{}` instance `{}` called with a bracket, \
+                                 `{}[..](..)` — the JIT does not lower a bracketed \
+                                 call-as-function spelling (`dmc run` does not \
+                                 dispatch it either — it prints `<opaque \
+                                 index(...)>`, #735); write `{}.forward[..](..)` \
+                                 explicitly, or use `dmc run` for full semantics",
+                                model, n, n, n));
+                        }
+                        Some(TyKind::ModelArray(model, _, _)) => {
+                            let model = model.clone();
+                            return unsupported_msg(span, Refusal::UnknownFn, format!(
+                                "`{}[i](..)` indexes a `[{}; N]` model array and \
+                                 calls the element as a function — the JIT does not \
+                                 resolve an array-element receiver to a specific \
+                                 instance; use `dmc run` for full semantics", n, model));
+                        }
+                        _ => {}
+                    }
+                }
                 match op {
                     PostfixOp::Index(elems) => {
                         for e in elems {
@@ -8515,10 +13906,25 @@ impl<'a> Translator<'a> {
             // thing: the program wrote `e.trim()`, not a call through a value,
             // and the refusal sent the reader looking for a closure. Name the
             // method that was actually written.
-            Expr::Postfix { op: PostfixOp::Field(m), .. } =>
-                return unsupported(span, Refusal::UnknownFn, &format!(
-                    "the `.{}()` method — of the str methods the JIT lowers \
-                     `.starts_with`, and no other", m)),
+            //
+            // A model receiver `model_of_expr` cannot pin down (p22's array
+            // element, p23's call result) used to fall through to this same
+            // arm and recite the str-method list — the wrong family entirely,
+            // sending the reader looking at strings for a receiver that was
+            // never one. `model_of_expr_diag_hint` widens *only this message*,
+            // never the lowering predicate above (`lower_model_method_call`
+            // keeps refusing both; see that function's doc comment for why
+            // that stays narrow).
+            Expr::Postfix { expr: recv, op: PostfixOp::Field(m), .. } =>
+                return match self.model_of_expr_diag_hint(recv) {
+                    Some(model) => unsupported(span, Refusal::UnknownFn, &format!(
+                        "the `.{}()` method on model `{}` — its receiver is not \
+                         a binding the JIT can resolve to a specific instance \
+                         (an array element or a call result)", m, model)),
+                    None => unsupported(span, Refusal::UnknownFn, &format!(
+                        "the `.{}()` method — of the str methods the JIT lowers \
+                         `.starts_with`, and no other", m)),
+                },
             _ => return unsupported(span, Refusal::IndirectCall, "indirect / dynamic calls"),
         };
 
@@ -8553,6 +13959,15 @@ impl<'a> Translator<'a> {
             "port_tensor_encode" => return self.lower_builtin_port_tensor_encode(args, span),
             "port_tensor_decode" => return self.lower_builtin_port_tensor_decode(args, span),
             "port_close"   => return self.lower_builtin_port_close(args, span),
+            // File I/O (STDLIB.md ~§3.10) as host calls; `read_bytes` stays
+            // `dmc run`-only (its `Tensor[i64,[N]]` result would need
+            // `TyKind::DynTensor`, which exists but is reachable only from KV
+            // reads and isn't plumbed for an i64-element host-call result)
+            // and falls through to the generic `jit-unknown-fn` refusal below.
+            "read_file"    => return self.lower_builtin_read_file(args, span),
+            "write_file"   => return self.lower_builtin_write_file(args, span),
+            "append_file"  => return self.lower_builtin_append_file(args, span),
+            "file_exists"  => return self.lower_builtin_file_exists(args, span),
             "str_concat"   => return self.lower_builtin_str_concat(args, span),
             "str_eq"       => return self.lower_builtin_str_eq(args, span),
             "str_get_char" => return self.lower_builtin_str_get_char(args, span),
@@ -8606,9 +14021,15 @@ impl<'a> Translator<'a> {
                     }
                     // Not a string; dispatch to the appropriate typed print_* fn.
                     let fn_name = match &ty {
-                        // #544: every integer kind prints through `print_i64` —
-                        // a masked narrow kind is already the extended i64 the
-                        // interpreter would render.
+                        // #597: `u64` gets its OWN print helper, checked before
+                        // the general `is_int()` arm below — its pattern can be
+                        // a negative `i64` (top bit set) that names a value at
+                        // or above 2^63, which `print_i64` would render signed.
+                        TyKind::Scalar(ScalarKind::U64) => "print_u64",
+                        // #544: every OTHER integer kind prints through
+                        // `print_i64` — a masked narrow kind is already the
+                        // extended i64 the interpreter would render, and its
+                        // zero-extended pattern is always non-negative.
                         TyKind::Scalar(k) if k.is_int() => "print_i64",
                         TyKind::Scalar(ScalarKind::F64) | TyKind::Scalar(ScalarKind::F32) => "print_f64",
                         TyKind::Scalar(ScalarKind::Bool) => "print_bool",
@@ -8617,6 +14038,7 @@ impl<'a> Translator<'a> {
                     };
                     let coerce_ty = match fn_name {
                         "print_i64"  => TyKind::Scalar(ScalarKind::I64),
+                        "print_u64"  => TyKind::Scalar(ScalarKind::U64),
                         "print_f64"  => TyKind::Scalar(ScalarKind::F64),
                         "print_bool" => TyKind::Scalar(ScalarKind::Bool),
                         _            => TyKind::Scalar(ScalarKind::Nil),
@@ -8732,7 +14154,25 @@ impl<'a> Translator<'a> {
             }
 
             // HashMap builtins.
-            "map_new"      => return self.lower_builtin_map_new(args, span),
+            // `map()` is `map_new()`'s alias (SPEC.md's Map-type paragraph).
+            // #720 review (F2): a user-declared top-level fn named `map` (or,
+            // in principle, `map_new`) must win over this alias — SPEC §4.12
+            // gives a model's own method precedence over a same-named free
+            // fn, and the same "the thing the program actually declared
+            // outranks a builtin spelling" logic applies here: `fn
+            // map(f: fn(i64)->i64, x: i64) -> i64 { f(x) }` is a real,
+            // `--check`-clean, `dmc run`-answering program, and the JIT was
+            // shadowing it with the alias before ever considering `self.fns`
+            // — `map(square, 3)` refused as `map_new takes no arguments`
+            // instead of calling the user's fn. `collect_fns` (the
+            // signature-declaration pre-pass) has already populated
+            // `self.fns`/`self.templates` for every top-level fn by the time
+            // any body lowers, so checking them here is safe: a name absent
+            // from both means no such user fn exists and the alias is free
+            // to claim it.
+            "map" | "map_new" if !self.fns.contains_key(name.as_str())
+                && !self.templates.contains_key(name.as_str()) =>
+                return self.lower_builtin_map_new(args, span),
             "map_get"      => return self.lower_builtin_map_get(args, span),
             "map_set"      => return self.lower_builtin_map_set(args, span),
             "map_contains" => return self.lower_builtin_map_contains(args, span),
@@ -8747,12 +14187,22 @@ impl<'a> Translator<'a> {
         // direct monomorphic resolution OR shape-var unification against a
         // template.
         let mut arg_vals: Vec<(Value, TyKind)> = Vec::with_capacity(args.len());
+        // #810/#812 hint: each argument's own identifier, when it is written
+        // as a plain `Ident` at the call site (`f[8](a, b)`'s `a`), so a bare-
+        // model refusal can name the caller's actual parameter instead of a
+        // placeholder — see `instantiate_template`'s use of this alongside
+        // `Translator::fn_name`.
+        let mut arg_idents: Vec<Option<String>> = Vec::with_capacity(args.len());
         for a in args {
             let e = match a {
                 CallArg::Positional(e) => e,
                 CallArg::Named { span, .. } => return unsupported(span, Refusal::ArgForm, "named call arguments"),
                 CallArg::Spread(s) => return unsupported(s, Refusal::ArgForm, "spread call arguments"),
             };
+            arg_idents.push(match e {
+                Expr::Ident(n, _) => Some(n.clone()),
+                _ => None,
+            });
             let (v, k) = self.lower_expr(e)?;
             arg_vals.push((v, k));
         }
@@ -8792,11 +14242,12 @@ impl<'a> Translator<'a> {
                     return err(span, format!(
                         "shape parameter `{}` of `{}` bound twice", sp_name, tmpl.name));
                 }
-                if let Ok(dim) = resolve_shape_expr(e, &self.shape_env, span) {
+                if let Ok(dim) = resolve_shape_expr(
+                        e, &self.shape_env, Some(&self.scope_const_dims()), span) {
                     explicit.push((sp_name, dim));
                 }
             }
-            self.instantiate_template(&tmpl, &arg_vals, &explicit, span)?
+            self.instantiate_template(&tmpl, &arg_vals, &arg_idents, &explicit, span)?
         } else {
             return unsupported_msg(span, Refusal::UnknownFn, format!("unknown function `{}`", name));
         };
@@ -8813,6 +14264,16 @@ impl<'a> Translator<'a> {
         // second — while preserving the single-arg "callee mutates the caller's
         // tensor" behavior (the writeback restores it). Matches the
         // interpreter's clone-args + writeback-`!` semantics.
+        //
+        // A `!` **model** param takes neither branch, deliberately: the value
+        // already is the i64 pointer to the instance's field struct, so a
+        // callee's `g.vals[i] = …` lands in the caller's instance directly.
+        // That is the interpreter's semantics for a model too (a shared
+        // `Rc<RefCell<..>>`, not a snapshot), including the aliasing corner —
+        // `f(m, m)` mutates one instance through both names on both backends.
+        // (Whole-field assignment — `g.n = g.n + 1` — is a separate gap: the
+        // JIT lowers no model-field store on any binding, `!` parameter or
+        // local, and refuses it as `jit-assign-form`.)
         let mut vals: Vec<Value> = Vec::with_capacity(arg_vals.len());
         let mut writebacks: Vec<(Value, Value, TensorTy)> = Vec::new(); // (orig, copy, ty)
         for (i, (v, k)) in arg_vals.into_iter().enumerate() {
@@ -8832,7 +14293,7 @@ impl<'a> Translator<'a> {
         let call = self.builder.ins().call(func_ref, &vals);
         // Copy each mutated `!` tensor back into the caller's storage.
         for (orig, copy, t) in &writebacks {
-            self.emit_memcpy_loop(*orig, *copy, t.nelems(), t.elem.cl());
+            self.emit_memcpy_loop(*orig, *copy, t.nelems(), t.elem.store_cl());
         }
         let results = self.builder.inst_results(call);
         if entry.ret == TyKind::Scalar(ScalarKind::Nil) {
@@ -8850,6 +14311,7 @@ impl<'a> Translator<'a> {
         &mut self,
         tmpl: &FnDecl,
         arg_vals: &[(Value, TyKind)],
+        arg_idents: &[Option<String>],
         explicit: &[(String, i64)],
         span: &Span,
     ) -> Result<FnEntry, JitError> {
@@ -8874,12 +14336,33 @@ impl<'a> Translator<'a> {
                 }
             }
         }
-        for (p, (_v, k)) in tmpl.params.iter().zip(arg_vals.iter()) {
+        for (i, (p, (_v, k))) in tmpl.params.iter().zip(arg_vals.iter()).enumerate() {
             let p_ty = p.ty.as_ref().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                 msg: format!("template param `{}` needs a type annotation", p.name),
                 line: p.span.line, col: p.span.col,
             })?;
-            unify_param_type(p_ty, k, &mut bindings, &p.span)?;
+            // N1: resolve a top-level `type` alias before unification, same as
+            // every other type-building site (`resolve_alias_ty`'s doc comment
+            // lists them). `unify_param_type` used to read `p_ty` raw, so a
+            // template param written through an alias (`type E = f32  fn
+            // f[N](x: Tensor[E,[N]])`) fell into the `Type::Named` case of the
+            // `Tensor`/`KV` arms — read as "a non-scalar element type" — and
+            // was refused `jit-element-type`, while both the un-aliased
+            // template (`Tensor[f32,[N]]`) and the non-template aliased form
+            // (`fn head(x: Tensor[E,[3]])`) lower. The rule this PR is built
+            // on: if the un-aliased form lowers, the aliased form must too.
+            let resolved_p_ty = resolve_alias_ty(p_ty, self.aliases)?;
+            // #810/#812 hint (reviewer pass): `fn_name` is the ENCLOSING fn
+            // being lowered right now — the one whose own declaration needs
+            // the fix, not `tmpl`'s (the callee being instantiated, already
+            // correctly shaped). `param_name` is this call argument's own
+            // identifier when it is a plain `Ident` — the caller's actual
+            // bare parameter in every fixture `bind_or_refuse_model_shape_args`
+            // covers — falling back to the historical placeholder `a` for an
+            // argument expression the hint can't name this way (a field
+            // access, a call result, …).
+            let param_name = arg_idents.get(i).and_then(|o| o.as_deref()).unwrap_or("a");
+            unify_param_type(&resolved_p_ty, k, &mut bindings, &p.span, span, &self.fn_name, param_name)?;
         }
         // Every declared shape_param must end up bound.
         for sp in &tmpl.shape_params {
@@ -8896,7 +14379,17 @@ impl<'a> Translator<'a> {
         }
         // Declare the specialized fn in the module now (signature only) so
         // we have a FuncId for the call. Definition is queued for later.
-        let sig_decl = declare_template_signature(self.module, tmpl, &bindings, &mangled, self.enums)?;
+        // A module constant (#268) may spell a dimension in this template's
+        // signature alongside its own shape params — as a fallback only, so
+        // `bindings` (which becomes the mono fn's `shape_env`) stays exactly
+        // the shape parameters inferred above. A param name or one of the
+        // template's own shape params shadows a same-named constant.
+        let consts = visible_const_dims(self.const_dims, |n| {
+            tmpl.params.iter().any(|p| p.name == n)
+                || tmpl.shape_params.iter().any(|sp| sp.name == n)
+        });
+        let sig_decl = declare_template_signature(
+            self.module, tmpl, &bindings, Some(&consts), &mangled, self.enums, self.aliases)?;
         self.fns.insert(mangled.clone(), sig_decl.clone());
         self.pending.push(PendingMono {
             template_name: tmpl.name.clone(),
@@ -9135,11 +14628,84 @@ impl<'a> Translator<'a> {
                 let call = self.builder.ins().call(func_ref, &[ls, rs]);
                 Ok((self.builder.inst_results(call)[0], TyKind::Str))
             }
+            // #760: a `map_get` result (`OptI64`) paired with anything that
+            // isn't a Scalar — a `str`/tensor/model/... comparison the
+            // interpreter runs dynamically (`fns == "x"`, #759's exact
+            // repro) — refuses classed, citing #721, rather than the uncoded
+            // `jit error` below. `OptI64` against another *Scalar* (`fns ==
+            // 3`, `fns + 1`) already matched the `(Scalar, Scalar)` arm
+            // above and reaches `scalar_binop`, which answers directly for
+            // `==`/`!=` against an absent value (no trap, matching the
+            // interpreter — #767) and otherwise decodes and traps LOCATED
+            // for every other operator (#480/#767, was an unlocated
+            // #300.4 trap) — that keeps computing, unaffected by this arm.
+            // `OptI64` against `Str` under `Add` also already matched the
+            // stringify arm just above (unaffected too — `"n=" + fns`
+            // renders the decoded payload, same as `dmc run`).
+            (TyKind::Scalar(ScalarKind::OptI64), _) | (_, TyKind::Scalar(ScalarKind::OptI64)) => {
+                Err(Self::opt_i64_refusal(span, format!(
+                    "operator `{:?}` is not defined for types `{}` and `{}`",
+                    op, lk.render(), rk.render())))
+            }
             _ => err(span, format!(
                 "operator `{:?}` is not defined for types `{}` and `{}`",
                 op, lk.render(), rk.render(),
             )),
         }
+    }
+
+    /// The integer half of `lower_scalar_tensor_broadcast` (#571/#632): the
+    /// scalar is wrapped into the joined element width once, outside the loop,
+    /// and the body is the scalar integer op — same code, same answers, as
+    /// `t[i] OP s`.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_scalar_tensor_int(
+        &mut self,
+        op: &BinOp,
+        s_val: Value, s_kind: ScalarKind,
+        t_val: Value, t_ty: &TensorTy,
+        span: &Span,
+        scalar_is_lhs: bool,
+    ) -> Result<(Value, TyKind), JitError> {
+        let jk = elem_kind_join(t_ty.elem, s_kind);
+        let base = Self::dotted_base_op(op);
+        let s_val = self.coerce_scalar(s_val, s_kind, jk, span)?;
+        let out_ty = TensorTy { elem: jk, shape: t_ty.shape.clone() };
+        let out_ptr = self.forge_alloc(out_ty.nbytes());
+        let n = out_ty.nelems();
+
+        let hdr = self.builder.create_block();
+        let body = self.builder.create_block();
+        let exit = self.builder.create_block();
+        self.builder.append_block_param(hdr, cl::I64);
+
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        self.jump(hdr, &[zero]);
+        self.enter(hdr);
+        let i = self.builder.block_params(hdr)[0];
+        let cap = self.builder.ins().iconst(cl::I64, n);
+        let cont = self.builder.ins().icmp(IntCC::SignedLessThan, i, cap);
+        self.brif(cont, body, exit);
+
+        self.enter(body);
+        let t_eb = self.builder.ins().iconst(cl::I64, t_ty.elem_bytes());
+        let o_eb = self.builder.ins().iconst(cl::I64, out_ty.elem_bytes());
+        let t_off = self.builder.ins().imul(i, t_eb);
+        let o_off = self.builder.ins().imul(i, o_eb);
+        let tv = self.tensor_load_elem(t_val, t_off, t_ty.elem);
+        let tv = self.coerce_scalar(tv, t_ty.elem, jk, span)?;
+        let (lhs, rhs) = if scalar_is_lhs { (s_val, tv) } else { (tv, s_val) };
+        let (ov, _) = self.scalar_binop(&base, lhs, jk, rhs, jk, span)?;
+        self.tensor_store_elem_k(out_ptr, o_off, ov, jk);
+        let one = self.builder.ins().iconst(cl::I64, 1);
+        let inext = self.builder.ins().iadd(i, one);
+        self.jump(hdr, &[inext]);
+        self.builder.seal_block(body);
+        self.builder.seal_block(hdr);
+        self.enter(exit);
+        self.builder.seal_block(exit);
+
+        Ok((out_ptr, TyKind::Tensor(out_ty)))
     }
 
     /// Lower a `scalar OP tensor` (or `tensor OP scalar`) elementwise op.
@@ -9159,11 +14725,32 @@ impl<'a> Translator<'a> {
             BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
             | BinOp::DotPow
             | BinOp::DotLt | BinOp::DotGt | BinOp::DotLe | BinOp::DotGe) {
+            // #760: `fns @ t` where `fns` is a `map_get` result (`OptI64`) —
+            // a `(Scalar, Tensor)` pair reaches this dispatch before the
+            // `lower_binop` `OptI64` catch-all ever runs (that arm sits below
+            // the scalar/tensor match arms, so it is shadowed here for any
+            // non-dotted op, matmul included) — refuses classed, citing
+            // #721, not the uncoded `jit error` below.
+            if matches!(s_kind, ScalarKind::OptI64) {
+                return Err(Self::opt_i64_refusal(span, format!(
+                    "operator `{:?}` is not defined on scalar/tensor mix, got `i64?`", op)));
+            }
             return err(span, format!(
                 "operator `{:?}` is not defined on scalar/tensor mix; \
                  use a dotted broadcast form (`.+ .- .* ./ .^ .< .> .<= .>=`)",
                 op,
             ));
+        }
+        // #571/#632: an integer scalar broadcast over an integer tensor is
+        // integer arithmetic at the joined width, the same rule the two-tensor
+        // path takes. The interpreter reaches it through the same
+        // `int_operand_width` test — a *float* scalar keeps the float path,
+        // where `t .* 0.5` belongs.
+        if t_ty.elem.is_int() && s_kind.is_int()
+            && matches!(op, BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv)
+        {
+            return self.lower_scalar_tensor_int(
+                op, s_val, s_kind, t_val, t_ty, span, scalar_is_lhs);
         }
         if t_ty.elem != ScalarKind::F32 {
             return unsupported_msg(span, Refusal::F32Only, "scalar-tensor broadcast is f32-only");
@@ -9377,31 +14964,45 @@ impl<'a> Translator<'a> {
             }
         }
         // #544: every fixed-width kind narrower than the i64 a literal is born
-        // as can be adopted, not just `i32`. Anything else (a genuine `i64`
-        // want) keeps its refusal.
-        if want != ScalarKind::I32 && !want.is_masked_int() {
+        // as can be adopted, not just `i32`. #597: `U64` adopts too — it is not
+        // `is_masked_int` (its machine width already IS its arithmetic width),
+        // so giving it its own kind would otherwise have DROPPED it out of this
+        // path, where it used to ride in as `I64` and never reach here at all.
+        // Anything else (a genuine `i64` want) keeps its refusal.
+        if want != ScalarKind::I32 && want != ScalarKind::U64 && !want.is_masked_int() {
             return Ok((l, lk, r, rk));
         }
         // #295's range check, at the adopted width: a literal that does not fit
         // is refused rather than silently truncated into a different answer
         // than `dmc run` computes.
-        let w = want.int_bits() as u32;
-        let (lo, hi) = if want.is_signed_int() {
-            (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
-        } else {
-            (0i64, (1i64 << w) - 1)
-        };
-        if n < lo || n > hi {
-            return err(span, format!(
-                "integer literal {} does not fit in `{}`, the type it adopts \
-                 from the other operand", n, want.name(),
-            ));
+        //
+        // `U64` is its own arm: the generic `1i64 << w` below overflows at
+        // w == 64, and the range it wants — `0..=u64::MAX` — is the WHOLE
+        // 64-bit slot, so every literal pattern is in range, including one
+        // whose top bit is set and whose `i64` reading is therefore negative
+        // (`a + 0xffffffffffffffff`). That is what `dmc run` reads there —
+        // §3.1: a 64-bit literal is a bit pattern (#282). A literal written
+        // with an explicit `-` never gets this far: check.rs rejects a negative
+        // literal against an unsigned type before codegen, at every width.
+        if want != ScalarKind::U64 {
+            let w = want.int_bits() as u32;
+            let (lo, hi) = if want.is_signed_int() {
+                (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
+            } else {
+                (0i64, (1i64 << w) - 1)
+            };
+            if n < lo || n > hi {
+                return err(span, format!(
+                    "integer literal {} does not fit in `{}`, the type it adopts \
+                     from the other operand", n, want.name(),
+                ));
+            }
         }
         // `I32` is a real `cl::I32`, so the constant has to be reduced into it.
-        // A masked kind is i64-backed and the literal is in range, so its
-        // machine value is already correct — adopting is a retag.
+        // A masked kind — and `U64` — is i64-backed and the literal is in
+        // range, so its machine value is already correct: adopting is a retag.
         let ty = TyKind::Scalar(want);
-        if want.is_masked_int() {
+        if want.is_masked_int() || want == ScalarKind::U64 {
             return Ok(if lit_is_lhs { (l, ty, r, rk) } else { (l, lk, r, ty) });
         }
         let narrowed = self.builder.ins()
@@ -9431,15 +15032,74 @@ impl<'a> Translator<'a> {
                 let res = self.builder.ins().icmp(cc, present, zero);
                 return Ok((res, ScalarKind::Bool));
             }
+            // #767: `map_get(...) == 3` / `!= 3` — one side `OptI64`, the
+            // other a genuine (decodable) `i64`, not the literal `nil`. The
+            // interpreter's `scalar_compare` has a blanket `(Nil, _) | (_,
+            // Nil)` rule (`Eq` false, `NotEq` true) that applies to a missing
+            // `map_get` result exactly as it does to the literal `nil` — a
+            // present-bit-clear `OptI64` is never equal to a genuine value,
+            // full stop, with no need to trap to find that out. When the key
+            // IS present, decode and compare its payload normally instead.
+            // A kind mismatch (`OptI64` vs `f64`/`bool`/...) is deliberately
+            // NOT special-cased here: it falls through to the decode-and-
+            // compare path below, which still raises the same "comparison
+            // operands disagree" refusal it always has, unconditional on
+            // runtime presence (a static type error, not this issue's
+            // divergence).
+            if lk == ScalarKind::OptI64 && rk == ScalarKind::I64 {
+                return Ok((self.opt_eq_vs_concrete(op, l, r), ScalarKind::Bool));
+            }
+            if rk == ScalarKind::OptI64 && lk == ScalarKind::I64 {
+                return Ok((self.opt_eq_vs_concrete(op, r, l), ScalarKind::Bool));
+            }
+            // `map_get(...) == map_get(...)`: both sides `OptI64`. Same
+            // blanket rule, generalized to a possibly-nil RHS too.
+            if lk == ScalarKind::OptI64 && rk == ScalarKind::OptI64 {
+                return Ok((self.opt_eq_vs_opt(op, l, r), ScalarKind::Bool));
+            }
         }
-        // Any other use of a maybe-nil operand (arithmetic, ordering) decodes it
-        // to its i64 payload, trapping on nil — matching the interpreter, which
-        // errors when a missing `map_get` result is used as a value (#300.4).
+        // Any other use of a maybe-nil operand (arithmetic, ordering, or an
+        // equality/inequality the special-casing above didn't resolve — a
+        // genuine kind mismatch) decodes it to its i64 payload. The trap is
+        // now a LOCATED runtime error (#480/#767) whose text matches the
+        // interpreter's own wording for `op`, instead of the old unlocated
+        // "nil value used where a value is required": the interpreter raises
+        // exactly this error, and only this error, when the missing
+        // `map_get` result is actually used as a value at runtime — a
+        // program that never touches the missing key still runs.
         let (l, lk) = if lk == ScalarKind::OptI64 {
-            (self.opt_unwrap_or_trap(l), ScalarKind::I64)
+            if rk == ScalarKind::OptI64 {
+                // #865 rework: `r` is ALSO an undecoded `OptI64` — its name
+                // ("nil" or "int") is a runtime question (its own present
+                // bit), not yet known here the way every other `rk` is.
+                // Baking `interp_scalar_type_name(rk)` (always "nil" for
+                // `OptI64`) was the bug: it printed "nil" for `r` even when
+                // `r` turns out present. Build both candidate messages and
+                // let `opt_unwrap_or_located_trap_dual` select on `r`'s
+                // actual present bit at runtime instead.
+                let msg_if_r_absent = Self::opt_i64_binop_trap_msg(op, "nil", "nil");
+                let msg_if_r_present = Self::opt_i64_binop_trap_msg(op, "nil", "int");
+                (
+                    self.opt_unwrap_or_located_trap_dual(
+                        l, r, msg_if_r_absent, msg_if_r_present, span,
+                    ),
+                    ScalarKind::I64,
+                )
+            } else {
+                let msg = Self::opt_i64_binop_trap_msg(op, "nil", Self::interp_scalar_type_name(rk));
+                (self.opt_unwrap_or_located_trap(l, msg, span), ScalarKind::I64)
+            }
         } else { (l, lk) };
+        // `lk` may have just become `I64` above — correctly so: if `l` WAS
+        // `OptI64` and reached this line, its decode above already proved it
+        // present, so "int" is its real type, not an approximation. This
+        // holds even when the original `rk` was ALSO `OptI64`: reaching this
+        // line means `l`'s own decode (above, `rk == OptI64` dual path
+        // included) did not trap, so `l` genuinely IS present — no runtime
+        // uncertainty on this side, unlike the `l`-branch above.
         let (r, rk) = if rk == ScalarKind::OptI64 {
-            (self.opt_unwrap_or_trap(r), ScalarKind::I64)
+            let msg = Self::opt_i64_binop_trap_msg(op, Self::interp_scalar_type_name(lk), "nil");
+            (self.opt_unwrap_or_located_trap(r, msg, span), ScalarKind::I64)
         } else { (r, rk) };
         // #473: a scalar float's width follows its declared type, so the two
         // operands can genuinely differ. Join them the way the interpreter's
@@ -9470,6 +15130,15 @@ impl<'a> Translator<'a> {
                 ));
             }
             let v = match (op, lk) {
+                // #597: an unsigned kind compares with the unsigned predicates
+                // — `U64`'s pattern can be a negative `i64` (top bit set), so
+                // the signed predicates would order it backwards. Narrower
+                // unsigned kinds (`U8`/`U16`/`U32`) are unaffected either way,
+                // since their zero-extended pattern is already non-negative.
+                (cmp, k) if k.is_int() && !k.is_signed_int() => {
+                    let cc = uint_cc(cmp);
+                    self.builder.ins().icmp(cc, l, r)
+                }
                 (cmp, k) if k.is_int() => {
                     let cc = int_cc(cmp);
                     self.builder.ins().icmp(cc, l, r)
@@ -9509,16 +15178,28 @@ impl<'a> Translator<'a> {
                     // #297: INT_MIN / -1 (and % -1) overflow i64 and raise a
                     // hardware #DE (SIGFPE) on x86 sdiv/srem. The interpreter
                     // returns a clean overflow error, so trap with the same
-                    // message before the division can fault.
+                    // message before the division can fault. #597: an unsigned
+                    // kind has no `MIN / -1` case at all (`div_overflow_check`
+                    // no-ops via `int_min()` returning `None`), and divides/
+                    // rems with `udiv`/`urem` instead of `sdiv`/`srem` — `U64`'s
+                    // pattern can be negative, so the signed op would compute
+                    // the wrong quotient (`u8`/`u16`/`u32` are unaffected either
+                    // way, since their zero-extended pattern is non-negative).
                     self.div_overflow_check(l, r, matches!(op, BinOp::Div), lk);
                     let zero = self.builder.ins().iconst(lk.cl(), 0);
                     let one = self.builder.ins().iconst(lk.cl(), 1);
                     let is_zero = self.builder.ins().icmp(IntCC::Equal, r, zero);
                     let safe_r = self.builder.ins().select(is_zero, one, r);
-                    let q = if matches!(op, BinOp::Div) {
-                        self.builder.ins().sdiv(l, safe_r)
+                    let q = if lk.is_signed_int() {
+                        if matches!(op, BinOp::Div) {
+                            self.builder.ins().sdiv(l, safe_r)
+                        } else {
+                            self.builder.ins().srem(l, safe_r)
+                        }
+                    } else if matches!(op, BinOp::Div) {
+                        self.builder.ins().udiv(l, safe_r)
                     } else {
-                        self.builder.ins().srem(l, safe_r)
+                        self.builder.ins().urem(l, safe_r)
                     };
                     self.builder.ins().select(is_zero, zero, q)
                 }
@@ -9535,9 +15216,19 @@ impl<'a> Translator<'a> {
                     self.shift_range_check(r, true, lk);
                     self.builder.ins().ishl(l, r)
                 }
+                // #597: an unsigned kind shifts logically (zero-fill), matching
+                // `OPERATORS.md §8a`'s arithmetic-for-signed / logical-for-
+                // unsigned split and the interpreter's `BitShr`. `U8`/`U16`/
+                // `U32` never told `sshr` and `ushr` apart because their
+                // zero-extended pattern is already non-negative; `U64` is the
+                // first kind where the pattern can have its top bit set.
                 BinOp::BitShr => {
                     self.shift_range_check(r, false, lk);
-                    self.builder.ins().sshr(l, r)
+                    if lk.is_signed_int() {
+                        self.builder.ins().sshr(l, r)
+                    } else {
+                        self.builder.ins().ushr(l, r)
+                    }
                 }
                 _ => return unsupported_msg(span, Refusal::OperandType, format!("operator `{:?}` is not lowered for ints", op)),
             };
@@ -9606,6 +15297,28 @@ impl<'a> Translator<'a> {
         self.builder.inst_results(call)[0]
     }
 
+    /// #674: the ONE emit-site distinction —
+    /// a **vault-spelled** constructor's own buffer is charged to and placed
+    /// in the root, not the entered budget, so it survives `reap(b)`. See
+    /// `forge_alloc_root`'s doc for the rule and why the callback takes bytes
+    /// alone. Every other one of the 82 `self.forge_alloc(` sites is
+    /// untouched.
+    fn forge_alloc_root(&mut self, nbytes: i64) -> Value {
+        let entry = self.fns.get("__dmc_forge_alloc_root")
+            .expect("forge_alloc_root not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let n = self.builder.ins().iconst(cl::I64, nbytes);
+        let call = self.builder.ins().call(func_ref, &[n]);
+        self.builder.inst_results(call)[0]
+    }
+
+    /// #674 slice 3d: `self.forge_alloc` or `self.forge_alloc_root`, selected
+    /// by the constructor's arena spelling — the shape every vault-capable
+    /// constructor emit site uses so the choice is made in exactly one place.
+    fn arena_alloc_by_spelling(&mut self, arena: &str, nbytes: i64) -> Value {
+        if arena == "vault" { self.forge_alloc_root(nbytes) } else { self.forge_alloc(nbytes) }
+    }
+
     /// #249: deep-copy a tensor value into a fresh forge allocation so the new
     /// binding/field/argument does not alias the source's backing store. This
     /// matches the interpreter's value-copy (clone) semantics — `let y = x`,
@@ -9617,7 +15330,7 @@ impl<'a> Translator<'a> {
         match ty {
             TyKind::Tensor(t) => {
                 let dst = self.forge_alloc(t.nbytes());
-                self.emit_memcpy_loop(dst, val, t.nelems(), t.elem.cl());
+                self.emit_memcpy_loop(dst, val, t.nelems(), t.elem.store_cl());
                 dst
             }
             TyKind::DynTensor(dt) => self.dyn_copy(val, dt),
@@ -9659,8 +15372,44 @@ impl<'a> Translator<'a> {
         self.builder.ins().imul(flat, elem_bytes)
     }
 
+    /// Read one element out of a tensor: load the STORAGE lane, then widen it
+    /// into the register width the kind computes in. A `u8` element is one
+    /// byte in the arena and a zero-extended i64 in flight; a `i8` element
+    /// sign-extends. That is the range `interp::IW::wrap` leaves a value in,
+    /// which is what keeps the two backends reading the same number out of
+    /// the same bytes.
     fn tensor_load_elem(&mut self, ptr: Value, byte_off: Value, elem: ScalarKind) -> Value {
-        self.tensor_load_at(ptr, byte_off, elem.cl())
+        let raw = self.tensor_load_at(ptr, byte_off, elem.store_cl());
+        self.extend_from_store(raw, elem)
+    }
+
+    /// Widen a value just loaded from a narrow tensor lane to `elem.cl()`.
+    /// A no-op for every kind whose storage width IS its machine width.
+    fn extend_from_store(&mut self, v: Value, elem: ScalarKind) -> Value {
+        let want = elem.cl();
+        if elem.store_cl() == want { return v; }
+        if elem.is_signed_int() {
+            self.builder.ins().sextend(want, v)
+        } else {
+            self.builder.ins().uextend(want, v)
+        }
+    }
+
+    /// Write one element into a tensor at the element type's STORAGE width.
+    /// The value arrives at the kind's compute width, so a narrow kind is
+    /// wrapped into its arithmetic range first — the interpreter applies
+    /// `IW::wrap` at exactly this point (`interp.rs`, #571) — and then
+    /// truncated to the lane. Without the truncation Cranelift would store
+    /// eight bytes over a one-byte element and corrupt its neighbours.
+    fn tensor_store_elem_k(&mut self, ptr: Value, byte_off: Value, val: Value, elem: ScalarKind) {
+        let v = if elem.is_masked_int() {
+            let masked = self.mask_to_kind(val, elem);
+            let sc = elem.store_cl();
+            if sc == elem.cl() { masked } else { self.builder.ins().ireduce(sc, masked) }
+        } else {
+            val
+        };
+        self.tensor_store_elem(ptr, byte_off, v);
     }
 
     /// `tensor_load_elem` for a caller holding a Cranelift type rather than a
@@ -10046,7 +15795,7 @@ impl<'a> Translator<'a> {
             let (v, k) = self.lower_expr(e)?;
             let v = self.coerce_to(v, &k, &target, span)?;
             let off = self.builder.ins().iconst(cl::I64, i as i64 * t.elem_bytes());
-            self.tensor_store_elem(ptr, off, v);
+            self.tensor_store_elem_k(ptr, off, v, elem);
         }
         Ok((ptr, TyKind::Tensor(t)))
     }
@@ -10209,9 +15958,19 @@ impl<'a> Translator<'a> {
             return Ok((result, TyKind::Scalar(ScalarKind::I64)));
         }
         // Tensor load — dispatch to the inner helper with already-lowered ptr+type.
-        let t = base_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("indexing requires a tensor or str, got `{}`", base_ty.render()),
-            line: span.line, col: span.col,
+        // #760: a `map_get` result (`OptI64`) refuses with a located
+        // `jit-conversion` citing #721, not the uncoded `jit error` below —
+        // covers both plain indexing (`x[i]`, `x[i, j]`) and slicing
+        // (`x[a..b]`), which both dispatch through here.
+        let t = base_ty.as_tensor().ok_or_else(|| {
+            if matches!(base_ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "indexing requires a tensor or str, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("indexing requires a tensor or str, got `{}`", base_ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         self.lower_tensor_load_with(base_v, &t, idxs, span)
     }
@@ -10367,7 +16126,10 @@ impl<'a> Translator<'a> {
         if result_shape.is_empty() {
             // All dims consumed by scalar indices — scalar load.
             let flags = cranelift::codegen::ir::MemFlagsData::new();
-            let v = self.builder.ins().load(t.elem.cl(), flags, addr, 0);
+            // Load the STORAGE lane, then widen to the compute width — a `u8`
+            // element is one byte here and a zero-extended i64 in flight.
+            let raw = self.builder.ins().load(t.elem.store_cl(), flags, addr, 0);
+            let v = self.extend_from_store(raw, t.elem);
             Ok((v, TyKind::Scalar(t.elem)))
         } else {
             // View into the same buffer with a new static shape.
@@ -10478,7 +16240,7 @@ impl<'a> Translator<'a> {
         let src_byte = self.builder.ins().imul(src_flat, eb);
         let out_byte = self.builder.ins().imul(i, eb);
         let v = self.tensor_load_elem(ptr, src_byte, t.elem);
-        self.tensor_store_elem(out_ptr, out_byte, v);
+        self.tensor_store_elem_k(out_ptr, out_byte, v, t.elem);
         let inext = self.builder.ins().iadd(i, one);
         self.jump(hdr, &[inext]);
         self.builder.seal_block(body);
@@ -10502,11 +16264,18 @@ impl<'a> Translator<'a> {
                     "a range slice with no explicit end"),
             };
             // Fully static bounds — the pre-#511 path, unchanged.
+            // `None`: a slice bound is a RUNTIME expression position. A bare
+            // ident here is a local, a loop variable or a scalar module
+            // constant, and each must lower through the path that honours the
+            // enclosing scope — folding a constant in here is what silently
+            // rewrote a bound that a local of the same name had shadowed.
+            // `fold_shape_expr`, not `resolve_shape_expr`: a bound is not a
+            // dimension, and `t[0..3]` starts at 0.
             let s_static = match start.as_deref() {
-                Some(e) => resolve_shape_expr(e, &self.shape_env, span),
+                Some(e) => fold_shape_expr(e, &self.shape_env, None, span),
                 None => Ok(0),
             };
-            if let (Ok(s), Ok(e)) = (&s_static, resolve_shape_expr(end_expr, &self.shape_env, span)) {
+            if let (Ok(s), Ok(e)) = (&s_static, fold_shape_expr(end_expr, &self.shape_env, None, span)) {
                 let mut e = e;
                 if *inclusive { e += 1; }
                 return Ok(IndexCat::Range { start: *s, end: e });
@@ -10674,9 +16443,18 @@ impl<'a> Translator<'a> {
             self.builder.ins().store(flags, rv, elem_addr, 0);
             return Ok(());
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("index-assign requires a tensor, got `{}`", ty.render()),
-            line: span.line, col: span.col,
+        // #760: `x[i] = v` where `x` is a `map_get` result (`OptI64`) refuses
+        // with a located `jit-conversion` citing #721, not the uncoded `jit
+        // error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "index-assign requires a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("index-assign requires a tensor, got `{}`", ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if idxs.len() != t.rank() {
             return err(span, format!(
@@ -10702,7 +16480,7 @@ impl<'a> Translator<'a> {
             .map(|(axis, &iv)| self.bounds_check_index(iv, t.shape[axis]))
             .collect();
         let byte_off = self.tensor_byte_offset(&t, &resolved_idx);
-        self.tensor_store_elem(ptr, byte_off, rv);
+        self.tensor_store_elem_k(ptr, byte_off, rv, t.elem);
         Ok(())
     }
 
@@ -10718,9 +16496,18 @@ impl<'a> Translator<'a> {
     ) -> Result<(), JitError> {
         // Lower destination tensor.
         let (dst_ptr, dst_ty) = self.lower_expr(base)?;
-        let dst_t = dst_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("slice-assign requires a tensor, got `{}`", dst_ty.render()),
-            line: span.line, col: span.col,
+        // #760: `x[a..b] = v` where `x` is a `map_get` result (`OptI64`)
+        // refuses with a located `jit-conversion` citing #721, not the
+        // uncoded `jit error` below.
+        let dst_t = dst_ty.as_tensor().ok_or_else(|| {
+            if matches!(dst_ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "slice-assign requires a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("slice-assign requires a tensor, got `{}`", dst_ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
 
         if idxs.len() != dst_t.rank() {
@@ -10729,11 +16516,18 @@ impl<'a> Translator<'a> {
             ));
         }
 
-        // Lower source tensor.
+        // Lower source tensor. Same #760 treatment: `x[a..b] = fns` where
+        // `fns` is a `map_get` result refuses classed, not uncoded.
         let (src_ptr, src_ty) = self.lower_expr(rhs)?;
-        let src_t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("slice-assign RHS must be a tensor, got `{}`", src_ty.render()),
-            line: span.line, col: span.col,
+        let src_t = src_ty.as_tensor().ok_or_else(|| {
+            if matches!(src_ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "slice-assign RHS must be a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("slice-assign RHS must be a tensor, got `{}`", src_ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
 
         // For each dimension, compute start/end values and whether it's scalar.
@@ -10830,6 +16624,22 @@ impl<'a> Translator<'a> {
         // Collect which dst dims are slice (non-scalar) dims.
         let slice_dims: Vec<usize> = (0..n).filter(|&i| !is_scalar[i]).collect();
 
+        // Validate: source and destination must share an element type. The
+        // single `eb_v` below is both operands' element stride, so a mismatch
+        // would walk one of the two buffers at the wrong width — silent before
+        // narrow elements existed (f32 and i64 both got 4 or 8 bytes by luck of
+        // the caller), a corrupt read the moment a `u8` is on one side.
+        //
+        // This is a REFUSAL, not an error: the interpreter has no such
+        // restriction (it assigns element by element, converting as it goes),
+        // so a `jit error` here would be scored a divergence by the
+        // differential tooling rather than the gap it is — the same reasoning
+        // as `port_tensor_wire_ty`'s `ElementType` refusal above.
+        if src_t.elem != dst_t.elem {
+            return unsupported_msg(span, Refusal::ElementType, format!(
+                "slice-assign: dst element type is `{}` but src is `{}`",
+                dst_t.elem.name(), src_t.elem.name()));
+        }
         // Validate: src rank must equal number of slice dims.
         if src_t.rank() != slice_dims.len() {
             return err(span, format!(
@@ -10910,7 +16720,7 @@ impl<'a> Translator<'a> {
             self.brif(cond, body, exit);
 
             self.enter(body);
-            self.loop_stack.push(LoopFrame { header, exit });
+            self.loop_stack.push(LoopFrame { header, exit, budget_depth: self.budget_stack.len() });
 
             levels.push(LoopLevel { header, body, exit, lv });
         }
@@ -10961,7 +16771,7 @@ impl<'a> Translator<'a> {
 
         // Load from src, store to dst.
         let loaded = self.tensor_load_elem(src_ptr, src_byte_off, src_t.elem);
-        self.tensor_store_elem(dst_ptr, dst_byte_off, loaded);
+        self.tensor_store_elem_k(dst_ptr, dst_byte_off, loaded, dst_t.elem);
 
         // ── Close loops (inner to outer) ────────────────────────────────────
         for ll in levels.into_iter().rev() {
@@ -11120,6 +16930,83 @@ impl<'a> Translator<'a> {
         Ok((out_ptr, TyKind::Tensor(out_ty)))
     }
 
+    /// The scalar op a dotted spelling means, for the integer elementwise
+    /// kernels. The mirror of the `base` table in `interp`'s
+    /// `tensor_elementwise_int`.
+    fn dotted_base_op(op: &BinOp) -> BinOp {
+        match op {
+            BinOp::DotAdd => BinOp::Add,
+            BinOp::DotSub => BinOp::Sub,
+            BinOp::DotMul => BinOp::Mul,
+            _ => BinOp::Div,
+        }
+    }
+
+    /// `a .OP b` over two equal-shaped INTEGER tensors (#571/#632): one flat
+    /// loop whose body is the *scalar* integer op, so the wrap at the element
+    /// width, the total `/` by zero, and the `MIN / -1` trap are the same code
+    /// (and therefore the same answers) as `a[i] OP b[i]`. The interpreter
+    /// routes the same way, through `int_arith`.
+    ///
+    /// No SIMD fast path: the vector kernel below is `F32X4`, and an integer
+    /// lane would need its own mask-per-op vector form to stay wrap-correct.
+    fn lower_elementwise_int(
+        &mut self,
+        op: &BinOp,
+        l: Value, lt: &TensorTy,
+        r: Value, rt: &TensorTy,
+        span: &Span,
+    ) -> Result<(Value, TyKind), JitError> {
+        let jk = elem_kind_join(lt.elem, rt.elem);
+        let base = Self::dotted_base_op(op);
+        let out_ty = TensorTy { elem: jk, shape: lt.shape.clone() };
+        let out_ptr = self.forge_alloc(out_ty.nbytes());
+        let n = out_ty.nelems();
+
+        let header = self.builder.create_block();
+        let body = self.builder.create_block();
+        let exit = self.builder.create_block();
+        self.builder.append_block_param(header, cl::I64);
+
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        self.jump(header, &[zero]);
+
+        self.enter(header);
+        let i = self.builder.block_params(header)[0];
+        let cap = self.builder.ins().iconst(cl::I64, n);
+        let cont = self.builder.ins().icmp(IntCC::SignedLessThan, i, cap);
+        self.brif(cont, body, exit);
+
+        self.enter(body);
+        // Each operand has its own element stride: the two sides may be
+        // different integer widths (a `u8` tensor meeting an i64 tensor
+        // literal), which `elem_kind_join` resolves to the narrow one.
+        let l_eb = self.builder.ins().iconst(cl::I64, lt.elem_bytes());
+        let r_eb = self.builder.ins().iconst(cl::I64, rt.elem_bytes());
+        let o_eb = self.builder.ins().iconst(cl::I64, out_ty.elem_bytes());
+        let l_off = self.builder.ins().imul(i, l_eb);
+        let r_off = self.builder.ins().imul(i, r_eb);
+        let o_off = self.builder.ins().imul(i, o_eb);
+        let lv = self.tensor_load_elem(l, l_off, lt.elem);
+        let rv = self.tensor_load_elem(r, r_off, rt.elem);
+        // Wrap both operands into the result width before the op, exactly as
+        // `int_arith` does with `w.wrap(a)` / `w.wrap(b)`.
+        let lv = self.coerce_scalar(lv, lt.elem, jk, span)?;
+        let rv = self.coerce_scalar(rv, rt.elem, jk, span)?;
+        let (ov, _) = self.scalar_binop(&base, lv, jk, rv, jk, span)?;
+        self.tensor_store_elem_k(out_ptr, o_off, ov, jk);
+        let one = self.builder.ins().iconst(cl::I64, 1);
+        let inext = self.builder.ins().iadd(i, one);
+        self.jump(header, &[inext]);
+
+        self.builder.seal_block(body);
+        self.builder.seal_block(header);
+        self.enter(exit);
+        self.builder.seal_block(exit);
+
+        Ok((out_ptr, TyKind::Tensor(out_ty)))
+    }
+
     fn lower_elementwise(
         &mut self,
         op: &BinOp,
@@ -11127,6 +17014,16 @@ impl<'a> Translator<'a> {
         r: Value, rt: &TensorTy,
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
+        // #571/#632: a dotted op over INTEGER elements is integer arithmetic at
+        // the element width, not float arithmetic over the lanes — `a .+ b` on
+        // two `Tensor[u8, …]` wraps at 8 bits exactly as `a[0] + b[0]` does, and
+        // (as in the interpreter) through the same code that lowers the scalar
+        // op. `NUMERICS.md §1.3` states this holds on both backends.
+        if lt.elem.is_int() && rt.elem.is_int() && lt.shape == rt.shape
+            && matches!(op, BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv)
+        {
+            return self.lower_elementwise_int(op, l, lt, r, rt, span);
+        }
         if lt.elem != ScalarKind::F32 || rt.elem != ScalarKind::F32 {
             return unsupported_msg(span, Refusal::F32Only, "elementwise ops are f32-only");
         }
@@ -11456,7 +17353,7 @@ impl<'a> Translator<'a> {
                 // Declare the index local once; redefine it per unrolled
                 // iteration so the body reads the concrete value via lower_ident
                 // (a non-differentiable Const node — loop indices aren't traced).
-                let loop_shadow: Vec<(String, Option<Variable>, Option<TyKind>)> =
+                let loop_shadow: Vec<(String, Option<Variable>, Option<TyKind>, Option<ConstDim>)> =
                     idx_name.iter().map(|n| self.shadow(n)).collect();
                 let idx_var = idx_name.as_ref().map(|n| {
                     let var = self.builder.declare_var(cl::I64);
@@ -11523,8 +17420,10 @@ impl<'a> Translator<'a> {
             }
             Expr::Cast { expr, ty, span: cspan } => {
                 // f32 -> f32 cast is identity for AD; other casts are
-                // treated as constants (gradient stops).
-                let target = ty_from_ast(ty, &self.shape_env)?;
+                // treated as constants (gradient stops). Resolve a scalar
+                // alias target first (SPEC.md §6.6), same as the non-AD path.
+                let ty = &resolve_alias_ty(ty, self.aliases)?;
+                let target = ty_from_ast(ty, &self.shape_env, Some(&self.scope_const_dims()))?;
                 let (v, sty, node) = self.ad_lower_expr(expr, cspan)?;
                 if target == sty {
                     Ok((v, sty, node))
@@ -11547,6 +17446,10 @@ impl<'a> Translator<'a> {
             }
             Expr::UnOp { op: UnOp::ReLU, operand: relu_op, span: uspan } => {
                 let (v, ty, inode) = self.ad_lower_expr(relu_op, uspan)?;
+                // #760 audit: `ty` can never be `Scalar(OptI64)` here — a `map_get`
+                // result can't even be built inside a `@grad fn` body (`ad_lower_call`
+                // gates every non-fused call to exactly 1 arg before name dispatch, and
+                // `map_get`/`map_new` take 2/0), so `ad_lower_expr` never produces one.
                 let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: "`\\>` in @grad requires a tensor operand".into(),
                     line: uspan.line, col: uspan.col,
@@ -11560,6 +17463,8 @@ impl<'a> Translator<'a> {
                 match op {
                     PostfixOp::Transpose => {
                         let (v, ty, inode) = self.ad_lower_expr(expr, pspan)?;
+                        // #760 audit: unreachable with `OptI64` — same reasoning as the
+                        // `ReLU` arm just above (`map_get` can't run inside a `@grad fn`).
                         let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                             msg: "transpose in @grad requires a tensor".into(),
                             line: pspan.line, col: pspan.col,
@@ -11609,6 +17514,25 @@ impl<'a> Translator<'a> {
     {
         let name = match callee {
             Expr::Ident(n, _) => n.clone(),
+            // #634: a model method call inside a
+            // `@grad fn` body. Slice 1 lowers the call everywhere else, and the
+            // backward pass is the one place it must NOT: the interpreter's tape
+            // does not cross the call either (p15 and p18 both fail at runtime
+            // with "must produce a scalar derived from a differentiable input",
+            // and p18's body is `x * 2.0` — no field read), so a JIT that
+            // differentiated through `M$$method` would answer where `dmc run`
+            // cannot. Refused, and named: this arm exists so the message says
+            // "a model method", not "indirect calls", which is what the program
+            // did not write.
+            Expr::Postfix { expr: recv, op: PostfixOp::Field(m), .. }
+                if self.model_of_expr(recv).is_some() =>
+            {
+                let model = self.model_of_expr(recv).unwrap_or_default();
+                return unsupported_msg(span, Refusal::Grad, format!(
+                    "a call to the `.{}()` method of model `{}` inside a `@grad fn` \
+                     body (the interpreter's tape does not cross a method call \
+                     either); use `dmc run` for full semantics", m, model));
+            }
             _ => return unsupported(span, Refusal::IndirectCall, "indirect calls in @grad"),
         };
         // Fused tensor ops with their own arity handled before the 1-arg gate.
@@ -11639,6 +17563,10 @@ impl<'a> Translator<'a> {
         match name.as_str() {
             "relu" | "tanh" | "gelu" | "sigmoid" | "silu" | "elu" | "mish" => {
                 let (inp_v, ty, inode) = self.ad_lower_expr(e, span)?;
+                // #760 audit: unreachable with `OptI64` — `e` is the callee's own
+                // single argument, itself gated to exactly 1 arg by the caller above
+                // before `name` is ever dispatched, so a `map_get(m, k)` call (2 args)
+                // can't be `e` either; `ad_lower_expr` never yields `OptI64`.
                 let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
                     msg: format!("`{}` in @grad requires a tensor argument", name),
                     line: span.line, col: span.col,
@@ -11680,6 +17608,8 @@ impl<'a> Translator<'a> {
             ).as_str()),
         };
         let (_v, ty, inode) = self.ad_lower_expr(e, span)?;
+        // #760 audit: unreachable with `OptI64` — same 1-arg gate as the
+        // activation match above rules out a live `map_get` as `e`.
         let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("`{}` requires a tensor argument", name),
             line: span.line, col: span.col,
@@ -11713,6 +17643,9 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to softmax in @grad"),
         };
         let (inp_v, ty, inode) = self.ad_lower_expr(xe, span)?;
+        // #760 audit: unreachable with `OptI64` — `xe` reaches `ad_lower_expr`,
+        // which can never produce one (`map_get` can't be called inside a
+        // `@grad fn` body; see the `ReLU` arm's note above for the mechanism).
         let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "softmax in @grad requires a tensor".into(),
             line: span.line, col: span.col,
@@ -11764,8 +17697,15 @@ impl<'a> Translator<'a> {
         };
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (g_v, g_ty, g_node) = self.ad_lower_expr(g_e, span)?;
+        // `eps_e` is lowered non-AD (below) since it's not part of the tape;
+        // its own `OptI64` case is real (`map_get` CAN appear here, unlike
+        // `x_e`/`g_e`) but never reaches an `.as_tensor()` fallback — `coerce_to`
+        // decodes-and-traps it straight into the `Scalar(F32)` target (#300.4).
         let (eps_raw, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps_raw, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
+        // #760 audit: `x_ty`/`g_ty` (unlike `eps_ty` above) can never be
+        // `OptI64` — both come from `ad_lower_expr`, which can't produce one
+        // (see the `ReLU` arm's note).
         let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rms_norm: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
@@ -11829,8 +17769,14 @@ impl<'a> Translator<'a> {
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (g_v, g_ty, g_node) = self.ad_lower_expr(g_e, span)?;
         let (b_v, b_ty, b_node) = self.ad_lower_expr(b_e, span)?;
+        // `eps_e` is non-AD (like `rms_norm`'s above): a live `OptI64` there
+        // decodes-and-traps into `Scalar(F32)` via `coerce_to`, never reaching
+        // an `.as_tensor()` fallback.
         let (eps_raw, eps_ty) = self.lower_expr(eps_e)?;
         let eps = self.coerce_to(eps_raw, &eps_ty, &TyKind::Scalar(ScalarKind::F32), span)?;
+        // #760 audit: `x_ty`/`g_ty`/`b_ty` can never be `OptI64` — all three
+        // come from `ad_lower_expr`, which can't produce one (see the `ReLU`
+        // arm's note).
         let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "layer_norm: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
@@ -11902,6 +17848,9 @@ impl<'a> Translator<'a> {
         let (x_v, x_ty, x_node) = self.ad_lower_expr(x_e, span)?;
         let (cos_v, cos_ty, cos_node) = self.ad_lower_expr(cos_e, span)?;
         let (sin_v, sin_ty, sin_node) = self.ad_lower_expr(sin_e, span)?;
+        // #760 audit: none of `x_ty`/`cos_ty`/`sin_ty` can be `OptI64` — all
+        // three come from `ad_lower_expr`, which can't produce one (see the
+        // `ReLU` arm's note).
         let xt = x_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: "rope: x must be a tensor".into(), line: span.line, col: span.col,
         })?.clone();
@@ -11930,7 +17879,7 @@ impl<'a> Translator<'a> {
         // Forward y: copy x, then rotate in place (same kernel as the builtin).
         let out_ty = xt.clone();
         let out_ptr = self.forge_alloc(out_ty.nbytes());
-        self.emit_memcpy_loop(out_ptr, x_v, xt.nelems(), xt.elem.cl());
+        self.emit_memcpy_loop(out_ptr, x_v, xt.nelems(), xt.elem.store_cl());
         self.rope_rotate_inplace(out_ptr, cos_v, sin_v, &xt, false);
         let node = self.ad.as_mut().unwrap().push(
             AdOp::Rope, vec![x_node, cos_node, sin_node],
@@ -11977,6 +17926,11 @@ impl<'a> Translator<'a> {
             }
             Some(_) => return unsupported(span, Refusal::ArgForm, "non-positional mask arg to attn in @grad"),
         };
+        // #760 audit: none of `q_ty`/`k_ty`/`v_ty` can be `OptI64` — all three
+        // come from `ad_lower_expr`, which can't produce one (see the `ReLU`
+        // arm's note). `mask` above is non-AD like `rms_norm`'s `eps`, but a
+        // live `OptI64` there already gets a classed `Refusal::OperandType`
+        // refusal from its own `match`'s fallback, not an uncoded `jit error`.
         let qt = q_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
             msg: format!("{}: q must be a tensor", name), line: span.line, col: span.col })?.clone();
         let kt = k_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
@@ -12582,7 +18536,7 @@ impl<'a> Translator<'a> {
         let mut tape_fwd: Vec<usize> = Vec::with_capacity(n);
 
         // Set of mut param node ids in the original forward graph.
-        let mut_param_set: std::collections::HashSet<usize> =
+        let mut_param_set: HashSet<usize> =
             fwd_mut_params.iter().map(|(_, nid)| *nid).collect();
 
         // Phase 1: replicate the forward graph in `st`.
@@ -13329,12 +19283,138 @@ impl<'a> Translator<'a> {
         if let TyKind::Bf16Tensor(bt) = &ty {
             return self.bf16_transpose(ptr, &bt.clone(), span);
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("transpose `'` requires a tensor, got `{}`", ty.render()),
-            line: span.line, col: span.col,
+        // #760: `fns'` where `fns` is a `map_get` result (`OptI64`) refuses
+        // with a located `jit-conversion` citing #721, not the uncoded `jit
+        // error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "transpose `'` requires a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("transpose `'` requires a tensor, got `{}`", ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         let (out_ptr, out_ty) = self.raw_transpose(ptr, &t, span)?;
         Ok((out_ptr, TyKind::Tensor(out_ty)))
+    }
+
+    /// `<expr>?` (SPEC.md §4.9, error propagation). `expr` must be a `(T,
+    /// Err)`-typed value (`Err` lowers to `TyKind::Str`, per `ty_from_ast` —
+    /// nil is the NULL pointer, matching every other nilable-str slot in this
+    /// file). Sugar per the spec:
+    ///
+    ///   let (t, e) = expr
+    ///   if e != nil { return (default[T], e) }
+    ///   t
+    ///
+    /// `check.rs` (`PostfixOp::Query`) already refuses `?` outside a function
+    /// whose own return type is `(_, Err)`-shaped before the JIT ever sees
+    /// this program (`dmc jit` type-checks first — see `main.rs`), so the
+    /// fallback `err(..)` below is a defense, not the enforcement point.
+    fn lower_query(&mut self, expr: &Expr, span: &Span) -> Result<(Value, TyKind), JitError> {
+        let (tup, tup_ty) = self.lower_expr(expr)?;
+        let elems = match &tup_ty {
+            TyKind::Tuple(es) if es.len() == 2 => es.clone(),
+            other => return err(span, format!(
+                "`?` requires a `(T, Err)` tuple, got `{}`", other.render())),
+        };
+        let (t_ty, e_ty) = (elems[0].clone(), elems[1].clone());
+        if !matches!(e_ty, TyKind::Str | TyKind::Scalar(ScalarKind::Nil)) {
+            return unsupported_msg(span, Refusal::Construct, format!(
+                "`?` on a tuple whose error half is `{}`, not `Err`/`str`/`nil`; \
+                 use `dmc run` for full semantics", e_ty.render()));
+        }
+        let (ret_t_ty, ret_e_ty) = match self.ret.clone() {
+            TyKind::Tuple(rs) if rs.len() == 2 => (rs[0].clone(), rs[1].clone()),
+            other => return err(span, format!(
+                "`?` is only legal inside a function returning `(T, Err)`; \
+                 this function returns `{}`", other.render())),
+        };
+
+        // Decode both halves unconditionally (both are plain 8-byte-slot
+        // loads with no side effects) before branching on the error half.
+        let flags = cranelift::codegen::ir::MemFlagsData::new();
+        let e_off = self.builder.ins().iconst(cl::I64, 8);
+        let e_ptr = self.builder.ins().iadd(tup, e_off);
+        let t_raw = self.decode_from_slot(tup, &t_ty);
+        let e_raw = self.decode_from_slot(e_ptr, &e_ty);
+        let _ = flags;
+
+        // `e != nil`: both `Str` and `Scalar(Nil)` encode `nil` as an
+        // all-zero i64 slot (see `encode_for_slot`/`decode_from_slot`), so
+        // one pointer test covers either error-half spelling.
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        let is_err = self.builder.ins().icmp(IntCC::NotEqual, e_raw, zero);
+
+        let err_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.brif(is_err, err_block, ok_block);
+
+        self.enter(err_block);
+        self.builder.seal_block(err_block);
+        {
+            // #674 slice 3d: the `?` early return is the fifth of B5's exit
+            // edges, and the one the design names as the trap. Emitted at the
+            // TOP of the error block, before the desugaring's own
+            // `default[T]` allocation below: that buffer is the compiler's,
+            // not the program's, and it belongs to the caller's budget rather
+            // than to the extent this edge is leaving.
+            self.emit_budget_exits_to_depth(0);
+            // `return (default[T], e)` — T is the ENCLOSING function's own
+            // declared success type (not necessarily the callee's, though by
+            // the `(T, Err)` convention they agree in every propagating call
+            // chain): this is the value `self.ret_val` below must satisfy.
+            let default_t = self.default_value_for(&ret_t_ty, span)?;
+            let e_for_ret = self.coerce_to(e_raw, &e_ty, &ret_e_ty, span)?;
+            let out = self.forge_alloc(16);
+            let t_slot = self.encode_for_slot(default_t, &ret_t_ty);
+            let e_slot = self.encode_for_slot(e_for_ret, &ret_e_ty);
+            self.builder.ins().store(cranelift::codegen::ir::MemFlagsData::new(), t_slot, out, 0);
+            self.builder.ins().store(cranelift::codegen::ir::MemFlagsData::new(), e_slot, out, 8);
+            self.emit_mut_param_copy_out();
+            self.ret_val(out);
+        }
+
+        self.enter(ok_block);
+        self.builder.seal_block(ok_block);
+        Ok((t_raw, t_ty))
+    }
+
+    /// SPEC.md §4.9's `default[T]` compiler intrinsic: "the zero value of
+    /// type T (0 / 0.0 / false / nil / zero-tensor), used only in the `?`
+    /// desugaring." Scoped to exactly that enumeration — scalars, `str`/`Err`
+    /// (whose zero value IS `nil`, the NULL pointer), and an all-zero tensor
+    /// over the element types the JIT can zero-fill (mirrors `forge.zeros`'s
+    /// own restriction in `lower_arena_alloc`). Anything else has no defined
+    /// default in the spec and is refused rather than guessed.
+    fn default_value_for(&mut self, kind: &TyKind, span: &Span) -> Result<Value, JitError> {
+        match kind {
+            TyKind::Scalar(ScalarKind::F32) => Ok(self.builder.ins().f32const(0.0)),
+            TyKind::Scalar(ScalarKind::F64) => Ok(self.builder.ins().f64const(0.0)),
+            TyKind::Scalar(ScalarKind::OptI64) => Ok(self.builder.ins().iconst(cl::I128, 0)),
+            TyKind::Scalar(sk) => Ok(self.builder.ins().iconst(sk.cl(), 0)),
+            // `nil` — the NULL pointer, same convention as every other
+            // nilable-str slot (`dmc_str_eq`, `s == nil`, the `Err`
+            // conversion arm in `coerce_to`).
+            TyKind::Str => Ok(self.builder.ins().iconst(cl::I64, 0)),
+            TyKind::Tensor(t) if matches!(t.elem, ScalarKind::F32 | ScalarKind::I32 | ScalarKind::I64) => {
+                let out = self.forge_alloc(t.nbytes());
+                // `nbytes() / 4` is a count of 4-byte WORDS to fill, not of
+                // elements — correct here only because the fill pattern is
+                // all-zero-bytes, so it doesn't matter whether a word lines
+                // up with one i64 element's low half or one i32/f32 element.
+                self.fill_const(out, t.nbytes() / 4, 0.0);
+                Ok(out)
+            }
+            _ => unsupported_msg(span, Refusal::Conversion, format!(
+                "`?`'s early return needs a default value for `{}`, which the \
+                 JIT cannot construct (only scalars, `str`/`Err`, and f32/i32/\
+                 i64 tensors have one); use `dmc run` for full semantics",
+                kind.render(),
+            )),
+        }
     }
 
     /// #324: transpose a bf16 weight at native 2-byte width, yielding a
@@ -13389,7 +19469,7 @@ impl<'a> Translator<'a> {
             1 => {
                 let out_ptr = self.forge_alloc(t.nbytes());
                 let n = t.nelems();
-                self.emit_memcpy_loop(out_ptr, ptr, n, t.elem.cl());
+                self.emit_memcpy_loop(out_ptr, ptr, n, t.elem.store_cl());
                 Ok((out_ptr, t.clone()))
             }
             2 => {
@@ -13438,7 +19518,7 @@ impl<'a> Translator<'a> {
                 let j_m = self.builder.ins().imul(j, m_v);
                 let dst_flat = self.builder.ins().iadd(j_m, i);
                 let dst_off = self.builder.ins().imul(dst_flat, eb_v);
-                self.tensor_store_elem(out_ptr, dst_off, v);
+                self.tensor_store_elem_k(out_ptr, dst_off, v, t.elem);
                 let jnext = self.builder.ins().iadd(j, one);
                 self.jump(j_hdr, &[jnext]);
                 self.builder.seal_block(j_body);
@@ -13564,7 +19644,7 @@ impl<'a> Translator<'a> {
                 let dst_f = self.builder.ins().iadd(dst_f, jm);
                 let dst_f = self.builder.ins().iadd(dst_f, i);
                 let dst_o = self.builder.ins().imul(dst_f, eb);
-                self.tensor_store_elem(out_ptr, dst_o, v);
+                self.tensor_store_elem_k(out_ptr, dst_o, v, t.elem);
 
                 let jnext = self.builder.ins().iadd(j, one);
                 self.jump(j_hdr, &[jnext]);
@@ -14891,10 +20971,82 @@ impl<'a> Translator<'a> {
             let result = self.builder.inst_results(call)[0];
             return Ok((result, TyKind::Scalar(ScalarKind::I64)));
         }
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: "`len` requires a tensor or str argument".into(),
-            line: span.line, col: span.col,
-        })?;
+        // Map (#751): call __dmc_map_len for the entry count. `HashMap::len`
+        // (the same map the interpreter's `Value::Map` arm reads) already
+        // agrees with `dmc run` — re-setting an existing key overwrites its
+        // slot rather than adding one, so no separate bookkeeping is needed.
+        if ty.is_map() {
+            let entry = self.fns.get("__dmc_map_len")
+                .expect("__dmc_map_len not registered").clone();
+            let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+            let call = self.builder.ins().call(func_ref, &[v]);
+            let result = self.builder.inst_results(call)[0];
+            return Ok((result, TyKind::Scalar(ScalarKind::I64)));
+        }
+        // Tuple (#754 review of #751): a tuple's arity is static — the JIT
+        // already lays it out as `n` uniform 8-byte slots (`TyKind::Tuple`'s
+        // own doc comment) — so `len((1,2,3))` needs no runtime call at all,
+        // unlike the tensor/str/Map cases above. `dmc run` answers `3` for
+        // this exact program (`interp.rs`'s `Value::Tuple(vs) => vs.len()`);
+        // the previous code sent it through the same `Refusal::Conversion`
+        // catch-all below, which was simply wrong — a tuple is not a "real
+        // type error" like a bool or a Port handle, len(tensor)/len(str)'s
+        // sibling case.
+        if let TyKind::Tuple(elems) = &ty {
+            let n = self.builder.ins().iconst(cl::I64, elems.len() as i64);
+            return Ok((n, TyKind::Scalar(ScalarKind::I64)));
+        }
+        // `list`/`range` (#754 review of #751): `dmc run` accepts both for
+        // `len` (`interp.rs`'s own "len: requires tensor, tuple, str, list,
+        // or map" names both), but the JIT has no runtime representation for
+        // either — list builtins refuse `jit-unknown-fn` before a list value
+        // could ever reach here (#749), and a bare range *expression* refuses
+        // `jit-construct` at its own construction (`Expr::Range`, "range
+        // expressions") for the same reason. The one way either still reaches
+        // `len`'s own argument here is a `list`/`range`-typed *signature*
+        // annotation — the same untyped escape hatch `map` gets (SPEC has no
+        // static `list` or `range` type) — which `ty_from_ast`'s fallback for
+        // an unrecognized name (jit.rs, "an unknown model" path) resolves to
+        // `TyKind::Model(name, _)` bearing that literal name, not a real
+        // model. Guard on `model_layouts` so a program that genuinely
+        // declares `model list { .. }` (a real, if confusingly named, model)
+        // still falls through to the real-type-error case below instead of
+        // this one. This is a written type the JIT cannot build — `jit-type-
+        // form` (DIAGNOSTICS.md §5.2) — not the checker failing to catch an
+        // ill-typed program, so it must not carry that framing.
+        if let TyKind::Model(name, _) = &ty {
+            if (name == "list" || name == "range") && !self.model_layouts.contains_key(name) {
+                return unsupported(span, Refusal::TypeForm, &format!(
+                    "`len`'s argument is `{0}`-typed — the JIT has no `{0}` type to build \
+                     (the same untyped escape hatch as `map`, but unlike `map` it has no JIT \
+                     representation either; list/range builtins don't lower, #749) — `dmc run` \
+                     computes this correctly, so this is a JIT gap, not a type error",
+                    name));
+            }
+        }
+        // Anything else gets the same located `jit-conversion` refusal #743's
+        // helper already gives a `map_get`/`map_set`/`map_contains` argument
+        // in the same shape, rather than the uncoded `jit error` this
+        // replaces:
+        //   - `TyKind::Scalar(OptI64)` — a `map_get` result (`len(map_get(d,
+        //     "fns"))` on a nested map value) is an opaque i64 payload in the
+        //     JIT regardless of what the interpreter's map actually stored
+        //     there, so it can never be verified as tensor/str/Map/tuple here;
+        //     cites #721.
+        //   - Any other definitively-wrong static type (i64/bool/f64 literal,
+        //     fn, a real Model instance, ...) — `dmc run` refuses this exact
+        //     program too (`interp.rs`'s own "len: requires tensor, tuple,
+        //     str, list, or map"), so per #480 this is a real bug in the
+        //     caller's program — a CHECK error is the eventual right answer,
+        //     but closing it is not #745: #745's fix is one concrete
+        //     parameter type per position, which works for the map builtins
+        //     (a key is always `str`) but cannot express `len`'s polymorphic
+        //     domain (tensor, str, Map, or tuple — no single type). Cites the
+        //     dedicated polymorphic-domain-check gap, #758, instead.
+        let t = match ty.as_tensor() {
+            Some(t) => t,
+            None => return Err(Self::len_type_refusal(span, &ty)),
+        };
         // #parity: len(tensor) is the size of the FIRST dimension (rows), like
         // the interpreter / numpy — not the flattened element count. (For a 1-D
         // tensor shape[0] == nelems, so this is unchanged there.)
@@ -14987,13 +21139,174 @@ impl<'a> Translator<'a> {
         Ok((res, TyKind::Scalar(ScalarKind::Bool)))
     }
 
+    /// #674: `forge.enter(b) {
+    /// … }`. The block itself is the arena block's scope machinery
+    /// unchanged (a block is a lexical scope and nothing more) — what this
+    /// adds is one `__dmc_budget_enter` before
+    /// it and one `__dmc_budget_exit` on **each of the five edges out of
+    /// it**:
+    ///
+    ///   * normal exit — emitted here, after the body, and only when the
+    ///     body left a fall-through edge at all (`is_filled`);
+    ///   * `return` — `lower_return`, before each of its three `ret_*`;
+    ///   * `break` / `continue` — `lower_break` / `lower_continue`, down to
+    ///     the enclosing loop's own `budget_depth`;
+    ///   * the `?` early return — `lower_query`'s error block.
+    ///
+    /// The edge set IS the gate: a missed edge leaves
+    /// `CURRENT_BUDGET` naming `b` for the rest of the program and
+    /// mis-charges every later allocation with no diagnostic — the same
+    /// class of silent wrong number B6 exists to close.
+    ///
+    /// Returns `None` when the body has no value, so a valueless
+    /// `forge.enter(b) { … }` in statement or tail position lowers exactly
+    /// as `forge { … }` does rather than reporting a missing tail.
+    fn lower_budget_block(&mut self, bb: &BudgetBlock) -> Result<Option<(Value, TyKind)>, JitError> {
+        // #478: the operand is not the block's value position — take the
+        // hint before lowering it and re-arm it on the body.
+        let want = self.float_lit_hint.take();
+        let (b_v, b_ty) = self.lower_expr(&bb.operand)?;
+        if !b_ty.is_budget() {
+            return err(&bb.operand.span_of(), format!(
+                "forge.enter: expects a `Budget`, found `{}`", b_ty.render()));
+        }
+        let prev = self.emit_budget_enter(b_v, &bb.span);
+        self.budget_stack.push(prev);
+        self.float_lit_hint = want;
+        let body = self.lower_block_value(&bb.body);
+        // Popped BEFORE the `?`, so a refusal inside the body cannot leave a
+        // phantom extent on the lowering stack for the rest of the function.
+        let prev = self.budget_stack.pop().expect("#674: budget_stack underflow");
+        let body = body?;
+        if !self.is_filled() {
+            self.emit_budget_exit(prev);
+        }
+        Ok(body)
+    }
+
+    /// #674: `<ctor> in b` — the same
+    /// register push as `enter`, held across exactly one constructor, so
+    /// PRE-A and the placement both land in `b`.
+    ///
+    /// The design's §5 line for this arm says "emits `forge_alloc_in`"; what
+    /// ships is the register, for the reason §3.3 gives on the line above
+    /// it — "one register read in the callback, the 82 `self.forge_alloc(`
+    /// emit sites and the 3 `forge_alloc_v` sites unchanged". A dedicated
+    /// `__dmc_forge_alloc_in` would redirect only the constructor's own
+    /// buffer; the register redirects everything the constructor evaluates,
+    /// which is what the interpreter's own `Expr::AllocIn` arm does (its
+    /// `BudgetGuard` is live across the whole constructor). Same charge for
+    /// `forge.zeros[f32, [4]] in b`, and parity rather than divergence for
+    /// `forge.zeros[f32, [n()]] in b`, where the shape argument's own
+    /// allocations are inside the override on both backends.
+    fn lower_alloc_in(&mut self, ctor: &Expr, budget: &Expr, span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        let want = self.float_lit_hint.take();
+        let (b_v, b_ty) = self.lower_expr(budget)?;
+        if !b_ty.is_budget() {
+            return err(&budget.span_of(), format!(
+                "`in`: expects a `Budget`, found `{}`", b_ty.render()));
+        }
+        let prev = self.emit_budget_enter(b_v, span);
+        self.budget_stack.push(prev);
+        self.float_lit_hint = want;
+        let v = self.lower_expr(ctor);
+        let prev = self.budget_stack.pop().expect("#674: budget_stack underflow");
+        let v = v?;
+        if !self.is_filled() {
+            self.emit_budget_exit(prev);
+        }
+        Ok(v)
+    }
+
+    /// #674 slice 3c: `forge.carve(parent, bytes)` and `forge.reap(b)` —
+    /// both runtime calls into the budget table (`__dmc_budget_carve`,
+    /// `__dmc_budget_reap`), located by `line`/`col` the same way
+    /// `lower_str_starts_with`'s call is. `method` is `"carve"` or `"reap"`,
+    /// the two forms `lower_expr`'s `PostfixOp::Call` arm already narrowed
+    /// the call to before reaching here.
+    fn lower_forge_budget_call(
+        &mut self,
+        method: &str,
+        args: &[CallArg],
+        span: &Span,
+    ) -> Result<(Value, TyKind), JitError> {
+        match method {
+            "carve" => {
+                if args.len() != 2 {
+                    return err(span, format!(
+                        "forge.carve: expects 2 arguments (parent, bytes), found {}",
+                        args.len()));
+                }
+                let (parent_e, bytes_e) = match (&args[0], &args[1]) {
+                    (CallArg::Positional(p), CallArg::Positional(b)) => (p, b),
+                    _ => return unsupported(span, Refusal::ArgForm,
+                        "named/spread argument to `forge.carve`"),
+                };
+                let (parent_v, parent_ty) = self.lower_expr(parent_e)?;
+                if !parent_ty.is_budget() {
+                    return err(span, format!(
+                        "forge.carve: parent must be a `Budget`, found `{}`", parent_ty.render()));
+                }
+                let (bytes_v, bytes_ty) = self.lower_expr(bytes_e)?;
+                let bytes_v = self.coerce_to(bytes_v, &bytes_ty, &TyKind::Scalar(ScalarKind::I64), span)?;
+                let entry = self.fns.get("__dmc_budget_carve")
+                    .expect("__dmc_budget_carve not registered").clone();
+                let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+                let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+                let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+                let call = self.builder.ins().call(func_ref, &[parent_v, bytes_v, line, col]);
+                let result = self.builder.inst_results(call)[0];
+                Ok((result, TyKind::Budget))
+            }
+            "reap" => {
+                if args.len() != 1 {
+                    return err(span, format!(
+                        "forge.reap: expects 1 argument (budget), found {}", args.len()));
+                }
+                let b_e = match &args[0] {
+                    CallArg::Positional(b) => b,
+                    _ => return unsupported(span, Refusal::ArgForm,
+                        "named/spread argument to `forge.reap`"),
+                };
+                let (b_v, b_ty) = self.lower_expr(b_e)?;
+                if !b_ty.is_budget() {
+                    return err(span, format!(
+                        "forge.reap: expects a `Budget`, found `{}`", b_ty.render()));
+                }
+                let entry = self.fns.get("__dmc_budget_reap")
+                    .expect("__dmc_budget_reap not registered").clone();
+                let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+                let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+                let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+                self.builder.ins().call(func_ref, &[b_v, line, col]);
+                // `forge.reap` returns `nil`.
+                let z = self.builder.ins().iconst(cl::I8, 0);
+                Ok((z, TyKind::Scalar(ScalarKind::Nil)))
+            }
+            _ => unreachable!("lower_forge_budget_call: method must be carve or reap"),
+        }
+    }
+
     /// Lower one positional argument that must already be a `str`.
+    ///
+    /// Bounds-checked rather than a raw `args[i]`: most callers already
+    /// reject a wrong argument count before reaching here, but `--check`
+    /// (not this function) is the one place arity is actually validated for
+    /// a real `dmc jit` run (`types.rs`'s builtin signature table), and at
+    /// least one caller (the file I/O builtins, #802 review) now relies on
+    /// that entirely rather than repeating the check — so `i` out of range
+    /// must fall through to a clean `JitError`, never a panic, for a caller
+    /// (or a test, `builtin_parity_jit_dispatches_every_listed_builtin`
+    /// included) that reaches this past `--check`.
     fn lower_str_arg(&mut self, args: &[CallArg], i: usize, what: &str, span: &Span)
         -> Result<Value, JitError>
     {
-        let e = match &args[i] {
-            CallArg::Positional(e) => e,
-            _ => return unsupported(span, Refusal::ArgForm, &format!("non-positional arg to `{}`", what)),
+        let e = match args.get(i) {
+            Some(CallArg::Positional(e)) => e,
+            Some(_) => return unsupported(span, Refusal::ArgForm, &format!("non-positional arg to `{}`", what)),
+            None => return err(span, format!("`{}`: missing argument", what)),
         };
         let (v, ty) = self.lower_expr(e)?;
         if !ty.is_str() {
@@ -15127,8 +21440,16 @@ impl<'a> Translator<'a> {
                     ScalarKind::F64 => W::F64,
                     ScalarKind::F32 => W::F32,
                     ScalarKind::Bool => W::Bool,
-                    other => return err(span, format!(
-                        "`{}`: tensor element `{}` has no copy-mode wire dtype (PORTS.md §3.2)",
+                    // #632 made the narrow integer widths constructible in the
+                    // JIT, so this arm became reachable. It is a REFUSAL, not an
+                    // error: the interpreter does cross such a tensor (tagging
+                    // it `i64` on the wire, which is its own question — §3.2
+                    // says the dtype states the payload's real width), so a
+                    // `jit error` here would be scored a divergence by the
+                    // differential tooling rather than the gap it is.
+                    other => return unsupported_msg(span, Refusal::ElementType, format!(
+                        "`{}`: a tensor whose element `{}` has no copy-mode wire dtype \
+                         (PORTS.md §3.2); use `dmc run` for full semantics",
                         what, other.name())),
                 };
                 Ok((w, t.shape.clone()))
@@ -15225,6 +21546,87 @@ impl<'a> Translator<'a> {
         self.builder.ins().store(flags, zero, pair, 0);
         self.builder.ins().store(flags, errv, pair, 8);
         Ok((pair, TyKind::Tuple(vec![TyKind::Scalar(ScalarKind::Nil), TyKind::Str])))
+    }
+
+    /// `read_file(path) -> (str, Err)` (`interp.rs:10098`). Host call through
+    /// `__dmc_read_file`, which already packs the `(value, Err)` pair.
+    fn lower_builtin_read_file(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        // Arity is `--check`'s job (`types.rs`'s `read_file` signature, `mk(1, ..)`)
+        // and it rejects a wrong count before this lowering ever runs.
+        // (The parity test below calls this lowering directly with no args, so the
+        // helper bounds-checks instead of asserting.)
+        let path = self.lower_str_arg(args, 0, "read_file: path", span)?;
+        let entry = self.fns.get("__dmc_read_file").expect("__dmc_read_file not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[path, line, col]);
+        let pair = self.builder.inst_results(call)[0];
+        Ok((pair, TyKind::Tuple(vec![TyKind::Str, TyKind::Str])))
+    }
+
+    /// `write_file(path, content) -> (nil, Err)` (`interp.rs:10130`). The
+    /// first half is always nil — the interpreter never returns a bool here.
+    fn lower_builtin_write_file(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        // Arity is `--check`'s job (`types.rs`'s `write_file` signature, `mk(2, ..)`)
+        // and it rejects a wrong count before this lowering ever runs.
+        // (The parity test below calls this lowering directly with no args, so the
+        // helper bounds-checks instead of asserting.)
+        let path = self.lower_str_arg(args, 0, "write_file: path", span)?;
+        let content = self.lower_str_arg(args, 1, "write_file: content", span)?;
+        let entry = self.fns.get("__dmc_write_file").expect("__dmc_write_file not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[path, content, line, col]);
+        let pair = self.builder.inst_results(call)[0];
+        Ok((pair, TyKind::Tuple(vec![TyKind::Scalar(ScalarKind::Nil), TyKind::Str])))
+    }
+
+    /// `append_file(path, content) -> (nil, Err)` (`interp.rs:10144`).
+    fn lower_builtin_append_file(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        // Arity is `--check`'s job (`types.rs`'s `append_file` signature, `mk(2, ..)`)
+        // and it rejects a wrong count before this lowering ever runs.
+        // (The parity test below calls this lowering directly with no args, so the
+        // helper bounds-checks instead of asserting.)
+        let path = self.lower_str_arg(args, 0, "append_file: path", span)?;
+        let content = self.lower_str_arg(args, 1, "append_file: content", span)?;
+        let entry = self.fns.get("__dmc_append_file").expect("__dmc_append_file not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[path, content, line, col]);
+        let pair = self.builder.inst_results(call)[0];
+        Ok((pair, TyKind::Tuple(vec![TyKind::Scalar(ScalarKind::Nil), TyKind::Str])))
+    }
+
+    /// `file_exists(path) -> bool` (`interp.rs:10162`).
+    fn lower_builtin_file_exists(&mut self, args: &[CallArg], span: &Span)
+        -> Result<(Value, TyKind), JitError>
+    {
+        // Arity is `--check`'s job (`types.rs`'s `file_exists` signature, `mk(1, ..)`)
+        // and it rejects a wrong count before this lowering ever runs.
+        // (The parity test below calls this lowering directly with no args, so the
+        // helper bounds-checks instead of asserting.)
+        let path = self.lower_str_arg(args, 0, "file_exists: path", span)?;
+        let entry = self.fns.get("__dmc_file_exists").expect("__dmc_file_exists not registered").clone();
+        let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+        let line = self.builder.ins().iconst(cl::I64, span.line as i64);
+        let col = self.builder.ins().iconst(cl::I64, span.col as i64);
+        let call = self.builder.ins().call(func_ref, &[path, line, col]);
+        let exists_i64 = self.builder.inst_results(call)[0];
+        // `ScalarKind::Bool` is `cl::I8` (line ~350) — narrow the runtime
+        // call's `i64` 0/1 the same way `str_eq`'s caller does, rather than
+        // handing downstream codegen an i64 SSA value under a Bool type.
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        let result = self.builder.ins().icmp(IntCC::NotEqual, exists_i64, zero);
+        Ok((result, TyKind::Scalar(ScalarKind::Bool)))
     }
 
     /// `str_get_char(s, i)` — return byte at index i as i64.
@@ -15345,6 +21747,165 @@ impl<'a> Translator<'a> {
         Ok((result, TyKind::Map))
     }
 
+    /// #720 review (F3d): `map_get`/`map_set`/`map_contains` all refuse a
+    /// non-`Map` first argument with the same "must be a Map, got `T`"
+    /// message — the right diagnostic for an ordinary type mistake, but the
+    /// wrong one when `T` is `nil` ONLY because the value traces back to a
+    /// call whose declared return type was omitted (`omitted_ret_fns`):
+    /// naming the map builtin blames the wrong line, three lines removed
+    /// from the fn that actually needs `-> T` (#695's original complaint,
+    /// which the F3a-c fixes above narrowed but did not close for THIS
+    /// position — a call used directly as the argument, never bound to a
+    /// name at all). Checked wherever a `!mty.is_map()` guard is about to
+    /// fire, in place of the generic message, so `map_get(dep(7), "v")` and
+    /// `if map_contains(dep(1), "v")` get the located refusal too, not just
+    /// `let d = dep(7)  map_get(d, "v")`.
+    ///
+    /// `e` is checked two ways, matching how `name` can have gotten here:
+    /// resolved directly (the call is the argument expression itself, F3d),
+    /// or through `omitted_ret_provenance` (the argument is a bare local
+    /// `lower_let` already recorded provenance for).
+    fn omitted_ret_arg_refusal(&self, e: &Expr, span: &Span, builtin: &str) -> Option<JitError> {
+        let fname = self.resolve_direct_call_name(e)
+            .filter(|n| self.omitted_ret_fns.contains(n))
+            .or_else(|| match e {
+                Expr::Ident(n, _) => self.omitted_ret_provenance.get(n).cloned(),
+                _ => None,
+            })?;
+        Some(unsupported_err(span, Refusal::Signature, format!(
+            "`{}`'s first argument came from calling `{}`, which has no declared \
+             return type — the JIT assumes such a fn returns nothing, so this \
+             value is `nil` regardless of what `{}`'s body actually produces; \
+             give `{}` an explicit `-> T` return type",
+            builtin, fname, fname, fname)))
+    }
+
+    /// #742 (review D1): `map_get`/`map_set`/`map_contains` refuse a non-`str`
+    /// key or a non-`Map` argument with a located `jit-conversion` refusal
+    /// naming the offending type — never the uncoded `jit error` #742
+    /// reported, whatever the type actually is. Two shapes reach here, and
+    /// they get different citations:
+    ///
+    /// - `TyKind::Scalar(OptI64)` — a `map_get` result is always an opaque
+    ///   i64 payload with a maybe-nil present bit in the JIT, no matter what
+    ///   the interpreter's map actually stored there, because the JIT's map
+    ///   values are untyped i64 words (#721). Using such a value as a `str`
+    ///   key (`map_set(defs, map_get(rec, "name"), rec)`, #742's original
+    ///   repro) or as the map argument itself — a nested-map read
+    ///   (`map_get(map_get(outer, "k"), "j")`), only reachable because
+    ///   storing `outer`'s inner map as a VALUE already erased it to opaque
+    ///   i64 on the way in — is the JIT's representation losing a
+    ///   distinction #721 will restore, not a mistake in the caller's
+    ///   program: cite #721.
+    /// - Any other definitively-wrong static type (an `i64`/`bool`/`f64`
+    ///   literal, a tensor, ...) — the JIT knows statically it is not
+    ///   `str`/`Map`, and `dmc run` refuses the exact same program too
+    ///   (`interp.rs`'s own "key must be str" / "first arg must be map"
+    ///   checks), so this really is a bug in the caller's program. Per #480
+    ///   that makes it a CHECK error, not a jit error — but the checker does
+    ///   not catch it yet, because the map builtins' signatures carry no
+    ///   parameter types (#745). Until #745 closes that gap the JIT is the
+    ///   only thing that catches it, so it gets the same located
+    ///   `jit-conversion` refusal rather than falling through to the uncoded
+    ///   `err()` this replaced: cite #745 instead of #721.
+    ///
+    /// #751 reuses this for `len`'s `OptI64` argument too — `len(map_get(d,
+    /// "fns"))` on a nested map value hits the exact same shape, and cites
+    /// #721 for the identical reason. `len`'s *other* non-tensor/str/Map/
+    /// tuple types do NOT reuse the `(see #745)` branch below any more
+    /// (#754 review of #751): `len` is polymorphic (tensor, str, Map, or
+    /// tuple — no single expected type), which is not the gap #745 tracks
+    /// (one concrete parameter type per position, sufficient for `map_get`/
+    /// `map_set`/`map_contains`'s single-typed arguments but not for a
+    /// multi-type domain). `len_type_refusal`, just below, gives that case
+    /// its own message citing #758 instead.
+    fn map_slot_type_refusal(span: &Span, builtin: &str, arg: &str, expect: &str, ty: &TyKind) -> JitError {
+        if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+            return unsupported_err(span, Refusal::Conversion, format!(
+                "`{}` {} must be {}, got `{}` — a `map_get` result is always opaque \
+                 `i64` in the JIT (map values are i64-only pending #721), so it can \
+                 never be verified as {} here even when its runtime value genuinely \
+                 is one",
+                builtin, arg, expect, ty.render(), expect));
+        }
+        let checker_note = if expect == "str" {
+            "map keys are str; the checker accepts this".to_string()
+        } else {
+            format!("{}'s first argument must be {}; the checker accepts this", builtin, expect)
+        };
+        unsupported_err(span, Refusal::Conversion, format!(
+            "`{}` {} must be {}, got `{}` — {} (see #745)",
+            builtin, arg, expect, ty.render(), checker_note))
+    }
+
+    /// `len`'s own non-tensor/str/Map/tuple fallback (#754 review of #751).
+    /// The `OptI64` shape (a `map_get` result) is identical to every other
+    /// caller of `map_slot_type_refusal`, so it's delegated there unchanged
+    /// (cites #721). Everything else is a real type error `dmc run` also
+    /// rejects at runtime, but the citation is #758, not #745 — #745's
+    /// mechanism (one concrete parameter type per position) cannot express
+    /// `len`'s polymorphic domain (tensor, str, Map, or tuple), so closing
+    /// this needs the dedicated polymorphic-domain check #758 tracks.
+    fn len_type_refusal(span: &Span, ty: &TyKind) -> JitError {
+        const EXPECT: &str = "a tensor, str, Map, or tuple";
+        if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+            return Self::map_slot_type_refusal(span, "len", "argument", EXPECT, ty);
+        }
+        unsupported_err(span, Refusal::Conversion, format!(
+            "`len` argument must be {}, got `{}` — len's argument must be {}; \
+             the checker accepts this (see #758)",
+            EXPECT, ty.render(), EXPECT))
+    }
+
+    /// #760: every operator or builtin that falls through an ordinary
+    /// "wrong type" fallback straight to an uncoded `jit error` when handed a
+    /// `map_get` result. Same reasoning as `map_slot_type_refusal` above,
+    /// generalized past the map builtins themselves: `map_get`'s result is
+    /// always `TyKind::Scalar(OptI64)` in the JIT — an opaque i64 payload,
+    /// present-bit and all — no matter what the interpreter's map actually
+    /// stored there (map values are i64-only pending #721). Treating it as a
+    /// genuine type error, the way the ordinary fallback does for a real
+    /// `bool`/tensor/model mismatch, is wrong: the runtime value might well
+    /// BE a tensor, a str, or a list — the JIT simply cannot see past the
+    /// opaque payload to check. `detail` is the site's own "X requires Y, got
+    /// `i64?`" wording (or, for `lower_binop`'s two-operand fallback,
+    /// "operator OP is not defined for types ..."); this appends the shared
+    /// citation.
+    ///
+    /// One helper, reused by every site #760 audited: indexing/slicing
+    /// (`lower_index`), element and slice assignment (`lower_tensor_store`,
+    /// `lower_tensor_slice_store`), arithmetic/comparison (`lower_binop`'s
+    /// final fallback), transpose (`lower_transpose`), and every builtin
+    /// reduction that requires a tensor argument (`sum`, `max`/`min`,
+    /// `argmax`/`argmin`, `variance`, `sum_along`/`mean_along`/`max_along`/
+    /// `min_along`, `softmax`, `print_tensor`). `for v in x` already refuses
+    /// any non-range iterable uniformly (`Refusal::LoopForm`, regardless of
+    /// the element type) and `print(x)` already branches on the opt's
+    /// present bit (#300.4) — both handle this shape correctly already and
+    /// needed no change. Plain `OptI64 + 1`-style arithmetic against another
+    /// scalar is unaffected: it reaches `scalar_binop`/`coerce_scalar`, which
+    /// decode-and-trap LOCATED (#480/#767) — genuinely computing, not
+    /// refusing. `OptI64 == 1`/`!= 1` no longer even traps: `scalar_binop`
+    /// answers directly for an absent value, matching the interpreter
+    /// (#767).
+    ///
+    /// #769: also reused at the very top of `coerce_to`, ahead of every
+    /// individual arm rather than inside one: an `OptI64` source coerced
+    /// into a pointer-carrying target (`Tensor`, `Bf16Tensor`, `KV`,
+    /// `KvArray`, `DynTensor`, `TritTensor`, `Model`, `ModelArray`, `Str`,
+    /// `Port`, `Map`, `Tuple`, or a payload-carrying `Enum`) is refused
+    /// there before the generic decode-then-recurse can reach one of those
+    /// types' own `i64`-source arms and reinterpret the decoded payload as
+    /// a live pointer — the segfault this issue is named for.
+    fn opt_i64_refusal(span: &Span, detail: impl Into<String>) -> JitError {
+        unsupported_err(span, Refusal::Conversion, format!(
+            "{} — a `map_get` result is always opaque `i64` in the JIT (map \
+             values are i64-only pending #721), so it can never be verified \
+             as anything more specific here even when its runtime value \
+             genuinely is",
+            detail.into()))
+    }
+
     fn lower_builtin_map_get(
         &mut self,
         args: &[CallArg],
@@ -15357,8 +21918,13 @@ impl<'a> Translator<'a> {
         let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_get`") };
         let (m, mty) = self.lower_expr(e0)?;
         let (k, kty) = self.lower_expr(e1)?;
-        if !mty.is_map() { return err(span, format!("`map_get` arg 1 must be a Map, got `{}`", mty.render())); }
-        if !kty.is_str() { return err(span, format!("`map_get` arg 2 must be str, got `{}`", kty.render())); }
+        if !mty.is_map() {
+            if let Some(e) = self.omitted_ret_arg_refusal(e0, span, "map_get") { return Err(e); }
+            return Err(Self::map_slot_type_refusal(span, "map_get", "arg 1", "a Map", &mty));
+        }
+        if !kty.is_str() {
+            return Err(Self::map_slot_type_refusal(span, "map_get", "arg 2", "str", &kty));
+        }
         // map_get is dynamically typed and returns `nil` on a missing key (#300.4).
         // Produce an OptI64 (I128: present-bit | value) built from map_contains +
         // map_get, so `print` / `== nil` see the miss and a plain-i64 use traps —
@@ -15393,6 +21959,97 @@ impl<'a> Translator<'a> {
         self.builder.ins().ireduce(cl::I64, opt)
     }
 
+    /// #767: `map_get(...) == x` / `!= x` where `x` is a genuine (non-nil,
+    /// non-`OptI64`) `i64` — matching `scalar_compare`'s blanket `(Nil, _) |
+    /// (_, Nil)` arm (`Eq` false, `NotEq` true) with NO trap when the map
+    /// held no value for the key: `x` is never itself nil here, so presence
+    /// alone decides which answer applies, no different from comparing to
+    /// the literal `nil` except that a present key also needs its payload
+    /// compared against `x`. `select` merges the two without branching —
+    /// there is no trap on this path at all any more.
+    fn opt_eq_vs_concrete(&mut self, op: &BinOp, opt: Value, concrete: Value) -> Value {
+        let cc = if matches!(op, BinOp::Eq) { IntCC::Equal } else { IntCC::NotEqual };
+        let present = self.opt_present(opt);
+        let decoded = self.opt_value(opt);
+        let value_cmp = self.builder.ins().icmp(cc, decoded, concrete);
+        let absent_answer = self.builder.ins()
+            .iconst(cl::I8, if matches!(op, BinOp::NotEq) { 1 } else { 0 });
+        self.builder.ins().select(present, value_cmp, absent_answer)
+    }
+
+    /// #767: `map_get(...) == map_get(...)` — both sides `OptI64`. Matches
+    /// `scalar_compare` exactly with no trap either way: `nil == nil` is
+    /// true (`!=` false), `nil` against a genuine value is the same blanket
+    /// answer `opt_eq_vs_concrete` uses, and two present values compare
+    /// their decoded payloads.
+    fn opt_eq_vs_opt(&mut self, op: &BinOp, l: Value, r: Value) -> Value {
+        let cc = if matches!(op, BinOp::Eq) { IntCC::Equal } else { IntCC::NotEqual };
+        let lp = self.opt_present(l);
+        let rp = self.opt_present(r);
+        let lv = self.opt_value(l);
+        let rv = self.opt_value(r);
+        let decoded_cmp = self.builder.ins().icmp(cc, lv, rv);
+        let same_presence = self.builder.ins().icmp(IntCC::Equal, lp, rp);
+        let both_nil = self.builder.ins()
+            .iconst(cl::I8, if matches!(op, BinOp::Eq) { 1 } else { 0 });
+        let mismatched = self.builder.ins()
+            .iconst(cl::I8, if matches!(op, BinOp::NotEq) { 1 } else { 0 });
+        // `same_presence`: both absent (nil == nil ⇒ `both_nil`) or both
+        // present (⇒ the real `decoded_cmp`) — `lp` (nonzero iff present)
+        // tells the two apart. Otherwise (one present, one absent) ⇒
+        // `mismatched`.
+        let when_same = self.builder.ins().select(lp, decoded_cmp, both_nil);
+        self.builder.ins().select(same_presence, when_same, mismatched)
+    }
+
+    /// The interpreter's own `Value::type_name()` spelling for a scalar kind
+    /// (#767) — coarser than the JIT's own `ScalarKind::name()` (every int
+    /// width there is just "int", not "i64"/"i8"/"u32"/...), needed to make
+    /// a JIT nil-trap message read exactly like `dmc run`'s. `scalar_binop`'s
+    /// two call sites only ever pass a STATIC kind here — one already proven
+    /// not to be `OptI64` (the both-`OptI64` shape is routed through
+    /// `opt_unwrap_or_located_trap_dual`/`emit_binop_nil_trap_dual` instead,
+    /// which resolve the other operand's name from its actual present bit at
+    /// runtime, #865), the other a kind that decode has already turned into a
+    /// genuine `I64`. The `OptI64 => "nil"` arm below is accordingly a
+    /// defensive fallback, not a live path; kept so an un-decoded `OptI64`
+    /// reaching here by some future caller still gets an honest name instead
+    /// of a panic.
+    fn interp_scalar_type_name(k: ScalarKind) -> &'static str {
+        match k {
+            ScalarKind::F32 | ScalarKind::F64 => "float",
+            ScalarKind::Bool => "bool",
+            ScalarKind::Nil | ScalarKind::OptI64 => "nil",
+            _ => "int",
+        }
+    }
+
+    /// The interpreter's own wording for "a `nil` operand reached `op`"
+    /// (#480/#767): `scalar_arith`'s shared "requires numeric operands"
+    /// message for every arithmetic op, each bitwise op's own "requires int"
+    /// (the interpreter's `BitAnd`/`BitOr`/.../`BitShr` arms each name only
+    /// the ONE operand that failed `as_int()`, never both), and
+    /// `scalar_compare`'s ordering-operator message. `l_name`/`r_name` are
+    /// the caller's already-resolved names for each side — "nil" for
+    /// whichever operand is the one about to be checked for presence, the
+    /// other side's `interp_scalar_type_name` otherwise. `==`/`!=` never
+    /// reach this (see `scalar_binop`'s own special-casing above); the arm
+    /// is a defensive fallback, not a live path.
+    fn opt_i64_binop_trap_msg(op: &BinOp, l_name: &str, r_name: &str) -> String {
+        use BinOp::*;
+        match op {
+            Add | Sub | Mul | Div | Mod | Pow | StarStar =>
+                format!("{:?} requires numeric operands, got {} and {}", op, l_name, r_name),
+            BitAnd => "& requires int, got nil".to_string(),
+            BitOr  => "| requires int, got nil".to_string(),
+            BitXor => "^ requires int, got nil".to_string(),
+            BitShl => "<< requires int, got nil".to_string(),
+            BitShr => ">> requires int, got nil".to_string(),
+            Lt | Gt | LtEq | GtEq => "ordering operators not defined for nil".to_string(),
+            _ => format!("operator `{:?}` is not defined for nil", op),
+        }
+    }
+
     fn lower_builtin_map_set(
         &mut self,
         args: &[CallArg],
@@ -15407,9 +22064,55 @@ impl<'a> Translator<'a> {
         let (m, mty) = self.lower_expr(e0)?;
         let (k, kty) = self.lower_expr(e1)?;
         let (v, vty) = self.lower_expr(e2)?;
-        if !mty.is_map() { return err(span, format!("`map_set` arg 1 must be a Map, got `{}`", mty.render())); }
-        if !kty.is_str() { return err(span, format!("`map_set` arg 2 must be str, got `{}`", kty.render())); }
-        // Coerce the value to i64.
+        if !mty.is_map() {
+            if let Some(e) = self.omitted_ret_arg_refusal(e0, span, "map_set") { return Err(e); }
+            return Err(Self::map_slot_type_refusal(span, "map_set", "arg 1", "a Map", &mty));
+        }
+        if !kty.is_str() {
+            return Err(Self::map_slot_type_refusal(span, "map_set", "arg 2", "str", &kty));
+        }
+        // #720 review (F4): the map's slots are untyped i64 words, and
+        // `coerce_to` happily manufactures one for almost anything —
+        // including two conversions that are silently WRONG for a value a
+        // caller expects `map_get` to hand back unchanged: `bool` becomes
+        // 0/1 (indistinguishable from the integers 0/1 — `map_set(m,"k",true)`
+        // then `map_get(m,"k")` answers `1`, not `true`), and a float
+        // TRUNCATES (`1.5` becomes `1`, no error, matching neither `dmc run`
+        // nor the caller's intent). `(TyKind::Tensor(_), I64) => Ok(v)` a few
+        // hundred lines below is a legitimate zero-cost bitcast for an
+        // EXTERN-fn boundary, where the callee genuinely wants a pointer —
+        // reusing it here stores a tensor's raw pointer as though it were a
+        // number, which is worse than either: not merely lossy but
+        // meaningless. `str` already refused (no integer coercion exists for
+        // it); this closes the same hole for every other non-integer kind
+        // instead of coercing through it. An actual integer — `i64` or one
+        // of #544's narrower masked kinds (`i32`/`u8`/`i16`/…) — still
+        // widens normally: unlike bool/float/tensor that conversion is
+        // value-preserving, the same one `dmc run`'s own dynamic int would
+        // make.
+        //
+        // `TyKind::Fn` is ALSO let through, deliberately, and is not part of
+        // the widened hole this refusal closes: `jit_closure_fn_in_map_lispy_
+        // pattern` (this file's own unit tests) stores a fn value and reads
+        // it back through an explicit `let f: fn(i64,i64)->i64 = map_get(..)`
+        // annotation — `coerce_to`'s own `(Fn, I64) => Ok(v)` / `(I64, Fn) =>
+        // Ok(v)` arms document this as an intentional round-trip (a fn
+        // pointer's bits ARE its i64 code address, so nothing is lost the
+        // way a float's fraction or a bool/int distinction is), and it is
+        // the lispy-VM dispatch-table idiom the JIT already supports and
+        // `dmc run` agrees with. Refusing it here would regress a working,
+        // tested pattern to chase a category (bool/float/tensor) it never
+        // shared the defect with.
+        if !(vty.as_scalar().is_some_and(|s| s.is_int()) || matches!(vty, TyKind::Fn(_, _))) {
+            return unsupported_msg(span, Refusal::Conversion, format!(
+                "`map_set`'s value argument must be an integer — got `{}`; the map's \
+                 slots are untyped `i64` words, and converting a `{}` into one here \
+                 would be silently wrong (a `bool` collapses to 0/1 indistinguishable \
+                 from a real integer, a float truncates, a tensor's pointer would be \
+                 stored as a number) rather than merely unsupported — #721 tracks the \
+                 typed-value representation that would let a map actually hold one",
+                vty.render(), vty.render()));
+        }
         let v = self.coerce_to(v, &vty, &TyKind::Scalar(ScalarKind::I64), span)?;
         let entry = self.fns.get("__dmc_map_set").expect("__dmc_map_set not registered").clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
@@ -15432,8 +22135,13 @@ impl<'a> Translator<'a> {
         let e1 = match &args[1] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `map_contains`") };
         let (m, mty) = self.lower_expr(e0)?;
         let (k, kty) = self.lower_expr(e1)?;
-        if !mty.is_map() { return err(span, format!("`map_contains` arg 1 must be a Map, got `{}`", mty.render())); }
-        if !kty.is_str() { return err(span, format!("`map_contains` arg 2 must be str, got `{}`", kty.render())); }
+        if !mty.is_map() {
+            if let Some(e) = self.omitted_ret_arg_refusal(e0, span, "map_contains") { return Err(e); }
+            return Err(Self::map_slot_type_refusal(span, "map_contains", "arg 1", "a Map", &mty));
+        }
+        if !kty.is_str() {
+            return Err(Self::map_slot_type_refusal(span, "map_contains", "arg 2", "str", &kty));
+        }
         let entry = self.fns.get("__dmc_map_contains").expect("__dmc_map_contains not registered").clone();
         let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
         let call = self.builder.ins().call(func_ref, &[m, k]);
@@ -15457,9 +22165,18 @@ impl<'a> Translator<'a> {
         }
         let e = match &args[0] { CallArg::Positional(e) => e, _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to trit_quantize") };
         let (src, src_ty) = self.lower_expr(e)?;
-        let t = src_ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: format!("`trit_quantize` requires a 2-D f32 tensor, got `{}`", src_ty.render()),
-            line: span.line, col: span.col,
+        // #760: `trit_quantize(fns)` where `fns` is a `map_get` result
+        // (`OptI64`) refuses classed, citing #721, not the uncoded `jit
+        // error` below.
+        let t = src_ty.as_tensor().ok_or_else(|| {
+            if matches!(src_ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "`trit_quantize` requires a 2-D f32 tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: format!("`trit_quantize` requires a 2-D f32 tensor, got `{}`", src_ty.render()),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if t.rank() != 2 {
             return err(span, "`trit_quantize` requires a 2-D tensor [K, N]");
@@ -15527,19 +22244,23 @@ impl<'a> Translator<'a> {
         args: &[CallArg],
         span: &Span,
     ) -> Result<(Value, TyKind), JitError> {
-        let (total, _count) = self.lower_sum_with_count(args, span)?;
-        Ok((total, TyKind::Scalar(ScalarKind::F32)))
+        let (total, _count, k) = self.lower_sum_with_count(args, span)?;
+        Ok((total, TyKind::Scalar(k)))
     }
 
     /// Core of `sum` / `mean`: lower the argument ONCE and reduce, returning
-    /// both the f32 total and the runtime i64 element count. #288: `mean`
-    /// previously re-lowered its argument expression to recover the count,
-    /// re-emitting the arg's IR — side effects ran twice under the JIT.
+    /// the total, the runtime i64 element count, and the total's scalar kind.
+    /// #288: `mean` previously re-lowered its argument expression to recover
+    /// the count, re-emitting the arg's IR — side effects ran twice under the
+    /// JIT. #632: the kind is now part of the contract, because an INTEGER
+    /// tensor reduces in f64 and an f32 one in f32, which is what the
+    /// interpreter does (`Value::Float(tensor_sum(t), t.float_width())`, where
+    /// `float_width` is `F32` only for an `F32` tensor).
     fn lower_sum_with_count(
         &mut self,
         args: &[CallArg],
         span: &Span,
-    ) -> Result<(Value, Value), JitError> {
+    ) -> Result<(Value, Value, ScalarKind), JitError> {
         if args.len() != 1 {
             return err(span, "`sum` takes exactly 1 argument");
         }
@@ -15574,12 +22295,30 @@ impl<'a> Translator<'a> {
                 let d = self.dyn_data_ptr(ptr, &dt);
                 (d, n)
             }
+            // #632: an integer- or bool-element tensor reduces in f64 and
+            // yields an f64 scalar. The interpreter accumulates over its f64
+            // backing lanes and tags the result `FW::F64`, so summing in f32
+            // here would disagree past 2^24 on a value both backends hold
+            // exactly. Integer addition in f64 is exact and therefore
+            // order-independent inside f64's integer range, which is the same
+            // range `NUMERICS.md §1.2` bounds backend parity by.
+            TyKind::Tensor(ref t) if t.elem.is_int() || t.elem.is_bool() => {
+                let (elem, n) = (t.elem, t.nelems());
+                let cnt = self.builder.ins().iconst(cl::I64, n);
+                let total = self.fused_sum_int(ptr, elem, cnt);
+                return Ok((total, cnt, ScalarKind::F64));
+            }
             TyKind::Tensor(_) | TyKind::KV(_) | TyKind::DynTensor(_) =>
                 return unsupported_msg(span, Refusal::F32Only, "`sum` is f32-only"),
+            // #760: `sum(fns)` / `mean(fns)` where `fns` is a `map_get` result
+            // (`OptI64`) refuses classed, citing #721, not the uncoded `jit
+            // error` below.
+            TyKind::Scalar(ScalarKind::OptI64) =>
+                return Err(Self::opt_i64_refusal(span, "`sum` requires a tensor or KV argument, got `i64?`")),
             _ => return err(span, "`sum` requires a tensor or KV argument"),
         };
         let total = self.fused_sum_v(data_ptr, count);
-        Ok((total, count))
+        Ok((total, count, ScalarKind::F32))
     }
 
     /// #272: `max(t)` / `min(t)` — full reduction of an f32 tensor (any rank) to
@@ -15614,6 +22353,12 @@ impl<'a> Translator<'a> {
             TyKind::Tensor(_) | TyKind::KV(_) | TyKind::DynTensor(_) =>
                 return unsupported_msg(span, Refusal::F32Only, format!(
                     "`{}` is f32-only; use `dmc run` for full semantics", name)),
+            // #760: `max(fns)`/`min(fns)` where `fns` is a `map_get` result
+            // (`OptI64`) refuses classed, citing #721, not the uncoded `jit
+            // error` below.
+            TyKind::Scalar(ScalarKind::OptI64) =>
+                return Err(Self::opt_i64_refusal(span, format!(
+                    "`{}` requires a tensor argument, got `i64?`", name))),
             _ => return err(span, format!("`{}` requires a tensor argument", name)),
         };
         let r = self.fused_minmax_v(data_ptr, count, is_max);
@@ -15660,6 +22405,12 @@ impl<'a> Translator<'a> {
             }
             TyKind::Tensor(_) => unsupported_msg(span, Refusal::F32Only, format!(
                 "`{}` is f32-only; use `dmc run` for full semantics", name)),
+            // #760: `argmax(fns)`/`argmin(fns)` where `fns` is a `map_get`
+            // result (`OptI64`) refuses classed, citing #721, not the
+            // uncoded `jit error` below.
+            TyKind::Scalar(ScalarKind::OptI64) =>
+                Err(Self::opt_i64_refusal(span, format!(
+                    "`{}` requires a tensor argument, got `i64?`", name))),
             _ => err(span, format!("`{}` requires a tensor argument", name)),
         }
     }
@@ -15785,10 +22536,12 @@ impl<'a> Translator<'a> {
         // JIT but once under `dmc run`. Bonus: the runtime count also makes
         // `mean` work on KV / dynamic-shape tensors (the re-walk only handled
         // static tensors and panicked otherwise).
-        let (total, count) = self.lower_sum_with_count(args, span)?;
-        let n_v = self.builder.ins().fcvt_from_sint(cl::F32, count);
+        let (total, count, k) = self.lower_sum_with_count(args, span)?;
+        // #632: divide at the total's own width — an integer tensor's mean is
+        // an f64 quotient of an f64 sum, as it is in the interpreter.
+        let n_v = self.builder.ins().fcvt_from_sint(k.cl(), count);
         let m = self.builder.ins().fdiv(total, n_v);
-        Ok((m, TyKind::Scalar(ScalarKind::F32)))
+        Ok((m, TyKind::Scalar(k)))
     }
 
     /// `variance(t)` = sum((x - mean)^2) / nelems. Population variance
@@ -15807,9 +22560,17 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `variance`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: "`variance` requires a tensor argument".into(),
-            line: span.line, col: span.col,
+        // #760: `variance(fns)` where `fns` is a `map_get` result (`OptI64`)
+        // refuses classed, citing #721, not the uncoded `jit error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "`variance` requires a tensor argument, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "`variance` requires a tensor argument".into(),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if t.elem != ScalarKind::F32 {
             return unsupported(span, Refusal::F32Only, "`variance` on a non-f32 tensor");
@@ -15890,9 +22651,18 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, Refusal::ArgForm, "non-positional args to `pull_to_mean`"),
         };
         let (ptr, ty) = self.lower_expr(t_expr)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: "`pull_to_mean` first arg must be a tensor".into(),
-            line: span.line, col: span.col,
+        // #760: `pull_to_mean(fns, a)` where `fns` is a `map_get` result
+        // (`OptI64`) refuses classed, citing #721, not the uncoded `jit
+        // error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "`pull_to_mean` first arg must be a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "`pull_to_mean` first arg must be a tensor".into(),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if t.elem != ScalarKind::F32 {
             return unsupported(span, Refusal::F32Only, "`pull_to_mean` on a non-f32 tensor");
@@ -15978,6 +22748,77 @@ impl<'a> Translator<'a> {
         let off = self.builder.ins().imul(i, eb);
         let v = self.tensor_load_elem(ptr, off, ScalarKind::F32);
         let acc2 = self.builder.ins().fadd(acc, v);
+        let inext = self.builder.ins().iadd(i, one);
+        self.jump(hdr, &[inext, acc2]);
+        self.builder.seal_block(body);
+        self.builder.seal_block(hdr);
+
+        self.enter(exit);
+        let total = self.builder.block_params(exit)[0];
+        self.builder.seal_block(exit);
+        total
+    }
+
+    /// `sum` over a flat INTEGER (or bool) buffer → f64 (#632). Each element is
+    /// read at its storage width, widened to i64 by its own signedness, and
+    /// converted to f64 before the add — the same value the interpreter holds
+    /// in that lane, since its tensors are f64-backed.
+    ///
+    /// A `u64` element converts as SIGNED, and that is deliberate even though
+    /// #643 gave `u64` its own `ScalarKind` and made scalar `u64 as f64`
+    /// unsigned. The interpreter's tensor backing lane is an f64, and it
+    /// stores a `u64` element as the signed pattern — it has to, or the
+    /// element could not round-trip: `-1.0` is exact in f64 and reads back as
+    /// `0xffff_ffff_ffff_ffff`, while `1.8446744073709552e19` is not, and
+    /// converting it back would saturate. So `fcvt_from_uint` here would make
+    /// the JIT DISAGREE with `dmc run` on a u64 tensor sum, which is a
+    /// backend divergence — the one thing this reduction may not be.
+    ///
+    /// The two conversions differ only for elements at or above 2^63. That is
+    /// three orders of magnitude outside f64's exact-integer range, which is
+    /// the range `NUMERICS.md §1.2` bounds backend parity by and the range
+    /// this f64 accumulator is already only accurate within (an `i64` element
+    /// sum is equally approximate past 2^53). Below 2^63 the signed and
+    /// unsigned readings of a `u64` are the same number, so inside the
+    /// supported range the choice is not observable. `sum` over a `u64` tensor
+    /// whose elements exceed 2^63 therefore agrees between the backends and
+    /// is negative on both, which is a shared limitation of the f64 lane, not
+    /// a JIT-only defect.
+    fn fused_sum_int(&mut self, ptr: Value, elem: ScalarKind, cap: Value) -> Value {
+        let zero = self.builder.ins().iconst(cl::I64, 0);
+        let one = self.builder.ins().iconst(cl::I64, 1);
+        let eb = self.builder.ins().iconst(cl::I64, elem.store_bytes());
+        let zerof = self.builder.ins().f64const(0.0_f64);
+
+        let hdr = self.builder.create_block();
+        let body = self.builder.create_block();
+        let exit = self.builder.create_block();
+        self.builder.append_block_param(hdr, cl::I64);
+        self.builder.append_block_param(hdr, cl::F64);
+        self.builder.append_block_param(exit, cl::F64);
+
+        self.jump(hdr, &[zero, zerof]);
+        self.enter(hdr);
+        let i = self.builder.block_params(hdr)[0];
+        let acc = self.builder.block_params(hdr)[1];
+        let cont = self.builder.ins().icmp(IntCC::SignedLessThan, i, cap);
+        self.builder.ins().brif(cont, body, &[], exit, &[acc.into()]);
+        self.block_filled = true;
+
+        self.enter(body);
+        let off = self.builder.ins().imul(i, eb);
+        let v = self.tensor_load_elem(ptr, off, elem);
+        // Widen to i64 before the float conversion: `bool` arrives as an i8 and
+        // `i32` as a real cl::I32, neither of which fcvt takes.
+        let v64 = if elem.cl() == cl::I64 {
+            v
+        } else if elem.is_signed_int() {
+            self.builder.ins().sextend(cl::I64, v)
+        } else {
+            self.builder.ins().uextend(cl::I64, v)
+        };
+        let vf = self.builder.ins().fcvt_from_sint(cl::F64, v64);
+        let acc2 = self.builder.ins().fadd(acc, vf);
         let inext = self.builder.ins().iadd(i, one);
         self.jump(hdr, &[inext, acc2]);
         self.builder.seal_block(body);
@@ -16116,6 +22957,15 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, Refusal::ArgForm, "non-positional arg"),
         };
         let (v, k) = self.lower_expr(e)?;
+        // #597: `abs` of a `u64` is the IDENTITY — an unsigned type has no
+        // negative values — and the result must stay an integer at that width.
+        // The f64 route below would both lose the low bits of a value above
+        // 2^53 and disagree with the interpreter, which returns the pattern
+        // untouched still tagged `U64`. (Before this, `fabs` ran on the
+        // SIGNED conversion of the pattern, so `abs(u64::MAX)` was 1.)
+        if op == "abs" && matches!(k, TyKind::Scalar(ScalarKind::U64)) {
+            return Ok((v, TyKind::Scalar(ScalarKind::U64)));
+        }
         // #287: compute in f64, matching the interpreter and the libm path
         // above (#209). Coercing through f32 first rounds the operand and
         // silently diverges from `dmc run` (e.g. ceil(2.00000005)).
@@ -16183,9 +23033,18 @@ impl<'a> Translator<'a> {
     ) -> Result<(Value, TyKind), JitError> {
         let (t_expr, axis) = self.parse_reduce_args(args, span)?;
         let (ptr, ty) = self.lower_expr(t_expr)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: "reduce_along requires a tensor argument".into(),
-            line: span.line, col: span.col,
+        // #760: `sum_along(fns, ax)` etc. where `fns` is a `map_get` result
+        // (`OptI64`) refuses classed, citing #721, not the uncoded `jit
+        // error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "reduce_along requires a tensor argument, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "reduce_along requires a tensor argument".into(),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if t.elem != ScalarKind::F32 {
             return unsupported_msg(span, Refusal::F32Only, "per-axis reductions are f32-only");
@@ -16587,9 +23446,17 @@ impl<'a> Translator<'a> {
             _ => {}
         }
 
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: "softmax requires a tensor".into(),
-            line: span.line, col: span.col,
+        // #760: `softmax(fns)` where `fns` is a `map_get` result (`OptI64`)
+        // refuses classed, citing #721, not the uncoded `jit error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "softmax requires a tensor, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "softmax requires a tensor".into(),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if t.elem != ScalarKind::F32 {
             return unsupported(span, Refusal::F32Only, "`softmax` on a non-f32 tensor");
@@ -17593,7 +24460,7 @@ impl<'a> Translator<'a> {
 
         let out_ptr = self.forge_alloc(xt.nbytes());
         // Copy x to out first, then rotate in place.
-        self.emit_memcpy_loop(out_ptr, x_ptr, xt.nelems(), xt.elem.cl());
+        self.emit_memcpy_loop(out_ptr, x_ptr, xt.nelems(), xt.elem.store_cl());
         self.rope_rotate_inplace(out_ptr, cos_ptr, sin_ptr, &xt, false);
         Ok((out_ptr, TyKind::Tensor(xt)))
     }
@@ -17731,7 +24598,7 @@ impl<'a> Translator<'a> {
     /// them). Allocates and returns the `dx` buffer.
     fn tensor_rope_backward(&mut self, adj: Value, cos_ptr: Value, sin_ptr: Value, xt: &TensorTy) -> Value {
         let out = self.forge_alloc(xt.nbytes());
-        self.emit_memcpy_loop(out, adj, xt.nelems(), xt.elem.cl());
+        self.emit_memcpy_loop(out, adj, xt.nelems(), xt.elem.store_cl());
         self.rope_rotate_inplace(out, cos_ptr, sin_ptr, xt, true);
         out
     }
@@ -18418,9 +25285,18 @@ impl<'a> Translator<'a> {
             _ => return unsupported(span, Refusal::ArgForm, "non-positional arg to `print_tensor`"),
         };
         let (ptr, ty) = self.lower_expr(e)?;
-        let t = ty.as_tensor().ok_or_else(|| JitError { kind: JitErrorKind::Error, refusal: None,
-            msg: "`print_tensor` requires a tensor argument".into(),
-            line: span.line, col: span.col,
+        // #760: `print_tensor(fns)` where `fns` is a `map_get` result
+        // (`OptI64`) refuses classed, citing #721, not the uncoded `jit
+        // error` below.
+        let t = ty.as_tensor().ok_or_else(|| {
+            if matches!(ty, TyKind::Scalar(ScalarKind::OptI64)) {
+                Self::opt_i64_refusal(span, "`print_tensor` requires a tensor argument, got `i64?`")
+            } else {
+                JitError { kind: JitErrorKind::Error, refusal: None,
+                    msg: "`print_tensor` requires a tensor argument".into(),
+                    line: span.line, col: span.col,
+                }
+            }
         })?.clone();
         if t.elem != ScalarKind::F32 {
             return unsupported(span, Refusal::F32Only, "`print_tensor` on a non-f32 tensor");
@@ -18501,6 +25377,12 @@ impl<'a> Translator<'a> {
             TyKind::Enum(_) => {
                 return unsupported(span, Refusal::OperandType, "unary operators are not defined on enums; cast to `i64` first");
             }
+            // #674: a `Budget` is "one
+            // opaque machine word, no arithmetic, no ordering, no literal" —
+            // unary operators are as undefined on it as a port handle.
+            TyKind::Budget => {
+                return unsupported(span, Refusal::OperandType, "unary operators are not defined on a Budget handle");
+            }
         };
         match op {
             UnOp::Neg => {
@@ -18530,6 +25412,12 @@ impl<'a> Translator<'a> {
             UnOp::ReLU => {
                 // max(x, 0) on a scalar f32.
                 if !sk.is_float() {
+                    // #760: `\> fns` where `fns` is a `map_get` result
+                    // (`OptI64`) refuses classed, citing #721, not the
+                    // uncoded `jit error` below.
+                    if sk == ScalarKind::OptI64 {
+                        return Err(Self::opt_i64_refusal(span, "`\\>` (ReLU) requires a float operand, got `i64?`"));
+                    }
                     return err(span, "`\\>` (ReLU) requires a float operand");
                 }
                 let v = self.coerce_scalar(v, sk, ScalarKind::F32, span)?;
@@ -19558,11 +26446,49 @@ impl<'a> Translator<'a> {
         if from == to { return Ok(v); }
         // A maybe-nil `map_get` result coerced to anything concrete: decode it
         // (trapping on nil) then coerce the i64 payload onward. map_get is
-        // dynamically typed (Unknown), so it flows into i64, fn-pointer, and
-        // tensor-pointer positions — all i64-backed (#300.4).
+        // dynamically typed (Unknown), so it flows into i64 and (per its own
+        // documented exception, `Fn`) fn-pointer positions — both genuinely
+        // i64-backed (#300.4).
+        //
+        // #769: it must NOT flow into a pointer-carrying target this way.
+        // `Tensor`/`Bf16Tensor` (and every other non-scalar `TyKind` below
+        // except `Fn`/`Budget`) are forge-allocated pointers at run time, and
+        // `to`'s own arm for an `i64` source either bitcasts the value
+        // straight through (`Ok(v)`) or — for `Enum` — treats it as an
+        // ordinal that is itself a pointer once the variant carries a
+        // payload. Falling through to decode-then-recurse would hand that
+        // arm the map's raw i64 payload with nothing to verify it against:
+        // `map_get`'s static type is always `Scalar(OptI64)` in the JIT, an
+        // opaque payload no matter what the interpreter's map actually
+        // stored (map values are i64-only pending #721), so the JIT cannot
+        // tell a genuine tensor pointer from a plain int that merely landed
+        // in the same map — and reinterpreting the latter as the former
+        // segfaults (the issue's own repro: a map_get'd int handed to a
+        // `Tensor` parameter). Refuse before recursing, via the same
+        // `opt_i64_refusal` helper #760/#764 built for this exact
+        // "unverifiable past the opaque payload" shape, rather than let one
+        // of those pointer arms run.
+        //
+        // `Fn` is the sole documented exception (see its own `i64 -> Fn`
+        // arm below): treating an opaque i64 as a function pointer is its
+        // deliberate, existing contract for a map of callbacks, unchanged
+        // here. `Budget` is excluded because it is documented as "never
+        // dereferenced" — an opaque descriptor, not a pointer. A
+        // payload-free `Enum` keeps accepting a bare ordinal (the same
+        // `n as SomeEnum` contract a literal i64 gets); only a
+        // payload-carrying variant's pointer-shaped ordinal is refused.
         if matches!(from, TyKind::Scalar(ScalarKind::OptI64))
             && !matches!(to, TyKind::Scalar(ScalarKind::OptI64)) {
-            let i = self.opt_unwrap_or_trap(v);
+            let refuse_as_pointer = match to {
+                TyKind::Scalar(_) | TyKind::Fn(_, _) | TyKind::Budget => false,
+                TyKind::Enum(name) => self.enum_payload_layouts.contains_key(name),
+                _ => true,
+            };
+            if refuse_as_pointer {
+                return Err(Self::opt_i64_refusal(span, format!(
+                    "cannot convert `{}` to `{}`", from.render(), to.render())));
+            }
+            let i = self.opt_unwrap_or_trap(v, span);
             return self.coerce_to(i, &TyKind::Scalar(ScalarKind::I64), to, span);
         }
         match (from, to) {
@@ -19573,6 +26499,41 @@ impl<'a> Translator<'a> {
             // float literal defaulting wide against a narrower declared
             // element type, e.g. `(7, 2.5)` returned as `(i64, f32)`.
             (TyKind::Tuple(fs), TyKind::Tuple(ts)) if fs.len() == ts.len() => {
+                // #879: the tuple can still differ in TYPE while every element
+                // is byte-identical in its 8-byte slot — the idiomatic fallible
+                // return `(n, nil)` typed as `(i64, Err)` is exactly this: the
+                // only element conversion involved is `Nil -> Str` (the arm
+                // below), which discards its input and re-derives a constant
+                // zero, because "both `Str` and `Scalar(Nil)` encode `nil` as
+                // an all-zero i64 slot" (that arm's own comment) — so the
+                // destination slot ends up holding what the source slot
+                // already held. When every element is either unchanged
+                // (`ft == tt`) or this zero case, return the SOURCE pointer
+                // instead of paying a second `forge_alloc` for bytes that
+                // don't change.
+                //
+                // This makes the coerced tuple ALIAS the source rather than
+                // being a fresh object — sound only because (a) a tuple is
+                // immutable once built: there is no tuple-element write form
+                // anywhere in this compiler (no `Expr::TupleIndex`/`.0` in
+                // `ast.rs`, and no assignment lowering targets a tuple slot in
+                // `jit.rs` or `interp.rs` — verified, not assumed, while fixing
+                // #879), so no write can ever tell the alias from a copy; and
+                // (b) the coercion's result and its source are both consumed
+                // within the same frame the source was built in, so whatever
+                // rewinds one rewinds the other at the same point. If a
+                // tuple-mutation form is ever added, this short-circuit must be
+                // revisited alongside it — and it is also why #841 §4 D's
+                // planned non-escaping-aggregate bracket must take its mark
+                // *before* the source tuple's own allocation, never between
+                // the source and an alias of it.
+                if fs.iter().zip(ts.iter()).all(|(ft, tt)| {
+                    ft == tt || matches!(
+                        (ft, tt),
+                        (TyKind::Scalar(ScalarKind::Nil), TyKind::Str))
+                }) {
+                    return Ok(v);
+                }
                 // #568: point a refused element conversion at the element the
                 // caller wrote, not at the enclosing expression. `take` so a
                 // nested tuple falls back to `span` rather than reusing these.
@@ -19696,6 +26657,19 @@ impl<'a> Translator<'a> {
                 Ok(v)
             }
             (TyKind::Port(_), TyKind::Str) => Ok(self.lower_port_render(v)),
+            // A bare `nil` literal (`Scalar(Nil)`, a 1-byte 0 with no
+            // pointer behind it) flowing into a `str`/`Err`-typed slot — the
+            // success half of the `(T, Err)` idiom, `return (v, nil)` chief
+            // among them (the tuple-element coercion in the arm above calls
+            // back into this one per element). `nil` in a str-typed slot IS
+            // the NULL pointer by convention (see `dmc_str_eq`'s doc comment
+            // and the `s == nil` binop arm) — not the 1-byte `Nil` bit
+            // pattern, which carries no address at all — so this widens to a
+            // fresh null i64 rather than reinterpreting `v`.
+            (TyKind::Scalar(ScalarKind::Nil), TyKind::Str) => {
+                let _ = v;
+                Ok(self.builder.ins().iconst(cl::I64, 0))
+            }
             // `b as str` — a bool renders as "true"/"false" (matching the
             // interpreter's Display for Value::Bool), NOT the "1"/"0" that
             // __dmc_str_from_int would give. Widen the cl::I8 bool to the i64 the
@@ -19727,6 +26701,16 @@ impl<'a> Translator<'a> {
             (TyKind::Scalar(ScalarKind::F64), TyKind::Str) => {
                 let entry = self.fns.get("__dmc_str_from_f64")
                     .expect("__dmc_str_from_f64 not registered").clone();
+                let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
+                let call = self.builder.ins().call(func_ref, &[v]);
+                Ok(self.builder.inst_results(call)[0])
+            }
+            // `n as str` for `u64` — #597: its own formatter, checked before
+            // the generic int arm below, for the reason `dmc_str_from_uint`
+            // gives (the pattern can be a negative `i64`).
+            (TyKind::Scalar(ScalarKind::U64), TyKind::Str) => {
+                let entry = self.fns.get("__dmc_str_from_uint")
+                    .expect("__dmc_str_from_uint not registered").clone();
                 let func_ref = self.module.declare_func_in_func(entry.id, self.builder.func);
                 let call = self.builder.ins().call(func_ref, &[v]);
                 Ok(self.builder.inst_results(call)[0])
@@ -19843,7 +26827,7 @@ impl<'a> Translator<'a> {
         // value decodes the payload, trapping cleanly on nil (matches the interp's
         // nil-in-arithmetic error); the reverse packs an i64/nil into the I128.
         if from == ScalarKind::OptI64 {
-            let i = self.opt_unwrap_or_trap(v);
+            let i = self.opt_unwrap_or_trap(v, span);
             return self.coerce_scalar(i, ScalarKind::I64, to, span);
         }
         if to == ScalarKind::OptI64 {
@@ -19876,7 +26860,40 @@ impl<'a> Translator<'a> {
             // int widen / narrow
             (ScalarKind::I32, ScalarKind::I64) => self.builder.ins().sextend(cl::I64, v),
             (ScalarKind::I64, ScalarKind::I32) => self.builder.ins().ireduce(cl::I32, v),
+            // #597: `u64` and `i64` are both a bare `cl::I64` register (neither
+            // is `is_masked_int` — a `u64`'s machine width already IS its
+            // arithmetic width), and the identical bit pattern IS the value at
+            // either kind — reinterpretation, not narrowing, so no instruction
+            // is needed. The only way this pair reaches `coerce_scalar` is the
+            // untyped-literal-default path (an unsuffixed `0` starts life
+            // tagged `I64` until a declared `u64` annotation retags it, same
+            // as `let x: i64 = 0`): SPEC §3.1 forbids a real `i64` and `u64`
+            // value from meeting, and check.rs already rejects that before
+            // codegen runs.
+            (ScalarKind::I64, ScalarKind::U64) | (ScalarKind::U64, ScalarKind::I64) => v,
+            // #597: the other two casts OUT of a `u64` that `i64` already had.
+            // Before `u64` got its own kind it WAS `I64` here, so `u64 as i32`
+            // and `u64 as bool` lowered through the `i64` arms below; splitting
+            // the kind off dropped both into the refusal. Neither reads the
+            // sign — `as i32` keeps the low 32 bits (§3.1's two's-complement
+            // narrowing, so `u64::MAX as i32` is -1, as `dmc run` computes) and
+            // `as bool` tests the pattern against zero.
+            (ScalarKind::U64, ScalarKind::I32) => self.builder.ins().ireduce(cl::I32, v),
+            (ScalarKind::U64, ScalarKind::Bool) => {
+                let z = self.builder.ins().iconst(cl::I64, 0);
+                self.builder.ins().icmp(IntCC::NotEqual, v, z)
+            }
             // int <-> float
+            // #597: a `u64` source is an unsigned MAGNITUDE sitting in a
+            // signed-looking register, so it converts with the unsigned
+            // instruction — `fcvt_from_sint` read u64::MAX's all-ones pattern
+            // as -1, and `u64::MAX as f64` printed `-1` on both backends. The
+            // reverse direction (`f64 as u64`) already saturates unsigned, in
+            // `lower_narrow_int_cast`. Every other integer kind reaching the
+            // generic arms below is signed or zero-extended and non-negative,
+            // so `from_sint` stays correct there.
+            (ScalarKind::U64, ScalarKind::F32) => self.builder.ins().fcvt_from_uint(cl::F32, v),
+            (ScalarKind::U64, ScalarKind::F64) => self.builder.ins().fcvt_from_uint(cl::F64, v),
             (k, ScalarKind::F32) if k.is_int() => self.builder.ins().fcvt_from_sint(cl::F32, v),
             (k, ScalarKind::F64) if k.is_int() => self.builder.ins().fcvt_from_sint(cl::F64, v),
             (ScalarKind::F32, ScalarKind::F64) => self.builder.ins().fpromote(cl::F64, v),
@@ -19917,6 +26934,23 @@ fn int_cc(op: &BinOp) -> IntCC {
         BinOp::Gt    => IntCC::SignedGreaterThan,
         BinOp::LtEq  => IntCC::SignedLessThanOrEqual,
         BinOp::GtEq  => IntCC::SignedGreaterThanOrEqual,
+        _ => unreachable!(),
+    }
+}
+
+/// #597: the unsigned twin of `int_cc`, for a `ScalarKind` whose
+/// `is_signed_int()` is false. Equality is identical either way (bit-for-bit
+/// comparison doesn't care about signedness) but ordering is not: `U64`'s
+/// pattern can be a negative `i64` (the top bit set), so `SignedLessThan` and
+/// friends would get it backwards.
+fn uint_cc(op: &BinOp) -> IntCC {
+    match op {
+        BinOp::Eq    => IntCC::Equal,
+        BinOp::NotEq => IntCC::NotEqual,
+        BinOp::Lt    => IntCC::UnsignedLessThan,
+        BinOp::Gt    => IntCC::UnsignedGreaterThan,
+        BinOp::LtEq  => IntCC::UnsignedLessThanOrEqual,
+        BinOp::GtEq  => IntCC::UnsignedGreaterThanOrEqual,
         _ => unreachable!(),
     }
 }
@@ -19991,6 +27025,10 @@ extern "C" fn dmc_div_overflow_trap(l: i64, r: i64, op_is_div: i64, bits: i64) -
 }
 
 extern "C" fn builtin_print_i64(x: i64) { println!("{}", x); }
+// #597: `u64`'s register can hold a negative `i64` pattern (top bit set) that
+// names a value at or above 2^63 — reinterpret it as `u64` before formatting,
+// matching the interpreter's `Value`'s `Debug` impl for `IW::U64`.
+extern "C" fn builtin_print_u64(x: i64) { println!("{}", x as u64); }
 extern "C" fn builtin_print_f64(x: f64) { println!("{}", x); }
 extern "C" fn builtin_print_bool(x: u8) { println!("{}", x != 0); }
 extern "C" fn builtin_print_nil()       { println!("nil"); }
@@ -20099,9 +27137,18 @@ extern "C" fn take_grad_at_idx(param_idx: i64) -> i64 {
 /// compiled `f$fwd_bwd` / `f$fwd_bwd_bwd`. Clears any stale grad slots (a prior
 /// grad call's entries must not leak into this call's epilogue) and returns the
 /// forge watermark the epilogue will restore to.
+///
+/// #614 (coordinator scope note, PR #779): this watermark is a compiler-
+/// internal `InternalMark` (`forge_snapshot_internal`), not the user-facing
+/// `Mark` `forge.snapshot()` returns. The forward pass's activations are
+/// intermediates the compiler allocated and will reclaim before the grad
+/// call returns — `MEMORY.md §1.1` already says implicit intermediates are
+/// not charged — so the epilogue below must rewind `used` along with the
+/// cursor. A user's own `forge.snapshot`/`forge.restore(mark)` keeps using
+/// the cursor-only `Mark`, so `used` stays monotonic across those.
 extern "C" fn grad_call_prologue() -> i64 {
     GRAD_SLOTS.with(|s| s.borrow_mut().clear());
-    forge_snapshot()
+    forge_snapshot_internal()
 }
 
 /// AUTODIFF.md §3 activation lifetime, exit half: called just before a compiled
@@ -20113,6 +27160,12 @@ extern "C" fn grad_call_prologue() -> i64 {
 /// The bounce through Rust-heap temporaries is deliberate: grads and
 /// activations interleave in the arena, and forge_alloc zeroes on allocation,
 /// so an in-arena move could clobber a source buffer before it is copied.
+///
+/// #614: `mark` is an `InternalMark` (see `grad_call_prologue`), so the
+/// `forge_restore_internal` call below returns the activations' charge to
+/// `used` as well as rewinding the cursor — this epilogue's rewind is a
+/// compiler intermediate cleanup, not the user-facing `forge.restore` #614's
+/// ruling makes monotonic.
 extern "C" fn grad_call_epilogue(mark: i64) {
     // Deterministic order: relocate in ascending param index.
     let mut entries: Vec<(usize, i64, i64)> = GRAD_SLOTS.with(|s| {
@@ -20130,7 +27183,7 @@ extern "C" fn grad_call_epilogue(mark: i64) {
         })
         .collect();
 
-    forge_restore(mark);
+    forge_restore_internal(mark);
 
     for (k, bytes) in saved {
         let new_ptr = forge_alloc(bytes.len() as i64);
@@ -20158,6 +27211,167 @@ pub fn take_grads() -> Vec<(usize, i64)> {
     })
 }
 
+// ─── Page-aligned chunk allocator (#674) ─────────────────────────────────
+//
+// `mprotect(PROT_NONE)` (`DMC_BUDGET_POISON=1`, below) needs a page-aligned
+// base and is EINVAL on a plain `Vec<u8>`, whose base carries only the global
+// allocator's alignment. `PageChunk` is `mmap(MAP_ANON | MAP_PRIVATE)`, so a
+// chunk is a whole number of pages starting on a page boundary and `mprotect`
+// applies to exactly it.
+//
+// REWORK (review of the original `std::alloc::alloc_zeroed`-under-a-page-
+// aligned-`Layout` version): that version defeated lazy zero pages. Rust's
+// `System` allocator only routes to `calloc` when `layout.align() <= 16`
+// (`std/src/sys/alloc/unix.rs`); at `align = page_size()` (16 KiB on this
+// host) it falls through to `posix_memalign`/`aligned_alloc` followed by an
+// explicit `ptr::write_bytes(ptr, 0, layout.size())` — which touches, and so
+// commits, every page of the chunk up front instead of leaving them for the
+// OS to fault in lazily on first touch. Measured (`/usr/bin/time -l`, peak
+// RSS): `dmc jit` on a bare 64-byte forge allocation went from 10 MB (main)
+// to 547 MB; `examples/attn_grad_jit.dmc` from 13 MB to 525 MB; the #803
+// 512 MiB-plus case (`--forge=556870912`) from 551 MB to 1084 MB — roughly
+// one eager-zeroed `DEFAULT_CHUNK` (512 MiB) per case, exactly what an
+// up-front `write_bytes` over the whole chunk would cost. `mmap(MAP_ANON)`
+// hands back pages the kernel satisfies from a shared zero page until
+// written, so a chunk again costs only the pages actually touched — the
+// same property the old `vec![0u8; sz]` fast path had, restored here for a
+// page-aligned allocation. Nothing in `ForgeArena::alloc` depended on the
+// chunk arriving zeroed *from this function*: every allocation's own bytes
+// are re-zeroed by `ptr::write_bytes(ptr, 0, nbytes)` right before they are
+// handed out (`ForgeArena::alloc`, below), which is what makes an mmap'd-
+// but-not-yet-faulted-in page indistinguishable from an eagerly zeroed one
+// at the point anything reads it.
+//
+// It exposes exactly the two methods `ForgeArena::alloc` uses on a chunk —
+// `len` and `as_mut_ptr` — so the five per-chunk use sites inside `alloc`
+// compile unchanged; `chunks.is_empty()` / `push` / `chunks.len()` are
+// operations on the outer `Vec`, not on a chunk, and are likewise untouched.
+//
+// The design's own reference allocator sketch's
+// bench compared `vec![0u8; sz]` against the `alloc_zeroed`-under-`Layout`
+// version at 64 KiB/1 MiB/16 MiB and found the delta immaterial — but every
+// case there also only touches the pointer and length (`black_box`), never
+// writes the chunk's bytes, and stops at 16 MiB. Neither property holds for
+// the regime the three measurements above are in: `ForgeArena::alloc` DOES
+// write every allocation's bytes, and `DEFAULT_CHUNK` is 512 MiB — 32x past
+// the bench's largest case. The bench's own conclusion ("costs nothing
+// measurable") is correct for what it measured and does not generalize to
+// the 512 MiB regime, which it never covered.
+struct PageChunk {
+    ptr: *mut u8,
+    /// Rounded up to a page multiple at construction; `Drop` and
+    /// `poison_and_protect` both recompute the mapping length from
+    /// `(len, page_size())` rather than storing it separately, so there is
+    /// exactly one source of truth for the allocation's shape.
+    len: usize,
+}
+
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        // SAFETY: `sysconf` with a valid, fixed `name` argument
+        // (`_SC_PAGESIZE`) has no preconditions and is safe to call at any
+        // time.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    })
+}
+
+impl PageChunk {
+    /// Allocate a zeroed, page-aligned chunk of at least `sz` bytes (rounded
+    /// up to a whole number of pages), or the OS error `mmap` left in
+    /// `errno` on allocation failure — the caller
+    /// (`ForgeArena::alloc_zeroed_chunk`) turns that into the same clean
+    /// exit the old `vec![0u8; sz]` fast path only gave an OVERSIZED request
+    /// via `try_reserve_exact` (#368 follow-up); `mmap` itself returns
+    /// `MAP_FAILED` rather than aborting at any size, so this now applies
+    /// uniformly instead of only past the old size threshold.
+    ///
+    /// #829: the error is captured here, immediately after the syscall
+    /// check, rather than the caller re-reading `errno` later — the same
+    /// reason `poison_and_protect`'s `mprotect` failure reads
+    /// `std::io::Error::last_os_error()` right where it fails: nothing else
+    /// runs between the syscall and the read to have a chance to clobber it.
+    fn try_alloc_zeroed(sz: usize) -> Result<PageChunk, std::io::Error> {
+        let page = page_size();
+        let len = (sz.max(1) + page - 1) & !(page - 1);
+        // SAFETY: `addr = null` lets the kernel choose the mapping address;
+        // `len` is non-zero. `MAP_ANON | MAP_PRIVATE` with `fd = -1, offset
+        // = 0` is the standard anonymous-mapping idiom and requires no
+        // other preconditions. The kernel hands back a page-aligned base by
+        // construction (mappings are always page-granular) and pages that
+        // read as zero until written — lazily, lazily committed physical
+        // memory on first touch, not on this call.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(PageChunk { ptr: ptr as *mut u8, len })
+    }
+    #[inline]
+    fn len(&self) -> usize { self.len }
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 { self.ptr }
+
+    /// `DMC_BUDGET_POISON=1` (the reap-time poison-quarantine mode): instead of
+    /// releasing the chunk at `reap`, fill it with a poison byte and mark it
+    /// `PROT_NONE`, so a stale JIT-held pointer into it faults on the next
+    /// touch instead of silently reading re-handed (or, worse, since-
+    /// released) bytes. The pages stay mapped, unreused, for the rest of the
+    /// process — `mem::forget` skips `Drop`'s `munmap`, since unmapping
+    /// `PROT_NONE` memory back to the kernel would let its address space be
+    /// reused, defeating the quarantine.
+    ///
+    /// REWORK: a failing `mprotect` used to be a `debug_assert_eq!` — silent
+    /// in release, the one build this poison mode's callers actually run
+    /// under (it is a runtime opt-in flag, not a `#[cfg(debug_assertions)]`
+    /// feature). A silently-unprotected chunk is exactly the failure mode
+    /// poison mode exists to convert into a loud one, so this then became a
+    /// plain `assert_eq!` — but `poison_and_protect` is only ever reached
+    /// from `budget_reap`, whose one production call site (`dmc_budget_reap`)
+    /// is `extern "C"` and non-unwinding: a panic crossing that frame boundary
+    /// is UB that in practice becomes a raw SIGABRT (exit 134) with no
+    /// located diagnostic and, under `--json`, no summary at all — the same
+    /// bare-`eprintln!`-shaped hole `budget_carve`/`budget_reap`/
+    /// `resolve_budget` were already routed around (see their doc comments).
+    /// Routed through `diag::out_of_band_fatal` instead, the same doctrine,
+    /// carrying the OS error `mprotect` left in `errno` and the chunk size.
+    fn poison_and_protect(self) {
+        unsafe {
+            std::ptr::write_bytes(self.ptr, 0xAA, self.len);
+            let rc = libc::mprotect(self.ptr as *mut libc::c_void, self.len, libc::PROT_NONE);
+            if rc != 0 {
+                crate::diag::out_of_band_fatal(&format!(
+                    "runtime error: mprotect(PROT_NONE) failed poisoning a {} \
+                     budget chunk: {}",
+                    crate::arena::fmt_bytes(self.len as u64),
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        }
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PageChunk {
+    fn drop(&mut self) {
+        // SAFETY: `(ptr, len)` is exactly the pair `mmap` returned in
+        // `try_alloc_zeroed`; `page_size()` cannot have changed since, and
+        // `len` is already the page-rounded mapping length `mmap` was
+        // called with (mmap requires no re-derivation the way `dealloc`'s
+        // `Layout` did).
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
 // ─── Forge arena ─────────────────────────────────────────────────────────────
 //
 // Slice 2 keeps the arena lifecycle deliberately simple: a single global
@@ -20167,6 +27381,11 @@ pub fn take_grads() -> Vec<(usize, i64)> {
 // implementation needs JIT-side mark/restore around every function frame.
 // That'll land when tensors start escaping fn boundaries in non-trivial
 // ways. For now, single-shot `dmc jit` runs don't care.
+//
+// #674 slice 3c: a carved budget is one `ForgeArena` instance per table
+// entry — "a child owns its own chunk list,
+// not a sub-range of the parent's". Entry 0's `ForgeArena` IS what used to
+// be the sole thread-local `FORGE` arena; see `BudgetEntry`/`BUDGETS` below.
 
 struct ForgeArena {
     /// Chain of backing buffers. We hand out pointers into these and never
@@ -20174,21 +27393,47 @@ struct ForgeArena {
     /// the program's lifetime. When the active chunk can't satisfy a
     /// request we advance to (or push) the next chunk rather than growing
     /// the current `Vec` in place (which would reallocate and invalidate
-    /// every outstanding pointer). #292.
-    chunks: Vec<Vec<u8>>,
+    /// every outstanding pointer). #292. #674 slice 3c: `PageChunk`, not
+    /// `Vec<u8>` — see that type's own doc comment.
+    chunks: Vec<PageChunk>,
     /// Index of the active chunk in `chunks`.
     cur: usize,
     /// Bump offset within the active chunk.
     cursor: usize,
     /// Default size for freshly pushed chunks. A single allocation larger
-    /// than this gets its own right-sized chunk instead.
-    chunk_size: usize,
-    /// #400: hard ceiling on the bytes this arena may commit, from
-    /// `--forge=<size>` (`MEMORY.md §1.1`). `None` is unbounded — the pre-#400
-    /// behavior. Exceeding it is a runtime error, not an OOM.
+    /// than this gets its own right-sized chunk instead. #674 slice 3c:
+    /// `None` — "unset" — for a freshly carved entry, whose first chunk is
+    /// sized from its own first request rather than committing the whole
+    /// extent up front; `0` cannot express that
+    /// (`with_limit` coerces a zero chunk size to `1`). Entry 0 (`new`,
+    /// `with_limit`, `with_chunk_size`) always keeps `Some`, exactly as the
+    /// single field always was before this slice.
+    chunk_size: Option<usize>,
+    /// #400: hard ceiling on `used` — the cumulative requested bytes this
+    /// arena may be asked for — from `--forge=<size>` (`MEMORY.md §1.1`).
+    /// `None` is unbounded — the pre-#400 behavior. Exceeding it is a
+    /// runtime error, not an OOM. #674 slice 2: never compared against
+    /// `committed`; see `used` and `committed` below.
     limit: Option<usize>,
-    /// Bytes committed across `chunks`. Compared against `limit`.
+    /// Bytes physically committed across `chunks` — an allocator statistic,
+    /// nothing more. #674 slice 2: `committed` used to be the quantity
+    /// `--forge` was checked against (via `chunk_size_for`'s remainder cap),
+    /// which is why the first allocation under a budget used to commit the
+    /// whole thing and why a chunk's leftover tail was reused as free relief
+    /// below the aligned minimum (the arena-budget design's §2.1).
+    /// Neither is true anymore: `committed` tracks physical chunk bytes for
+    /// diagnostics and chunk-chaining bookkeeping only and is never compared
+    /// against `limit`.
     committed: usize,
+    /// #614/#674 slice 2: cumulative aligned bytes ever handed to `alloc` —
+    /// the ONLY quantity `--forge` is checked against. It rises on every
+    /// `alloc` and nothing, `restore` included, ever rewinds it back down
+    /// (that's #614: a rewind returns bytes to reuse, never budget). Mirrors
+    /// the interpreter's monotonic `forge_used` (`interp.rs:1219`): a
+    /// cumulative charge, not a model of live bytes, and — as of slice 2 —
+    /// the meter asks for the allocation's own requested need, not for
+    /// whatever the physical allocator happened to commit.
+    used: usize,
 }
 
 impl ForgeArena {
@@ -20215,62 +27460,83 @@ impl ForgeArena {
     /// arena costs nothing. (Small `chunk_size` values are used by the unit
     /// tests to exercise chunk chaining cheaply.)
     fn with_chunk_size(chunk_size: usize) -> Self {
-        ForgeArena { chunks: Vec::new(), cur: 0, cursor: 0, chunk_size, limit: None, committed: 0 }
-    }
-
-    /// As `with_chunk_size`, plus a hard ceiling on committed bytes.
-    fn with_limit(chunk_size: usize, limit: usize) -> Self {
         ForgeArena {
-            chunks: Vec::new(), cur: 0, cursor: 0,
-            chunk_size: chunk_size.max(1), limit: Some(limit), committed: 0,
+            chunks: Vec::new(), cur: 0, cursor: 0, chunk_size: Some(chunk_size), limit: None,
+            committed: 0, used: 0,
         }
     }
 
-    /// Would committing `add` more bytes on top of `committed` break the
-    /// budget? Pure, so the exhaustion decision is testable without the exit
-    /// that follows it. `committed` is a parameter because the reused-chunk
-    /// path in `alloc` first gives back the old chunk's bytes.
-    fn exceeds_budget_from(&self, committed: usize, add: usize) -> bool {
+    /// As `with_chunk_size`, plus a hard ceiling on cumulative requested
+    /// (`used`) bytes — not on `committed`; see the `limit` field doc.
+    fn with_limit(chunk_size: usize, limit: usize) -> Self {
+        ForgeArena {
+            chunks: Vec::new(), cur: 0, cursor: 0,
+            chunk_size: Some(chunk_size.max(1)), limit: Some(limit), committed: 0, used: 0,
+        }
+    }
+
+    /// #674: a freshly carved budget's own
+    /// arena. `carve` only reserves meter — "No storage is committed" — so
+    /// this constructs nothing physical; `chunk_size: None` means "unset",
+    /// sized from the entry's own first `alloc` request rather than from
+    /// `extent` (committing the whole reservation on the first byte, as
+    /// entry 0 under a small `--forge` already does and a carved entry must
+    /// not). `limit: Some(extent)` is kept only as the chunk-sizing ceiling
+    /// this field has always been (`chunk_size_for`'s remainder cap, #779)
+    /// — PRE-A itself reads the *table's* `free`, never this arena's own
+    /// `exceeds_budget` (§3.1).
+    fn carved(extent: usize) -> Self {
+        ForgeArena {
+            chunks: Vec::new(), cur: 0, cursor: 0,
+            chunk_size: None, limit: Some(extent), committed: 0, used: 0,
+        }
+    }
+
+    /// Would adding `add` more requested bytes to the meter break `--forge`?
+    /// Pure, so the exhaustion decision is testable without the exit that
+    /// follows it. #674 slice 2: checked against `used` — the cumulative
+    /// aligned bytes `alloc` has ever been asked for — and nothing else.
+    /// Before slice 2 this also ran against the physical `committed` total
+    /// (the reused-chunk path in `alloc` checked its own running commit);
+    /// that comparison is gone; `committed` is allocator bookkeeping now,
+    /// never a quantity `--forge` is measured against.
+    fn exceeds_budget(&self, add: usize) -> bool {
         match self.limit {
-            Some(limit) => committed.saturating_add(add) > limit,
+            Some(limit) => self.used.saturating_add(add) > limit,
             None => false,
         }
     }
 
-    /// `exceeds_budget_from` against the current `committed`. Only the tests
-    /// want this shorthand — `alloc` always has an explicit base, because the
-    /// reused-chunk path releases the old chunk's bytes first.
-    #[cfg(test)]
-    fn exceeds_budget(&self, add: usize) -> bool {
-        self.exceeds_budget_from(self.committed, add)
-    }
-
     /// How big should the next chunk be, given that the allocation in flight
-    /// needs `need` aligned bytes and `committed` bytes are already booked?
+    /// needs `need` aligned bytes?
     ///
-    /// #400: the answer used to be `chunk_size.max(need)`, which over-reserves
-    /// against a budget. With the 512 MiB default chunk and `--forge=768M`,
-    /// the second chunk asked for another 512 MiB — 1 GiB against a 768 MiB
-    /// budget — so only `floor(768/512) * 512 = 512 MiB` of the budget was
-    /// ever usable and the program died claiming a 64 MiB tensor did not fit
-    /// with 512 MiB committed of 768 MiB. Capping the chunk at what is left
-    /// makes `usable == budget` for every budget.
-    ///
-    /// The cap never shrinks below `need`: a single allocation larger than
-    /// the remaining budget must still be attempted as one right-sized chunk,
-    /// so the diagnostic reports the real shortfall rather than a rounding
-    /// artifact. That is also what makes the diagnostic arithmetic honest —
-    /// whenever this chunk fails the budget check, its size *is* the aligned
-    /// allocation size.
-    fn chunk_size_for(&self, need: usize, committed: usize) -> usize {
-        let base = self.chunk_size.max(need);
-        match self.limit {
-            Some(limit) => base.min(limit.saturating_sub(committed).max(need)),
-            None => base,
-        }
+    /// #674 slice 2: sized from the request alone — `chunk_size.max(need)` —
+    /// never from the budget's remainder. Before slice 2 (#779 included — the
+    /// remainder cap below predates and outlives that fix) a chunk under a
+    /// live `--forge` limit was capped at `limit - committed`: that made a
+    /// chunk's leftover tail reusable as free relief a real allocation never
+    /// gets, which is why the measured JIT minimum for a budget could sit
+    /// below the aligned request total (the arena-budget design's
+    /// §2.1, 2026-09-05: `dc_let.dmc` ran at `--forge=32777`, 55 B under
+    /// its `32832` B aligned total) — a pre-#779 figure: #779's own
+    /// monotonic-`used` check already closes this particular gap, so `main`
+    /// measures the full `32832` B today even though the remainder-capped
+    /// chunk sizing that could in principle still allow it is only removed
+    /// here. `--forge` is now checked once, in `check_budget`,
+    /// against `used`; chunk sizing is a pure allocator decision and may
+    /// commit more physical bytes than the remaining budget technically
+    /// allows — those bytes are lazily-committed OS pages (`MEMORY.md
+    /// §1.1`) and a caller can never touch more of them than `used` permits,
+    /// so nothing escapes the meter. #674 slice 3c: `chunk_size` is now an
+    /// `Option` — `unwrap_or(need)` falls back to the request itself when
+    /// unset (a carved entry's first chunk, §3.3) — but the formula is
+    /// byte-identical to `self.chunk_size.max(need)` wherever the field is
+    /// `Some`, which is every entry this slice's compatibility gate covers.
+    fn chunk_size_for(&self, need: usize) -> usize {
+        self.chunk_size.unwrap_or(need).max(need)
     }
 
-    /// Check a pending commit of `add` bytes on top of `committed` against
+    /// Check a pending charge of `add` more requested bytes against
     /// `--forge`. The JIT's allocator is an `extern "C"` callback with no
     /// error channel back into compiled code, so by default exhaustion exits
     /// the process the same way an oversized chunk does. Under `dmc test` the
@@ -20282,8 +27548,14 @@ impl ForgeArena {
     /// The wording matches the interpreter's exhaustion error verbatim
     /// (`Interpreter::charge_arena`); only the source location differs, which
     /// the JIT does not have at the allocation callback.
-    fn check_budget_from(&self, committed: usize, add: usize) {
-        if !self.exceeds_budget_from(committed, add) {
+    ///
+    /// #674 slice 2: `exceeds_budget` and the reported "free" figure here now
+    /// agree by construction — both are `used`-based — where before this
+    /// method could be called against `committed` (chunk-commit paths) and
+    /// disagree with a message built from `used`. One running total, one
+    /// message.
+    fn check_budget(&self, add: usize) {
+        if !self.exceeds_budget(add) {
             return;
         }
         let limit = self.limit.unwrap_or(0);
@@ -20291,7 +27563,7 @@ impl ForgeArena {
             "forge arena exhausted: this allocation needs {}, but only {} of the \
              {} --forge budget is free",
             crate::arena::fmt_bytes(add as u64),
-            crate::arena::fmt_bytes(limit.saturating_sub(committed) as u64),
+            crate::arena::fmt_bytes(limit.saturating_sub(self.used) as u64),
             crate::arena::fmt_bytes(limit as u64),
         );
         match forge_on_exhaustion() {
@@ -20305,46 +27577,113 @@ impl ForgeArena {
         }
     }
 
-    fn check_budget(&self, add: usize) {
-        self.check_budget_from(self.committed, add);
-    }
-
     #[inline]
     fn align_up(n: usize) -> usize {
         (n + Self::ALIGN - 1) & !(Self::ALIGN - 1)
     }
 
-    /// Allocate a zeroed chunk of `sz` bytes. A normal-sized chunk takes the
-    /// fast `vec![0u8; _]` path (lazily zero-committed by the OS). An oversized
-    /// single allocation — a huge tensor whose bytes exceed `chunk_size` — is
-    /// reserved fallibly so the process exits with a clean message instead of
-    /// aborting or OOM-killing with no output (#368 follow-up). (On a
-    /// memory-overcommit OS a request that exceeds RAM may still be reaped by
-    /// the OOM-killer on first touch — that is an OS policy we can't intercept.)
-    fn alloc_zeroed_chunk(sz: usize, chunk_size: usize) -> Vec<u8> {
-        if sz <= chunk_size {
-            return vec![0u8; sz];
+    /// Allocate a zeroed, page-aligned chunk of `sz` bytes (#674 slice 3c:
+    /// `PageChunk`, not `vec![0u8; sz]` — see that type's doc comment for
+    /// why, and for why it is `mmap`, not `std::alloc::alloc_zeroed`, under
+    /// the hood as of this REWORK). `mmap` reports failure as `MAP_FAILED`
+    /// at any size rather than aborting through the global allocator, so an
+    /// oversized single allocation — a huge tensor — still exits with a
+    /// clean message instead of panicking or OOM-killing with no output
+    /// (#368 follow-up), now uniformly rather than only past the old
+    /// `sz <= chunk_size` threshold. (On a memory-overcommit OS a request
+    /// that exceeds RAM may still be reaped by the OOM-killer on first
+    /// touch — that is an OS policy we can't intercept.)
+    ///
+    /// #829: this is the one arena fatal `lower_arena_alloc`'s compile-time
+    /// RAM guard (`jit.rs`, `"needs {} but the system has {} of RAM"`)
+    /// cannot stand in for, and the one that used to exit through a bare
+    /// `eprintln!` + `exit(1)` instead of `diag::out_of_band_fatal` — found
+    /// by the #822 re-review, pre-existing, not introduced by that PR. The
+    /// guard only ever runs at all for a *literal* shape (`shape_lit_dims`
+    /// must fold every dimension; the JIT's forge constructors take no
+    /// other kind, so that is every call site) and only ever compares
+    /// against *total* physical RAM (`total_system_memory_bytes`'s
+    /// `_SC_PHYS_PAGES`), which is a host-wide figure a cgroup/container
+    /// memory limit, an `RLIMIT_AS`, or simply another process's own
+    /// resident set can leave nowhere near actually free. A request the
+    /// guard waves through as "less than the box's RAM" can still be one
+    /// `mmap` refuses — the failure this path is left to handle alone, with
+    /// no earlier check standing between the program and it. Routed
+    /// through `out_of_band_fatal`, like every sibling fatal above, so a
+    /// `--json` consumer sees the schema-1 diagnostic and summary here too,
+    /// not raw prose on a stream it is trying to parse as JSON.
+    fn alloc_zeroed_chunk(sz: usize) -> PageChunk {
+        match PageChunk::try_alloc_zeroed(sz) {
+            Ok(c) => c,
+            Err(os_err) => {
+                crate::diag::out_of_band_fatal(&Self::chunk_alloc_fatal_message(sz, &os_err));
+            }
         }
-        let mut v: Vec<u8> = Vec::new();
-        if v.try_reserve_exact(sz).is_err() {
-            eprintln!(
-                "runtime error: forge could not allocate {:.1} GiB — tensor shape too large for available memory",
-                sz as f64 / (1024.0 * 1024.0 * 1024.0));
-            std::process::exit(1);
-        }
-        v.resize(sz, 0u8);
-        v
+    }
+
+    /// The sentence `alloc_zeroed_chunk` hands to `out_of_band_fatal` on an
+    /// `mmap` refusal, pulled out on its own so a test can assert on the
+    /// exact wording without going through `out_of_band_fatal` itself —
+    /// which calls `std::process::exit` and so cannot be driven from inside
+    /// this test binary (see `chunk_alloc_failure_message_matches_the_out_of_band_fatal_doctrine`,
+    /// below).
+    fn chunk_alloc_fatal_message(sz: usize, os_err: &std::io::Error) -> String {
+        format!(
+            "runtime error: mmap failed allocating a {} forge chunk: {}",
+            crate::arena::fmt_bytes(sz as u64),
+            os_err,
+        )
     }
 
     fn alloc(&mut self, nbytes: usize) -> *mut u8 {
-        // `vec![0u8; N]` lowers to `alloc_zeroed`; on Linux that hands back
-        // lazily-committed zero pages, so a chunk costs only the pages
-        // actually touched.
+        // #614/#674 slice 2: charge the meter, against `used` alone, before
+        // doing anything physical. `restore` rewinds `cursor` — and, via the
+        // reused-chunk paths below, can leave `committed` untouched too — so
+        // this is the one check in the whole function a rewind can never
+        // evade: `used` rises on every call and nothing, `restore` included,
+        // ever rewinds it back down. The cursor rewind and the memory reuse
+        // below are unaffected — only whether this call's bytes count
+        // against `--forge` changes. Chunk sizing below is sized purely from
+        // `need` and never re-checked against the budget: `committed` is
+        // allocator bookkeeping, not a second meter.
+        let need = Self::align_up(nbytes);
+        self.check_budget(need);
+        self.used += need;
+
+        // #674: a carved entry's
+        // `chunk_size` starts `None` — "unset" — so its first request fixes
+        // it once, here, rather than committing the whole `extent` on the
+        // first byte the way entry 0's always-`Some` field would. Later
+        // requests past the first chunk keep using this same size (the
+        // `Some` branch below never runs this again). Entry 0 (`new`,
+        // `with_limit`, `with_chunk_size`) always constructs with `Some`, so
+        // this is a no-op for it — its chunk sizing is untouched.
+        if self.chunk_size.is_none() {
+            let extent = self.limit.unwrap_or(need);
+            let page = page_size();
+            let rounded = (need + page - 1) & !(page - 1);
+            self.chunk_size = Some(extent.min(rounded.max(64 * 1024)));
+        }
+
+        // `PageChunk::try_alloc_zeroed` is page-aligned `mmap(MAP_ANON)`; on
+        // Linux/macOS that hands back lazily-committed zero pages, so a
+        // chunk costs only the pages actually touched — true again as of
+        // this REWORK's mmap fix (see `PageChunk`'s doc comment); it was
+        // false of the `alloc_zeroed`-under-`Layout` version this comment
+        // used to describe, which eagerly touched (and so committed) the
+        // whole chunk on this call.
+        //
+        // `committed` is credited with the chunk's own `.len()` — the
+        // actual page-rounded mapping length `PageChunk::try_alloc_zeroed`
+        // produced — not `sz`, the (only 64-byte-aligned) request that was
+        // asked for; the two can differ when `sz` itself isn't already a
+        // page multiple (`chunk_size_for` can return a bare `need` past a
+        // carved entry's or `DEFAULT_CHUNK`'s size). One unit throughout.
         if self.chunks.is_empty() {
-            let sz = self.chunk_size_for(Self::align_up(nbytes), self.committed);
-            self.check_budget(sz);
-            self.committed += sz;
-            self.chunks.push(Self::alloc_zeroed_chunk(sz, self.chunk_size));
+            let sz = self.chunk_size_for(need);
+            let chunk = Self::alloc_zeroed_chunk(sz);
+            self.committed += chunk.len();
+            self.chunks.push(chunk);
         }
         loop {
             let aligned = Self::align_up(self.cursor);
@@ -20363,24 +27702,22 @@ impl ForgeArena {
             // waste is at most one allocation's worth.
             self.cur += 1;
             self.cursor = 0;
-            let need = Self::align_up(nbytes);
             if self.cur == self.chunks.len() {
-                let sz = self.chunk_size_for(need, self.committed);
-                self.check_budget(sz);
-                self.committed += sz;
-                self.chunks.push(Self::alloc_zeroed_chunk(sz, self.chunk_size));
+                let sz = self.chunk_size_for(need);
+                let chunk = Self::alloc_zeroed_chunk(sz);
+                self.committed += chunk.len();
+                self.chunks.push(chunk);
             } else if self.chunks[self.cur].len() < need {
                 // A reused (above-cursor, hence free) chunk that is too small
                 // for this allocation. Nothing points into it, so replacing
-                // it is safe — and its bytes go back to the budget before the
-                // replacement is sized and checked, so a grow is metered as
-                // the difference rather than as a fresh commit.
+                // it is safe. The budget itself was already charged to
+                // `used` above; `committed` is just updated to reflect the
+                // physical swap (old chunk's bytes out, new chunk's in).
                 let old = self.chunks[self.cur].len();
-                let freed = self.committed - old;
-                let sz = self.chunk_size_for(need, freed);
-                self.check_budget_from(freed, sz);
-                self.committed = freed + sz;
-                self.chunks[self.cur] = Self::alloc_zeroed_chunk(sz, self.chunk_size);
+                let sz = self.chunk_size_for(need);
+                let chunk = Self::alloc_zeroed_chunk(sz);
+                self.committed = self.committed - old + chunk.len();
+                self.chunks[self.cur] = chunk;
             }
         }
     }
@@ -20414,17 +27751,439 @@ impl ForgeArena {
         self.cur = ci;
         self.cursor = off;
     }
+
+    /// Snapshot the arena's full state — `(cur, cursor, used)` — for a
+    /// **compiler-inserted** rewind, as opposed to `snapshot`'s user-facing
+    /// `(cur, cursor)` mark.
+    ///
+    /// #614's ruling (coordinator scope note on PR #779) is that the meter
+    /// goes monotonic only for the language-level `forge.snapshot`/
+    /// `forge.restore(mark)` pair: those keep using `Mark` above, so `used`
+    /// never rewinds across a user-visible restore. But `grad_call_epilogue`
+    /// (AUTODIFF.md §3) issues its own rewind after every `fwd_bwd` to
+    /// reclaim the forward pass's activations — a rewind the user never
+    /// asked for and cannot observe, over temporaries the compiler itself
+    /// inserted. `MEMORY.md §1.1` already carves those out ("implicit
+    /// intermediates … are not charged"), so the epilogue's rewind must
+    /// give its charge back or every `@grad` step loop pays for activations
+    /// it never asked to keep. `InternalMark` is how it does that: it
+    /// captures `used` too, and `restore_internal` rewinds it, while
+    /// ordinary `forge.restore` (via `Mark`) never touches `used` at all.
+    fn snapshot_internal(&self, budget: usize) -> InternalMark {
+        InternalMark { budget, cur: self.cur, cursor: self.cursor, used: self.used }
+    }
+
+    /// The `InternalMark` counterpart to `restore`: same cursor rewind, plus
+    /// `used` rewinds to the value it held at the snapshot. Only compiler-
+    /// inserted call sites (see `InternalMark`'s doc comment for which ones)
+    /// may reach this — it is not, and must never become, reachable from
+    /// `forge.restore` (see `snapshot_internal`).
+    ///
+    /// #674 slice 3c: `budget` is the table index this restore is about to
+    /// apply to (the caller's `CURRENT_BUDGET`) — asserted against the
+    /// mark's own `budget` tag first, since "a mark is a watermark in one
+    /// arena, and there are now several" — a rule this backend enforces before
+    /// trusting the tag. In 3c the
+    /// register is always 0, so this never trips; it is the same assertion
+    /// `forge.snapshot`/`forge.restore`'s own mismatch check makes, built
+    /// ahead of slice 3d's `enter`, which is what could first make the two
+    /// sides disagree.
+    fn restore_internal(&mut self, mark: InternalMark, budget: usize) {
+        let InternalMark { budget: mark_budget, cur: ci, cursor: off, used } = mark;
+        assert_eq!(
+            mark_budget, budget,
+            "forge restore (internal): mark was taken in budget {}, but this \
+             restore targets budget {} — a compiler-inserted mark cannot \
+             cross an entered-budget boundary",
+            mark_budget, budget,
+        );
+        assert!(
+            ci < self.chunks.len() || (ci == 0 && off == 0),
+            "forge restore (internal): chunk {} out of range (have {} chunks) — \
+             snapshot from a different arena?",
+            ci, self.chunks.len(),
+        );
+        assert!(
+            ci < self.cur || (ci == self.cur && off <= self.cursor),
+            "forge restore (internal): mark ({}, {}) is ahead of cursor ({}, {})",
+            ci, off, self.cur, self.cursor,
+        );
+        debug_assert!(used <= self.used, "forge restore (internal): used {} is ahead of current {}", used, self.used);
+        self.cur = ci;
+        self.cursor = off;
+        self.used = used;
+    }
+
+    /// #674: consume the arena and hand
+    /// back its chunk list, for `reap` to either drop (the ordinary release
+    /// path — dropping the returned `Vec` frees every chunk) or poison and
+    /// quarantine one by one under `DMC_BUDGET_POISON=1`.
+    fn into_chunks(self) -> Vec<PageChunk> {
+        self.chunks
+    }
+}
+
+/// A compiler-internal watermark over `(cur, cursor, used)`, taken by
+/// `ForgeArena::snapshot_internal` and consumed by `ForgeArena::restore_internal`.
+/// Distinct from the user-facing `Mark` (`ForgeArena::snapshot`/`restore`,
+/// opaque `usize`s that JIT source manipulates as `forge.snapshot()`/
+/// `forge.restore(mark)`) precisely so the two can rewind different things:
+/// see `snapshot_internal`'s doc comment for why (#614).
+///
+/// Two compiler-inserted rewinds are its users: `grad_call_epilogue`,
+/// reclaiming a `fwd_bwd` call's forward-pass activations, and the
+/// forward-only entry of a `@grad fn` (a plain call, not `.fwd_bwd`),
+/// reclaiming its own activations the same way — both are intermediates the
+/// user never asked to keep, so both give their charge back through this
+/// mark rather than the monotonic one `forge.restore` uses.
+#[derive(Clone, Copy, Debug)]
+struct InternalMark {
+    /// #674: the budget-table index this
+    /// mark was taken in. Always 0 until slice 3d's `enter` can change the
+    /// current-budget register mid-call; carried now so `restore_internal`
+    /// has something to assert against as soon as it can.
+    budget: usize,
+    cur: usize,
+    cursor: usize,
+    used: usize,
+}
+
+// ─── The budget table (#674) ────────────────────────────────────────────────
+//
+// One entry per live `Budget`. Entry 0 is `forge.root`, sized from `--forge`
+// (or unbounded) exactly as the old sole `FORGE` arena always was — this
+// table IS that arena's new home, not a second thing beside it: entry 0's
+// `ForgeArena` is what `FORGE` used to be, and a program that never carves
+// touches nothing else in this section.
+
+/// One budget-table entry. Fields mirror the design's own budget-entry shape
+/// exactly: `generation`/`parent`/`extent`/`used`/`free`/`children`, plus this backend's own
+/// storage — a whole `ForgeArena`, since "a child owns its own chunk list,
+/// not a sub-range of the parent's" (a deliberate region-ownership choice).
+struct BudgetEntry {
+    /// Bumped by `reap`; compared against a descriptor's packed generation
+    /// on every use (`resolve_budget`) — a stale handle's generation
+    /// mismatches the table's, `budget-stale`. Entry 0's never moves:
+    /// `forge.root` is never reapable (`b != root`, `budget_reap`).
+    generation: u32,
+    /// The parent entry's table index. `parent(0) == 0` — the root is its
+    /// own parent, the fixed point `reap`'s `b != root` guard rests on.
+    parent: usize,
+    /// Bytes carved — the whole reservation, spent and unspent alike.
+    /// Entry 0's is `--forge`, or `usize::MAX` (unbounded, §4.1) when no
+    /// `--forge` was given — PRE is then vacuous, since no real request
+    /// (bounded by `i64`) can ever exceed it.
+    extent: usize,
+    /// Cumulative bytes allocated into this entry directly (never through a
+    /// child) — kept in lockstep with `arena.used` by `budget_allocate`.
+    used: usize,
+    /// Bytes still available to `carve` or `allocate` from this entry. Kept
+    /// explicit, not derived, so (NN) is a guard rather than an invariant
+    /// taken on faith (§3.1).
+    free: usize,
+    /// Count of live (un-reaped) children carved from this entry; `reap`
+    /// refuses (`budget-reap`, R2) while this is nonzero.
+    children: usize,
+    /// This entry's own chunk list and bump cursor.
+    arena: ForgeArena,
+    /// `false` once `reap`'d; the slot may be reused by a later `carve`
+    /// (§6 Q8) — `generation` alone, already bumped at that reap, is what keeps a
+    /// pre-reap descriptor pointed at this slot from matching the reused
+    /// entry.
+    live: bool,
+}
+
+/// Packed-descriptor layout (§3.1, §6 Q8): 20 bits of index (1 048 575 live
+/// budgets), the rest generation. REWORK: this used to say "a reused index
+/// cannot be confused with its predecessor short of 2^44 reaps of that one
+/// slot" — wrong. The packed *field* has 44 bits of room (64 − 20), but the
+/// value that actually lands in it is `BudgetEntry::generation`, stored as
+/// `u32` and advanced with `wrapping_add(1)` at each `reap` (below); it
+/// wraps, and the ambiguity window reopens, every 2^32 reaps of one slot —
+/// the storage width, not the packed bit width, is what bounds this.
+const BUDGET_INDEX_BITS: i64 = 20;
+const BUDGET_INDEX_MASK: i64 = (1i64 << BUDGET_INDEX_BITS) - 1;
+
+fn pack_budget_descriptor(generation: u32, index: usize) -> i64 {
+    ((generation as i64) << BUDGET_INDEX_BITS) | (index as i64 & BUDGET_INDEX_MASK)
+}
+
+fn unpack_budget_descriptor(desc: i64) -> (u32, usize) {
+    let index = (desc & BUDGET_INDEX_MASK) as usize;
+    let generation = (desc >> BUDGET_INDEX_BITS) as u32;
+    (generation, index)
+}
+
+/// Validate a `Budget` descriptor against the table and return its live
+/// index, or exit with a located `budget-stale` — the entry was reaped
+/// (possibly since reused by a later `carve`; the generation compare, not
+/// just the index bound, is what still catches that case, §6 Q8).
+///
+/// REWORK: routed through `diag::out_of_band_fatal` (was a bare `eprintln!`
+/// + `exit(1)`), the same fix and for the same reason as `budget_carve`'s
+/// and `budget_reap`'s own refusals below — see `budget_carve`'s doc
+/// comment for why a JIT-side runtime refusal needs this at all.
+fn resolve_budget(budgets: &[BudgetEntry], desc: i64, line: i64, col: i64) -> usize {
+    let (generation, index) = unpack_budget_descriptor(desc);
+    if index >= budgets.len() || !budgets[index].live || budgets[index].generation != generation {
+        crate::diag::out_of_band_fatal(&format!(
+            "runtime error at {}:{}: budget-stale: this budget handle names a \
+             budget that was already reaped",
+            line, col));
+    }
+    index
+}
+
+/// `DMC_BUDGET_POISON=1` (§3.4): a debug policy, sibling of `DMC_FORGE_TRACE`
+/// and `FORGE_ON_EXHAUSTION`.
+///
+/// REWORK: used to be a bare `std::env::var` read at every `reap` — but
+/// `std::env::set_var`/`remove_var` are process-wide, not thread-local, and
+/// this test binary is multi-threaded, so a test that flipped the env var
+/// around its own `reap` could race a concurrently-running test's *unrelated*
+/// `env::var` read anywhere in the process (not just this one). Read the
+/// environment exactly ONCE, cached here; `budget_reap` (below) now takes
+/// the resulting flag as a plain parameter instead of consulting the
+/// environment itself, so `dmc_budget_reap` (the one production call site)
+/// reads it once via this function and a test drives `budget_reap` directly
+/// with a literal `true`/`false` — no shared mutable process state, and
+/// nothing left to race.
+fn budget_poison_enabled() -> bool {
+    static POISON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *POISON.get_or_init(|| {
+        std::env::var("DMC_BUDGET_POISON").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// `forge.carve(parent, bytes)` (§3.1's `carve(p, n)`): reserve `bytes` of
+/// meter from `parent` — **(PRE)** `bytes <= free(parent)`, `budget-carve`
+/// (R1) if not — and open a new table entry that owns no storage until its
+/// own first allocation (§3.3's first-chunk sizing). Returns the packed
+/// descriptor.
+///
+/// REWORK: both of this function's refusals (PRE, and a full table) are now
+/// routed through `diag::out_of_band_fatal` rather than a bare `eprintln!` +
+/// `exit(1)` — the same fix `ForgeArena::check_budget`'s `forge arena
+/// exhausted` already has, for the same reason: a bare `eprintln!` prints a
+/// prose line into a stream `--json` consumers parse as JSON, with no
+/// envelope, from inside compiled code's own call stack where there is no
+/// way back to `real_main`'s normal diagnostic path.
+fn budget_carve(budgets: &mut Vec<BudgetEntry>, free_list: &mut Vec<usize>, parent_desc: i64, bytes: i64, line: i64, col: i64) -> i64 {
+    let parent = resolve_budget(budgets, parent_desc, line, col);
+    // A non-positive *literal* `bytes` is refused at check time (§2.3); a
+    // non-literal that still evaluates non-positive here has no PRE reading
+    // to fall back to (`free` is unsigned) — clamp to 0 rather than
+    // underflow the parent's meter on a negative `bytes`.
+    let need = bytes.max(0) as usize;
+    let free = budgets[parent].free;
+    if need > free {
+        crate::diag::out_of_band_fatal(&format!(
+            "runtime error at {}:{}: budget-carve: this carve needs {}, but only \
+             {} of the parent budget's {} extent is free",
+            line, col,
+            crate::arena::fmt_bytes(need as u64),
+            crate::arena::fmt_bytes(free as u64),
+            crate::arena::fmt_bytes(budgets[parent].extent as u64),
+        ));
+        // `fmt_bytes` used to round to one decimal place per unit, so a
+        // carve that missed by exactly one byte at a round boundary could
+        // read "needs 6 MiB, but only 6.0 MiB … is free" — #805 fixed that
+        // display quirk in `fmt_bytes` itself, so every caller (this one
+        // included) picked it up for free.
+    }
+    budgets[parent].free -= need;
+    budgets[parent].children += 1;
+    // Reuse the most recently reaped (dead) slot, if any — §6 Q8: "a reaped
+    // index is reused without the generation wrapping". A dead slot's
+    // `generation` was already bumped by the `reap` that freed it, so the
+    // new entry's descriptor differs from every descriptor that ever named
+    // this slot.
+    //
+    // REWORK (reviewer, slice 3c): this used to be `budgets.iter()
+    // .position(|e| !e.live)` — an O(n) scan of the WHOLE table on every
+    // carve, O(n²) over a carve/reap loop (measured: 19.3 min to reach the
+    // 1 048 576-entry bound). `free_list` is a stack of indices `reap` freed
+    // and `carve` has not yet reclaimed — the same free-index stack
+    // interp.rs's slice 3b already uses (`Interpreter::budget_free`,
+    // origin/claude/t-674s3b) — turning this into an O(1) pop. Semantics are
+    // unchanged: still the SAME slot, still its already-bumped `generation`,
+    // still reused only when the stack (equivalently, the old scan) has one
+    // to give. Kept as an explicit parameter rather than a bare thread-local
+    // (as `BUDGETS` itself is) so a caller that hands this function its OWN
+    // `budgets: Vec<BudgetEntry>` — every unit test below does, precisely to
+    // stay independent of the `BUDGETS` thread-local and of each other — gets
+    // its own independent free list too, rather than one shared stack
+    // silently leaking reused indices across tests whose tables are
+    // otherwise unrelated (the test harness reuses OS threads across
+    // `#[test]` fns, so a bare `thread_local!` here would alias them).
+    let reuse = free_list.pop();
+    let (index, generation) = match reuse {
+        Some(i) => (i, budgets[i].generation),
+        None => {
+            // `pack_budget_descriptor` masks a fresh index to
+            // `BUDGET_INDEX_BITS` (20) bits with no bound check of its own —
+            // an index past `BUDGET_INDEX_MASK` would silently alias a low
+            // index instead of refusing. `budgets.len()` is the only place a
+            // brand-new (non-reused) index is minted, so this is the one
+            // place that needs the check.
+            if budgets.len() as i64 > BUDGET_INDEX_MASK {
+                crate::diag::out_of_band_fatal(&format!(
+                    "runtime error at {}:{}: budget-carve: the budget table \
+                     is full ({} live budgets) — reap one before carving \
+                     another",
+                    line, col, budgets.len(),
+                ));
+            }
+            (budgets.len(), 0)
+        }
+    };
+    let entry = BudgetEntry {
+        generation, parent, extent: need, used: 0, free: need, children: 0,
+        arena: ForgeArena::carved(need), live: true,
+    };
+    if index == budgets.len() { budgets.push(entry); } else { budgets[index] = entry; }
+    pack_budget_descriptor(generation, index)
+}
+
+/// `forge.reap(b)` (§3.1's `reap(b)`): release `b`'s storage and credit its
+/// whole extent — spent and unspent alike — to `parent(b)`. Refused
+/// (`budget-reap`, R2, **(LOC)**'s `children(b) == 0` guard) while `b` has a
+/// live child, and (§3.1(b), §4.1) for the root, whose `parent(0) == 0`
+/// fixed point would otherwise credit its own `free` to itself.
+///
+/// `poison`: whether to retain, poison and quarantine `b`'s chunks instead
+/// of dropping them (`DMC_BUDGET_POISON=1`, §3.4, R1) — REWORK: a parameter
+/// now, not an `std::env::var` read inside this function; see
+/// `budget_poison_enabled`'s doc comment for why. Both refusals below are
+/// routed through `diag::out_of_band_fatal`, matching `budget_carve`.
+fn budget_reap(budgets: &mut Vec<BudgetEntry>, free_list: &mut Vec<usize>, desc: i64, line: i64, col: i64, poison: bool) {
+    let b = resolve_budget(budgets, desc, line, col);
+    if b == 0 {
+        crate::diag::out_of_band_fatal(&format!(
+            "runtime error at {}:{}: budget-reap: `forge.root` cannot be reaped \
+             — the root budget has no parent to credit",
+            line, col));
+    }
+    let children = budgets[b].children;
+    if children > 0 {
+        crate::diag::out_of_band_fatal(&format!(
+            "runtime error at {}:{}: budget-reap: {}",
+            line, col,
+            crate::arena::budget_live_child_clause(children as u64),
+        ));
+    }
+    let parent = budgets[b].parent;
+    let extent = budgets[b].extent;
+    // Release the entry's own storage — the ordinary case drops its chunks
+    // here; `poison` (`DMC_BUDGET_POISON=1`) instead retains, poisons and
+    // quarantines them (§3.4, R1), so a stale read faults instead of
+    // reading re-handed (or freed) bytes. Either way the credit below is
+    // unconditional: it is a meter credit, matched by bytes ACTUALLY
+    // returned — released now, or never-to-be-reused-but-mapped under
+    // poison — not by whether anything was spent.
+    let old_arena = std::mem::replace(&mut budgets[b].arena, ForgeArena::carved(0));
+    if poison {
+        for chunk in old_arena.into_chunks() {
+            chunk.poison_and_protect();
+        }
+    }
+    // else: `old_arena` (and its chunks) drop at the end of this scope.
+    budgets[parent].free += extent;
+    budgets[parent].children -= 1;
+    budgets[b].generation = budgets[b].generation.wrapping_add(1);
+    budgets[b].live = false;
+    budgets[b].extent = 0;
+    budgets[b].used = 0;
+    budgets[b].free = 0;
+    budgets[b].children = 0;
+    // Reviewer edit (slice 3c): hand this now-dead slot to `budget_carve`'s
+    // O(1) free-index stack, generation already bumped above — see
+    // `budget_carve`'s doc comment on `free_list`.
+    free_list.push(b);
+}
+
+/// `allocate(r, n)` (§3.1): place `nbytes` in entry `r`'s own storage.
+/// **(PRE-A)** reads the table's `free`, never `ForgeArena::exceeds_budget`
+/// (§3.1's own argument for why the arena-level check alone would let a
+/// parent spend a child's reservation) — except for entry 0 with no live
+/// child, "the one case where the two agree", where this is the exact
+/// unmodified `ForgeArena::alloc` call path #779/#803 already gate on, so
+/// slice 3c's compatibility promise costs no new code on the hot path.
+fn budget_allocate(budgets: &mut Vec<BudgetEntry>, r: usize, nbytes: usize) -> *mut u8 {
+    if r == 0 && budgets[0].children == 0 {
+        let ptr = budgets[0].arena.alloc(nbytes);
+        let need = ForgeArena::align_up(nbytes);
+        budgets[0].used = budgets[0].used.saturating_add(need);
+        budgets[0].free = budgets[0].free.saturating_sub(need);
+        return ptr;
+    }
+    let need = ForgeArena::align_up(nbytes);
+    let free = budgets[r].free;
+    if need > free {
+        // Byte-identical to `ForgeArena::check_budget`'s own sentence for
+        // the root (entry 0 with a live child is the one new way to reach
+        // that sentence through this path rather than through `alloc`
+        // itself); a carved entry says "the entered budget's ... extent"
+        // instead of naming `--forge`, which never bounded it.
+        let msg = if r == 0 {
+            format!(
+                "forge arena exhausted: this allocation needs {}, but only {} of \
+                 the {} --forge budget is free",
+                crate::arena::fmt_bytes(need as u64),
+                crate::arena::fmt_bytes(free as u64),
+                crate::arena::fmt_bytes(budgets[0].extent as u64),
+            )
+        } else {
+            format!(
+                "forge arena exhausted: this allocation needs {}, but only {} of \
+                 the entered budget's {} extent is free",
+                crate::arena::fmt_bytes(need as u64),
+                crate::arena::fmt_bytes(free as u64),
+                crate::arena::fmt_bytes(budgets[r].extent as u64),
+            )
+        };
+        match forge_on_exhaustion() {
+            OnExhaustion::Abort => {
+                crate::diag::out_of_band_fatal(&format!("runtime error: {}", msg));
+            }
+            OnExhaustion::Record => record_forge_exhaustion(msg),
+        }
+    }
+    budgets[r].free = budgets[r].free.saturating_sub(need);
+    budgets[r].used = budgets[r].used.saturating_add(need);
+    budgets[r].arena.alloc(nbytes)
 }
 
 // JIT-emitted code runs single-threaded on the thread that calls
-// `run_main` / `fwd_bwd`, so the arena lives in thread-local storage with
+// `run_main` / `fwd_bwd`, so the table lives in thread-local storage with
 // no lock on the hot path — one `RefCell` borrow + a bump. This removes a
 // mutex acquire from every tensor allocation.
 thread_local! {
-    static FORGE: std::cell::RefCell<Option<ForgeArena>> =
-        const { std::cell::RefCell::new(None) };
-    /// #400: the `--forge=<size>` budget, read when the arena is first created.
-    /// Thread-local like the arena itself; `set_forge_limit` is called on the
+    /// Empty means "not yet initialized" — entry 0 (the root) is pushed
+    /// lazily by `with_budgets`, mirroring the old `FORGE: RefCell<Option<..>>`
+    /// lazy-init-on-first-use pattern exactly, so a program that never
+    /// allocates and never carves still costs nothing.
+    static BUDGETS: std::cell::RefCell<Vec<BudgetEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Reviewer edit (slice 3c): indices `budget_reap` has freed and
+    /// `budget_carve` has not yet reclaimed — mirrors slice 3b's
+    /// `Interpreter::budget_free` (interp.rs, origin/claude/t-674s3b). Kept
+    /// as ITS OWN thread-local, a sibling of `BUDGETS` rather than a field
+    /// folded into it, because `BUDGETS` is a bare `Vec` (no wrapping
+    /// struct to add a field to without touching every `with_budgets`
+    /// caller); the two are always read and cleared together (`with_budgets`
+    /// initializes only `BUDGETS` lazily, but `dmc_budget_carve`/
+    /// `dmc_budget_reap` below borrow both, and `reset_forge_arena` clears
+    /// both) so being a separate cell costs nothing in practice.
+    static BUDGET_FREE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// #674 slice 3c: the entered-budget register `forge.enter`/`in b` will
+    /// push to at slice 3d. Always 0 in 3c — every allocation charges entry
+    /// 0, the root, exactly as today; `forge_alloc` reads it once per call,
+    /// "one register read in the callback" (§3.3).
+    static CURRENT_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// #400: the `--forge=<size>` budget, read when entry 0 is first created.
+    /// Thread-local like the table itself; `set_forge_limit` is called on the
     /// same thread that later runs the compiled code.
     static FORGE_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// #400: what happens when a commit does not fit the budget. See
@@ -20437,7 +28196,26 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// #400: what `ForgeArena::check_budget_from` does when the budget is blown.
+/// Ensure the table is initialized — entry 0, the root, built exactly as
+/// `ForgeArena::new()` always was — and hand the closure mutable access to
+/// it. `extent`/`free` start at entry 0's `limit`, or `usize::MAX` when
+/// `--forge` was not given (§4.1: unbounded, PRE vacuous).
+fn with_budgets<R>(f: impl FnOnce(&mut Vec<BudgetEntry>) -> R) -> R {
+    BUDGETS.with(|cell| {
+        let mut g = cell.borrow_mut();
+        if g.is_empty() {
+            let arena = ForgeArena::new();
+            let extent = arena.limit.unwrap_or(usize::MAX);
+            g.push(BudgetEntry {
+                generation: 0, parent: 0, extent, used: 0, free: extent, children: 0,
+                arena, live: true,
+            });
+        }
+        f(&mut g)
+    })
+}
+
+/// #400: what `ForgeArena::check_budget` does when the budget is blown.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OnExhaustion {
     /// Print the diagnostic and exit(1). The right answer for a single-shot
@@ -20498,14 +28276,29 @@ pub fn take_forge_exhaustion() -> Option<String> {
 /// until some unlucky file in the middle exhausts it. Safe to call only
 /// between runs — every pointer the arena handed out dies with it.
 pub fn reset_forge_arena() {
-    FORGE.with(|cell| *cell.borrow_mut() = None);
+    // #674 slice 3c: clears the WHOLE table, not just entry 0 — a carved
+    // budget must not survive into the next `dmc test` file any more than
+    // the root arena itself used to.
+    BUDGETS.with(|cell| cell.borrow_mut().clear());
+    // Reviewer edit (slice 3c): `BUDGET_FREE` names indices into `BUDGETS`
+    // by position — stale entries here would outlive the table they pointed
+    // into and hand the next program's first carve a bogus "free" slot.
+    BUDGET_FREE.with(|cell| cell.borrow_mut().clear());
+    // #674 slice 3d: the entered-budget register names an index into the
+    // table just cleared. `__dmc_budget_exit` restores it on every exit edge,
+    // so a clean run always leaves it at 0 — this is the belt for a run that
+    // died inside an extent (a trap, an `out_of_band_fatal` from a nested
+    // harness) on a thread `dmc test` then reuses for the next file.
+    CURRENT_BUDGET.with(|c| c.set(0));
     FORGE_EXHAUSTED.with(|c| *c.borrow_mut() = None);
 }
 
-extern "C" fn forge_alloc(bytes: i64) -> i64 {
-    // #292 diagnostic: set DMC_FORGE_TRACE=1 to log every allocation, or
-    // DMC_FORGE_TRACE=<N> to log only allocations of at least N bytes. Helps
-    // pin down oversize/mis-broadcast buffers in a real-model forward.
+/// #292 diagnostic: set DMC_FORGE_TRACE=1 to log every allocation, or
+/// DMC_FORGE_TRACE=<N> to log only allocations of at least N bytes. Helps
+/// pin down oversize/mis-broadcast buffers in a real-model forward. Shared
+/// by both allocator callbacks so a vault-spelled constructor's buffer is
+/// traced exactly as a forge-spelled one is.
+fn forge_trace(bytes: i64) {
     if let Ok(v) = std::env::var("DMC_FORGE_TRACE") {
         let threshold: i64 = v.parse().unwrap_or(1).max(1);
         if bytes >= threshold {
@@ -20516,11 +28309,43 @@ extern "C" fn forge_alloc(bytes: i64) -> i64 {
             });
         }
     }
-    FORGE.with(|cell| {
-        let mut g = cell.borrow_mut();
-        if g.is_none() { *g = Some(ForgeArena::new()); }
-        g.as_mut().unwrap().alloc(bytes as usize) as i64
+}
+
+extern "C" fn forge_alloc(bytes: i64) -> i64 {
+    forge_trace(bytes);
+    // #674 slice 3c (§3.3): "one register read in the callback" — every one
+    // of the 82 `self.forge_alloc(` emit sites and the 3 `forge_alloc_v`
+    // sites are unchanged; only this dispatch, inside the callback, is new.
+    // Slice 3d is what finally makes the register non-zero (`forge.enter`,
+    // `<ctor> in b`); before it, every allocation charged entry 0.
+    with_budgets(|budgets| {
+        let cur = CURRENT_BUDGET.with(|c| c.get());
+        budget_allocate(budgets, cur, bytes as usize) as i64
     })
+}
+
+/// #674: allocate in **entry 0, the root**,
+/// whatever `CURRENT_BUDGET` says. This is the runtime half of the rule —
+/// "`vault.<ctor>[…]` inside an entered extent, no `in b`: charges
+/// the **root**" — which `dmc run` already implements by charging
+/// `vault_used`, a flat per-process meter a budget never owns.
+///
+/// The design spells the mechanism `forge_alloc_in(root, n)`: "the emit site
+/// knows the spelling (`check.rs:is_vault_ctor`) and emits
+/// `forge_alloc_in(root, n)`: one emit-site distinction, not 82". The only
+/// budget this callback can ever be asked for is the root — `vault.<ctor> in
+/// b` is refused at check time as R3's second instance (§3.5's second
+/// bullet), so no descriptor ever reaches here — so it takes bytes alone and
+/// names entry 0 directly, which is the same distinction without a
+/// descriptor to resolve or a `budget-stale` path that can never be taken.
+///
+/// Only the constructor's OWN buffer comes through here. Its ARGUMENTS are
+/// ordinary code in whatever budget is entered and go through `forge_alloc`
+/// above, charging `b` — the same split `dmc run` gets from `VaultTagGuard`
+/// covering the allocation and not the argument evaluation.
+extern "C" fn forge_alloc_root(bytes: i64) -> i64 {
+    forge_trace(bytes);
+    with_budgets(|budgets| budget_allocate(budgets, 0, bytes as usize) as i64)
 }
 
 thread_local! {
@@ -20530,10 +28355,9 @@ thread_local! {
 /// Returns the current forge cursor as an opaque mark (i64). JIT source
 /// calls this as `forge.snapshot()` to capture the pre-frame watermark.
 extern "C" fn forge_snapshot() -> i64 {
-    FORGE.with(|cell| {
-        let mut g = cell.borrow_mut();
-        if g.is_none() { *g = Some(ForgeArena::new()); }
-        g.as_mut().unwrap().snapshot() as i64
+    with_budgets(|budgets| {
+        let cur = CURRENT_BUDGET.with(|c| c.get());
+        budgets[cur].arena.snapshot() as i64
     })
 }
 
@@ -20543,11 +28367,91 @@ extern "C" fn forge_restore(mark: i64) {
     if mark < 0 {
         panic!("forge.restore: mark {} is negative (snapshot returned from a different arena?)", mark);
     }
-    FORGE.with(|cell| {
-        let mut g = cell.borrow_mut();
-        if g.is_none() { *g = Some(ForgeArena::new()); }
-        g.as_mut().unwrap().restore(mark as usize);
+    with_budgets(|budgets| {
+        let cur = CURRENT_BUDGET.with(|c| c.get());
+        budgets[cur].arena.restore(mark as usize);
     })
+}
+
+/// #614: the compiler-internal counterpart to `forge_snapshot`. Reached two
+/// ways: indirectly through `grad_call_prologue` (never itself lowered from
+/// JIT source), and directly as the `__dmc_forge_snapshot_internal` import a
+/// forward-only `@grad fn` entry lowers to (PR#779) — see `InternalMark`'s
+/// doc comment for both. Captures `used` alongside the cursor
+/// (`ForgeArena::snapshot_internal`) so the matching restore can give that
+/// call's own charge back. The mark itself doesn't fit the packed-`usize`
+/// scheme `forge_snapshot` uses (`used` has no small bit budget to pack
+/// into), so it's boxed and handed across the JIT/Rust boundary as a raw
+/// pointer disguised as an i64 — the same trick an opaque handle would play,
+/// without needing a side table. Every call to this function is paired with
+/// exactly one `forge_restore_internal` call in its counterpart
+/// (`grad_call_epilogue`, or the forward-only entry's own rewind), so
+/// nothing leaks the box.
+extern "C" fn forge_snapshot_internal() -> i64 {
+    let mark = with_budgets(|budgets| {
+        let cur = CURRENT_BUDGET.with(|c| c.get());
+        budgets[cur].arena.snapshot_internal(cur)
+    });
+    Box::into_raw(Box::new(mark)) as i64
+}
+
+/// #614: consumes the boxed `InternalMark` produced by `forge_snapshot_internal`
+/// and rewinds the arena's cursor AND `used` to it. See that function's doc
+/// comment for why this exists separately from `forge_restore`.
+extern "C" fn forge_restore_internal(mark: i64) {
+    let mark = unsafe { *Box::from_raw(mark as *mut InternalMark) };
+    with_budgets(|budgets| {
+        let cur = CURRENT_BUDGET.with(|c| c.get());
+        budgets[cur].arena.restore_internal(mark, cur);
+    })
+}
+
+/// `forge.carve(parent, bytes)` (#674 slice 3c). `line`/`col` locate the
+/// `budget-carve`/`budget-stale` runtime errors the same way `dmc_str_len`'s
+/// own trailing `line, col` pair locates its runtime errors.
+extern "C" fn dmc_budget_carve(parent: i64, bytes: i64, line: i64, col: i64) -> i64 {
+    with_budgets(|budgets| {
+        BUDGET_FREE.with(|free| budget_carve(budgets, &mut free.borrow_mut(), parent, bytes, line, col))
+    })
+}
+
+/// `forge.reap(b)` (#674 slice 3c) — returns nothing (`nil`); its lowering
+/// (`Jit::lower_forge_budget_call`) discards this call's (non-existent)
+/// result and produces the `nil` value itself.
+///
+/// The one production call site that reads `budget_poison_enabled()` — see
+/// its doc comment for why that is now a cached, once-read flag rather than
+/// an `env::var` call inside `budget_reap` itself.
+extern "C" fn dmc_budget_reap(b: i64, line: i64, col: i64) {
+    let poison = budget_poison_enabled();
+    with_budgets(|budgets| {
+        BUDGET_FREE.with(|free| budget_reap(budgets, &mut free.borrow_mut(), b, line, col, poison))
+    })
+}
+
+/// `forge.enter(b) { … }`'s push (#674) —
+/// and `<ctor> in b`'s, which is the same push held across exactly one
+/// constructor. Resolves the descriptor first, so a handle naming a reaped
+/// budget is the located `budget-stale` every other budget operation gives
+/// (`resolve_budget`), then swaps `CURRENT_BUDGET` and hands back the index
+/// it displaced.
+///
+/// Returning the OUTER index rather than pushing a runtime stack is what
+/// makes nesting free and makes the five exit edges symmetrical: the value
+/// is a Cranelift SSA value dominating the whole extent, so the lowering
+/// emits `__dmc_budget_exit(prev)` on each edge and no run-time structure
+/// has to agree with the CFG about how many scopes an edge leaves.
+extern "C" fn dmc_budget_enter(b: i64, line: i64, col: i64) -> i64 {
+    let index = with_budgets(|budgets| resolve_budget(budgets, b, line, col));
+    CURRENT_BUDGET.with(|c| c.replace(index)) as i64
+}
+
+/// `forge.enter`'s pop: restore the register to the index
+/// `__dmc_budget_enter` displaced — the OUTER budget, never unconditionally
+/// the root, so an `enter` nested inside an `enter` restores what it
+/// shadowed. Nothing is reaped; `b` outlives the block (B5).
+extern "C" fn dmc_budget_exit(prev: i64) {
+    CURRENT_BUDGET.with(|c| c.set(prev as usize));
 }
 
 // ─── Tensor printers (special-cased, not generic builtins) ───────────────────
@@ -20713,6 +28617,14 @@ extern "C" fn dmc_str_from_int(n: i64) -> i64 {
     buf
 }
 
+/// `n as str` for a `u64` — #597: `n`'s bit pattern can be a negative `i64`
+/// (top bit set) that names a value at or above 2^63, so it is reinterpreted
+/// as `u64` before formatting, matching `dmc_str_from_int`'s signed sibling
+/// and the interpreter's `Value`'s `Debug` impl for `IW::U64`.
+extern "C" fn dmc_str_from_uint(n: i64) -> i64 {
+    forge_str_from_rust(&(n as u64).to_string())
+}
+
 /// Pack a Rust string into a fresh forge string [len: i64][bytes: u8*] —
 /// the shared tail of every `*_from_*` string constructor.
 fn forge_str_from_rust(s: &str) -> i64 {
@@ -20790,20 +28702,57 @@ extern "C" fn dmc_flush() {
 
 // Called when a `match` has no arm matching the scrutinee at runtime. The
 // interpreter raises a clean error here; the JIT used to emit a bare trap
-// (SIGILL). Print + exit(1) so both backends reject non-exhaustive matches
-// gracefully.
-extern "C" fn dmc_match_trap() -> ! {
-    eprintln!("runtime error: match: no arm matched scrutinee");
-    std::process::exit(1);
+// (SIGILL), then (still pre-#866) a bare `eprintln!` + `exit(1)` so both
+// backends reject non-exhaustive matches gracefully.
+//
+// #866: routed through `out_of_band_fatal`, exactly like the `dmc_binop_nil_trap`
+// sibling below (#865) — `dmc jit --json` gets a schema-1 diagnostic and
+// summary object instead of bare prose on stderr. The match expression's own
+// span (baked in as `line`/`col` at the call site, `emit_match_trap`) locates
+// the message, matching #480's doctrine for the located siblings.
+extern "C" fn dmc_match_trap(line: i64, col: i64) -> ! {
+    crate::diag::out_of_band_fatal(&format!(
+        "runtime error at {}:{}: match: no arm matched scrutinee", line, col));
 }
 
 // #300.4: a maybe-nil value (a `map_get` result) was used where a concrete value
 // is required (arithmetic, an i64 binding). The interpreter raises a runtime
 // error on `nil` in those positions; match it instead of silently using 0.
-extern "C" fn dmc_nil_trap() -> ! {
-    eprintln!("runtime error: nil value used where a value is required \
-               (a missing map_get result — guard with map_contains or compare to nil)");
-    std::process::exit(1);
+//
+// #866: routed through `out_of_band_fatal` like `dmc_match_trap` above, located
+// at the decode site's span (baked in as `line`/`col` by `opt_unwrap_or_trap`).
+extern "C" fn dmc_nil_trap(line: i64, col: i64) -> ! {
+    crate::diag::out_of_band_fatal(&format!(
+        "runtime error at {}:{}: nil value used where a value is required \
+         (a missing map_get result — guard with map_contains or compare to nil)",
+        line, col));
+}
+
+// #480/#767: `scalar_binop`'s located counterpart to `dmc_nil_trap`, above.
+// `==`/`!=` against an absent `map_get` result no longer reach this at all —
+// they answer like the interpreter instead (nil == x is false, nil != x is
+// true) — but every OTHER operator still has to decode the opaque payload to
+// use it, and traps here when it turns out absent. `msg` is the exact
+// interpreter wording for `op` (`scalar_arith`'s "requires numeric operands",
+// a bitwise op's "requires int", or the ordering comparisons' "ordering
+// operators not defined for nil"), baked into the module as bytes the same
+// way a string literal is (`lower_str_literal`), since it is fully known at
+// compile time — only whether the trap actually fires is a runtime question.
+//
+// REWORK (#865 review, #822 doctrine): routed through `diag::out_of_band_fatal`
+// instead of a bare `eprintln!` + `exit(1)`, exactly like `check_budget`'s
+// "forge arena exhausted" fatal above — so `dmc jit --json` gets a schema-1
+// diagnostic and summary object instead of bare prose on stderr. DIAGNOSTICS.md
+// §5.1 reserves the `runtime` kind for a later pass; `out_of_band_fatal`'s
+// `Diagnostic::unstructured` is the correct interim shape, with the `line:col`
+// span left in the prose message exactly as it already was. The `dmc_nil_trap`/
+// `dmc_match_trap` siblings above shared the same bare-`eprintln!` defect,
+// filed separately as #866 and fixed there the same way (located, routed
+// through `out_of_band_fatal`).
+extern "C" fn dmc_binop_nil_trap(msg_ptr: i64, msg_len: i64, line: i64, col: i64) -> ! {
+    let bytes = unsafe { std::slice::from_raw_parts(msg_ptr as *const u8, msg_len as usize) };
+    let msg = std::str::from_utf8(bytes).unwrap_or("<non-utf8 nil-trap message>");
+    crate::diag::out_of_band_fatal(&format!("runtime error at {}:{}: {}", line, col, msg));
 }
 
 extern "C" fn dmc_print_str(s: i64) {
@@ -21052,6 +29001,62 @@ extern "C" fn dmc_port_close(handle: i64, line: i64, col: i64) -> i64 {
     }
 }
 
+// ─── File I/O runtime ────────────────────────────────────────────────────────
+//
+// `read_file`/`write_file`/`append_file`/`file_exists` (STDLIB.md ~§3.10,
+// `interp.rs` ~10098-10168) as host calls, mirroring the interpreter's
+// `std::fs` calls and error text exactly: the `err` half of every pair is
+// `e.to_string()` on the `std::io::Error` `std::fs` returns, byte for byte,
+// so `dmc run` and `dmc jit` raise the identical message for a missing file
+// or an unwritable path. `read_bytes` is not here: its `Tensor[i64,[N]]`
+// result needs a runtime-extent tensor, and the JIT has one
+// (`TyKind::DynTensor`) — but it's reachable only from KV reads
+// (`kv_materialize`) and isn't plumbed for an i64-element host-call result,
+// so it stays a `dmc run`-only builtin (`jit-unknown-fn`) until that's done.
+
+/// `read_file(path) -> (str, Err)` (`interp.rs:10098`). The content half is
+/// nil on failure, matching `Value::Tuple(vec![Value::Nil, Value::Str(..)])`.
+extern "C" fn dmc_read_file(path: i64, line: i64, col: i64) -> i64 {
+    let path = port_str_or_die(path, "read_file: path must be str", line, col);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => forge_pair(forge_str_from_rust(&content), 0),
+        Err(e) => forge_pair(0, forge_str_from_rust(&e.to_string())),
+    }
+}
+
+/// `write_file(path, content) -> (nil, Err)` (`interp.rs:10130`). The first
+/// half is always nil, success included — the interpreter never returns a
+/// bool here, so neither does this.
+extern "C" fn dmc_write_file(path: i64, content: i64, line: i64, col: i64) -> i64 {
+    let path = port_str_or_die(path, "write_file: path must be str", line, col);
+    let content = port_str_or_die(content, "write_file: content must be str", line, col);
+    match std::fs::write(&path, content) {
+        Ok(()) => forge_pair(0, 0),
+        Err(e) => forge_pair(0, forge_str_from_rust(&e.to_string())),
+    }
+}
+
+/// `append_file(path, content) -> (nil, Err)` (`interp.rs:10144`): open with
+/// `append(true).create(true)`, exactly as the interpreter does.
+extern "C" fn dmc_append_file(path: i64, content: i64, line: i64, col: i64) -> i64 {
+    use std::io::Write;
+    let path = port_str_or_die(path, "append_file: path must be str", line, col);
+    let content = port_str_or_die(content, "append_file: content must be str", line, col);
+    match std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+        Ok(mut f) => match f.write_all(content.as_bytes()) {
+            Ok(()) => forge_pair(0, 0),
+            Err(e) => forge_pair(0, forge_str_from_rust(&e.to_string())),
+        },
+        Err(e) => forge_pair(0, forge_str_from_rust(&e.to_string())),
+    }
+}
+
+/// `file_exists(path) -> bool` (`interp.rs:10162`).
+extern "C" fn dmc_file_exists(path: i64, line: i64, col: i64) -> i64 {
+    let path = port_str_or_die(path, "file_exists: path must be str", line, col);
+    if std::path::Path::new(&path).exists() { 1 } else { 0 }
+}
+
 // ─── HashMap builtins ────────────────────────────────────────────────────────
 
 /// Read a demoniC forge string (i64 pointer) into a Rust String.
@@ -21093,6 +29098,17 @@ extern "C" fn dmc_map_contains(map_ptr: i64, key_str: i64) -> i64 {
     let m = unsafe { &*(map_ptr as *const HashMap<String, i64>) };
     let key = dmc_str_to_rust(key_str);
     m.contains_key(&key) as i64
+}
+
+/// `len(m)` (#751): the map's entry count. `HashMap::insert` overwrites an
+/// existing key in place rather than adding a second slot, so re-setting a
+/// key already present never double-counts — this agrees with `dmc run`'s
+/// `Value::Map` (also a `HashMap`, `interp.rs`'s `"len"` arm) without any
+/// extra bookkeeping.
+extern "C" fn dmc_map_len(map_ptr: i64) -> i64 {
+    if map_ptr == 0 { return 0; }
+    let m = unsafe { &*(map_ptr as *const HashMap<String, i64>) };
+    m.len() as i64
 }
 
 // ─── Trit tensor builtins ────────────────────────────────────────────────────
@@ -21184,7 +29200,14 @@ extern "C" fn dmc_vault_load_raw(path_str: i64, numel: i64, elem_bytes: i64) -> 
                   path, file_data.len(), total_bytes);
         return 0;
     }
-    let buf = forge_alloc(total_bytes as i64);
+    // #674: `vault.load` is a VAULT-spelled
+    // constructor, so its buffer charges the ROOT even when the call sits
+    // inside `forge.enter(b) { … }` — the same rule `lower_arena_alloc`
+    // applies at the emit site for `vault.zeros/ones/uninit`. This one is
+    // made in the callback rather than at the emit site only because the
+    // allocation itself lives here; the spelling is still what decides it,
+    // since nothing but `vault.load` reaches this function.
+    let buf = forge_alloc_root(total_bytes as i64);
     unsafe {
         std::ptr::copy_nonoverlapping(
             file_data.as_ptr(),
@@ -21261,8 +29284,8 @@ pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
 //
 // The accumulation order is BLAS's, not `SPEC.md §7.4b`'s ascending-k
 // contracted FMA. That is why this path is off unless `--blas` is given and is
-// unreachable inside `@deterministic` — see `docs/design/EXTERN_FN_LOWERING.md
-// §3` and `NUMERICS.md §2.2`.
+// unreachable inside `@deterministic` — an extern call's accumulation order
+// can't be pinned down the way that mode requires (`NUMERICS.md §2.2`).
 
 /// The C `cblas_sgemm`, as this file needs to call it. Row-major
 /// (`CblasRowMajor` = 101), no transpose on either operand (`CblasNoTrans` =
@@ -21306,7 +29329,7 @@ fn cblas_sgemm_addr() -> Option<usize> {
 
 /// The MAC count at or above which `cblas_sgemm` wins.
 ///
-/// Measured on an M5 (see `docs/design/EXTERN_FN_LOWERING.md §2.2`): square
+/// Measured on an M5 (the crossover point where `cblas_sgemm` starts winning): square
 /// GEMM crosses near 2^15 MACs and bandwidth-bound GEMV somewhere in
 /// 2^14–2^16, so the crossover is shape-dependent. 2^17 sits above every
 /// measured one with a ≥8x margin — the nearest measured points are 8.6x at
@@ -21890,12 +29913,15 @@ extern "C" fn dmc_vault_load_npz(
         // Partial load — copy/convert what we have (useful for debugging).
         let available = raw.len().saturating_sub(data_offset);
         let src_avail = available.min(src_bytes);
-        let buf = forge_alloc(total_bytes as i64);
+        // #674 slice 3d (§3.5): vault-spelled — charges the root. See
+        // `dmc_vault_load_raw`.
+        let buf = forge_alloc_root(total_bytes as i64);
         npz_fill(buf as *mut u8, &raw[data_offset..data_offset + src_avail], convert);
         return buf;
     }
 
-    let buf = forge_alloc(total_bytes as i64);
+    // #674 slice 3d (§3.5): vault-spelled — charges the root.
+    let buf = forge_alloc_root(total_bytes as i64);
     npz_fill(buf as *mut u8, &raw[data_offset..data_offset + src_bytes], convert);
     buf
 }
@@ -22033,6 +30059,112 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    // #661 review finding 6: `replace_word` (which `demangle` uses to put a
+    // merged name back to its source spelling) must not touch a merged name
+    // that is merely a substring of a longer, unrelated one — `a$b` is not
+    // "found" inside `xa$b`, because the byte immediately before that
+    // occurrence (`x`) is itself a word byte, so the match is not anchored on
+    // both sides. Plain `str::replace` has no such notion and would corrupt
+    // `xa$b` into `xhelper` here.
+    #[test]
+    fn replace_word_does_not_corrupt_a_longer_name_it_is_a_substring_of() {
+        assert_eq!(replace_word("call to a$b failed", "a$b", "helper"),
+                   "call to helper failed");
+        assert_eq!(replace_word("call to xa$b failed", "a$b", "helper"),
+                   "call to xa$b failed");
+        // Both in one message: only the whole-token occurrence is rewritten.
+        assert_eq!(replace_word("a$b vs xa$b", "a$b", "helper"),
+                   "helper vs xa$b");
+    }
+
+    // #634: a model method's symbol reads back as the dot form the user wrote.
+    // The `$$` separator is what makes this decidable — every merge-produced
+    // prefix is a single `$` followed by a bare user identifier, so a name with
+    // two consecutive `$` can only be `mangle_method_name`'s.
+    #[test]
+    fn a_method_symbol_demangles_to_dot_form() {
+        let no_models: HashMap<String, Vec<String>> = HashMap::new();
+        assert_eq!(mangle_method_name("Buf", "fill!"), "Buf$$fill!");
+        assert_eq!(demangle_method_symbols("unknown function `Buf$$fill!`", &no_models),
+                   "unknown function `Buf.fill!`");
+        // The merge's prefix has already come off upstream in `Jit::demangle`;
+        // if one is still attached, only the method separator is rewritten, so
+        // the leftover is visible rather than silently read as part of a name.
+        assert_eq!(demangle_method_symbols("in `util$Buf$$fill!`", &no_models),
+                   "in `util$Buf.fill!`");
+        // A name the merge produced — one `$` — is left exactly as it is. This
+        // is the N2 case: `M.dmc`'s private `fn method` merges to `M$method`,
+        // which must not be mistaken for model `M`'s method `method`.
+        assert_eq!(demangle_method_symbols("in `M$method`", &no_models), "in `M$method`");
+        // And the JIT's own suffixes are untouched.
+        assert_eq!(demangle_method_symbols("in `loss$fwd_bwd`", &no_models), "in `loss$fwd_bwd`");
+    }
+
+    // #634 slice 2: one instantiation of a shape-generic model's method reads
+    // back as the receiver type the user wrote, `Buf[4].fill!` — and does so
+    // only on the evidence of `Buf`'s own declared shape-param names, so a
+    // model whose NAME ends in digits cannot be mistaken for an instantiation.
+    #[test]
+    fn a_monomorphized_method_symbol_demangles_to_the_receiver_type() {
+        let models: HashMap<String, Vec<String>> = [
+            ("Buf".to_string(), vec!["N".to_string()]),
+            ("Surface".to_string(), vec!["H".to_string(), "W".to_string()]),
+            ("M4".to_string(), Vec::new()),
+            ("util".to_string(), vec!["M".to_string()]),
+        ].into_iter().collect();
+        let empty: HashMap<String, i64> = HashMap::new();
+        assert_eq!(mangle_mono_method_name(
+                       "Buf", &["N".to_string()], "fill!", &[],
+                       &[("N".to_string(), 4)].into_iter().collect(), &empty),
+                   "Buf$$N4$$fill!");
+        assert_eq!(demangle_method_symbols("unknown function `Buf$$N4$$fill!`", &models),
+                   "unknown function `Buf[4].fill!`");
+        assert_eq!(demangle_method_symbols("in `Surface$$H2_W3$$blit!`", &models),
+                   "in `Surface[2, 3].blit!`");
+        // A merge prefix ahead of the model stays attached — `Jit::demangle`'s
+        // own loop is what removes one, and only when the merge renamed it.
+        assert_eq!(demangle_method_symbols("in `ui$Surface$$H2_W3$$blit!`", &models),
+                   "in `ui$Surface[2, 3].blit!`");
+        // A model named `M4` under a merge prefix is `util$M4` — ONE `$` — so
+        // it never reaches `render_mono_model` carrying a mono suffix at all,
+        // and `util$M4$$get` reads back as `M4`'s method. Under the old
+        // single-`$` mono spelling this and model `util` at `M=4` had the
+        // identical spelling and only the declared shape-param names told them
+        // apart; the `$$` now settles it before the evidence is consulted.
+        assert_eq!(demangle_method_symbols("in `util$M4$$get`", &models),
+                   "in `util$M4.get`");
+        // A method's own bracket suffix stays as the JIT spells it, on a single
+        // `$` — it sits to the right of a `$$` the merge cannot write, so it
+        // needs no separator of its own.
+        assert_eq!(demangle_method_symbols("in `Buf$$N4$$blit!$K2`", &models),
+                   "in `Buf[4].blit!$K2`");
+        assert_eq!(mangle_mono_method_name(
+                       "Buf", &["N".to_string()], "blit!", &["K".to_string()],
+                       &[("N".to_string(), 4)].into_iter().collect(),
+                       &[("K".to_string(), 2)].into_iter().collect()),
+                   "Buf$$N4$$blit!$K2");
+        // D2's collision, at the two functions that produce it: `model A[N]` at
+        // `N = 4` and a merge-renamed private `model N4` in `A.dmc` must not
+        // spell their methods the same way. The merge writes `A$N4`, one `$`.
+        assert_eq!(mangle_mono_method_name(
+                       "A", &["N".to_string()], "f", &[],
+                       &[("N".to_string(), 4)].into_iter().collect(), &empty),
+                   "A$$N4$$f");
+        assert_ne!(mangle_mono_method_name(
+                       "A", &["N".to_string()], "f", &[],
+                       &[("N".to_string(), 4)].into_iter().collect(), &empty),
+                   mangle_method_name("A$N4", "f"));
+        // D1's shadow: `model Buf[N]`'s `f![N]`, at two receivers and one
+        // bracket. The model half must follow the receiver, not the bracket.
+        let two = |n: i64| mangle_mono_method_name(
+            "Buf", &["N".to_string()], "f!", &["N".to_string()],
+            &[("N".to_string(), n)].into_iter().collect(),
+            &[("N".to_string(), 2)].into_iter().collect());
+        assert_eq!(two(4), "Buf$$N4$$f!$N2");
+        assert_eq!(two(2), "Buf$$N2$$f!$N2");
+        assert_ne!(two(4), two(2));
+    }
 
     // #292: bf16/f16 npz loads are widened to f32 (the JIT stores them
     // f32-backed). Verify the widening helpers against known bit patterns.
@@ -22198,6 +30330,564 @@ mod tests {
         assert_eq!(j, i, "JIT/interp divergence ({} vs {}) for:\n{}", j, i, src);
     }
 
+    // ─── module constants as shape dimensions (jit-error defect) ────────────
+    //
+    // A top-level `let NAME = <literal>` module constant (#268) is a legal
+    // shape dimension, in a non-generic fn's signature and body alike — the
+    // checker's `SymDim::from_expr` (shape.rs) treats a bare shape-position
+    // ident as an opaque symbolic `Var` regardless of what it names, so it
+    // never distinguishes "a fn's own shape parameter" from "a module
+    // constant"; the interpreter resolves either off the same environment
+    // chain. The JIT's shape resolver, by contrast, only ever consulted a
+    // fn's bound `shape_env` (its bracketed generics), so a module constant
+    // used as a dimension had no binding to be found under and misreported
+    // "unbound shape parameter `NAME`" — a defect (DIAGNOSTICS.md §3,
+    // `jit-error`), not the JIT declining a real gap. `resolve_shape_expr`'s
+    // `ConstDim` fallback fixes this; these are its differential tests.
+    //
+    // Each pins a VALUE as well as JIT/interp agreement: a differential
+    // assertion alone also passes when both backends are wrong the same way,
+    // and the value is what the issue actually reported.
+
+    /// The repro from the issue: a non-generic top-level fn whose return type
+    /// and body both use a module constant as a `Tensor` shape dimension.
+    #[test]
+    fn top_level_const_as_shape_dim_nongeneric_fn() {
+        let src = "\
+let CHANNELS: u64 = 3u64
+fn retain_default() -> Tensor[f32, [CHANNELS]] {
+    let !t = forge.zeros[f32, [CHANNELS]]
+    t[0] = 1.0
+    t[1] = 2.0
+    t[2] = 3.0
+    t
+}
+fn main() -> i64 {
+    sum(retain_default()) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 6);
+    }
+
+    /// Order independence: the constant is declared AFTER the fn that uses it
+    /// as a shape dimension. `compile_program`'s pre-pass folds every top-level
+    /// module constant into the `ConstDim` table before any fn signature is
+    /// declared, matching the checker's `SymDim`, which never evaluates the
+    /// name and so is insensitive to source order in the first place.
+    #[test]
+    fn top_level_const_as_shape_dim_forward_reference() {
+        let src = "\
+fn retain_default() -> Tensor[f32, [CHANNELS]] {
+    let !t = forge.zeros[f32, [CHANNELS]]
+    t[0] = 1.0
+    t[1] = 2.0
+    t[2] = 3.0
+    t
+}
+let CHANNELS: u64 = 3u64
+fn main() -> i64 {
+    sum(retain_default()) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 6);
+    }
+
+    /// The same constant used as a model field's shape dimension — the other
+    /// shape-position site `collect_fns` resolves ahead of any call
+    /// (`Item::Model`'s arm, via `lower_ty_for_model`).
+    #[test]
+    fn top_level_const_as_model_field_shape_dim() {
+        let src = "\
+let CHANNELS: u64 = 3u64
+model Sample {
+    data: Tensor[f32, [CHANNELS]]
+}
+fn make() -> Sample {
+    let !d = forge.zeros[f32, [CHANNELS]]
+    d[0] = 7.0
+    d[1] = 8.0
+    d[2] = 9.0
+    Sample { data: d }
+}
+fn main() -> i64 {
+    let s = make()
+    sum(s.data) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 24);
+    }
+
+    /// A module constant alongside a REAL shape parameter in the same
+    /// `Tensor` type — exercises `instantiate_template`'s
+    /// `declare_template_signature` call (a shape-generic fn's specialized
+    /// signature), not just `declare_fn`'s. `CHANNELS` in the `for` header is
+    /// a *scalar* use and still travels the #268 path.
+    #[test]
+    fn top_level_const_alongside_shape_param() {
+        let src = "\
+let CHANNELS: u64 = 3u64
+fn first_row[B](x: Tensor[f32, [B, CHANNELS]]) -> f32 {
+    let !s: f32 = 0.0
+    for c in 0..CHANNELS {
+        s = s + x[0, c]
+    }
+    s
+}
+fn main() -> i64 {
+    let !x = forge.zeros[f32, [2, 3]]
+    x[0, 0] = 1.0
+    x[0, 1] = 2.0
+    x[0, 2] = 3.0
+    (first_row(x) * 1000.0) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 6000);
+    }
+
+    /// #793 (regression from #766): the same module constant, used as an
+    /// implicit shape param in TWO fn signatures, must check clean AND run
+    /// to the same value on both backends — `check.rs`'s `check_tests`
+    /// module pins the check-only half of this same repro
+    /// (`implicit_shape_param_folds_the_same_way_across_two_fn_signatures_
+    /// 793`); this is its runtime counterpart, since the issue was found via
+    /// a real program going red under `dmc --check`, not a runtime
+    /// divergence — the fix must not introduce one.
+    #[test]
+    fn top_level_const_implicit_shape_param_passes_through_two_fn_signatures_793() {
+        let src = "\
+let N = 4
+fn inner(c: Tensor[f32, [N]]) -> f32 { sum(c) }
+fn outer(c: Tensor[f32, [N]]) -> f32 { inner(c) }
+fn main() -> i64 {
+    let !c = forge.zeros[f32, [N]]
+    c[0] = 1.0
+    c[1] = 2.0
+    c[2] = 3.0
+    c[3] = 4.0
+    outer(c) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 10);
+    }
+
+    /// Same repro, typed/suffixed `let` form — the issue's second reported
+    /// site.
+    #[test]
+    fn top_level_const_implicit_shape_param_passes_through_two_fn_signatures_typed_let_793() {
+        let src = "\
+let DATA_BLOCKS: u64 = 4u64
+fn inner(c: Tensor[u64, [DATA_BLOCKS]]) -> i64 { sum(c) as i64 }
+fn outer(c: Tensor[u64, [DATA_BLOCKS]]) -> i64 { inner(c) }
+fn main() -> i64 {
+    let !c = forge.zeros[u64, [DATA_BLOCKS]]
+    c[0] = 1u64
+    c[1] = 2u64
+    c[2] = 3u64
+    c[3] = 4u64
+    outer(c)
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 10);
+    }
+
+    /// A genuinely unbound shape-position ident (not a module constant, not a
+    /// shape parameter) must still be the refusal this whole mechanism exists
+    /// to preserve — the fallback only ever resolves a name that IS a module
+    /// constant; it must never paper over an actual defect.
+    #[test]
+    fn shape_dim_still_unbound_without_a_matching_const() {
+        let src = "\
+fn retain_default() -> Tensor[f32, [NOPE]] {
+    let !t = forge.zeros[f32, [NOPE]]
+    t
+}
+fn main() -> i64 { sum(retain_default()) as i64 }
+";
+        let err = jit_compile_jiterr(src);
+        assert!(err.to_string().contains("unbound shape parameter"),
+            "expected an unbound-shape-parameter refusal, got: {}", err);
+    }
+
+    // ─── the boundaries of that fallback ────────────────────────────────────
+    //
+    // A module constant resolves as a dimension ONLY in a type-level shape
+    // position, ONLY when nothing in scope binds the name, and ONLY when its
+    // value is a positive integer. Everywhere else the program must behave
+    // exactly as it did before this fix. Each test below is a case where an
+    // earlier draft — which seeded every fn's `shape_env` with the constants
+    // instead of offering them as a positional fallback — changed behaviour it
+    // had no business changing.
+
+    /// A LOCAL shadowing a module constant must win in a runtime slice bound.
+    /// Seeding `shape_env` folded `K` to the module constant's 2 inside
+    /// `affine_index_expr`, so `t[K..K+1]` silently read a different row than
+    /// `dmc run` did — a run/JIT divergence, and a regression of #511.
+    #[test]
+    fn const_shadowed_by_a_local_stays_out_of_a_slice_bound() {
+        let src = "\
+let K = 2
+fn main() -> i64 {
+    let K = 5
+    let !t = forge.zeros[f32, [8]]
+    for i in 0..8 {
+        t[i] = (i as f32) * 10.0
+    }
+    let s = t[K..K+1]
+    sum(s) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 50);
+    }
+
+    /// Same, for a LOOP VARIABLE shadowing the constant — the #511 form the
+    /// affine slice path exists for (`t[i..i+1]` with a runtime start and a
+    /// compile-time extent).
+    #[test]
+    fn const_shadowed_by_a_loop_var_stays_out_of_a_slice_bound() {
+        let src = "\
+let K = 2
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [8]]
+    for i in 0..8 {
+        t[i] = (i as f32) * 10.0
+    }
+    let !acc: f32 = 0.0
+    for K in 4..8 {
+        let s = t[K..K+1]
+        acc = acc + sum(s)
+    }
+    acc as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 220);
+    }
+
+    /// A narrow-width module constant used as a SCALAR keeps its declared
+    /// width. A `shape_env` entry is a bare i64, and the lookup ran ahead of
+    /// #268's re-lowering of the initializer (which carries the width), so
+    /// `W * 2i32` started failing with "operands disagree: `i64` vs `i32`" on
+    /// a program that had always worked.
+    #[test]
+    fn narrow_width_const_keeps_its_width_in_scalar_arithmetic() {
+        for (decl, mul) in [
+            ("let W: i32 = 7i32", "2i32"),
+            ("let W: u32 = 7u32", "2u32"),
+            ("let W: u8 = 7u8",   "2u8"),
+        ] {
+            let src = format!("{}\nfn main() -> i64 {{ (W * {}) as i64 }}\n", decl, mul);
+            assert_jit_eq_interp(&src);
+            assert_eq!(jit_run_i64(&src).expect("JIT run failed"), 14, "for:\n{}", src);
+        }
+    }
+
+    /// #712: a LITERAL local `let` shadowing a module constant is now as
+    /// foldable an allocation dimension as the module constant it shadows —
+    /// folded to the LOCAL's own value, never the module constant's (which
+    /// would have allocated 2 elements for a loop the interpreter runs 5
+    /// times). This used to be the bare "unbound shape parameter" `jit-error`
+    /// (#480 class): the JIT had no fold path for a local at all, only for a
+    /// module constant (#620).
+    #[test]
+    fn const_shadowed_by_a_local_is_an_allocation_dim_712() {
+        let src = "\
+let N = 2
+fn main() -> i64 {
+    let N = 5
+    let !t = forge.zeros[f32, [N]]
+    for i in 0..N {
+        t[i] = 1.0
+    }
+    sum(t) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 5);
+    }
+
+    /// #737: every folded shape dimension goes through `int_arith`, so the
+    /// fold answers `n / 0` and `n % 0` with the interpreter's 0 (SPEC.md
+    /// §3.1: integer division and modulo by zero are 0) instead of one arm
+    /// holding its own `Div if r != 0` guard and `%` not folding at all —
+    /// and an i64 overflow wraps (no debug-build panic) into the classed
+    /// negative-shape refusal.
+    #[test]
+    fn folded_dim_modulo_by_zero_is_zero_on_both_backends_737() {
+        let src = "fn main() -> i64 {\n    let H = 7 % 0\n    let !t = forge.zeros[i64, [H]]\n    sum(t)\n}\n";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 0);
+    }
+
+    #[test]
+    fn folded_dim_division_by_zero_is_zero_on_both_backends_737() {
+        let src = "fn main() -> i64 {\n    let H = 4 / 0\n    let !t = forge.zeros[i64, [H]]\n    sum(t)\n}\n";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 0);
+    }
+
+    #[test]
+    fn folded_dim_narrow_modulo_by_zero_is_zero_737() {
+        let src = "fn main() -> i64 {\n    let H = 7u8 % 0u8\n    let !t = forge.zeros[i64, [H]]\n    sum(t)\n}\n";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 0);
+    }
+
+    /// The overflow case is the one that used to PANIC in a debug build (bare
+    /// `l + r`): it now wraps to i64::MIN through `int_arith` and lands in the
+    /// classed negative-shape refusal — in debug and release alike, which is
+    /// why this test must run under `cargo test` (debug) in CI.
+    #[test]
+    fn folded_dim_i64_overflow_wraps_into_the_negative_shape_refusal_737() {
+        let src = "fn main() -> i64 {\n    let H = 9223372036854775807 + 1\n    let !t = forge.zeros[i64, [H]]\n    sum(t)\n}\n";
+        let err = jit_compile_jiterr(src);
+        assert_eq!(err.kind, JitErrorKind::Unsupported, "got: {}", err);
+        assert!(err.msg.contains("-9223372036854775808") && err.msg.contains("cannot be negative"),
+            "got: {}", err);
+    }
+
+    /// The same shadowing shape, for a VALUE PARAMETER named like a module
+    /// constant. A parameter is bound to a caller-supplied runtime value, not
+    /// a `let`, so it is not in `local_const_dims` and stays refused — but
+    /// classed and naming the binding (#712), never the bare #480-class
+    /// "unbound shape parameter".
+    #[test]
+    fn const_shadowed_by_a_value_param_is_not_an_allocation_dim() {
+        let src = "\
+let N = 2
+fn build(N: i64) -> i64 {
+    let !t = forge.zeros[f32, [N]]
+    sum(t) as i64 + N
+}
+fn main() -> i64 { build(5) }
+";
+        let err = jit_compile_jiterr(src);
+        assert_eq!(err.kind, JitErrorKind::Unsupported, "got: {}", err);
+        // #718 rework (R2): was `TypeForm` — a parameter's runtime value is
+        // not statically known, so `DynamicShape` (DIAGNOSTICS.md §5.2) is
+        // the accurate class; `TypeForm` is reserved for a value that IS
+        // known and simply isn't an integer.
+        assert_eq!(err.refusal, Some(Refusal::DynamicShape), "got: {}", err);
+        assert!(err.msg.contains('`') && err.msg.contains("N") && err.msg.contains("parameter"),
+            "a value param must shadow the constant, not fold to it, and must name \
+             itself in a classed refusal; got: {}", err);
+    }
+
+    /// A FLOAT module constant in a shape position is not a dimension in any
+    /// backend — but that is the JIT declining a nonsensical program, so it
+    /// owes a classed `jit-ineligible` refusal (DIAGNOSTICS.md §3), not the
+    /// bare "unbound shape parameter" defect signal it used to emit.
+    #[test]
+    fn float_const_in_a_shape_position_is_a_classed_refusal() {
+        let src = "\
+let N = 3.0
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [N]]
+    sum(t) as i64
+}
+";
+        let err = jit_compile_jiterr(src);
+        assert_eq!(err.kind, JitErrorKind::Unsupported, "got: {}", err);
+        assert_eq!(err.refusal, Some(Refusal::TypeForm), "got: {}", err);
+        assert!(err.msg.contains("is not an integer"), "got: {}", err);
+    }
+
+    /// A negative extent is a verdict on the DIMENSION, not on a leaf of it.
+    /// `let Z = 0` is a perfectly good term of `[A + Z]`, which folds to 5;
+    /// refusing at the leaf turned a working program into a refusal.
+    #[test]
+    fn a_zero_leaf_is_fine_when_the_dimension_folds_positive() {
+        let src = "\
+let Z = 0
+let A = 5
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [A + Z]]
+    for i in 0..5 {
+        t[i] = 1.0
+    }
+    sum(t) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 5);
+    }
+
+    /// The other side of the same move: a dimension that folds negative out of
+    /// literals alone never passed a `ConstDim` leaf at all, so it reached the
+    /// allocator and was reported as needing 17179869184.0 GiB. Judged on the
+    /// folded value it is the classed refusal it should be.
+    #[test]
+    fn a_dimension_that_folds_negative_is_a_classed_refusal() {
+        let src = "\
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [0 - 3]]
+    sum(t) as i64
+}
+";
+        let err = jit_compile_jiterr(src);
+        assert_eq!(err.kind, JitErrorKind::Unsupported, "got: {}", err);
+        assert_eq!(err.refusal, Some(Refusal::TypeForm), "got: {}", err);
+        assert!(err.msg.contains("cannot be negative"), "got: {}", err);
+    }
+
+    /// ZERO is not refused. A zero-length tensor is a legal value on both
+    /// backends (#258: `mean` of one is NaN under `run` and the JIT alike), so
+    /// a constant that folds to it is a dimension like the literal `[0]` that
+    /// has always compiled — refusing it would be a gap invented here, not a
+    /// defect fixed.
+    #[test]
+    fn a_dimension_that_folds_to_zero_is_a_legal_extent() {
+        let src = "\
+let Z = 0
+fn main() -> i64 {
+    let m = mean(forge.zeros[f32, [Z]])
+    if m == m { 0 } else { 1 }
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 1);
+    }
+
+    /// A constant that IS negative still refuses, and the message still names
+    /// the declaration it came from.
+    #[test]
+    fn a_negative_module_constant_dimension_names_the_constant() {
+        let src = "\
+let N = -3
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [N]]
+    sum(t) as i64
+}
+";
+        let err = jit_compile_jiterr(src);
+        assert_eq!(err.refusal, Some(Refusal::TypeForm), "got: {}", err);
+        assert!(err.msg.contains("`N` is -3"), "got: {}", err);
+        assert!(err.msg.contains("cannot be negative"), "got: {}", err);
+    }
+
+    // ─── a lambda body is inside its enclosing function's shape scope ────────
+    //
+    // A lambda's deferred `FnMeta` carried an empty `shape_env`, so the
+    // enclosing fn's monomorphized shape parameters were unbound inside it and
+    // the module-constant fallback answered in their place — the fallback
+    // standing in for a binding that exists, which is the one thing it must
+    // never do. Both forms below are silent run/JIT divergences.
+
+    /// A shape parameter as a DIMENSION inside a lambda body. `outer` is
+    /// called with a 2-long tensor, so `forge.ones[f32, [N]]` is `[2]`; the
+    /// lambda allocated the module constant's 8 and answered 11 for 5.
+    #[test]
+    fn enclosing_shape_param_is_a_dimension_inside_a_lambda_body() {
+        let src = "\
+let N = 8
+fn outer[N](x: Tensor[f32, [N]]) -> f32 {
+    let g = fn(y: f32) -> f32 {
+        let t = forge.ones[f32, [N]]
+        y + sum(t)
+    }
+    g(sum(x))
+}
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [2]]
+    t[0] = 1.0
+    t[1] = 2.0
+    outer(t) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 5);
+    }
+
+    /// The same shape parameter as a SCALAR inside a lambda body — the
+    /// `lower_ident` path, which reads `shape_env` before falling through to
+    /// #268's re-lowering of the module constant's initializer. With the env
+    /// empty the constant's 8 was multiplied in where the fn's own 2 belonged:
+    /// 24 for 6.
+    #[test]
+    fn enclosing_shape_param_is_a_scalar_inside_a_lambda_body() {
+        let src = "\
+let N = 8
+fn outer[N](x: Tensor[f32, [N]]) -> f32 {
+    let g = fn(y: f32) -> f32 { y * (N as f32) }
+    g(sum(x))
+}
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [2]]
+    t[0] = 1.0
+    t[1] = 2.0
+    outer(t) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 6);
+    }
+
+    /// A lambda's own signature is in that scope too: its parameter and return
+    /// types resolve against the enclosing fn's shape parameters, so a lambda
+    /// taking the enclosing tensor type compiles instead of refusing with
+    /// "cannot convert `Tensor[f32, [2]]` to `Tensor[f32, [8]]`".
+    #[test]
+    fn enclosing_shape_param_is_a_lambda_param_type() {
+        let src = "\
+let N = 8
+fn outer[N](x: Tensor[f32, [N]]) -> f32 {
+    let g = fn(y: Tensor[f32, [N]]) -> f32 { sum(y) }
+    g(x)
+}
+fn main() -> i64 {
+    let !t = forge.zeros[f32, [2]]
+    t[0] = 1.0
+    t[1] = 2.0
+    outer(t) as i64
+}
+";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).expect("JIT run failed"), 3);
+    }
+
+    /// The shadowing rule is unchanged inside a lambda: a LOCAL of the
+    /// enclosing body named like a module constant is CAPTURED, not folded —
+    /// #712's `local_const_dims` fold table is per-fn and a lambda gets its
+    /// own fresh one, so a capture (loaded from the `__env` array at
+    /// prologue, like a parameter) is not in it either. Still refused, but
+    /// classed and naming the binding (#712), never the bare #480-class
+    /// "unbound shape parameter".
+    #[test]
+    fn const_shadowed_by_a_local_is_not_a_lambda_body_dim() {
+        let src = "\
+let N = 8
+fn main() -> i64 {
+    let N = 2
+    let g = fn(y: f32) -> f32 {
+        let t = forge.ones[f32, [N]]
+        y + sum(t)
+    }
+    g(3.0) as i64
+}
+";
+        let err = jit_compile_jiterr(src);
+        assert_eq!(err.kind, JitErrorKind::Unsupported, "got: {}", err);
+        // #718 rework (R2): was `TypeForm` — a lambda capture's runtime value
+        // is not statically known, so `DynamicShape` (DIAGNOSTICS.md §5.2)
+        // is the accurate class. This fixture's `N` is itself a #712-foldable
+        // local (`let N = 2`, no `!`) captured by the lambda, so it is also
+        // the R5 gap tracked in `tools/jit_probes.py`'s `GAP_ALLOWLIST`
+        // (`shape_local_let_capture_in_lambda_body_718`): SPEC.md §3.5.1 says
+        // capturing closures are supported on both backends, but the JIT's
+        // per-fn fold table isn't visible inside a lambda body, so the
+        // capture is read as an ordinary runtime value and refused instead.
+        assert_eq!(err.refusal, Some(Refusal::DynamicShape), "got: {}", err);
+        assert!(err.msg.contains('`') && err.msg.contains("N"),
+            "a captured local must shadow the constant, not fold to it, and must \
+             name itself in a classed refusal; got: {}", err);
+    }
+
     // ─── ForgeArena (#292): growable chunked bump allocator ──────────────────
     //
     // Exercised with a tiny chunk size so chunk chaining is cheap to test;
@@ -22217,18 +30907,26 @@ mod tests {
 
     #[test]
     fn forge_arena_grows_past_first_chunk() {
-        // 256-byte chunks; allocate well past one chunk's worth and verify
-        // every pointer stays live (earlier allocations are not clobbered by
-        // later growth — the defining property of the chained design).
-        let mut a = ForgeArena::with_chunk_size(256);
+        // #674 slice 3c: chunks are now `PageChunk` (page-aligned), so no
+        // chunk is ever smaller than one OS page regardless of the
+        // requested `chunk_size` — sizing this test's chunk and allocation
+        // count off the real page size (rather than a fixed small constant
+        // like the pre-3c "256-byte chunks") keeps it forcing multiple
+        // chunks on any host's page size. Allocate several pages' worth and
+        // verify every pointer stays live (earlier allocations are not
+        // clobbered by later growth — the defining property of the chained
+        // design).
+        let chunk_size = page_size();
+        let mut a = ForgeArena::with_chunk_size(chunk_size);
+        let n = (chunk_size / 128) * 3; // several chunks' worth of 128-aligned strides
         let mut ptrs = Vec::new();
-        for i in 0..64 {
-            let p = a.alloc(100); // 100 rounds to a 128-aligned stride → 2 per chunk
-            touch(p, 100, i as u8);
+        for i in 0..n {
+            let p = a.alloc(100); // 100 rounds to a 128-aligned stride
+            touch(p, 100, (i % 256) as u8);
             ptrs.push(p);
         }
-        // The first allocation still holds its bytes after 63 more allocations
-        // forced new chunks.
+        // The first allocation still holds its bytes after growth forced
+        // new chunks.
         unsafe { assert_eq!(*ptrs[0], 0, "first allocation was clobbered by growth"); }
         assert!(a.chunks.len() > 1, "arena never grew past one chunk");
     }
@@ -22267,12 +30965,17 @@ mod tests {
     fn forge_arena_snapshot_restore_across_chunks() {
         // Snapshot in chunk 0, spill into later chunks, then restore: the
         // watermark returns to chunk 0 and the spilled chunks are reused
-        // (capacity retained — no per-frame reallocation).
-        let mut a = ForgeArena::with_chunk_size(256);
+        // (capacity retained — no per-frame reallocation). #674 slice 3c:
+        // sized off the real page size — see
+        // `forge_arena_grows_past_first_chunk`'s comment for why a fixed
+        // small chunk size no longer forces multiple `PageChunk`s.
+        let chunk_size = page_size();
+        let mut a = ForgeArena::with_chunk_size(chunk_size);
         let _warm = a.alloc(64);
         let mark = a.snapshot();
         // Force growth past the snapshot's chunk.
-        for _ in 0..16 { let p = a.alloc(120); touch(p, 120, 7); }
+        let n = (chunk_size / 128) * 3;
+        for _ in 0..n { let p = a.alloc(120); touch(p, 120, 7); }
         let before_chunks = a.chunks.len();
         assert!(before_chunks > 1);
         assert!(a.cur > 0, "did not spill into a later chunk");
@@ -22281,7 +30984,7 @@ mod tests {
         // Capacity is retained for reuse — restore must not drop chunks.
         assert_eq!(a.chunks.len(), before_chunks, "restore dropped chunk capacity");
         // Re-allocating after restore reuses the same backing chunks.
-        for _ in 0..16 { let p = a.alloc(120); touch(p, 120, 9); }
+        for _ in 0..n { let p = a.alloc(120); touch(p, 120, 9); }
         assert_eq!(a.chunks.len(), before_chunks, "re-fill after restore re-grew the arena");
     }
 
@@ -22304,13 +31007,27 @@ mod tests {
 
     #[test]
     fn forge_arena_within_budget_allocates() {
-        // 1 KiB budget, 1 KiB of chunk: four 256-byte allocations all fit.
-        let mut a = ForgeArena::with_limit(1024, 1024);
+        // #674 slice 3c REWORK: a "1 KiB budget, 1 KiB chunk" no longer
+        // holds literally — `PageChunk` page-rounds every chunk (see
+        // `the_whole_budget_is_usable_when_it_is_not_a_chunk_multiple`'s
+        // comment, same rounding), and `committed` now tracks the chunk's
+        // own real, page-rounded `.len()` rather than the unrounded request
+        // (finding 3 of this REWORK — `ForgeArena::alloc` used to credit
+        // `committed` with the request `sz`, silently wrong by
+        // `page_size() - sz` bytes whenever `sz` wasn't already a page
+        // multiple, which a hardcoded 1024 on a 16 KiB-page host never is).
+        // Parameterized on the real page size instead, so the test's intent
+        // — one budgeted chunk, four equal allocations exactly filling it —
+        // holds on every host regardless of page size.
+        let page = page_size();
+        let quarter = page / 4;
+        let mut a = ForgeArena::with_limit(page, page);
         for i in 0..4 {
-            let p = a.alloc(256);
-            touch(p, 256, i as u8);
+            let p = a.alloc(quarter);
+            touch(p, quarter, i as u8);
         }
-        assert_eq!(a.committed, 1024, "committed more than the single budgeted chunk");
+        assert_eq!(a.used, page, "the meter did not see all four allocations");
+        assert_eq!(a.committed, page, "committed more than the single budgeted (page-rounded) chunk");
         assert!(!a.exceeds_budget(0));
     }
 
@@ -22341,7 +31058,7 @@ mod tests {
     #[test]
     fn forge_arena_budget_survives_snapshot_restore() {
         // `restore` rewinds the cursor but keeps the chunks, so the committed
-        // total — the thing the budget meters — does not move.
+        // total does not move.
         let mut a = ForgeArena::with_limit(1024, 1024);
         let mark = a.snapshot();
         let p = a.alloc(512);
@@ -22352,6 +31069,63 @@ mod tests {
         let q = a.alloc(512);
         assert_eq!(p, q, "restore did not rewind the cursor");
         assert_eq!(a.committed, committed, "re-fill after restore re-committed");
+
+        // #614: the budget itself — not just `committed` — must not move
+        // either. A restore returns bytes to reuse, never bytes to the
+        // meter, on both backends: the second alloc above reused the exact
+        // same bytes `p` pointed at, but it is still charged as 512 more
+        // bytes against `--forge`.
+        assert_eq!(a.used, 1024, "the alloc after restore was not charged");
+        a.restore(mark);
+        assert!(
+            a.exceeds_budget(512),
+            "a third restore/alloc cycle should exceed the --forge budget \
+             even though the bytes are physically free to reuse — a rewind \
+             must not make a snapshot/restore loop a way around --forge",
+        );
+    }
+
+    #[test]
+    fn forge_arena_internal_mark_restores_used_but_user_mark_does_not() {
+        // #614 scope note (PR #779): the user-facing `Mark` (`snapshot`/
+        // `restore`) must keep `used` monotonic — the assertion above already
+        // covers that. The compiler-internal `InternalMark`
+        // (`snapshot_internal`/`restore_internal`), used only by
+        // compiler-inserted rewinds (`grad_call_prologue`/`grad_call_epilogue`
+        // and the forward-only `@grad fn` entry — see `InternalMark`'s doc
+        // comment), is the opposite: it must give `used` back, because those
+        // rewinds are over compiler intermediates (`MEMORY.md §1.1`), not
+        // something the user asked to keep.
+        let mut a = ForgeArena::with_limit(1024, 1024);
+
+        let user_mark = a.snapshot();
+        let internal_mark = a.snapshot_internal(0);
+        assert_eq!(user_mark, a.snapshot(), "both marks start at the same watermark");
+
+        let p = a.alloc(512);
+        touch(p, 512, 7);
+        assert_eq!(a.used, 512);
+
+        // A user restore rewinds the cursor (memory is reused) but not `used`.
+        a.restore(user_mark);
+        assert_eq!(a.used, 512, "a user restore must not rewind `used`");
+        let q = a.alloc(512);
+        assert_eq!(p, q, "user restore did not rewind the cursor");
+        assert_eq!(a.used, 1024, "the re-alloc after a user restore was not charged again");
+
+        // An internal restore rewinds BOTH the cursor and `used` back to the
+        // snapshot — the epilogue's activations return their charge in full.
+        a.restore_internal(internal_mark, 0);
+        assert_eq!(a.used, 0, "an internal restore must rewind `used` to its captured value");
+        let r = a.alloc(512);
+        assert_eq!(p, r, "internal restore did not rewind the cursor");
+        assert_eq!(a.used, 512, "the alloc after an internal restore should be the only charge");
+        assert!(
+            !a.exceeds_budget(512),
+            "an internal-mark restore/alloc cycle must not exhaust the budget \
+             the way a user-mark cycle does — that's the whole point of #614's \
+             carve-out for compiler intermediates",
+        );
     }
 
     #[test]
@@ -22361,7 +31135,7 @@ mod tests {
         set_forge_limit(Some(4096));
         let a = ForgeArena::new();
         set_forge_limit(None);
-        assert_eq!(a.chunk_size, 4096);
+        assert_eq!(a.chunk_size, Some(4096));
         assert_eq!(a.limit, Some(4096));
     }
 
@@ -22369,72 +31143,109 @@ mod tests {
     fn no_forge_limit_keeps_the_default_chunk() {
         set_forge_limit(None);
         let a = ForgeArena::new();
-        assert_eq!(a.chunk_size, ForgeArena::DEFAULT_CHUNK);
+        assert_eq!(a.chunk_size, Some(ForgeArena::DEFAULT_CHUNK));
         assert_eq!(a.limit, None);
     }
 
     #[test]
     fn the_whole_budget_is_usable_when_it_is_not_a_chunk_multiple() {
-        // #400: the quantization bug in miniature. A 6 KiB budget with 4 KiB
-        // chunks used to deliver only 4 KiB — the second chunk asked for
-        // another full 4 KiB (8 KiB total) and was refused, even though
-        // 4 KiB + 1 KiB is comfortably inside 6 KiB. Six 1 KiB allocations
-        // must all land, and `committed` must stop exactly at the budget.
-        let mut a = ForgeArena::with_limit(4096, 6144);
+        // #400's quantization bug in miniature, re-measured for #674 slice
+        // 2's requested-byte metering: a 1.5-chunk budget. Six allocations
+        // of a quarter chunk each must all land — `used` is the meter, and
+        // it stops exactly at the budget, landing on the chunk boundary
+        // partway through (the 5th allocation spills into a second chunk).
+        // `committed` is no longer capped at the budget: slice 2 sizes
+        // every chunk from `chunk_size`/`need` alone, so the second chunk
+        // is a FULL chunk too, and physical `committed` (2 chunks) runs
+        // past the 1.5-chunk budget. That is allocator over-provision, not
+        // meter slack — the 7th allocation is still refused on `used`.
+        //
+        // #674 slice 3c: parameterized on the real page size, not a fixed
+        // "4 KiB chunk" — `PageChunk` rounds every chunk up to a whole
+        // number of pages, so a chunk smaller than one page no longer
+        // exists (see `forge_arena_grows_past_first_chunk`'s comment).
+        let chunk = page_size();
+        let quarter = chunk / 4;
+        let limit = chunk + chunk / 2; // 1.5 chunks
+        let mut a = ForgeArena::with_limit(chunk, limit);
         for i in 0..6 {
-            let p = a.alloc(1024);
-            touch(p, 1024, i as u8);
+            let p = a.alloc(quarter);
+            touch(p, quarter, i as u8);
         }
-        assert_eq!(a.committed, 6144, "the budget was not fully usable");
-        assert!(a.exceeds_budget(1), "a full arena claimed room for one more byte");
+        assert_eq!(a.used, limit, "the meter did not land exactly on the budget");
+        assert_eq!(a.committed, chunk * 2, "chunk sizing should no longer cap at the budget remainder");
+        assert!(a.exceeds_budget(1), "a fully-used arena claimed room for one more byte");
     }
 
     #[test]
-    fn a_chunk_never_reserves_past_the_budget() {
-        // The exact arithmetic of the shipped repro: 512 MiB chunks under
-        // `--forge=768M`. With 512 MiB committed and a 64 MiB tensor in hand,
-        // the next chunk must be the 256 MiB that is left, not another
-        // 512 MiB that overshoots the budget by 256 MiB.
+    fn chunk_size_for_ignores_the_budget_remainder() {
+        // #674 slice 2: `chunk_size_for` asks only for the request's own
+        // aligned need — `chunk_size.max(need)` — never for what is left of
+        // `--forge`. Before this slice (on `main` too — #779 did not touch
+        // this method), this same call, with 512 MiB already committed of a
+        // 768 MiB budget, returned the 256 MiB *remainder*; that "the first
+        // chunk is sized to what is left of the budget" mechanism is what
+        // the arena-budget design's §2.1 (2026-09-05) blames for the
+        // JIT's minimum budget sitting below the aligned request total
+        // (`dc_let.dmc` ran at `--forge=32777`, 55 B under its `32832` B
+        // aligned total) — a pre-#779 figure: #779's own monotonic-`used`
+        // check already closes that particular gap, so `main` measures the
+        // full `32832` B today even with this remainder-capping mechanism
+        // still in place.
         const MIB: usize = 1 << 20;
-        let mut a = ForgeArena::with_limit(512 * MIB, 768 * MIB);
-        assert_eq!(a.chunk_size_for(64 * MIB, 0), 512 * MIB);
-        assert_eq!(a.chunk_size_for(64 * MIB, 512 * MIB), 256 * MIB);
-        a.committed = 512 * MIB;
-        assert!(
-            !a.exceeds_budget(a.chunk_size_for(64 * MIB, a.committed)),
-            "a 64 MiB tensor was refused with 256 MiB of the budget free",
-        );
+        let a = ForgeArena::with_limit(512 * MIB, 768 * MIB);
+        assert_eq!(a.chunk_size_for(64 * MIB), 512 * MIB, "sized from chunk_size/need, not the budget");
 
-        // Once the budget really is gone, the chunk collapses to the aligned
-        // allocation itself — which is what makes the diagnostic honest: the
-        // size it decides on is the size it prints.
-        a.committed = 768 * MIB;
-        let need = ForgeArena::align_up(64 * MIB);
-        assert_eq!(a.chunk_size_for(need, a.committed), need);
-        assert!(a.exceeds_budget(need));
+        // `committed` no longer has a say in chunk sizing at all — not even
+        // at the extreme where it already equals the whole budget.
+        let mut a2 = ForgeArena::with_limit(512 * MIB, 768 * MIB);
+        a2.committed = 768 * MIB;
+        assert_eq!(a2.chunk_size_for(64 * MIB), 512 * MIB, "committed must not influence chunk sizing");
+
+        // A request larger than the default chunk still gets its own
+        // right-sized chunk — that part of the mechanism is unchanged.
+        let need = ForgeArena::align_up(600 * MIB);
+        assert_eq!(a2.chunk_size_for(need), need);
     }
 
     #[test]
-    fn a_budget_above_the_default_chunk_reserves_only_what_is_left() {
+    fn refusal_is_decided_by_used_not_committed() {
+        // #674 slice 2: the exhaustion decision is `used`-based, full stop.
+        // Inflate `committed` past the limit — legitimate now that chunk
+        // sizing over-provisions relative to the budget — while `used` stays
+        // low: `exceeds_budget` must still say no, because `committed` is
+        // never compared against `--forge`. Then push `used` itself to the
+        // limit and confirm the same call trips.
+        let mut a = ForgeArena::with_limit(1024, 1024);
+        a.committed = 10 * 1024;
+        assert!(!a.exceeds_budget(1), "committed running past the budget must not trip the meter");
+        a.used = 1024;
+        assert!(a.exceeds_budget(1), "used at the limit must trip the meter regardless of committed");
+    }
+
+    #[test]
+    fn a_budget_above_the_default_chunk_no_longer_shrinks_the_second_chunk() {
         // Through `new()` + `alloc`, with a budget larger than the 512 MiB
-        // default chunk — the shape that shipped broken. The allocation is
-        // deliberately small: proving the *sizing* needs no half-gigabyte of
-        // touched pages in CI, and `the_whole_budget_is_usable_when_it_is_not_a_chunk_multiple`
-        // above already drives the same code path to real exhaustion.
+        // default chunk. Before #674 slice 2 the second chunk was capped at
+        // the 256 MiB left of a 768 MiB budget (`a_chunk_never_reserves_past
+        // _the_budget`'s old name); slice 2 sizes every chunk from
+        // `chunk_size`/`need` alone, so the second chunk is the full
+        // default 512 MiB again. `committed` running past the nominal
+        // budget is the allocator's business now, not the meter's — `used`
+        // is still checked against `--forge` on every `alloc`, independently
+        // of chunk size.
         const MIB: usize = 1 << 20;
         set_forge_limit(Some(768 * MIB as u64));
         let mut a = ForgeArena::new();
         set_forge_limit(None);
-        assert_eq!(a.chunk_size, ForgeArena::DEFAULT_CHUNK, "768 MiB should not shrink the chunk");
+        assert_eq!(a.chunk_size, Some(ForgeArena::DEFAULT_CHUNK), "768 MiB should not shrink the chunk");
         assert_eq!(a.limit, Some(768 * MIB));
 
         let p = a.alloc(1024);
         touch(p, 1024, 0x11);
         assert_eq!(a.committed, 512 * MIB, "the first chunk is the default chunk");
-        // The second chunk is the 256 MiB remainder. Pre-#400-fix this asked
-        // for 512 MiB and exited the process claiming a tensor did not fit.
-        assert_eq!(a.chunk_size_for(64 * MIB, a.committed), 256 * MIB);
-        assert!(!a.exceeds_budget(a.chunk_size_for(64 * MIB, a.committed)));
+        assert_eq!(a.chunk_size_for(64 * MIB), 512 * MIB, "chunk sizing ignores the 256 MiB left of the budget");
+        assert!(!a.exceeds_budget(64 * MIB), "the meter (`used`) is nowhere near exhausted yet");
     }
 
     #[test]
@@ -22457,6 +31268,575 @@ mod tests {
              of the 1 KiB --forge budget is free",
         );
         assert!(take_forge_exhaustion().is_none(), "the diagnostic was not consumed");
+    }
+
+    // ─── The budget table (#674) ──────────────────────────────────────────
+    //
+    // Chunk ownership, first-chunk sizing and the poison fault need direct
+    // access to a carved entry's storage, which only this module's own
+    // private API (`budget_carve`/`budget_allocate`/`budget_reap`,
+    // `BudgetEntry`, `PageChunk`) can reach — hence here rather than in the
+    // integration tests. `compiler/tests/jit_budgets_3c.rs` covers what is
+    // reachable from source through carve/reap alone, and
+    // `compiler/tests/jit_budgets_3d.rs` covers `forge.enter`/`in b` end to
+    // end, one case per exit edge.
+    //
+    // #674 slice 3d adds the two register tests below the storage ones: the
+    // `__dmc_budget_enter`/`__dmc_budget_exit` PAIR itself, exercised
+    // directly on `CURRENT_BUDGET` rather than through a lowering, so the
+    // nesting rule (an inner exit restores the OUTER index, never the root)
+    // is pinned independently of any one edge.
+
+    /// A minimal one-entry table (just the root) with the given extent, for
+    /// exercising `budget_carve`/`budget_allocate`/`budget_reap` directly
+    /// without going through the `BUDGETS` thread-local (so these tests
+    /// don't depend on, or disturb, any other test's `--forge`/`FORGE_LIMIT`
+    /// state).
+    fn root_budget_table(extent: usize) -> Vec<BudgetEntry> {
+        vec![BudgetEntry {
+            generation: 0, parent: 0, extent, used: 0, free: extent, children: 0,
+            arena: ForgeArena::with_limit(1024 * 1024, extent), live: true,
+        }]
+    }
+
+    // REWORK: this file used to have a `BUDGET_REAP_TEST_LOCK` mutex here,
+    // serializing every test below because the poison test flipped the
+    // process-wide `DMC_BUDGET_POISON` env var around its own `reap` and
+    // env vars are not thread-local. `budget_reap` now takes the poison
+    // flag as a plain parameter (see its doc comment and
+    // `budget_poison_enabled`'s) instead of reading the environment inside
+    // the function, so no test here touches shared mutable process state
+    // any more — each builds its own independent `budgets: Vec<BudgetEntry>`
+    // — and the lock has nothing left to serialize.
+
+    #[test]
+    fn a_carved_childs_chunks_are_its_own_and_reap_credits_the_whole_extent() {
+        // #674 slice 3c (§3.1's region-ownership decision): a carved entry
+        // owns its OWN chunk list, never a sub-range of the parent's — this
+        // table starts as a bare root with no chunks committed, so nothing
+        // the child allocates can land in the parent's storage by
+        // construction (they are different `ForgeArena`s entirely).
+        // `reap` credits the child's WHOLE extent to the parent — spent and
+        // unspent alike, never merely the unspent remainder ((LOC), #674
+        // criterion 2).
+        let mut budgets = root_budget_table(16 * 1024 * 1024);
+        let mut budget_free: Vec<usize> = Vec::new();
+        let root_desc = pack_budget_descriptor(0, 0);
+        let child_desc = budget_carve(&mut budgets, &mut budget_free, root_desc, 4 * 1024 * 1024, 0, 0);
+        let (_, child_idx) = unpack_budget_descriptor(child_desc);
+
+        assert_eq!(budgets[0].free, 12 * 1024 * 1024, "carve did not reserve meter from the parent");
+        assert_eq!(budgets[0].children, 1);
+        assert!(budgets[0].arena.chunks.is_empty(), "carve must not commit any storage — meter only");
+
+        // Allocate less than the child's extent — the credit at reap must
+        // still be the WHOLE extent, not this smaller remainder.
+        let p = budget_allocate(&mut budgets, child_idx, 4096);
+        assert!(!p.is_null());
+        assert!(!budgets[child_idx].arena.chunks.is_empty(), "the child's own alloc did not commit the child's own chunk");
+        assert!(budgets[0].arena.chunks.is_empty(), "a child's chunk must never land in the parent's chunk list");
+        assert_eq!(budgets[child_idx].used, ForgeArena::align_up(4096));
+        assert!(budgets[child_idx].free < 4 * 1024 * 1024, "the child's own allocation should have spent its own free");
+
+        budget_reap(&mut budgets, &mut budget_free, child_desc, 0, 0, false);
+        assert_eq!(budgets[0].free, 16 * 1024 * 1024, "reap did not credit the WHOLE extent back to the parent");
+        assert_eq!(budgets[0].children, 0, "reap did not decrement the parent's live-child count");
+        assert!(!budgets[child_idx].live, "a reaped entry must not read as live");
+    }
+
+    #[test]
+    fn a_carved_entrys_first_chunk_is_sized_from_its_first_request_not_its_extent() {
+        // #674 slice 3c (§3.3): a 64 MiB child's first 4 KiB allocation must
+        // commit a chunk sized from the 4 KiB request (page-rounded, 64 KiB
+        // floor), never the whole 64 MiB extent — the RSS point the design
+        // measures against sizing every carved entry's first chunk the way
+        // entry 0's `DEFAULT_CHUNK.min(limit)` rule does.
+        let mut budgets = root_budget_table(128 * 1024 * 1024);
+        let mut budget_free: Vec<usize> = Vec::new();
+        let root_desc = pack_budget_descriptor(0, 0);
+        let extent: usize = 64 * 1024 * 1024;
+        let child_desc = budget_carve(&mut budgets, &mut budget_free, root_desc, extent as i64, 0, 0);
+        let (_, child_idx) = unpack_budget_descriptor(child_desc);
+
+        assert_eq!(budgets[child_idx].arena.chunk_size, None, "unset until the first request");
+        let _p = budget_allocate(&mut budgets, child_idx, 4096);
+        let committed = budgets[child_idx].arena.chunks[0].len();
+        assert!(
+            committed < extent,
+            "the first chunk ({committed} B) committed the whole 64 MiB extent \
+             instead of sizing from the 4 KiB request",
+        );
+        assert!(
+            committed <= 1024 * 1024,
+            "the first chunk should be small (page-rounded, 64 KiB floor), got {committed} B",
+        );
+        assert!(
+            budgets[child_idx].arena.chunk_size.is_some(),
+            "the first request must fix chunk_size, not leave it unset forever",
+        );
+    }
+
+    #[test]
+    fn entry_zero_chunk_size_is_always_some_a_carved_entrys_starts_none() {
+        // #674 slice 3c: entry 0 (`ForgeArena::new`/`with_limit`/
+        // `with_chunk_size`) always constructs with `Some` — its chunk
+        // sizing is byte-identical to before this slice. A freshly carved
+        // entry starts `None` — "unset" — until its own first request
+        // (§3.3), which `with_limit`'s zero-coercion (`chunk_size.max(1)`)
+        // could not represent.
+        let root = ForgeArena::new();
+        assert!(root.chunk_size.is_some(), "entry 0 must always start with a known chunk size");
+
+        let carved = ForgeArena::carved(1024 * 1024);
+        assert_eq!(carved.chunk_size, None, "a carved entry's chunk size starts unset");
+    }
+
+    // ─── #829: the chunk allocator's own mmap-refusal fatal ───────────────
+
+    #[test]
+    fn chunk_alloc_failure_message_matches_the_out_of_band_fatal_doctrine() {
+        // `alloc_zeroed_chunk`'s `mmap`-refusal fatal now goes through
+        // `out_of_band_fatal`, like every sibling arena/budget fatal above
+        // (`check_budget`'s `forge arena exhausted`, `budget_carve`,
+        // `budget_reap`, `resolve_budget`, `poison_and_protect`'s `mprotect`
+        // failure) — no longer a bare `eprintln!` + `exit(1)` a `--json`
+        // consumer would see as raw prose with no envelope.
+        //
+        // `out_of_band_fatal` itself calls `std::process::exit`, so — like
+        // every other fatal in this file (see the note on
+        // `carve_reap_carve_reuses_the_freed_index_and_refuses_the_old_handle`
+        // above) — it cannot be driven from inside this test binary: doing
+        // so would take the whole binary down with no `--json`-armed
+        // summary path to catch it in-process. Worse, this particular
+        // fatal's OWN trigger (an `mmap` the OS actually refuses) turns out
+        // to be unreachable from a `.dmc` program at all, on this host: a
+        // request small enough for `mmap` to grant (this OS lazily commits,
+        // so even a many-GiB anonymous mapping succeeds without touching
+        // real memory) is always small enough to also be granted by the
+        // arena; a request large enough for `mmap` to refuse (empirically,
+        // >= 2^48 bytes here) is always large enough that `lower_arena_alloc`'s
+        // compile-time RAM guard (`"needs {} but the system has {} of RAM"`,
+        // above `alloc_zeroed_chunk` in this file) already refuses it first,
+        // at compile time, for the only kind of shape the JIT's forge
+        // constructors accept — a literal one (`shape_lit_dims`). Manually:
+        // `setrlimit(RLIMIT_AS, ...)`, the standard way to starve a process
+        // of address space without needing gigabytes of real RAM, is not
+        // enforceable on Darwin (`ulimit -v` here fails outright: "setrlimit
+        // failed: invalid argument") — confirmed by hand while writing this
+        // test, not asserted by it. In production this path is still very
+        // much reachable — a cgroup/container memory ceiling, or another
+        // process's own resident set, can leave a host's *actual* free
+        // memory far short of what `total_system_memory_bytes`'s
+        // `_SC_PHYS_PAGES` reports as the *total* the guard checks against —
+        // it just is not reachable FROM A TEST on this platform.
+        //
+        // So this asserts on the exact sentence `chunk_alloc_fatal_message`
+        // builds instead — the same format string `alloc_zeroed_chunk` feeds
+        // `out_of_band_fatal`, so a change to the wording (or a regression
+        // back to a bare `eprintln!`) is caught here even though the actual
+        // process exit is not.
+        let os_err = std::io::Error::from_raw_os_error(libc::ENOMEM);
+        let msg = ForgeArena::chunk_alloc_fatal_message(3 * 1024 * 1024 * 1024, &os_err);
+        assert_eq!(
+            msg,
+            format!("runtime error: mmap failed allocating a 3 GiB forge chunk: {}", os_err),
+        );
+    }
+
+    #[test]
+    fn try_alloc_zeroed_reports_the_oss_own_refusal_past_the_mappable_range() {
+        // The mechanism `chunk_alloc_fatal_message`'s caller depends on:
+        // `try_alloc_zeroed` really does turn `mmap`'s `MAP_FAILED` into an
+        // `Err` carrying the OS's own `errno`, not a `None` that has lost
+        // it. A request this large is refused by `mmap` on any host
+        // (Darwin included — probed by hand at 2^48 and up while writing
+        // this test) regardless of physical RAM, `--forge`, or any compile-
+        // time guard: it goes straight at the primitive, well below and
+        // independent of `lower_arena_alloc`'s RAM guard or `check_budget`'s
+        // `--forge` meter, so it stays reachable even though the full
+        // `alloc_zeroed_chunk` -> `out_of_band_fatal` path above is not.
+        let err = PageChunk::try_alloc_zeroed(1usize << 56)
+            .err()
+            .expect("an mmap request this large must be refused, not granted");
+        // Some OS error must come back — which errno depends on the
+        // platform/kernel, so this does not pin one, only that `errno` was
+        // captured rather than lost.
+        let _ = err.raw_os_error();
+    }
+
+    #[test]
+    fn poisoned_chunks_fault_on_a_stale_read_after_reap() {
+        // `DMC_BUDGET_POISON=1` (§3.4, R1): a reaped entry's chunks are
+        // retained, filled with a poison byte and `mprotect(PROT_NONE)`'d
+        // rather than released, so a stale read faults instead of silently
+        // reading re-handed (or freed) bytes. Runs the whole
+        // carve/allocate/reap/dereference sequence in a forked CHILD
+        // process — a real subprocess — so the expected SIGSEGV cannot take
+        // the test binary down with it; the parent waits and asserts the
+        // child died by that signal.
+        //
+        // REWORK: `poison` is passed to `budget_reap` directly as `true`
+        // rather than set through the `DMC_BUDGET_POISON` env var — no
+        // process-wide mutable state, so no lock is needed against other
+        // tests in this file (see the note above this test group).
+        let mut budgets = root_budget_table(16 * 1024 * 1024);
+        let mut budget_free: Vec<usize> = Vec::new();
+        let root_desc = pack_budget_descriptor(0, 0);
+        let child_desc = budget_carve(&mut budgets, &mut budget_free, root_desc, 1024 * 1024, 0, 0);
+        let (_, child_idx) = unpack_budget_descriptor(child_desc);
+        let ptr = budget_allocate(&mut budgets, child_idx, 64) as usize;
+        budget_reap(&mut budgets, &mut budget_free, child_desc, 0, 0, true);
+
+        // SAFETY: single-purpose test fork — the child touches one raw
+        // pointer and exits without allocating or calling back into Rust's
+        // higher-level machinery, which is what makes forking a
+        // multi-threaded test process (mostly) safe here.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                let p = ptr as *mut u8;
+                std::ptr::write_volatile(p, 0xFFu8);
+            }
+            // A write that did NOT fault is itself the failure case; exit
+            // distinctly (neither 0 nor a signal) so the parent can tell
+            // "didn't crash" apart from "crashed for some other reason".
+            unsafe { libc::_exit(42) };
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            libc::WIFSIGNALED(status),
+            "expected the child to die by a protection-fault signal touching \
+             poisoned memory; raw status {status}",
+        );
+        // A `PROT_NONE` access is a hardware protection fault either way, but
+        // which signal the kernel reports for it is a platform detail, not
+        // part of this slice's contract: Linux delivers SIGSEGV; Darwin/BSD
+        // deliver SIGBUS for the same class of access violation on some
+        // mappings. Either is the fault the poison mode exists to produce.
+        let sig = libc::WTERMSIG(status);
+        assert!(
+            sig == libc::SIGSEGV || sig == libc::SIGBUS,
+            "expected SIGSEGV or SIGBUS, got signal {sig}",
+        );
+    }
+
+    #[test]
+    fn carve_reap_carve_reuses_the_freed_index_and_refuses_the_old_handle() {
+        // Reviewer edit (slice 3c): `budget_carve`'s free-index stack must
+        // reuse the SAME slot a `reap` just freed (not merely give back an
+        // externally-equivalent budget) and must keep the (LOC)/(NN)
+        // generation discipline `resolve_budget` polices — the same
+        // observable contract the old O(n) `iter().position` scan gave, now
+        // reached by an O(1) `Vec::pop` instead (see `budget_carve`'s doc
+        // comment on `free`). This checks `resolve_budget`'s own condition
+        // directly rather than calling it on the stale descriptor —
+        // `resolve_budget`'s refusal exits the process via
+        // `diag::out_of_band_fatal`, which would take the whole test binary
+        // down with it (there is no `--json`-armed summary path to catch it
+        // in-process either); the CLI-level refusal is covered end to end by
+        // `tests/jit_budgets_3c.rs`'s
+        // `a_reused_slot_still_makes_the_old_descriptor_stale`.
+        let mut budgets = root_budget_table(16 * 1024 * 1024);
+        let mut budget_free: Vec<usize> = Vec::new();
+        let root_desc = pack_budget_descriptor(0, 0);
+
+        let b1_desc = budget_carve(&mut budgets, &mut budget_free, root_desc, 1024 * 1024, 0, 0);
+        let (b1_gen, b1_idx) = unpack_budget_descriptor(b1_desc);
+        budget_reap(&mut budgets, &mut budget_free, b1_desc, 0, 0, false);
+        assert_eq!(
+            budget_free, vec![b1_idx],
+            "reap did not push the freed index onto the free-index stack",
+        );
+
+        let b2_desc = budget_carve(&mut budgets, &mut budget_free, root_desc, 1024 * 1024, 0, 0);
+        let (b2_gen, b2_idx) = unpack_budget_descriptor(b2_desc);
+
+        assert_eq!(b2_idx, b1_idx, "the second carve did not reuse the index the reap just freed");
+        assert!(budget_free.is_empty(), "carve did not pop the index it reused off the free-index stack");
+        assert_ne!(
+            b2_gen, b1_gen,
+            "the reused slot's generation did not change, so the old handle would still resolve",
+        );
+
+        // The condition `resolve_budget` would apply to `b1_desc` now that
+        // the slot has been reused: same index, different generation — the
+        // exact case (LOC)/(NN) and §6 Q8 require to be refused as stale.
+        assert!(budgets[b1_idx].live, "the reused slot must read live under its new occupant");
+        assert_eq!(budgets[b1_idx].generation, b2_gen, "the live slot's generation must be the NEW carve's");
+        assert_ne!(
+            budgets[b1_idx].generation, b1_gen,
+            "the old descriptor's generation must no longer match the slot it named — \
+             it would incorrectly resolve to the new occupant",
+        );
+    }
+
+    #[test]
+    fn two_hundred_reap_carve_cycles_keep_the_table_at_its_minimum_size() {
+        // Reviewer edit (slice 3c): the free-index stack exists so a
+        // carve/reap loop reuses the ONE freed slot instead of growing the
+        // table by one live-then-dead entry per cycle — the O(n²) shape the
+        // reviewer measured (19.3 min to reach the 1 048 576-entry bound).
+        // 200 cycles, not the full bound: this is a correctness check on
+        // table growth, not the timing regression itself (`--forge`-bound
+        // timing belongs to a probe/benchmark, not a `cargo test` unit
+        // test that has to run fast every time).
+        let mut budgets = root_budget_table(16 * 1024 * 1024);
+        let mut budget_free: Vec<usize> = Vec::new();
+        let root_desc = pack_budget_descriptor(0, 0);
+
+        for _ in 0..200 {
+            let desc = budget_carve(&mut budgets, &mut budget_free, root_desc, 4096, 0, 0);
+            budget_reap(&mut budgets, &mut budget_free, desc, 0, 0, false);
+        }
+
+        assert_eq!(
+            budgets.len(), 2,
+            "200 reap/carve cycles grew the table to {} entries instead of reusing \
+             the one freed slot — the free-index stack is not being reused",
+            budgets.len(),
+        );
+        assert_eq!(
+            budget_free.len(), 1,
+            "exactly one index should be sitting free after an equal count of carves and reaps",
+        );
+    }
+
+    // ─── #674 slice 3d: the entered-budget register ───────────────────────
+
+    #[test]
+    fn budget_enter_exit_restores_the_outer_index_674() {
+        // The push/pop nesting rule: `__dmc_budget_enter` returns
+        // the index it DISPLACED, and `__dmc_budget_exit` puts that back —
+        // so an `enter` nested inside an `enter` restores the OUTER budget,
+        // never unconditionally the root. Driven on the thread-local pair
+        // directly, so it holds independently of which of the five exit
+        // edges emitted the call.
+        reset_forge_arena();
+        let root = pack_budget_descriptor(0, 0);
+        let d1 = dmc_budget_carve(root, 64 * 1024, 0, 0);
+        let d2 = dmc_budget_carve(root, 64 * 1024, 0, 0);
+        let (_, i1) = unpack_budget_descriptor(d1);
+        let (_, i2) = unpack_budget_descriptor(d2);
+        assert_ne!(i1, i2);
+
+        assert_eq!(CURRENT_BUDGET.with(|c| c.get()), 0, "a program starts at the root");
+        let p1 = dmc_budget_enter(d1, 0, 0);
+        assert_eq!(p1, 0, "the outermost enter displaces the root");
+        assert_eq!(CURRENT_BUDGET.with(|c| c.get()), i1);
+
+        let p2 = dmc_budget_enter(d2, 0, 0);
+        assert_eq!(p2 as usize, i1, "a nested enter displaces the OUTER index, not the root");
+        assert_eq!(CURRENT_BUDGET.with(|c| c.get()), i2);
+
+        dmc_budget_exit(p2);
+        assert_eq!(CURRENT_BUDGET.with(|c| c.get()), i1,
+            "the inner exit restored the root instead of the enclosing budget");
+        dmc_budget_exit(p1);
+        assert_eq!(CURRENT_BUDGET.with(|c| c.get()), 0);
+        reset_forge_arena();
+    }
+
+    #[test]
+    fn an_allocation_follows_the_entered_budget_register_674() {
+        // The other half of the pair: `forge_alloc` reads `CURRENT_BUDGET`
+        // ("one register read in the callback", §3.3), so the SAME emit site
+        // charges the entered budget inside the extent and the root after
+        // it. Nothing here is bisected — the table's own `used` is read
+        // directly, which is the strongest form the assertion has.
+        reset_forge_arena();
+        let root = pack_budget_descriptor(0, 0);
+        let d = dmc_budget_carve(root, 1024 * 1024, 0, 0);
+        let (_, i) = unpack_budget_descriptor(d);
+        let root_before = with_budgets(|b| b[0].used);
+
+        let prev = dmc_budget_enter(d, 0, 0);
+        assert!(forge_alloc(4096) != 0);
+        dmc_budget_exit(prev);
+        assert!(forge_alloc(4096) != 0);
+
+        let (root_used, child_used) = with_budgets(|b| (b[0].used, b[i].used));
+        assert_eq!(child_used, ForgeArena::align_up(4096),
+            "the allocation inside the extent did not charge the entered budget");
+        assert_eq!(root_used - root_before, ForgeArena::align_up(4096),
+            "the allocation after the exit did not charge the root");
+        reset_forge_arena();
+    }
+
+    /// #674 slice 3d: compile and run `src` through the JIT, then report
+    /// `(value, root.used, child.used)` — the child being table entry 1, the
+    /// single budget every edge case below carves.
+    ///
+    /// Reading the two meters is a stronger assertion than the bisection the
+    /// probes use, and a safe one here: every case gives the child a 1 MiB
+    /// extent, so a leaked register mis-charges but never EXHAUSTS, and
+    /// `budget_allocate`'s exhaustion path (`out_of_band_fatal`, a process
+    /// exit) cannot take the test binary down with it. The bisected form of
+    /// the same claim lives in `tools/jit_probes.py`, in its own process.
+    fn jit_run_budget_674(src: &str) -> (i64, usize, usize) {
+        reset_forge_arena();
+        let v = jit_run_i64(src).expect("jit run failed");
+        let meters = with_budgets(|b| (b[0].used, b[1].used));
+        reset_forge_arena();
+        (v, meters.0, meters.1)
+    }
+
+    /// The shared assertion for the five edge cases: the block charged the
+    /// child and nothing else did, and the 16 KiB allocation AFTER the block
+    /// charged the root.
+    fn assert_edge_pops_674(src: &str, want: i64) {
+        let (v, root_used, child_used) = jit_run_budget_674(src);
+        assert_eq!(v, want);
+        assert!(child_used > 0, "nothing charged the entered budget — did the enter fire?");
+        assert!(child_used < 16 * 1024,
+            "the entered budget was charged {child_used} B: the 16 KiB allocation AFTER \
+             the block landed in it, so the register never came back");
+        assert!(root_used >= 16 * 1024,
+            "the root was charged only {root_used} B: the post-block allocation did not \
+             reach it");
+    }
+
+    #[test]
+    fn budget_enter_pops_on_the_normal_edge_674() {
+        assert_edge_pops_674(
+            "fn main() -> i64 {\n\
+                 let b = forge.carve(forge.root, 1048576)\n\
+                 forge.enter(b) { let u = forge.zeros[f32, [64]] }\n\
+                 let t = forge.zeros[f32, [4096]]\n\
+                 1\n\
+             }", 1);
+    }
+
+    #[test]
+    fn budget_enter_pops_on_the_return_edge_674() {
+        assert_edge_pops_674(
+            "fn f(b: Budget) -> i64 {\n\
+                 forge.enter(b) { let u = forge.zeros[f32, [64]]\n return 7 }\n\
+                 3\n\
+             }\n\
+             fn main() -> i64 {\n\
+                 let b = forge.carve(forge.root, 1048576)\n\
+                 let k = f(b)\n\
+                 let t = forge.zeros[f32, [4096]]\n\
+                 k\n\
+             }", 7);
+    }
+
+    #[test]
+    fn budget_enter_pops_on_the_break_edge_674() {
+        assert_edge_pops_674(
+            "fn main() -> i64 {\n\
+                 let b = forge.carve(forge.root, 1048576)\n\
+                 for i in 0..3 {\n\
+                     forge.enter(b) { let u = forge.zeros[f32, [64]]\n break }\n\
+                 }\n\
+                 let t = forge.zeros[f32, [4096]]\n\
+                 1\n\
+             }", 1);
+    }
+
+    #[test]
+    fn budget_enter_pops_on_the_continue_edge_674() {
+        assert_edge_pops_674(
+            "fn main() -> i64 {\n\
+                 let b = forge.carve(forge.root, 1048576)\n\
+                 for i in 0..3 {\n\
+                     forge.enter(b) { let u = forge.zeros[f32, [64]]\n continue }\n\
+                 }\n\
+                 let t = forge.zeros[f32, [4096]]\n\
+                 1\n\
+             }", 1);
+    }
+
+    #[test]
+    fn budget_enter_pops_on_the_query_edge_674() {
+        // The edge the design names as the trap: a `?` early return leaves
+        // the extent AND the function, and `Expr::ArenaBlock`'s own
+        // `self.eval_block(&ab.body)?` shape is what a copy of it would get
+        // wrong here.
+        assert_edge_pops_674(
+            "fn g() -> (i64, Err) { (0, \"boom\") }\n\
+             fn f(b: Budget) -> (i64, Err) {\n\
+                 forge.enter(b) {\n\
+                     let u = forge.zeros[f32, [64]]\n\
+                     let y = g()?\n\
+                     let v = forge.zeros[f32, [64]]\n\
+                 }\n\
+                 (5, nil)\n\
+             }\n\
+             fn main() -> i64 {\n\
+                 let b = forge.carve(forge.root, 1048576)\n\
+                 let (v, e) = f(b)\n\
+                 let t = forge.zeros[f32, [4096]]\n\
+                 v + 1\n\
+             }", 1);
+    }
+
+    #[test]
+    fn alloc_in_charges_the_named_budget_and_restores_674() {
+        // B3: `… in b` overrides the register for exactly one constructor.
+        // Inside `forge.enter(small)`, the `in big` constructor charges
+        // `big` and the one after it goes back to `small` — three meters
+        // read directly, which no bisection can separate this cleanly.
+        reset_forge_arena();
+        let v = jit_run_i64(
+            "fn main() -> i64 {\n\
+                 let small = forge.carve(forge.root, 1048576)\n\
+                 let big = forge.carve(forge.root, 1048576)\n\
+                 forge.enter(small) {\n\
+                     let t = forge.zeros[f32, [4096]] in big\n\
+                     let u = forge.zeros[f32, [64]]\n\
+                 }\n\
+                 1\n\
+             }").expect("jit run failed");
+        assert_eq!(v, 1);
+        let (small_used, big_used) = with_budgets(|b| (b[1].used, b[2].used));
+        assert!(big_used >= 16 * 1024,
+            "`in big` charged {big_used} B — the override did not reach the constructor");
+        assert!(small_used > 0 && small_used < 16 * 1024,
+            "the entered budget was charged {small_used} B: either the `in big` constructor \
+             landed in it, or the constructor after the override did not");
+        reset_forge_arena();
+    }
+
+    #[test]
+    fn a_vault_ctor_inside_enter_charges_the_root_not_the_entered_budget_674() {
+        // #674: "`vault.<ctor>[…]`
+        // INSIDE an entered extent, no `in b`: charges the ROOT. The spelling
+        // says Vault; no budget was named." `dmc run` has always done this —
+        // Vault is a flat `vault_used` meter no budget owns — but the JIT
+        // lowers both spellings into the ONE arena (`MEMORY.md §1.1`), so
+        // until this test's fix every `self.forge_alloc(` site read
+        // `CURRENT_BUDGET` and a `vault.*` constructor went into `b`'s
+        // storage. `forge.reap(b)` then freed memory the program still held
+        // (`compiler/tests/jit_budgets_3d.rs`,
+        // `a_vault_ctor_inside_enter_survives_the_reap`, is that half, in its
+        // own process because the old behaviour was a SIGSEGV).
+        //
+        // Two runs of the SAME program one token apart, with the table's own
+        // meters read directly: `vault` puts the 16 KiB in entry 0, `forge`
+        // puts it in the child, and nothing else about the two runs differs —
+        // which is a sharper statement than either run alone, since both
+        // roots also carry the 1 MiB the carve itself charged.
+        const SRC: &str = "fn main() -> i64 {\n\
+                 let b = forge.carve(forge.root, 1048576)\n\
+                 forge.enter(b) { @@[f32, [4096]] }\n\
+                 1\n\
+             }";
+        let (v_vault, root_vault, child_vault) =
+            jit_run_budget_674(&SRC.replace("@@", "vault.zeros"));
+        let (v_forge, root_forge, child_forge) =
+            jit_run_budget_674(&SRC.replace("@@", "forge.zeros"));
+        assert_eq!((v_vault, v_forge), (1, 1));
+
+        let sixteen_k = ForgeArena::align_up(16 * 1024);
+        assert_eq!(child_vault, 0,
+            "the `vault.*` constructor charged the entered budget {child_vault} B —              §3.5 routes its own allocation to the root whatever `CURRENT_BUDGET` says");
+        assert_eq!(child_forge, sixteen_k,
+            "the `forge.*` twin charged the entered budget {child_forge} B, not the              {sixteen_k} B it asked for — the control is not discriminating");
+        assert_eq!(root_vault - root_forge, sixteen_k,
+            "the 16 KiB did not MOVE from the child to the root when the spelling              changed: root was {root_vault} B under `vault`, {root_forge} B under              `forge`");
     }
 
     fn jit_run_i64(src: &str) -> Result<i64, String> {
@@ -22963,6 +32343,139 @@ mod tests {
     }
 
     #[test]
+    fn elem_kind_tables_agree() {
+        // #632: `tensor_elem_kind` (keyed by `ScalarType`) and
+        // `tensor_elem_kind_by_name` (keyed by the constructor's spelling) are
+        // the same table written twice, because a constructor names its element
+        // type with an identifier and an annotation names it with a type. They
+        // must answer identically for every name, or `forge.zeros[u8, …]` and
+        // `Tensor[u8, …]` disagree about how wide an element is — which is a
+        // silently corrupt buffer, not a type error.
+        for (name, sty) in [
+            ("f32", ScalarType::F32), ("f64", ScalarType::F64),
+            ("bf16", ScalarType::Bf16), ("f16", ScalarType::F16),
+            ("tf32", ScalarType::Tf32), ("bool", ScalarType::Bool),
+            ("i8", ScalarType::I8), ("i16", ScalarType::I16),
+            ("i32", ScalarType::I32), ("i64", ScalarType::I64),
+            ("u8", ScalarType::U8), ("u16", ScalarType::U16),
+            ("u32", ScalarType::U32), ("u64", ScalarType::U64),
+            ("int8", ScalarType::Int8),
+            // Refused by both, and that has to agree too.
+            ("int4", ScalarType::Int4),
+            ("str", ScalarType::Str), ("trit", ScalarType::Trit),
+        ] {
+            assert_eq!(tensor_elem_kind(&sty), tensor_elem_kind_by_name(name),
+                "element-kind tables disagree for `{}`", name);
+        }
+
+        // Both tables agreeing is necessary but not sufficient: they would
+        // also agree if both were wrong the same way. Pin the two rows where
+        // "wrong the same way" is the live risk. `u64` must NOT collapse into
+        // `I64` (#643 made the two kinds differ on `/ % >>` and ordering
+        // above 2^63), and `bool` must stay its own one-byte kind rather than
+        // widening into an integer lane.
+        assert_eq!(tensor_elem_kind(&ScalarType::U64), Some(ScalarKind::U64));
+        assert_eq!(tensor_elem_kind(&ScalarType::I64), Some(ScalarKind::I64));
+        assert_eq!(tensor_elem_kind(&ScalarType::Bool), Some(ScalarKind::Bool));
+
+        // #632 review: `narrow_scalar_kind` (#544, plain SCALAR narrow-width
+        // lowering) and `tensor_elem_kind` (#632, TENSOR element lowering) are
+        // a second pair of `ScalarType -> ScalarKind` tables, kept separately
+        // because a scalar `u8` and a `u8` tensor element go through different
+        // lowering paths — but nothing asserted they name the SAME width for
+        // the types both cover. An edit to either that updates one table and
+        // not the other would corrupt a buffer rather than raise a type error,
+        // exactly like the #632 bug this whole file is about.
+        //
+        // That risk was not hypothetical: #643 landed `ScalarKind::U64` and
+        // updated `narrow_scalar_kind` for it while this branch still had
+        // `tensor_elem_kind` share `I64` for `u64`, and merging the two is
+        // exactly where this assertion fired.
+        // `Int4` is intentionally NOT in this list: `narrow_scalar_kind`
+        // lowers a scalar `int4`, but a tensor of it has no storage lane
+        // (`the_sub_byte_int4_element_is_still_refused`), so the two tables
+        // disagreeing there is by design, not a drift.
+        for sty in [
+            ScalarType::I8, ScalarType::Int8, ScalarType::I16,
+            ScalarType::U8, ScalarType::U16, ScalarType::U32, ScalarType::U64,
+        ] {
+            let narrow = narrow_scalar_kind(&sty);
+            let tensor = tensor_elem_kind(&sty);
+            assert!(narrow.is_some() && tensor.is_some(),
+                "expected both tables to cover `{sty:?}`");
+            assert_eq!(narrow, tensor,
+                "narrow_scalar_kind and tensor_elem_kind disagree for `{sty:?}`");
+        }
+
+        // #667: a THIRD site named this same table by hand —
+        // `lower_ty_for_model`'s `Type::Tensor` arm, which decides the
+        // storage kind of a `model M { t: Tensor[T, …] }` FIELD. It had
+        // drifted from `tensor_elem_kind` for `u64` (still `ScalarKind::I64`)
+        // even after #641 fixed the other two tables, which is exactly how a
+        // model-field `Tensor[u64, [2]]` ended up laid out as `i64` while the
+        // identical tensor as a local lowered correctly. Drive
+        // `lower_ty_for_model` with a one-field `Tensor[T, [2]]` for every
+        // scalar `T` that has a storage lane and assert its element kind
+        // matches `tensor_elem_kind(T)` exactly — the model-field path is no
+        // longer allowed its own copy of this table.
+        let dummy_span = Span { line: 0, col: 0, start: 0, end: 0 };
+        for sty in [
+            ScalarType::F32, ScalarType::F64, ScalarType::Bool,
+            ScalarType::I64, ScalarType::U64,
+            ScalarType::I32, ScalarType::U32,
+            ScalarType::I16, ScalarType::U16,
+            ScalarType::I8, ScalarType::U8, ScalarType::Int8,
+            ScalarType::F16, ScalarType::Tf32,
+        ] {
+            let want = tensor_elem_kind(&sty)
+                .unwrap_or_else(|| panic!("expected a tensor lane for `{sty:?}`"));
+            let field_ty = Type::Tensor(
+                Box::new(Type::Scalar(sty.clone(), dummy_span.clone())),
+                ShapeSpec {
+                    elems: vec![ShapeElem::Expr(Box::new(
+                        Expr::Literal(Literal::Int(2, None), dummy_span.clone()),
+                    ))],
+                    span: dummy_span.clone(),
+                },
+                dummy_span.clone(),
+            );
+            let env = HashMap::new();
+            match lower_ty_for_model(&field_ty, &env, None, &dummy_span) {
+                Ok(TyKind::Tensor(TensorTy { elem, .. })) => assert_eq!(
+                    elem, want,
+                    "lower_ty_for_model and tensor_elem_kind disagree for a `Tensor[{sty:?}, …]` model field"
+                ),
+                other => panic!(
+                    "expected a concrete Tensor TyKind for a `Tensor[{sty:?}, …]` model field, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_elements_store_at_their_own_width() {
+        // The invariant the whole change rests on: a tensor element occupies
+        // the width its type names, not the register the value computes in.
+        // `bits()` (machine) and `store_bytes()` (storage) are 64 vs 1 for a
+        // masked narrow kind, and it is the second that sizes an allocation.
+        for (sty, want_bytes) in [
+            (ScalarType::U8, 1), (ScalarType::I8, 1), (ScalarType::Bool, 1),
+            (ScalarType::U16, 2), (ScalarType::I16, 2),
+            (ScalarType::U32, 4), (ScalarType::I32, 4), (ScalarType::F32, 4),
+            (ScalarType::U64, 8), (ScalarType::I64, 8), (ScalarType::F64, 8),
+        ] {
+            let k = tensor_elem_kind(&sty).expect("has a lane");
+            assert_eq!(k.store_bytes(), want_bytes, "store width of `{}`", k.name());
+            let t = TensorTy { elem: k, shape: vec![7] };
+            assert_eq!(t.elem_bytes(), want_bytes);
+            assert_eq!(t.nbytes(), 7 * want_bytes);
+            // The storage lane's Cranelift type is exactly that many bytes, so
+            // the load and the stride can never disagree (#552's failure mode).
+            assert_eq!(k.store_cl().bytes() as i64, want_bytes, "lane type of `{}`", k.name());
+        }
+    }
+
+    #[test]
     fn jit_non_f32_tensor_constructors() {
         // #237: forge constructors are no longer f32-only. bf16/f16/tf32 compute
         // as f32 (the @cast-no-op convention, #179); i32/bool allocate by width.
@@ -22978,9 +32491,12 @@ mod tests {
         // bool uninit and kv[bf16] only need to *construct* without a JIT error.
         assert!(jit_run_i64("fn main() -> i64 { let !t = forge.uninit[bool, [2, 2]]   0 }").is_ok());
         assert!(jit_run_i64("fn main() -> i64 { let !c = forge.kv[bf16, [1, 8, ~, 128]](capacity = 4)   0 }").is_ok());
-        // zeros/ones for non-32-bit dtypes are cleanly rejected (the fill is 32-bit).
-        let e = jit_run_i64("fn main() -> i64 { let t = forge.zeros[bool, [4]]   0 }").unwrap_err();
-        assert!(e.contains("uninit"), "expected a 'use uninit' hint, got: {}", e);
+        // #632: zeros/ones at a sub-word dtype fill at the element's own width
+        // instead of being refused for want of a 32-bit pattern.
+        assert_eq!(jit_run_i64(
+            "fn main() -> i64 { let t = forge.zeros[bool, [4]]   if t[2] { 1 } else { 0 } }").unwrap(), 0);
+        assert_eq!(jit_run_i64(
+            "fn main() -> i64 { let t = forge.ones[bool, [4]]   if t[3] { 1 } else { 0 } }").unwrap(), 1);
     }
 
     #[test]
@@ -23141,6 +32657,35 @@ mod tests {
         "#;
         let err = jit_run_i64(src).unwrap_err();
         assert!(err.contains("any") && err.contains("dmc run"), "got: {}", err);
+    }
+
+    #[test]
+    fn jit_scalar_type_refusal_spells_fp8_e4m3() {
+        // #833: `scalar_from_ast`'s refusal used to Debug-print the
+        // `ScalarType` variant name (`Fp8E4M3`) instead of routing through
+        // the canonical `fmt::scalar_type_str` table (`fp8_e4m3`, matching
+        // SPEC §3.1 / GRAMMAR.ebnf) that annotation position already uses.
+        let src = r#"
+            fn f(x: fp8_e4m3) -> fp8_e4m3 { x }
+            fn main() -> fp8_e4m3 { f(1.0 as fp8_e4m3) }
+        "#;
+        let err = jit_compile_err(src);
+        assert!(err.contains("scalar type `fp8_e4m3` is not lowered by the JIT"),
+            "got: {}", err);
+    }
+
+    #[test]
+    fn jit_tensor_elem_refusal_spells_fp8_e4m3() {
+        // #833 sibling: the tensor-element-type refusal in SIGNATURE
+        // position (not the constructor bracket #831 already fixed) had the
+        // same Debug-print bug.
+        let src = r#"
+            fn f(t: Tensor[fp8_e4m3, [4]]) -> f64 { 0.0 }
+            fn main() -> f64 { 0.0 }
+        "#;
+        let err = jit_compile_err(src);
+        assert!(err.contains("tensor element type `fp8_e4m3` is not lowered"),
+            "got: {}", err);
     }
 
     #[test]
@@ -28034,28 +37579,37 @@ fn main() -> i64 { 0 }
               let !x = forge.zeros[f32, [4]]\n\
               sum(x[1..]) as i64 }",
              "jit-slice"),
-            // #572 — a narrow integer tensor element the JIT cannot allocate.
+            // #572/#632 — a tensor element with no byte-aligned storage lane.
+            // (`i8`/`bool`/`i64` used to sit here; #632 gave every byte-aligned
+            // width a lane, so what is left refused is the sub-byte and the
+            // 8-bit-float kinds.)
             ("fn main() -> i64 {\n\
-              let !t = forge.zeros[i8, [2]]\n\
+              let !t = forge.zeros[int4, [2]]\n\
               t[0] = 3\n\
               t[0] as i64 }",
              "jit-element-type"),
-            // #572 sibling — `forge.zeros[bool, ..]` (32-bit zero-fill).
+            // #572 sibling — an 8-bit float element has no lowering at all.
             ("fn main() -> i64 {\n\
-              let t = forge.zeros[bool, [4]]\n\
-              if t[0] { 1 } else { 0 } }",
+              let t = forge.ones[fp8_e4m3, [4]]\n\
+              t[0] as i64 }",
              "jit-element-type"),
-            // #572 sibling — `forge.ones` fills f32 only.
-            ("fn main() -> i64 {\n\
-              let t = forge.ones[i64, [4]]\n\
-              t[0] }",
-             "jit-element-type"),
-            // #568 — a user-written `(T, Err)` returning `nil`.
-            ("fn g() -> (i64, Err) { (1, nil) }\n\
-              fn main() -> i64 { let (v, e) = g()  v }",
+            // A `map_get` (dynamically typed `OptI64`) landing in a
+            // tuple slot declared `Port`: the checker accepts it (an `Unknown`
+            // result is compatible with anything), but the JIT has no
+            // `i64 -> Port` conversion once the maybe-nil wrapper is
+            // unwrapped. (`(T, Err)` returning `nil` was this same code
+            // ("jit-conversion") until this branch gave `Err` a real representation
+            // — see `jit_tuple_err_refusal_points_at_the_offending_element`,
+            // which now exercises this pairing instead.)
+            ("fn g(m: Map) -> (i64, Port) { (1, map_get(m, \"k\")) }\n\
+              fn main() -> i64 {\n\
+              let !m = map()\n\
+              map_set(m, \"k\", 5)\n\
+              let (v, e) = g(m)\n\
+              v }",
              "jit-conversion"),
             // sweep — a tensor element type in a SIGNATURE, not a constructor.
-            ("fn f(x: Tensor[i8, [2]]) -> i64 { x[0] as i64 }\n\
+            ("fn f(x: Tensor[int4, [2]]) -> i64 { x[0] as i64 }\n\
               fn main() -> i64 { 0 }",
              "jit-element-type"),
             // sweep — a rank the JIT has no loops for.
@@ -28101,13 +37655,1279 @@ fn main() -> i64 { 0 }
     fn jit_tuple_err_refusal_points_at_the_offending_element() {
         // #568 defect 3: the refusal reported the enclosing `fn`'s span, when
         // the whole point of a span is to name the thing that cannot be
-        // lowered. `nil` is on line 2, column 9 — the `fn` is on line 1.
-        let e = jit_compile_jiterr("fn g() -> (i64, Err) {\n    (1, nil)\n}\n\
-                                    fn main() -> i64 { let (v, e) = g()  v }");
-        assert_eq!((e.line, e.col), (2, 9), "span should name the `nil`, got `{}`", e);
-        // …and defects 1 and 2: classified, and directing to `dmc run`.
+        // lowered. `map_get(m, "k")` is on line 2, column 9 — the `fn` is on
+        // line 1.
+        //
+        // This used to be `fn g() -> (i64, Err) { (1, nil) }` — a `(T, Err)`
+        // tuple whose `nil` was, at the time, exactly this same offending-
+        // element case. This branch gave `Err` a real JIT representation (a nilable
+        // `str`), so that pairing now lowers cleanly (see
+        // `jit_error_propagation_and_mutable_err_idiom` below) and no longer
+        // demonstrates a refusal. `map_get` (dynamically typed) landing in a
+        // `Port`-typed tuple slot is a different, still-refused conversion
+        // that exercises the identical per-element-span mechanism.
+        //
+        // #769: this used to fall to `coerce_to`'s generic catch-all (`Port`
+        // had no `i64`-source arm at all, so it was already refused, just
+        // with that arm's generic "cannot convert ...; use `dmc run`"
+        // wording). `coerce_to`'s new top-of-function guard now intercepts
+        // every pointer-carrying target — `Port` included — before the
+        // catch-all ever runs, via the same `opt_i64_refusal` helper
+        // #760/#764 built and citing #721, same as every other guarded
+        // target. Still `jit-conversion`, still spans the offending
+        // element; only the message improved.
+        let e = jit_compile_jiterr(
+            "fn g(m: Map) -> (i64, Port) {\n    (1, map_get(m, \"k\"))\n}\n\
+             fn main() -> i64 {\n\
+             let !m = map()\n\
+             map_set(m, \"k\", 5)\n\
+             let (v, e) = g(m)\n\
+             v }");
+        assert_eq!((e.line, e.col), (2, 9), "span should name the `map_get(..)` call, got `{}`", e);
+        // …and defects 1 and 2: classified, and citing #721 (#769: no longer
+        // the generic catch-all's "use `dmc run`" direction).
         assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
-        assert!(e.msg.contains("use `dmc run`"), "no `dmc run` direction: {}", e);
+        assert!(e.msg.contains("cannot convert `i64?` to `Port`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+    }
+
+    // ─── #760: every operation on a `map_get` result refuses classed ───────
+    //
+    // #742/#743/#754 gave `map_get`/`map_set`/`map_contains`/`len` a located
+    // `jit-conversion` for an `OptI64` operand (`map_slot_type_refusal`,
+    // above `lower_builtin_map_get`), citing #721. #760 found the same
+    // uncoded `jit error` shape at every other site that requires a
+    // concrete tensor/str type and used to fall straight through an
+    // `.as_tensor()`/type-match fallback: indexing, slicing, element and
+    // slice assignment, arithmetic/comparison, transpose, and the tensor-only
+    // builtin reductions. Each now special-cases `OptI64` first via the
+    // shared `opt_i64_refusal` helper (just above `map_slot_type_refusal`)
+    // and cites #721 too, before ever reaching its ordinary fallback. One
+    // test per audited site: the refusal's class and a message substring,
+    // plus what `dmc run` does for the identical program (`interp_run_i64`)
+    // — the map here can only ever hold the plain `i64` the JIT's own
+    // `map_set` restricts it to (#721), so `dmc run` genuinely agrees the
+    // value isn't a tensor/str either; the point is the JIT cannot prove
+    // that statically from `map_get`'s `OptI64` result type alone, in
+    // *arbitrary* corpus code, not that this specific reduced repro was
+    // secretly fine.
+    const OPT_I64_SETUP: &str = "let !d = map_new()\nmap_set(d, \"k\", 3)\nlet fns = map_get(d, \"k\")\n";
+
+    #[test]
+    fn jit_760_indexing_map_get_result_refuses_conversion() {
+        // The issue's own repro shape: `let fns = map_get(d, "fns")  fns[i]`.
+        // `x[i, j]` (multi-index) and a slice `x[a..b]` dispatch through the
+        // exact same `lower_index` fallback (`lower_tensor_load_with`'s
+        // caller), so this one site covers both.
+        let src = format!("fn main() -> i64 {{\n{}let i = 0\nlet v = fns[i]\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("indexing requires a tensor or str, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: indexing an int falls through the interpreter's
+        // forward-compat catch-all (`Value::Opaque("index")`, interp.rs) —
+        // it runs, silently, rather than erroring. `v` is bound but not
+        // returned, since the opaque value itself has no i64 form to hand
+        // back to `interp_run_i64`.
+        assert_eq!(interp_run_i64(&src), Ok(0));
+    }
+
+    #[test]
+    fn jit_760_slicing_map_get_result_refuses_conversion() {
+        let src = format!("fn main() -> i64 {{\n{}let s = fns[0..1]\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("indexing requires a tensor or str, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        assert_eq!(interp_run_i64(&src), Ok(0), "dmc run should fall through the same opaque-index path as plain indexing");
+    }
+
+    #[test]
+    fn jit_760_for_in_map_get_result_is_already_a_classed_loop_form_refusal() {
+        // `for v in fns` where `fns` is a `map_get` result never reached the
+        // uncoded shape #760 is about: `lower_for` only lowers `for _ in
+        // a..b` (a range) and refuses every other iterable — including this
+        // one — uniformly with `Refusal::LoopForm`, regardless of the
+        // element's type. No fix needed; pinned here as a regression test
+        // so this shape doesn't quietly start reaching the tensor/str
+        // fallback if `lower_for` is ever generalized to real collections.
+        let src = format!("fn main() -> i64 {{\n{}for v in fns {{ print(v) }}\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-loop-form"), "{}", e);
+        assert!(e.msg.contains("for-loop over collections"), "{}", e);
+        // `dmc run`: a real runtime error — an int genuinely isn't iterable.
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("cannot iterate over int"));
+    }
+
+    #[test]
+    fn jit_760_comparison_map_get_result_vs_str_refuses_conversion() {
+        // #759's exact shape: `map_get(...) == "some str"`. `(Scalar,
+        // Scalar)` pairs (`fns == 3`, `fns + 1`) already reach `scalar_binop`,
+        // which answers directly for `==`/`!=` against an absent value and
+        // decode-and-traps LOCATED for every other operator (#480/#767) —
+        // genuinely computing, untouched by this fix. Only a `Scalar(OptI64)`
+        // paired with a non-Scalar (`Str` here) falls to `lower_binop`'s
+        // final fallback.
+        let src = format!("fn main() -> i64 {{\n{}let b = fns == \"hello\"\nif b {{ 1 }} else {{ 0 }} }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("operator `Eq` is not defined for types `i64?` and `str`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("comparison requires numeric, str, or bool operands"));
+    }
+
+    // ─── #767: `map_get(...) == 3` answers like the interpreter ─────────────
+    //
+    // `dmc run`: a missing `map_get` result IS `Value::Nil`, and
+    // `scalar_compare`'s blanket `(Nil, _) | (_, Nil)` rule makes `==`/`!=`
+    // legal comparisons against ANY value (`Eq` false, `NotEq` true) — no
+    // error. `dmc jit` used to decode-and-trap unconditionally for every
+    // operator including these two, an unlocated divergence (found reviewing
+    // #764). `scalar_binop` now special-cases `==`/`!=` against a
+    // present-bit-clear `OptI64` before the shared decode step, matching
+    // `dmc run` exactly with no trap either way; every other operator still
+    // traps on an absent value, but the trap is now LOCATED (#480).
+
+    #[test]
+    fn jit_767_eq_absent_answers_false_no_trap() {
+        assert_jit_eq_interp(&format!(
+            "fn main() -> i64 {{\n{}\
+             let v = map_get(d, \"missing\")\n\
+             if v == 3 {{ 1 }} else {{ 0 }} }}",
+            "let !d = map_new()\nmap_set(d, \"present\", 5)\n"));
+    }
+
+    #[test]
+    fn jit_767_neq_absent_answers_true_no_trap() {
+        assert_jit_eq_interp(&format!(
+            "fn main() -> i64 {{\n{}\
+             let v = map_get(d, \"missing\")\n\
+             if v != 3 {{ 1 }} else {{ 0 }} }}",
+            "let !d = map_new()\nmap_set(d, \"present\", 5)\n"));
+    }
+
+    #[test]
+    fn jit_767_eq_present_still_compares_the_payload() {
+        // #764's own note: `OptI64 == 3` against a PRESENT key already
+        // computed correctly (decode, then compare) — regression-pinned.
+        assert_jit_eq_interp(
+            "fn main() -> i64 {\n\
+             let !d = map_new()\nmap_set(d, \"k\", 3)\n\
+             let v = map_get(d, \"k\")\n\
+             if v == 3 { 1 } else { 0 } }");
+        assert_jit_eq_interp(
+            "fn main() -> i64 {\n\
+             let !d = map_new()\nmap_set(d, \"k\", 3)\n\
+             let v = map_get(d, \"k\")\n\
+             if v == 4 { 1 } else { 0 } }");
+    }
+
+    #[test]
+    fn jit_767_eq_vs_literal_nil_unaffected() {
+        // The pre-existing #300.4 special case (`OptI64 == nil`) must keep
+        // working unchanged now that it shares the block with #767's fix.
+        assert_jit_eq_interp(
+            "fn main() -> i64 {\n\
+             let !d = map_new()\n\
+             let v = map_get(d, \"missing\")\n\
+             if v == nil { 1 } else { 0 } }");
+        assert_jit_eq_interp(
+            "fn main() -> i64 {\n\
+             let !d = map_new()\nmap_set(d, \"k\", 3)\n\
+             let v = map_get(d, \"k\")\n\
+             if v == nil { 1 } else { 0 } }");
+    }
+
+    #[test]
+    fn jit_767_both_sides_map_get_results() {
+        // `map_get(...) == map_get(...)`: both operands `OptI64`. `nil ==
+        // nil` is true, `nil` against a genuine value is the same blanket
+        // false, and two present values compare their decoded payloads —
+        // covering all three shapes, no trap in any of them.
+        let setup = "let !d = map_new()\nmap_set(d, \"a\", 5)\nmap_set(d, \"b\", 6)\nmap_set(d, \"c\", 5)\n";
+        // both absent
+        assert_jit_eq_interp(&format!(
+            "fn main() -> i64 {{\n{}let v1 = map_get(d, \"x\")\nlet v2 = map_get(d, \"y\")\nif v1 == v2 {{ 1 }} else {{ 0 }} }}",
+            setup));
+        // one absent, one present
+        assert_jit_eq_interp(&format!(
+            "fn main() -> i64 {{\n{}let v1 = map_get(d, \"a\")\nlet v2 = map_get(d, \"missing\")\nif v1 == v2 {{ 1 }} else {{ 0 }} }}",
+            setup));
+        // both present, equal payloads
+        assert_jit_eq_interp(&format!(
+            "fn main() -> i64 {{\n{}let v1 = map_get(d, \"a\")\nlet v2 = map_get(d, \"c\")\nif v1 == v2 {{ 1 }} else {{ 0 }} }}",
+            setup));
+        // both present, different payloads
+        assert_jit_eq_interp(&format!(
+            "fn main() -> i64 {{\n{}let v1 = map_get(d, \"a\")\nlet v2 = map_get(d, \"b\")\nif v1 == v2 {{ 1 }} else {{ 0 }} }}",
+            setup));
+    }
+
+    #[test]
+    fn jit_767_kind_mismatch_still_refuses_at_compile_time() {
+        // `OptI64 == 3.0`: the decoded payload is always `i64`, so a `f64`
+        // on the other side is a genuine static type error — unrelated to
+        // nil, and unconditional on runtime presence. #767 must not special-
+        // case this away; it still refuses exactly as before the fix.
+        let e = jit_compile_jiterr(&format!(
+            "fn main() -> i64 {{\n{}let b = fns == 3.0\nif b {{ 1 }} else {{ 0 }} }}", OPT_I64_SETUP));
+        assert_eq!(e.kind, JitErrorKind::Error, "{}", e);
+        assert!(e.msg.contains("comparison operands disagree"), "{}", e);
+    }
+
+    /// #480/#767: every operator OTHER than `==`/`!=` on an absent `map_get`
+    /// result still traps at runtime (the interpreter itself errors there —
+    /// this is not a divergence to erase, just an unlocated JIT message to
+    /// fix). `dmc run`'s message carries no location (the interpreter never
+    /// attaches one to this class); `dmc jit`'s now does, at the operator's
+    /// own span — this is the one place the two backends' text is expected
+    /// to differ, so it is checked per-backend rather than with
+    /// `assert_cli_agree`.
+    #[test]
+    fn jit_767_ordering_on_absent_is_a_located_runtime_error() {
+        let src = "fn main() -> i64 {\n    let !d = map_new()\n    \
+                    map_set(d, \"present\", 5)\n    let v = map_get(d, \"missing\")\n    \
+                    if v < 3 { 1 } else { 0 }\n}\n";
+        let (rc_run, _, se_run) = cli_run("767_ordering_absent", "run", src);
+        let (rc_jit, _, se_jit) = cli_run("767_ordering_absent", "jit", src);
+        assert_eq!(rc_run, Some(1), "run stderr: {}", se_run);
+        assert_eq!(rc_jit, Some(1), "jit stderr: {}", se_jit);
+        assert_eq!(se_run, "runtime error: ordering operators not defined for nil");
+        assert_eq!(se_jit, "runtime error at 5:8: ordering operators not defined for nil");
+    }
+
+    #[test]
+    fn jit_767_add_on_absent_is_a_located_runtime_error() {
+        let src = "fn main() -> i64 {\n    let !d = map_new()\n    \
+                    map_set(d, \"present\", 5)\n    let v = map_get(d, \"missing\")\n    \
+                    v + 1\n}\n";
+        let (rc_run, _, se_run) = cli_run("767_add_absent", "run", src);
+        let (rc_jit, _, se_jit) = cli_run("767_add_absent", "jit", src);
+        assert_eq!(rc_run, Some(1), "run stderr: {}", se_run);
+        assert_eq!(rc_jit, Some(1), "jit stderr: {}", se_jit);
+        assert_eq!(se_run, "runtime error: Add requires numeric operands, got nil and int");
+        assert_eq!(se_jit, "runtime error at 5:5: Add requires numeric operands, got nil and int");
+        // Present key: both backends compute the same answer, no trap.
+        assert_jit_eq_interp(
+            "fn main() -> i64 {\n    let !d = map_new()\n    \
+             map_set(d, \"present\", 5)\n    let v = map_get(d, \"present\")\n    \
+             v + 1\n}\n");
+    }
+
+    #[test]
+    fn jit_767_bitand_on_absent_is_a_located_runtime_error() {
+        let src = "fn main() -> i64 {\n    let !d = map_new()\n    \
+                    map_set(d, \"present\", 5)\n    let v = map_get(d, \"missing\")\n    \
+                    v & 1\n}\n";
+        let (rc_run, _, se_run) = cli_run("767_bitand_absent", "run", src);
+        let (rc_jit, _, se_jit) = cli_run("767_bitand_absent", "jit", src);
+        assert_eq!(rc_run, Some(1), "run stderr: {}", se_run);
+        assert_eq!(rc_jit, Some(1), "jit stderr: {}", se_jit);
+        assert_eq!(se_run, "runtime error: & requires int, got nil");
+        assert_eq!(se_jit, "runtime error at 5:5: & requires int, got nil");
+    }
+
+    /// #865 REWORK of #767: when BOTH operands are `map_get` results
+    /// (`OptI64`), the located trap for the ABSENT side used to name the
+    /// OTHER side "nil" unconditionally — `interp_scalar_type_name(OptI64)`
+    /// answers "nil" regardless of whether the other operand is actually
+    /// present, because that side hasn't been decoded yet at the point the
+    /// message is built. But the other side's real name IS a runtime
+    /// question (its own present bit), so the message must reflect it: `a +
+    /// b` with only `a` absent must read "got nil and int" (`b` present),
+    /// not "got nil and nil". Fixed by `opt_unwrap_or_located_trap_dual` /
+    /// `emit_binop_nil_trap_dual`, which bake both candidate messages and
+    /// `select` on the other operand's actual present bit at runtime.
+    #[test]
+    fn jit_767_both_map_get_lhs_absent_names_the_present_rhs_int() {
+        let src = "fn main() -> i64 {\n  let !d = map_new()  map_set(d, \"present\", 5)\n  \
+                    let a = map_get(d, \"missing\")\n  let b = map_get(d, \"present\")\n  a + b\n}\n";
+        let (rc_run, _, se_run) = cli_run("767_both_lhs_absent", "run", src);
+        let (rc_jit, _, se_jit) = cli_run("767_both_lhs_absent", "jit", src);
+        assert_eq!(rc_run, Some(1), "run stderr: {}", se_run);
+        assert_eq!(rc_jit, Some(1), "jit stderr: {}", se_jit);
+        assert_eq!(se_run, "runtime error: Add requires numeric operands, got nil and int");
+        assert_eq!(se_jit, "runtime error at 5:3: Add requires numeric operands, got nil and int",
+            "expected the present RHS named \"int\", not a static \"nil\" guess: {}", se_jit);
+    }
+
+    /// Mirror direction: the PRESENT operand is the LHS, the ABSENT one the
+    /// RHS. By the time the RHS's trap message is built, the LHS's own
+    /// decode has already proved it present (its decode ran first and did
+    /// not trap) — so `lk` is a genuine `I64` there, never a static `OptI64`
+    /// guess, and this direction was already correct before the fix. Pinned
+    /// so it stays that way.
+    #[test]
+    fn jit_767_both_map_get_rhs_absent_names_the_present_lhs_int() {
+        let src = "fn main() -> i64 {\n  let !d = map_new()  map_set(d, \"present\", 5)\n  \
+                    let a = map_get(d, \"missing\")\n  let b = map_get(d, \"present\")\n  b + a\n}\n";
+        let (rc_run, _, se_run) = cli_run("767_both_rhs_absent", "run", src);
+        let (rc_jit, _, se_jit) = cli_run("767_both_rhs_absent", "jit", src);
+        assert_eq!(rc_run, Some(1), "run stderr: {}", se_run);
+        assert_eq!(rc_jit, Some(1), "jit stderr: {}", se_jit);
+        assert_eq!(se_run, "runtime error: Add requires numeric operands, got int and nil");
+        assert_eq!(se_jit, "runtime error at 5:3: Add requires numeric operands, got int and nil");
+    }
+
+    /// Both `map_get` operands absent: the runtime select must also resolve
+    /// to "nil" for the other side (not just default to "int") — proving the
+    /// select genuinely reads the other operand's present bit both ways.
+    #[test]
+    fn jit_767_both_map_get_absent_names_nil_and_nil() {
+        let src = "fn main() -> i64 {\n  let !d = map_new()\n  \
+                    let a = map_get(d, \"missing\")\n  let b = map_get(d, \"missing2\")\n  a + b\n}\n";
+        let (rc_run, _, se_run) = cli_run("767_both_absent", "run", src);
+        let (rc_jit, _, se_jit) = cli_run("767_both_absent", "jit", src);
+        assert_eq!(rc_run, Some(1), "run stderr: {}", se_run);
+        assert_eq!(rc_jit, Some(1), "jit stderr: {}", se_jit);
+        assert_eq!(se_run, "runtime error: Add requires numeric operands, got nil and nil");
+        assert_eq!(se_jit, "runtime error at 5:3: Add requires numeric operands, got nil and nil");
+    }
+
+    #[test]
+    fn jit_760_index_assign_map_get_result_refuses_conversion() {
+        let src = "fn main() -> i64 {\nlet !d = map_new()\nmap_set(d, \"k\", 3)\nlet !fns = map_get(d, \"k\")\nfns[0] = 5\n0 }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("index-assign requires a tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("indexed assignment requires a tensor, got int"));
+    }
+
+    #[test]
+    fn jit_760_slice_assign_map_get_result_refuses_conversion_on_either_side() {
+        // The destination (`fns[a..b] = v`) and the RHS (`t[a..b] = fns`)
+        // are two different fallbacks in `lower_tensor_slice_store`; cover
+        // both.
+        let dst_src = "fn main() -> i64 {\n\
+            let !d = map_new()\nmap_set(d, \"k\", 3)\nlet !fns = map_get(d, \"k\")\n\
+            let a = forge.zeros[f32, [2]]\nfns[0..1] = a\n0 }";
+        let e = jit_compile_jiterr(dst_src);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("slice-assign requires a tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(dst_src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("indexed assignment requires a tensor, got int"));
+
+        let rhs_src = format!("fn main() -> i64 {{\n{}let !a = forge.zeros[f32, [2]]\na[0..1] = fns\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&rhs_src);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("slice-assign RHS must be a tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: the RHS shape is never even inspected before the LHS is
+        // stored into, so this runs (a no-op-looking success), same as
+        // plain indexing above.
+        assert_eq!(interp_run_i64(&rhs_src), Ok(0));
+    }
+
+    #[test]
+    fn jit_760_transpose_map_get_result_refuses_conversion() {
+        let src = format!("fn main() -> i64 {{\n{}let t = fns'\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("transpose `'` requires a tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("transpose requires tensor"));
+    }
+
+    #[test]
+    fn jit_760_sum_of_map_get_result_refuses_conversion() {
+        // The audit's own example: `sum(x)` — a builtin whose argument must
+        // be a tensor. `mean` shares this exact fallback (`lower_sum_with_
+        // count`), so is not duplicated here.
+        let src = format!("fn main() -> i64 {{\n{}let s = sum(fns)\ns as i64 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("`sum` requires a tensor or KV argument, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: `sum` of a plain int is a degenerate single-value
+        // reduction in the interpreter — it succeeds, answering the int
+        // back unchanged, not an error.
+        assert_eq!(interp_run_i64(&src), Ok(3));
+    }
+
+    #[test]
+    fn jit_760_print_of_map_get_result_already_computes() {
+        // `print(x)`: the audit's last named category, and the one site that
+        // needed no fix — `OptI64` is special-cased ahead of the tensor/str
+        // dispatch (line ~12578, "print: unsupported type" is never
+        // reached), branching on the opt's present bit exactly as the
+        // interpreter's dynamic print does (#300.4). Regression test: `sum`,
+        // `max`, `min`, `print_tensor` all being genuine no-ops on a plain
+        // int in `dmc run` (checked directly above / below) is a property of
+        // *those* builtins, not of `print`'s own present/nil branch — this
+        // pins that this specific site keeps computing under the JIT too.
+        let src = format!("fn main() -> i64 {{\n{}print(fns)\n0 }}", OPT_I64_SETUP);
+        assert_eq!(jit_run_i64(&src), Ok(0), "print(map_get(...)) should still lower, not refuse");
+        assert_eq!(interp_run_i64(&src), Ok(0));
+    }
+
+    #[test]
+    fn jit_760_further_audited_builtin_sites_refuse_conversion() {
+        // The rest of the "passing to a builtin expecting a tensor" category
+        // the audit's `sum(x)` example represents: every other tensor-only
+        // reduction/transform hits an identical `.as_tensor()`-or-match
+        // fallback and got the identical one-line fix. `(src, want_msg,
+        // interp_result)` — `interp_result` is `Ok` when `dmc run` treats a
+        // plain int as a degenerate no-op (`max`/`min`/`print_tensor`, like
+        // `sum` above) and a message substring when it's a genuine runtime
+        // type error (`argmax`/`argmin`/`variance`/`sum_along`/`softmax`).
+        for (src, want_msg, interp_result) in [
+            (format!("fn main() -> i64 {{\n{}let r = max(fns)\nr as i64 }}", OPT_I64_SETUP),
+             "`max` requires a tensor argument, got `i64?`", Ok(3)),
+            (format!("fn main() -> i64 {{\n{}let r = min(fns)\nr as i64 }}", OPT_I64_SETUP),
+             "`min` requires a tensor argument, got `i64?`", Ok(3)),
+            (format!("fn main() -> i64 {{\n{}let r = argmax(fns)\nr }}", OPT_I64_SETUP),
+             "`argmax` requires a tensor argument, got `i64?`",
+             Err("`argmax`: arg 0 must be a tensor, got int")),
+            (format!("fn main() -> i64 {{\n{}let r = argmin(fns)\nr }}", OPT_I64_SETUP),
+             "`argmin` requires a tensor argument, got `i64?`",
+             Err("`argmin`: arg 0 must be a tensor, got int")),
+            (format!("fn main() -> i64 {{\n{}let r = variance(fns)\nr as i64 }}", OPT_I64_SETUP),
+             "`variance` requires a tensor argument, got `i64?`",
+             Err("`variance`: arg 0 must be a tensor, got int")),
+            (format!("fn main() -> i64 {{\n{}let r = sum_along(fns, 0)\n0 }}", OPT_I64_SETUP),
+             "reduce_along requires a tensor argument, got `i64?`",
+             Err("`sum_along`: arg 0 must be a tensor, got int")),
+            (format!("fn main() -> i64 {{\n{}let r = softmax(fns)\n0 }}", OPT_I64_SETUP),
+             "softmax requires a tensor, got `i64?`",
+             Err("`softmax`: arg 0 must be a tensor, got int")),
+            (format!("fn main() -> i64 {{\n{}print_tensor(fns)\n0 }}", OPT_I64_SETUP),
+             "`print_tensor` requires a tensor argument, got `i64?`", Ok(0)),
+        ] {
+            let e = jit_compile_jiterr(&src);
+            assert_eq!(e.kind, JitErrorKind::Unsupported, "for:\n{}\ngot `{}`", src, e);
+            assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"),
+                "for:\n{}\ngot `{}`", src, e);
+            assert!(e.msg.contains(want_msg), "for:\n{}\ngot `{}`", src, e);
+            assert!(e.msg.contains("#721"), "for:\n{}\ngot `{}`", src, e);
+            match interp_result {
+                Ok(n) => assert_eq!(interp_run_i64(&src), Ok(n), "for:\n{}", src),
+                Err(sub) => {
+                    let run = interp_run_i64(&src);
+                    assert!(run.is_err(), "for:\n{}\nexpected a runtime error, got {:?}", src, run);
+                    assert!(run.as_ref().unwrap_err().contains(sub),
+                        "for:\n{}\nexpected error containing {:?}, got {:?}", src, sub, run);
+                }
+            }
+        }
+    }
+
+    // ─── #760 follow-up: five more sites, found on a second pass over the
+    // audit's own coverage claim ─────────────────────────────────────────
+    //
+    // The first pass covered every `.as_tensor()`/type-match fallback the
+    // audit named, but missed five more with the identical shape: an
+    // if-condition, prefix `\>` (ReLU) on a bare scalar, a `Scalar × Tensor`
+    // pair (shadowed — see below), `pull_to_mean`, and `trit_quantize`. Same
+    // fix, same one test per site.
+
+    #[test]
+    fn jit_760_if_condition_on_map_get_result_refuses_conversion() {
+        // The interpreter runs this: a non-bool condition's `as_bool()` is
+        // `None`, silently taken as false (#300.4) — not a runtime error.
+        let src = format!("fn main() -> i64 {{\n{}let r = if fns {{ 1 }} else {{ 2 }}\nr }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("if-condition must be `bool`, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        assert_eq!(interp_run_i64(&src), Ok(2));
+    }
+
+    #[test]
+    fn jit_760_relu_of_map_get_result_refuses_conversion() {
+        // `dmc run`: `\>` on a genuine int decodes and computes `max(x, 0)`,
+        // same as any other scalar op on an `OptI64` (#300.4).
+        let src = format!("fn main() -> i64 {{\n{}let r = \\>fns\nr as i64 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("`\\>` (ReLU) requires a float operand, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        assert_eq!(interp_run_i64(&src), Ok(3));
+    }
+
+    #[test]
+    fn jit_760_scalar_tensor_matmul_map_get_result_refuses_conversion() {
+        // The shadowing case: `lower_binop`'s `(Scalar, Tensor)` arm dispatches
+        // to `lower_scalar_tensor_broadcast` for ANY op before its own
+        // `OptI64` catch-all ever runs (that arm sits below the scalar/tensor
+        // match arms) — so `fns @ t` used to fall through the broadcast
+        // function's own "not a dotted op" fallback uncoded. A dotted op
+        // (`fns .* t`) is unaffected: it still decodes-and-computes via
+        // `coerce_scalar`, the same as any other `Scalar(OptI64)` used as a
+        // genuine scalar (#300.4) — not touched by this fix.
+        let src = format!(
+            "fn main() -> i64 {{\n{}let t = forge.zeros[f32, [2, 2]]\nlet r = fns @ t\n0 }}",
+            OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("operator `Matmul` is not defined on scalar/tensor mix, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: a real runtime error — matmul genuinely needs rank >= 2
+        // on both sides, and a decoded int is rank 0.
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("matmul requires rank"));
+    }
+
+    #[test]
+    fn jit_760_pull_to_mean_of_map_get_result_refuses_conversion() {
+        let src = format!("fn main() -> i64 {{\n{}let r = pull_to_mean(fns, 0.5)\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("`pull_to_mean` first arg must be a tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("`pull_to_mean`: arg 0 must be a tensor, got int"));
+    }
+
+    #[test]
+    fn jit_760_trit_quantize_of_map_get_result_refuses_conversion() {
+        // `dmc run`: a no-op-looking success, like `sum`/`print_tensor` above —
+        // `trit_quantize` falls through the interpreter's forward-compat
+        // catch-all on a non-tensor argument rather than erroring.
+        let src = format!("fn main() -> i64 {{\n{}let r = trit_quantize(fns)\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("`trit_quantize` requires a 2-D f32 tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        assert_eq!(interp_run_i64(&src), Ok(0));
+    }
+
+    #[test]
+    fn jit_760_split_receiver_map_get_result_refuses_conversion() {
+        let src = format!("fn main() -> i64 {{\n{}let (a, b) = fns.split[2, axis=0]\n0 }}", OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("`.split` expects a tensor, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("`.split` expects a tensor, got int"));
+    }
+
+    #[test]
+    fn jit_760_stream_append_rhs_map_get_result_refuses_conversion() {
+        let src = format!(
+            "fn main() -> i64 {{\nlet !cache: KV[f32, [4, ~, 8]] = forge.kv[f32, [4, ~, 8]](capacity = 64)\n{}cache <- fns\n0 }}",
+            OPT_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("`<-` requires a tensor on the right, got `i64?`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("<- stream-arrow requires tensor on both sides"));
+    }
+
+    // ─── #769: `coerce_to` itself never reinterprets a `map_get` result ────
+    //
+    // #760/#764 audited every *operator or builtin* that falls through an
+    // ordinary type-fallback to an uncoded `jit error` on an `OptI64`
+    // operand. They never audited `coerce_to` itself — the function every
+    // one of those sites (and every ordinary function call) already routes
+    // an argument through to convert it to its parameter's declared type.
+    // `coerce_to`'s own top-of-function special case unconditionally
+    // decoded an `OptI64` source's payload and recursed with a plain `i64`
+    // source — which is exactly right for a genuinely scalar target
+    // (`i64`, `bool`, `f32`, ...), but for `Tensor` (and `Bf16Tensor`) that
+    // recursion lands on an arm that bitcasts an `i64` straight through as
+    // a pointer (`(Scalar(I64), Tensor(_)) => Ok(v)`, kept for legitimate
+    // raw-pointer model-field initialization) — turning the map's plain
+    // int payload into a "tensor" whose data pointer is whatever small
+    // integer the map held. `sum` then dereferences it: a segfault, no
+    // diagnostic (the issue's own repro, reduced on #764's head).
+    //
+    // The fix refuses before recursing whenever `to` is any pointer-
+    // carrying `TyKind` (everything except a `Scalar`, the documented `Fn`
+    // exception — an opaque i64 IS deliberately accepted there as a code
+    // pointer, e.g. from a map of callbacks — and `Budget`, documented as
+    // never dereferenced), via the same `opt_i64_refusal` helper. One test
+    // per target shape reachable from a plain function call: `Tensor` (the
+    // issue's own repro), `str` (previously did NOT crash — it rendered
+    // the decoded int as a decimal string via `__dmc_str_from_int`, a
+    // silent wrong-answer rather than a segfault, now refused instead),
+    // and `Model`/`KV` (already safe before this fix — neither had an
+    // `i64`-source arm, so both already fell through to `coerce_to`'s
+    // generic catch-all refusal; now they get the same richer `#721`-
+    // citing message as every other guarded target instead of the
+    // catch-all's generic wording).
+    const MAP_GET_I64_SETUP: &str =
+        "let !d = map_new()\nmap_set(d, \"k\", 3)\nlet fns = map_get(d, \"k\")\n";
+
+    #[test]
+    fn jit_769_tensor_param_map_get_result_refuses_conversion() {
+        // The issue's own repro: `fn f(t: Tensor[f32, [2]]) -> f32 { sum(t) }`
+        // called with a `map_get` result. Pre-fix this segfaulted (exit 139)
+        // instead of refusing.
+        let src = format!(
+            "fn f(t: Tensor[f32, [2]]) -> i64 {{ sum(t) as i64 }}\n\
+             fn main() -> i64 {{\n{}f(fns) }}",
+            MAP_GET_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("cannot convert `i64?` to `Tensor[f32, [2]]`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: the interpreter hands the int straight to `sum`, which
+        // answers it back (its own oddity, out of scope for this issue —
+        // see #721's "typed map values" and #860, filed alongside this fix
+        // for "sum of a non-tensor answers the scalar").
+        assert_eq!(interp_run_i64(&src), Ok(3));
+    }
+
+    #[test]
+    fn jit_769_str_param_map_get_result_refuses_conversion() {
+        let src = format!(
+            "fn take(s: str) -> i64 {{ len(s) }}\n\
+             fn main() -> i64 {{\n{}take(fns) }}",
+            MAP_GET_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("cannot convert `i64?` to `str`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: a real runtime error — `len` rejects a plain int.
+        let run = interp_run_i64(&src);
+        assert!(run.is_err(), "expected a runtime error, got {:?}", run);
+        assert!(run.unwrap_err().contains("len: requires tensor, tuple, str, list, or map"));
+    }
+
+    #[test]
+    fn jit_769_model_param_map_get_result_refuses_conversion() {
+        // `Model` had no `(Scalar(I64), Model(..))` arm at all, so this was
+        // already safe pre-fix (it fell to `coerce_to`'s generic catch-all).
+        // Pinned so the improved, `#721`-citing message doesn't regress to
+        // the catch-all's generic "cannot convert ...; use `dmc run`"
+        // wording, and so a future `Model`-targeted fast path can't
+        // reintroduce a pointer bitcast without this test catching it.
+        let src = format!(
+            "model Point {{ x: i64 }}\n\
+             fn take(p: Point) -> i64 {{ 0 }}\n\
+             fn main() -> i64 {{\n{}take(fns) }}",
+            MAP_GET_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("cannot convert `i64?` to `Point`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        // `dmc run`: `take` never touches `p`, so this runs to completion.
+        assert_eq!(interp_run_i64(&src), Ok(0));
+    }
+
+    #[test]
+    fn jit_769_kv_param_map_get_result_refuses_conversion() {
+        // Same "already safe, now better-cited" shape as the `Model` case
+        // above, for the other no-arm pointer-carrying target family.
+        let src = format!(
+            "fn take(c: KV[f32, [~, 4]]) -> i64 {{ 0 }}\n\
+             fn main() -> i64 {{\n{}take(fns) }}",
+            MAP_GET_I64_SETUP);
+        let e = jit_compile_jiterr(&src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        assert!(e.msg.contains("cannot convert `i64?` to `KV[f32, [~, 4]]`"), "{}", e);
+        assert!(e.msg.contains("#721"), "{}", e);
+        assert_eq!(interp_run_i64(&src), Ok(0));
+    }
+
+    // ─── error propagation `?` and the mutable `Err` idiom ─────────────────
+    //
+    // The 0.0.6 JIT parity push: `?` and the `(T, Err)`
+    // idiom were two `jit-*` refusals on one gap — `Err` had no JIT
+    // representation, so a `(T, Err)`-returning fn refused the moment it built
+    // its own return value, and `?` refused on top of that.
+
+    #[test]
+    fn jit_query_unwraps_on_success_and_propagates_on_error() {
+        // SPEC.md §4.9: `expr?` sugars to
+        //   let (t, e) = expr
+        //   if e != nil { return (default[T], e) }
+        //   t
+        // — the no-error branch just unwraps to `T`; the error branch
+        // early-returns the CALLER's own `(default[T], e)` rather than
+        // continuing with `t`.
+        let success = "\
+            fn half(n: i64) -> (i64, Err) {\n\
+                if n % 2 != 0 { return (0, \"odd\") }\n\
+                (n / 2, nil)\n\
+            }\n\
+            fn twice_half(n: i64) -> (i64, Err) {\n\
+                let h = half(n)?\n\
+                let h2 = half(h)?\n\
+                (h2, nil)\n\
+            }\n\
+            fn main() -> i64 {\n\
+                let (v, e) = twice_half(8)\n\
+                v\n\
+            }\n";
+        // 8 is even, and so is half(8) == 4: both `?`s unwrap cleanly to 2.
+        assert_eq!(jit_run_i64(success).expect("jit"), 2);
+
+        let error = "\
+            fn half(n: i64) -> (i64, Err) {\n\
+                if n % 2 != 0 { return (0, \"odd\") }\n\
+                (n / 2, nil)\n\
+            }\n\
+            fn twice_half(n: i64) -> (i64, Err) {\n\
+                let h = half(n)?\n\
+                let h2 = half(h)?\n\
+                (h2, nil)\n\
+            }\n\
+            fn main() -> i64 {\n\
+                let (v, e) = twice_half(9)\n\
+                v\n\
+            }\n";
+        // 9 is odd: `half(9)` returns `(0, "odd")`, and `?` propagates
+        // `twice_half`'s own `(default[i64], "odd") == (0, "odd")` straight
+        // out — `h2` never binds, `half(h)` never runs.
+        assert_eq!(jit_run_i64(error).expect("jit"), 0);
+    }
+
+    #[test]
+    fn jit_query_agrees_with_the_interpreter() {
+        // Full-process parity for the program above, including the `Err`
+        // string itself (`jit_run_i64` only sees `main`'s `i64`, not what
+        // `twice_half` actually put in the error half).
+        assert_cli_agree("query_propagation",
+            "fn half(n: i64) -> (i64, Err) {\n\
+                 if n % 2 != 0 { return (0, \"odd\") }\n\
+                 (n / 2, nil)\n\
+             }\n\
+             fn twice_half(n: i64) -> (i64, Err) {\n\
+                 let h = half(n)?\n\
+                 let h2 = half(h)?\n\
+                 (h2, nil)\n\
+             }\n\
+             fn main() -> nil {\n\
+                 let (v, e) = twice_half(8)\n\
+                 print(v)\n\
+                 print(e == nil)\n\
+                 let (v2, e2) = twice_half(9)\n\
+                 print(v2)\n\
+                 print(e2)\n\
+                 nil\n\
+             }\n",
+            0, "2\ntrue\n0\nodd\n", "");
+    }
+
+    #[test]
+    fn jit_mutable_err_accumulator_idiom_agrees_with_the_interpreter() {
+        // `let !err = nil` later reassigned a `str` — the `(T, Err)` idiom's
+        // mutable half (SPEC.md §3.9, worked at §5.1's shadow-vs-assign
+        // example). Before this branch this was a `jit-conversion` refusal
+        // ("cannot convert `str` to `nil`") the moment the reassignment was
+        // reached, because the untyped `nil` initializer bound `err` as the
+        // 1-byte `TyKind::Scalar(Nil)`; `collect_nil_str_hint_vars` now spots
+        // the later string assignment and binds it `TyKind::Str` (nil = NULL
+        // pointer) from the start.
+        assert_cli_agree("mutable_err_idiom",
+            "fn check(n: i64) -> str {\n\
+                 let !err = nil\n\
+                 if n < 0 { err = \"negative\" }\n\
+                 if n > 100 { err = \"too big\" }\n\
+                 err\n\
+             }\n\
+             fn main() -> nil {\n\
+                 print(check(5))\n\
+                 print(check(-1))\n\
+                 print(check(200))\n\
+                 nil\n\
+             }\n",
+            0, "nil\nnegative\ntoo big\n", "");
+    }
+
+    /// The `?` error path returns `(default[T], e)` — the CALLER's own default
+    /// for `T`, not whatever the callee happened to put in the value half.
+    ///
+    /// SPEC.md §4.9 is literal about the desugaring:
+    ///
+    ///     let (t, e) = expr
+    ///     if e != nil { return (default[T], e) }
+    ///     t
+    ///
+    /// so a callee that returns `(777, "odd")` propagates as `(0, "odd")`.
+    /// Every probe here is written with a NON-ZERO error-path value, because
+    /// a zero one cannot tell `default[T]` apart from "whatever the callee
+    /// said" — the two answers coincide.
+    ///
+    /// **#628**: the interpreter does NOT do this. `interp.rs`'s `propagate`
+    /// hands the callee's whole tuple back up, so `dmc run` prints the callee's
+    /// value (`777`) where `dmc jit` prints `default[i64]` (`0`). The JIT is
+    /// the conformant side, so these are JIT-value PINS and not
+    /// `assert_cli_agree` parity assertions — the interpreter's column is
+    /// asserted only loosely (it is either today's defect or, once #628 has
+    /// landed, the same value the JIT gives). When #628 merges, delete the
+    /// `want_interp` column and fold the whole table into `assert_cli_agree`.
+    /// This is also why the corresponding `tools/jit_probes.py` probes use
+    /// zero-valued error paths: that battery FAILS on any run/jit divergence
+    /// and has no way to spell "known interpreter defect".
+    #[test]
+    fn jit_query_error_path_is_default_t_not_the_callees_value() {
+        // (name, source, JIT stdout — the spec answer, interpreter stdout today)
+        let cases: &[(&str, &str, &str, &str)] = &[
+            // T = i64.
+            ("q628_i64", r#"
+fn half(n: i64) -> (i64, Err) {
+    if n % 2 != 0 { return (777, "odd") }
+    (n / 2, nil)
+}
+fn twice(n: i64) -> (i64, Err) {
+    let h = half(n)?
+    (h, nil)
+}
+fn main() -> nil {
+    let (v, e) = twice(9)
+    print(v)
+    print(e)
+    nil
+}
+"#, "0\nodd\n", "777\nodd\n"),
+            // T = f32 — `default[f32]` is 0.0, not the callee's 3.5.
+            ("q628_f32", r#"
+fn f(n: i64) -> (f32, Err) {
+    if n < 0 { return (3.5, "neg") }
+    (1.0, nil)
+}
+fn g(n: i64) -> (f32, Err) {
+    let v = f(n)?
+    (v, nil)
+}
+fn main() -> nil {
+    let (v, e) = g(-1)
+    print(v)
+    print(e)
+    nil
+}
+"#, "0\nneg\n", "3.5\nneg\n"),
+            // T = bool — `default[bool]` is false, not the callee's true.
+            ("q628_bool", r#"
+fn f(n: i64) -> (bool, Err) {
+    if n < 0 { return (true, "neg") }
+    (false, nil)
+}
+fn g(n: i64) -> (bool, Err) {
+    let v = f(n)?
+    (v, nil)
+}
+fn main() -> nil {
+    let (v, e) = g(-1)
+    print(v)
+    print(e)
+    nil
+}
+"#, "false\nneg\n", "true\nneg\n"),
+            // T = str — `default[str]` is `nil`, not the callee's "fallback".
+            ("q628_str", r#"
+fn f(n: i64) -> (str, Err) {
+    if n < 0 { return ("fallback", "neg") }
+    ("ok", nil)
+}
+fn g(n: i64) -> (str, Err) {
+    let v = f(n)?
+    (v, nil)
+}
+fn main() -> nil {
+    let (v, e) = g(-1)
+    print(v)
+    print(e)
+    nil
+}
+"#, "nil\nneg\n", "fallback\nneg\n"),
+            // T = Tensor — `default[Tensor[f32, [2]]]` is a ZERO tensor of that
+            // shape, not the callee's 9-filled one.
+            ("q628_tensor", r#"
+fn f(n: i64) -> (Tensor[f32, [2]], Err) {
+    let !t = forge.zeros[f32, [2]]
+    if n < 0 {
+        t[0] = 9.0
+        t[1] = 9.0
+        return (t, "neg")
+    }
+    (t, nil)
+}
+fn g(n: i64) -> (Tensor[f32, [2]], Err) {
+    let v = f(n)?
+    (v, nil)
+}
+fn main() -> nil {
+    let (v, e) = g(-1)
+    print(v[0])
+    print(e)
+    nil
+}
+"#, "0\nneg\n", "9\nneg\n"),
+            // `?` inside a loop body: the early return leaves the loop AND the
+            // function. The second call (`sum_to(3)`, no error) is the control:
+            // both backends already agree on it, so a failure there is not #628.
+            ("q628_loop", r#"
+fn f(n: i64) -> (i64, Err) {
+    if n == 3 { return (777, "hit three") }
+    (n, nil)
+}
+fn sum_to(n: i64) -> (i64, Err) {
+    let !acc = 0
+    for i in 0..n {
+        let v = f(i)?
+        acc = acc + v
+    }
+    (acc, nil)
+}
+fn main() -> nil {
+    let (v, e) = sum_to(5)
+    print(v)
+    print(e)
+    let (v2, e2) = sum_to(3)
+    print(v2)
+    print(e2)
+    nil
+}
+"#, "0\nhit three\n3\nnil\n", "777\nhit three\n3\nnil\n"),
+            // `?` inside a nested block — the return unwinds out of the `if`.
+            ("q628_nested", r#"
+fn f(n: i64) -> (i64, Err) {
+    if n < 0 { return (777, "neg") }
+    (n * 2, nil)
+}
+fn g(n: i64) -> (i64, Err) {
+    if n != 0 {
+        let v = f(n)?
+        return (v + 1, nil)
+    }
+    (0, nil)
+}
+fn main() -> nil {
+    let (v, e) = g(-1)
+    print(v)
+    print(e)
+    nil
+}
+"#, "0\nneg\n", "777\nneg\n"),
+            // Two `?`s in ONE expression: the first is evaluated, the second
+            // must not be once the first has propagated. `g(1, 2)` is the
+            // control (both `?`s succeed, 2 + 4 = 6 on both backends).
+            ("q628_twice", r#"
+fn f(n: i64) -> (i64, Err) {
+    if n < 0 { return (777, "neg") }
+    (n * 2, nil)
+}
+fn g(a: i64, b: i64) -> (i64, Err) {
+    let s = f(a)? + f(b)?
+    (s, nil)
+}
+fn main() -> nil {
+    let (v, e) = g(1, 2)
+    print(v)
+    print(e)
+    let (v2, e2) = g(1, -1)
+    print(v2)
+    print(e2)
+    nil
+}
+"#, "6\nnil\n0\nneg\n", "6\nnil\n777\nneg\n"),
+        ];
+        let mut still_diverging = Vec::new();
+        for (name, src, want_jit, want_interp) in cases {
+            let (jrc, jout, jerr) = cli_run(name, "jit", src);
+            assert_eq!(jrc, Some(0), "[jit {}] stderr: {}", name, jerr);
+            assert_eq!(jerr, "", "[jit {}] stderr", name);
+            assert_eq!(
+                &jout, want_jit,
+                "[jit {}] the `?` error path must return SPEC §4.9's \
+                 `(default[T], e)`", name,
+            );
+            let (rrc, rout, rerr) = cli_run(name, "run", src);
+            assert_eq!(rrc, Some(0), "[run {}] stderr: {}", name, rerr);
+            if &rout == want_jit {
+                continue; // #628 has landed: the two backends now agree.
+            }
+            assert_eq!(
+                &rout, want_interp,
+                "[run {}] the interpreter neither matches the JIT (so #628 is \
+                 not fixed) nor reproduces the #628 defect this test documents \
+                 — a third behavior nobody specified", name,
+            );
+            still_diverging.push(*name);
+        }
+        if !still_diverging.is_empty() {
+            eprintln!(
+                "note: #628 (interp.rs `propagate` returns the callee's tuple \
+                 instead of `(default[T], e)`) is still open — run/jit diverge \
+                 on: {}. These stay JIT-value pins until it lands.",
+                still_diverging.join(", "),
+            );
+        }
+    }
+
+    /// A shadowed `let !x = nil` is NOT promoted to the nilable-`str`
+    /// representation — the JIT refuses the function exactly as it did before
+    /// `collect_nil_str_hint_vars` existed.
+    ///
+    /// The hint was originally an intersection of NAMES over the whole
+    /// function body, and the promotion site matched on the name alone. With
+    /// an outer `let !x = nil` that is never assigned and an inner, shadowing
+    /// `let !x = nil; x = "inner"` inside an `if`, that promoted BOTH — and
+    /// since the JIT's `locals` map has no block scoping, the inner `str`
+    /// binding stayed visible after the `if` closed. The interpreter printed
+    /// `inner / nil / true`; the JIT printed `inner / inner / false`.
+    ///
+    /// The scan now promotes only an outermost-scope binding whose name
+    /// nothing else in the function rebinds, and keys the result by the
+    /// `let`'s span rather than its name, so this program takes the old road:
+    /// the inner `x` stays `TyKind::Scalar(Nil)` and `x = "inner"` is a clean
+    /// `jit-conversion` refusal. A refusal is a correct answer; a wrong
+    /// number is not.
+    #[test]
+    fn jit_a_shadowed_nil_let_is_not_promoted_to_str() {
+        let e = jit_compile_jiterr(
+            "fn f(n: i64) -> nil {\n\
+                 let !x = nil\n\
+                 if n > 0 {\n\
+                     let !x = nil\n\
+                     x = \"inner\"\n\
+                     print(x)\n\
+                 }\n\
+                 print(x)\n\
+                 print(x == nil)\n\
+                 nil\n\
+             }\n\
+             fn main() -> nil { f(1) }\n");
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+        // The UNSHADOWED idiom still lowers — the fix narrows the hint, it
+        // does not withdraw it (see
+        // `jit_mutable_err_accumulator_idiom_agrees_with_the_interpreter`).
+    }
+
+    /// #625 N1: `HintScan::expr`'s walk — the one that feeds `binds`, rule
+    /// 2's "bound exactly once" shadow count — did not recurse into call
+    /// arguments, struct-literal field values, index expressions, range
+    /// endpoints or `FnLit` bodies. A shadowing `let` hidden inside any of
+    /// those was invisible to the count, so `binds` read 1 and an outer
+    /// `let !err = nil` got promoted to the nilable-`str` local even though
+    /// the program shadows it — rule 2 passing on a false negative.
+    ///
+    /// This is a SILENT MISCOMPILE, not a mere over-refusal, and reproducing
+    /// it needs both halves reachable independently of the missed construct:
+    /// an outer `err = "outer"` the (already-correct) shallow scan finds on
+    /// its own, so `str_assigns` contains "err" and the filter is even
+    /// consulted; and a shadowing `let !err = nil` hidden inside the missed
+    /// construct that is never itself reassigned, so it does not *independently*
+    /// hit its own `jit-conversion` refusal (a shadow that reassigns a string
+    /// inside its own scope always refuses on its own account, promoted or
+    /// not — rule 1 restricts promotion to outermost-scope `let`s regardless
+    /// of this bug, so that shape can't show the divergence).
+    ///
+    /// Verified against the actual pre-fix commit (d193915, this branch
+    /// before this patch) and the main-tip commit (6196815, before the whole
+    /// `(T, Err)`-lowering feature): on the pre-fix binary the JIT compiles
+    /// and RUNS cleanly, printing `nil` / `true` for the untouched-looking
+    /// outer `err` — wrong, because the JIT's flat (unscoped) locals map lets
+    /// the hidden shadow's own `let !err = nil` clobber the outer's promoted
+    /// slot the moment it's declared, discarding the outer's real `"outer"`
+    /// value. The interpreter (correctly scoped) prints `outer` / `false`,
+    /// and so does the main-tip JIT, which refuses at the `err = "outer"`
+    /// assignment with `jit-conversion` because it has no promotion feature
+    /// at all yet. After this fix, `binds` counts the hidden shadow, rule 2
+    /// disqualifies the outer candidate, and the JIT on this branch refuses
+    /// at the very same `err = "outer"` line, matching main and the
+    /// interpreter's refusal-worthy diagnosis instead of the silent `nil` /
+    /// `true`.
+    ///
+    /// One test per missed `Expr` shape: a block-valued call argument, a
+    /// struct-literal field value, and an index expression.
+    #[test]
+    fn jit_shadowed_nil_let_inside_a_call_arg_is_not_promoted_to_str() {
+        let src = r#"
+fn touch(x: i64) -> i64 { x }
+
+fn f(n: i64) -> nil {
+    let !err = nil
+    err = "outer"
+    touch({
+        let !err = nil
+        0
+    })
+    print(err)
+    print(err == nil)
+    nil
+}
+
+fn main() -> nil { f(touch(1)) }
+"#;
+        let (rc, out, se) = cli_run("shadow_in_call_arg", "run", src);
+        assert_eq!(rc, Some(0), "[run] stderr: {}", se);
+        assert_eq!(out, "outer\nfalse\n", "[run] the outer `err` must keep its real value");
+
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+    }
+
+    #[test]
+    fn jit_shadowed_nil_let_inside_a_struct_lit_field_is_not_promoted_to_str() {
+        let src = r#"
+model Box { v: i64 }
+
+fn f(n: i64) -> nil {
+    let !err = nil
+    err = "outer"
+    let b = Box {
+        v: {
+            let !err = nil
+            0
+        }
+    }
+    print(b.v)
+    print(err)
+    print(err == nil)
+    nil
+}
+
+fn main() -> nil { f(1) }
+"#;
+        let (rc, out, se) = cli_run("shadow_in_struct_field", "run", src);
+        assert_eq!(rc, Some(0), "[run] stderr: {}", se);
+        assert_eq!(out, "0\nouter\nfalse\n", "[run] the outer `err` must keep its real value");
+
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+    }
+
+    #[test]
+    fn jit_shadowed_nil_let_inside_an_index_expr_is_not_promoted_to_str() {
+        let src = r#"
+fn f(n: i64) -> nil {
+    let !err = nil
+    err = "outer"
+    let t = forge.zeros[f32, [4]]
+    let v = t[{
+        let !err = nil
+        0
+    }]
+    print(v)
+    print(err)
+    print(err == nil)
+    nil
+}
+
+fn main() -> nil { f(1) }
+"#;
+        let (rc, out, se) = cli_run("shadow_in_index_expr", "run", src);
+        assert_eq!(rc, Some(0), "[run] stderr: {}", se);
+        assert_eq!(out, "0\nouter\nfalse\n", "[run] the outer `err` must keep its real value");
+
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal.map(|r| r.code()), Some("jit-conversion"), "{}", e);
+    }
+
+    /// #819 (the same review pass that filed the `check.rs` #403 gap this
+    /// commit also fixes): `HintScan::expr`'s `_ => {}` tail dropped
+    /// `Expr::AllocIn` (`<ctor> in b`) entirely, so a shadowing `let` hidden
+    /// inside its `budget` operand's `{ … }` block — `forge.zeros[…] in {
+    /// let !err = nil  b }` — went uncounted by `binds`, the very miss this
+    /// walker's own doc comment calls a SILENT WRONG ANSWER (see the three
+    /// tests above).
+    ///
+    /// `Expr::AllocIn` also refuses unconditionally in `lower_expr`
+    /// (`Refusal::Construct`, jit.rs), so — unlike the three cases above —
+    /// this miscount cannot yet surface as a wrong `dmc jit` answer: any
+    /// function containing `AllocIn` anywhere refuses before promotion could
+    /// matter. That is exactly `MEMORY`'s "harmless while every `in b`
+    /// refuses at runtime (3a), a silent-wrong path once 3b/3d lower it" —
+    /// so this asserts directly on `HintScan`'s own `binds` count rather
+    /// than through a `dmc jit`/`dmc run` divergence, since there is none to
+    /// observe yet.
+    #[test]
+    fn hint_scan_counts_a_shadowing_let_inside_an_alloc_in_operand_819() {
+        let src = "fn f(b: Budget) -> nil {\n\
+                       let !err = nil\n\
+                       let t = forge.ones[f32, [4]] in {\n\
+                           let !err = nil\n\
+                           b\n\
+                       }\n\
+                       nil\n\
+                   }\n";
+        let toks = Lexer::new(src).tokenize().expect("lex ok");
+        let prog = Parser::new(toks).parse_program().expect("parse ok");
+        let f = prog.items.iter().find_map(|i| match i {
+            Item::Fn(f) if f.name == "f" => Some(f),
+            _ => None,
+        }).expect("fn f");
+        let mut scan = HintScan::default();
+        scan.block(&f.body, 0);
+        assert_eq!(
+            scan.binds.get("err").copied(), Some(2),
+            "both `let !err = nil` bindings — the outer one and the one \
+             hidden inside the `in` operand's block — must be counted, or a \
+             future promotion of `err` cannot tell the two apart"
+        );
+    }
+
+    /// `Err` is a convention (SPEC.md §3.9), not a reserved word: `check.rs`
+    /// accepts `model Err { … }` like any other model, and a program that
+    /// declares one means THAT model everywhere it writes `Err`.
+    ///
+    /// Giving the `Err` spelling a nilable-`str` representation unconditionally
+    /// broke such a program — `e.code` refused with "field access on non-model
+    /// type" where it had lowered as an ordinary model field read before. The
+    /// arm now stands down when the program declares its own `model Err`.
+    /// (Whether the CHECKER should reserve the name instead is a spec
+    /// question; the JIT does not get to answer it by refusing programs the
+    /// checker accepts.)
+    #[test]
+    fn a_user_declared_model_err_still_lowers_as_a_model() {
+        assert_eq!(
+            jit_run_i64(
+                "model Err {\n\
+                     code: i64\n\
+                 }\n\
+                 fn code_of(e: Err) -> i64 { e.code }\n\
+                 fn main() -> i64 {\n\
+                     let e = Err { code: 7 }\n\
+                     code_of(e)\n\
+                 }\n").expect("jit"),
+            7);
+        // …and the flag that decides this is per-compilation, not sticky: a
+        // program compiled after it on the same thread still gets SPEC §3.9's
+        // `Err`. (`compile_program` sets it unconditionally; this asserts it.)
+        assert_eq!(
+            jit_run_i64(
+                "fn half(n: i64) -> (i64, Err) {\n\
+                     if n % 2 != 0 { return (0, \"odd\") }\n\
+                     (n / 2, nil)\n\
+                 }\n\
+                 fn main() -> i64 {\n\
+                     let h = half(8)\n\
+                     let (v, e) = h\n\
+                     v\n\
+                 }\n").expect("jit"),
+            4);
     }
 
     #[test]
@@ -28335,23 +39155,32 @@ fn main() -> i64 { 0 }
     #[test]
     fn jit_extern_abi_admits_the_widths_that_match() {
         // The other side of the rule: everything whose machine width equals
-        // its declared one goes through. `dmc_test_add_f32` is `no_mangle`, so
-        // the pre-flight resolves it against this test binary's own image.
+        // its declared one goes through. The symbols are libm's, which every
+        // host has loaded, so the pre-flight resolves them on macOS and Linux
+        // alike. The test binary's own `no_mangle` helpers are NOT usable
+        // here: Linux does not export an executable's symbols to the dynamic
+        // table without `-rdynamic`, so `dlsym` cannot see them there, and
+        // the public CI (x86_64 Linux) failed on exactly that.
         jit_compile_only(r#"
-            extern fn dmc_test_add_f32(a: f32, b: f32) -> f32
+            extern fn fmaxf(a: f32, b: f32) -> f32
             fn main() -> i64 { 0 }
         "#).expect("f32 should compile");
         jit_compile_only(r#"
-            extern fn dmc_test_scale_ptr(p: *f32, n: i64, s: f32) -> f32
+            extern fn modff(x: f32, iptr: *f32) -> f32
             fn main() -> i64 { 0 }
-        "#).expect("*f32 + i64 should compile");
+        "#).expect("*f32 should compile");
+        jit_compile_only(r#"
+            extern fn labs(x: i64) -> i64
+            fn main() -> i64 { 0 }
+        "#).expect("i64 should compile");
     }
 
     #[test]
     fn jit_extern_fn_rawptr_type_parses_and_compiles() {
-        // *f32 and i64 param types are accepted without error.
+        // A raw-pointer parameter type is accepted without error. libm's
+        // `modff` takes a `float*`; see the note on symbol resolution above.
         jit_compile_only(r#"
-            extern fn dmc_test_scale_ptr(ptr: *f32, n: i64, scale: f32) -> f32
+            extern fn modff(x: f32, iptr: *f32) -> f32
             fn main() -> i64 { 0 }
         "#).expect("should compile");
     }
@@ -29492,6 +40321,281 @@ fn main() -> i64 {
         ] { assert_jit_eq_interp(src); }
     }
 
+    // ─── Top-level `type` aliases (SPEC.md §6.6, ROADMAP.md §2) ──────────────
+    //
+    // A top-level `type X = <target>` used to be refused outright at the item
+    // level (`jit-item`, "`type` aliases at top level") — the whole file, not
+    // just the alias, since `collect_fns` walks every item. Now the
+    // declaration is transparent metadata (`Jit::aliases`, collected in
+    // `compile_program`) and `resolve_alias_ty` resolves a non-parameterized
+    // alias to its target at each site the JIT builds a `TyKind`: fn
+    // signatures (`declare_fn`/`declare_template_signature`), model fields
+    // (`collect_fns`'s `Item::Model` arm), `forge.zeros[..]`'s dtype argument
+    // (`lower_arena_alloc`), and casts (both the plain and `@grad`/AD paths).
+
+    #[test]
+    fn jit_type_alias_scalar_signature_parity() {
+        // `Role` in a fn param AND return type used to make the whole file
+        // `jit-item`-refused; it now resolves to `u8` in both positions.
+        //
+        // In-range value (not a width-wrapping one): `dmc run` loses the
+        // target's narrow width through an alias — issue #626 — so a wrapping
+        // case would fail this parity assertion for an interpreter reason,
+        // not an alias-resolution one.
+        // `jit_type_alias_scalar_signature_wraps_at_target_width` below checks
+        // the JIT side of that same case on its own, without interp agreement.
+        assert_jit_eq_interp(
+            "type Role = u8\n\
+             fn bump(r: Role) -> Role { r + 1 }\n\
+             fn main()->i64{ bump(10) as i64 }");
+    }
+
+    #[test]
+    fn jit_type_alias_scalar_signature_wraps_at_target_width() {
+        // The JIT-only half of the case above: `Role`'s signature use must
+        // resolve all the way to `ScalarKind::U8`, not just "some scalar",
+        // or 255+1 would answer 256 (i64-width) instead of wrapping to 0.
+        assert_eq!(jit_run_i64(
+            "type Role = u8\n\
+             fn bump(r: Role) -> Role { r + 1 }\n\
+             fn main()->i64{ bump(255) as i64 }").unwrap(), 0);
+    }
+
+    #[test]
+    fn jit_type_alias_chain_signature() {
+        // A chain of aliases (`type A = B  type B = u8`) resolves through
+        // both hops, matching `check.rs::resolve_type_alias`'s own chasing.
+        assert_eq!(jit_run_i64(
+            "type A = B\n\
+             type B = u8\n\
+             fn bump(r: A) -> A { r + 1 }\n\
+             fn main()->i64{ bump(255) as i64 }").unwrap(), 0);
+    }
+
+    #[test]
+    fn jit_type_alias_model_field_parity() {
+        // `Idx` as a model field type used to make the whole file
+        // `jit-item`-refused; the field now lays out exactly as a bare `i32`
+        // field would (not as an unknown-model opaque pointer).
+        assert_jit_eq_interp(
+            "type Idx = i32\n\
+             model Acct { v: Idx }\n\
+             fn main()->i64{ let a = Acct{v: 42}\n a.v as i64 }");
+    }
+
+    #[test]
+    fn jit_type_alias_cast_parity() {
+        // `Byte` as a cast target used to make the whole file `jit-item`-
+        // refused; the cast now resolves through to `u8` like a direct cast.
+        assert_jit_eq_interp(
+            "type Byte = u8\n\
+             fn main()->i64{ let x: i64 = 12\n (x as Byte) as i64 }");
+    }
+
+    #[test]
+    fn jit_type_alias_cast_wraps_at_target_width() {
+        assert_eq!(jit_run_i64(
+            "type Byte = u8\n\
+             fn main()->i64{ let x: i64 = 300\n (x as Byte) as i64 }").unwrap(), 44);
+    }
+
+    #[test]
+    fn jit_type_alias_forge_zeros_dtype() {
+        // `forge.zeros[Count, [3]]` where `type Count = i64`. Exercised
+        // directly against `Jit::compile_program` (skipping `check.rs`,
+        // exactly like every other helper in this module): the checker's
+        // own `forge.zeros` dtype matcher (`scalar_type_from_ident` in
+        // check.rs) is a separate hardcoded name match with no alias
+        // awareness, so THE CHECKER BLOCKS THIS FORM TODAY: from the CLI both
+        // `dmc run` and `dmc jit` stop at "undefined identifier `Count`"
+        // before either backend's alias handling is reached. That is a
+        // pre-existing, separate gap, deliberately not fixed here — so
+        // `forge.zeros[Alias, ..]` is NOT a user-visible feature of this
+        // change. This test covers the JIT's own `lower_arena_alloc`
+        // resolution in isolation, so that half doesn't sit untested until
+        // the checker gap is closed too.
+        assert_eq!(jit_run_i64(
+            "type Count = i64\n\
+             fn main()->i64{ let !t=forge.zeros[Count, [3]]\n \
+             t[0]=10\n t[1]=20\n t[2]=30\n t[0]+t[1]+t[2] }").unwrap(), 60);
+    }
+
+    #[test]
+    fn jit_type_alias_forge_zeros_unsupported_element_still_refused() {
+        // The alias is transparent, not a backdoor: an alias to an element
+        // type the JIT does not lower is refused exactly as the bare spelling
+        // is, and the refusal names the RESOLVED type so the message says
+        // which width was actually asked for.
+        //
+        // This test used to alias `u8`, back when the JIT only zero-filled
+        // f32/i32/i64. #632 gave every byte-aligned width its own storage
+        // lane, so `u8` lowers now and is no longer an example of anything
+        // refused — see `jit_type_alias_to_a_narrow_element_lowers` below,
+        // which pins that composition. `int4` is the durable example: 4 bits
+        // is not a storage lane, so a tensor of it stays refused by design
+        // rather than being silently widened, and it is expected to keep
+        // failing here after the integer element roster stops moving.
+        let err = jit_run_i64(
+            "type Nibble = int4\n\
+             fn main()->i64{ let !t=forge.zeros[Nibble, [3]]\n t[0] as i64 }").unwrap_err();
+        assert!(err.contains("int4"),
+            "expected the resolved dtype name in the message, got: {err}");
+        assert!(!err.contains("Nibble"),
+            "the message should name the resolved scalar type, not the alias: {err}");
+    }
+
+    #[test]
+    fn jit_type_alias_to_a_narrow_element_lowers() {
+        // #622 (aliases are transparent) composed with #632 (every
+        // byte-aligned width has its own lane): `type Role = u8` allocates a
+        // ONE-BYTE lane, not a lane the width of the alias's name.
+        //
+        // The expectation separates the two possible mistakes. 255 + 1 wraps
+        // to 0 only if the element really is 8 bits wide; an alias resolved to
+        // some wider default would answer 256. And the second element proves
+        // the store stayed inside its own lane — if `t[0] = 255` had been
+        // written at the compute width it would have scribbled over `t[1]`,
+        // which is checked here to still read 7.
+        //
+        // Like its sibling above this drives `Jit::compile_program` directly:
+        // check.rs's own `forge.zeros` dtype matcher has no alias awareness,
+        // so `forge.zeros[Role, …]` is still blocked from the CLI by a
+        // separate, pre-existing checker gap.
+        assert_eq!(jit_run_i64(
+            "type Role = u8\n\
+             fn main()->i64{ let !t=forge.zeros[Role, [3]]\n \
+             t[0]=255\n t[1]=7\n \
+             let a:u8=t[0]\n let b:u8=t[1]\n \
+             (((a+1) as i64) * 100) + (b as i64) }").unwrap(), 7);
+    }
+
+    #[test]
+    fn jit_type_alias_shape_generic_param_is_refused_as_type_form_not_jit_error() {
+        // Deliberately out of scope: `resolve_alias_ty` resolves only a
+        // *non-parameterized* alias; a shape-generic one (`type Batch[B] =
+        // ...`) needs its shape arguments substituted at the use site, which
+        // is separate work.
+        //
+        // But the refusal has to be *classified*. `dmc run` accepts these
+        // programs (the checker substitutes shape args fine), so they are
+        // valid per SPEC — a JIT that can't lower them owes a
+        // `jit-ineligible`/`jit-type-form` ("outside the JIT subset"), never
+        // a `jit-error`, which DIAGNOSTICS/#480 define as "the JIT failed on
+        // something it is supposed to handle", i.e. a compiler defect.
+        //
+        // Before this was classified, the alias name escaped as a
+        // `Type::Named` and was read downstream as an unknown *model*: the
+        // two bodies below then failed with "`sum` requires a tensor or KV
+        // argument" and "indexing requires a tensor or str, got `Batch`" —
+        // both bare `jit-error`s, both blaming the body for a type-position
+        // limitation.
+        for body in ["sum(x)", "x[0,0]"] {
+            let src = format!(
+                "type Batch[B] = Tensor[f32, [B, 8]]\n\
+                 fn f(x: Batch[4]) -> f32 {{ {body} }}\n\
+                 fn main() -> i64 {{ let !t = forge.zeros[f32, [4, 8]]\n \
+                 t[0,0] = 1.0\n (f(t)) as i64 }}");
+            let e = jit_compile_jiterr(&src);
+            assert!(matches!(e.kind, JitErrorKind::Unsupported),
+                "body `{body}`: a shape-generic alias must be an `Unsupported` refusal \
+                 (`jit-ineligible`), not a `jit-error` compiler-defect signal: {e:?}");
+            assert_eq!(e.refusal, Some(Refusal::TypeForm),
+                "body `{body}`: expected the `jit-type-form` class, got {:?}", e.refusal);
+            assert!(e.msg.contains("Batch"),
+                "body `{body}`: the message should name the alias, got: {}", e.msg);
+        }
+    }
+
+    #[test]
+    fn jit_type_alias_nested_tensor_element_lowers() {
+        // #3 (recursion): `resolve_alias_ty` used to rewrite only the
+        // OUTERMOST `Type::Named`, so `Tensor[E, [3]]` kept `E` as its element
+        // and `ty_from_ast` failed with a bare `jit-error`, "tensor element
+        // must be a scalar" — while the un-aliased `Tensor[f32, [3]]` lowers.
+        // The rule: if the un-aliased form lowers, the aliased form must too.
+        assert_jit_eq_interp(
+            "type E = f32\n\
+             fn head(x: Tensor[E, [3]]) -> f32 { x[0] }\n\
+             fn main()->i64{ let !t = forge.zeros[f32, [3]]\n \
+             t[0] = 7.0f32\n head(t) as i64 }");
+    }
+
+    #[test]
+    fn jit_type_alias_template_tensor_element_lowers() {
+        // N1 (review finding on #3's recursion fix): `unify_param_type`, the
+        // template-instantiation twin of `ty_from_ast`, still read the raw
+        // written `Type` and never went through `resolve_alias_ty`. So
+        // `Tensor[E, [N]]` in a TEMPLATE param kept `E` as a `Type::Named` in
+        // its `Type::Tensor` arm, which reads any non-`Type::Scalar` element
+        // as "a tensor template parameter with a non-scalar element type" and
+        // refuses `jit-element-type` — while both the un-aliased template
+        // (`Tensor[f32, [N]]`) and the non-template aliased form (the sibling
+        // `jit_type_alias_nested_tensor_element_lowers` test above) lower.
+        // Same rule as everywhere else in this file: if the un-aliased form
+        // lowers, the aliased form must too.
+        assert_jit_eq_interp(
+            "type E = f32\n\
+             fn head[N](x: Tensor[E, [N]]) -> f32 { x[0] }\n\
+             fn main()->i64{ let !t = forge.zeros[f32, [3]]\n \
+             t[0] = 7.0f32\n head(t) as i64 }");
+    }
+
+    #[test]
+    fn jit_type_alias_nested_tuple_return_lowers() {
+        // #3 (recursion), the other nesting the checker's `resolve_type`
+        // handles: `-> (Byte, i64)` used to reach `coerce_to` with `Byte`
+        // still a `Type::Named`, refused as `jit-conversion` ("cannot convert
+        // `i64` to `Byte`") while the un-aliased `(u8, i64)` compiles.
+        assert_jit_eq_interp(
+            "type Byte = u8\n\
+             fn pair() -> (Byte, i64) { (3, 4) }\n\
+             fn main()->i64{ let (a, b) = pair()\n (a as i64) + b }");
+    }
+
+    #[test]
+    fn jit_type_alias_let_annotation_lowers() {
+        // #2: the `let` annotation was the one type-building site with no
+        // alias resolution, so `let b: Byte = 12` was `jit-conversion`
+        // ("cannot convert `i64` to `Byte`").
+        assert_jit_eq_interp(
+            "type Byte = u8\n\
+             fn main()->i64{ let b: Byte = 12\n b as i64 }");
+    }
+
+    #[test]
+    fn jit_type_alias_let_annotation_narrows_to_target_width() {
+        // The JIT-only half: the annotation must resolve all the way to
+        // `ScalarKind::U8`, so 255+1 wraps to 0. Not an
+        // `assert_jit_eq_interp` — `dmc run` answers 256 here (issue #626,
+        // the interpreter losing a narrow width through an alias); this
+        // pins the JIT's own, correct behavior independently of that.
+        assert_eq!(jit_run_i64(
+            "type Role = u8\n\
+             fn main()->i64{ let r: Role = 255\n (r + 1) as i64 }").unwrap(), 0);
+    }
+
+    #[test]
+    fn jit_type_alias_grad_fn_loss_type_lowers() {
+        // #1: `@grad fn … -> S` with `type S = f32` hit `declare_grad_fn`'s
+        // syntactic `matches!(ret_type, Some(Type::Scalar(F32, _)))` test and
+        // was rejected through `err` — a `jit-error` — even though the
+        // un-aliased `-> f32` form lowers and runs. Resolve first, then test.
+        let src = "type S = f32\n\
+                   @grad fn fit_loss(!w: Tensor[f32, [1, 3]],\n\
+                                     x: Tensor[f32, [3, 4]],\n\
+                                     y: Tensor[f32, [1, 4]]) -> S {\n\
+                       let pred = w @ x\n\
+                       let d = pred .- y\n\
+                       mean(d .* d) * 0.5\n\
+                   }\n\
+                   fn main() -> i64 { 0 }";
+        let toks = Lexer::new(src).tokenize().unwrap();
+        let prog = Parser::new(toks).parse_program().unwrap();
+        let mut jit = Jit::new().unwrap();
+        jit.compile_program(&prog).expect(
+            "an aliased `@grad fn` loss type must lower exactly like the un-aliased `-> f32`");
+    }
+
     #[test]
     fn jit_continue_in_for_loop_parity() {
         // The JIT lowered `continue` as a jump to the loop header, skipping the
@@ -29513,6 +40617,53 @@ fn main() -> i64 {
         assert_jit_eq_interp("fn main()->i64{ len(forge.zeros[f32,[3,5]]) as i64 }");
         assert_jit_eq_interp("fn main()->i64{ len(forge.zeros[f32,[2,3,4]]) as i64 }");
         assert_jit_eq_interp("fn main()->i64{ len([1.0f32,2.0f32,3.0f32,4.0f32]) as i64 }"); // 1-D unchanged
+    }
+
+    /// #754 review of #751: `len` of a tuple is its (static) arity, matching
+    /// `dmc run`'s `Value::Tuple(vs) => vs.len()` — no runtime call needed,
+    /// unlike the tensor/str/Map cases above. This used to fall through to
+    /// the generic non-tensor/str/Map refusal and reject a program `dmc run`
+    /// answers correctly (3/3).
+    #[test]
+    fn jit_len_of_tuple_is_arity() {
+        assert_jit_eq_interp("fn main()->i64{ len((1,2,3)) }");
+        assert_jit_eq_interp("fn main()->i64{ len((1,2)) }");
+        assert_jit_eq_interp("fn main()->i64{ let t=(1,2,3,4,5)  len(t) }");
+    }
+
+    /// #754 review of #751: a `list`/`range`-typed *signature* annotation is
+    /// the same untyped escape hatch `map` gets (SPEC has no static `list`
+    /// or `range` type) — `ty_from_ast`'s fallback for an unrecognized name
+    /// resolves it to `TyKind::Model(name, _)`. `len` on such a value must
+    /// refuse as a JIT representation gap (`jit-type-form`), not the
+    /// `jit-conversion` "the checker accepts this" wording real type errors
+    /// get below it — `dmc run` genuinely computes a correct answer for
+    /// both (interp.rs's `Value::List`/`Value::Range` arms), so this is not
+    /// a bug in the caller's program.
+    #[test]
+    fn jit_len_of_list_or_range_typed_param_is_a_type_form_gap() {
+        for (src, want_name) in [
+            ("fn f(x: list) -> i64 { len(x) }\nfn main() -> i64 { f(0) }", "list"),
+            ("fn f(x: range) -> i64 { len(x) }\nfn main() -> i64 { f(0) }", "range"),
+        ] {
+            let e = jit_compile_jiterr(src);
+            assert_eq!(e.refusal, Some(Refusal::TypeForm), "for:\n{}\ngot: {:?}", src, e);
+            assert!(e.msg.contains(&format!("`{}`-typed", want_name)), "for:\n{}\ngot: {}", src, e.msg);
+            assert!(!e.msg.contains("the checker accepts this"),
+                "must not claim the checker accepts an ill-typed program: {}", e.msg);
+        }
+    }
+
+    /// The name-based `list`/`range` gap detection above must not misfire on
+    /// a genuinely user-declared model that happens to be named `list` —
+    /// `len` on a real model instance is a real type error (`dmc run` rejects
+    /// it too), same bucket as `len(true)`, not the representation gap above.
+    #[test]
+    fn jit_len_of_a_model_literally_named_list_is_a_real_type_error() {
+        let e = jit_compile_jiterr(
+            "model list { n: i64 }\nfn main() -> i64 { let x = list { n: 3 }  len(x) }");
+        assert_eq!(e.refusal, Some(Refusal::Conversion));
+        assert!(e.msg.contains("the checker accepts this (see #758)"), "got: {}", e.msg);
     }
 
     #[test]
@@ -29814,6 +40965,90 @@ fn main() -> i64 {
 }
 "#;
         assert_eq!(jit_run_i64(src).unwrap(), 99);
+    }
+
+    // ─── #695: `map`-typed signatures, the `map()` alias, and an omitted
+    // fn return type feeding `map_get` ────────────────────────────────────────
+
+    #[test]
+    fn jit_map_lowercase_type_annotation_param_parity() {
+        // examples/demonic_lexer.dmc:128 / lispy_vm.dmc:28 shape: a parameter
+        // written `t: map` (lowercase — the spelling `dmc --check`/`dmc run`
+        // actually accept; `types.rs` parses only lowercase `"map"` into
+        // `TyType::Map`). Before #695 `ty_from_ast` recognized only `Map`
+        // (capitalized, which no `--check`-admitted program spells), so this
+        // fell into the generic `Named` arm as `TyKind::Model("map", [])` and
+        // `map_get`'s `is_map()` check failed with "must be a Map, got `map`".
+        // The value is a plain i64 (not str) deliberately: `map_set`'s value
+        // argument is unconditionally coerced to i64 today (a separate,
+        // pre-existing gap in the Map value representation, not what #695
+        // is about), so a str value here would fail for an unrelated reason
+        // and obscure what this test checks — the `map`-typed parameter.
+        assert_jit_eq_interp(r#"
+            fn get_k(t: map) -> i64 { map_get(t, "k") }
+            fn main() -> i64 {
+                let !m = map_new()
+                map_set(m, "k", 42)
+                get_k(m)
+            }
+        "#);
+    }
+
+    #[test]
+    fn jit_map_lowercase_type_annotation_return_parity() {
+        // The same spelling in return-type position (`-> map`).
+        assert_jit_eq_interp(r#"
+            fn make(v: i64) -> map {
+                let !m = map_new()
+                map_set(m, "v", v)
+                m
+            }
+            fn main() -> i64 { map_get(make(99), "v") }
+        "#);
+    }
+
+    #[test]
+    fn jit_map_bare_constructor_alias_parity() {
+        // SPEC.md's Map-type paragraph: `map_new()` (alias: `map()`). #695
+        // found `map` absent from the JIT's builtin dispatch — only
+        // `map_new` was recognized — so any program using the `map()`
+        // spelling refused as `jit-unknown-fn` before it ever reached
+        // `map_get` (examples/package_manifest.dmc's `dependency`/`main`).
+        assert_jit_eq_interp(r#"
+            fn main() -> i64 {
+                let !m = map()
+                map_set(m, "k", 7)
+                map_get(m, "k")
+            }
+        "#);
+    }
+
+    #[test]
+    fn jit_omitted_return_type_let_bound_call_is_refused_as_signature() {
+        // examples/package_manifest.dmc:35 shape: `dependency` has no `-> T`,
+        // so the JIT's signature builder assumes it returns nothing
+        // (`declare_fn`'s `None => TyKind::Scalar(ScalarKind::Nil)`) — right
+        // for a call made only for effect, wrong the moment a caller keeps
+        // the result. Before #695 `let dep = dependency(..)` silently bound
+        // `dep` to a bare `nil`, and the mistype surfaced three lines away as
+        // an uncoded `jit error: map_get arg 1 must be a Map, got nil` — #480's
+        // exact defect class, a refusal with no code. It must now be a located,
+        // classified `jit-signature` refusal at the `let`, naming the callee,
+        // not a message about `map_get` at all.
+        let e = jit_compile_jiterr(
+            "fn dependency(v: i64) {\n\
+             \x20   let !m = map()\n\
+             \x20   map_set(m, \"v\", v)\n\
+             \x20   m\n\
+             }\n\
+             fn main() -> i64 {\n\
+             \x20   let dep = dependency(7)\n\
+             \x20   map_get(dep, \"v\")\n\
+             }");
+        assert_eq!(e.kind, JitErrorKind::Unsupported, "{}", e);
+        assert_eq!(e.refusal, Some(Refusal::Signature), "{}", e);
+        assert!(e.msg.contains("dependency") && e.msg.contains("no declared return type"),
+            "message should name the fn and the gap: {}", e);
     }
 
     // ─── slice-assign (issue #165) ───────────────────────────────────────────
@@ -30436,6 +41671,937 @@ fn main() -> i64 {
 "#;
         assert_jit_eq_interp(src);
         assert_eq!(jit_run_i64(src).unwrap(), 20120); // loss 20, w unmoved (1, 2)
+    }
+
+    // ── `!` mutating parameters outside `@grad fn` ──────────────────────────
+    //
+    // The convention was already whole; only the door was shut. A `!` tensor
+    // parameter has been copy-in/copy-out since #249 and copy-out-on-rebind
+    // since #553, and both were live on the template path — but a
+    // non-shape-generic `fn bump(!b: Box)` was refused at `declare_fn` with
+    // `jit-signature`. That is the plainest spelling of how a program written
+    // in a language with no free-standing methods mutates a structure: free
+    // functions taking it by reference. These pin the representations the
+    // convention covers, the interpreter semantics each has to match, and the
+    // refusal that guards the rest.
+
+    #[test]
+    fn jit_mut_tensor_param_on_a_plain_fn_writes_back() {
+        // The repro: identical body to the template form that always worked,
+        // minus the `[N]`. Refused as `jit-signature` before this change.
+        let src = r#"
+fn fill(!t: Tensor[i64, [4]], v: i64) -> i64 {
+    t[0] = v
+    t[3] = v * 2
+    v
+}
+fn main() -> i64 {
+    let !t = forge.zeros[i64, [4]]
+    let r = fill(t, 6)
+    r * 1000 + t[0] * 100 + t[3]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 6612); // returned 6, t[0] 6, t[3] 12
+    }
+
+    #[test]
+    fn jit_mut_tensor_param_on_a_plain_fn_writes_back_after_a_rebind() {
+        // #553's copy-out has to fire on this path too: the callee rebinds the
+        // parameter to a fresh buffer, so the buffer the caller copies back is
+        // no longer the one it passed in unless the callee copies first.
+        let src = r#"
+fn scale(!t: Tensor[f32, [3]]) -> f32 {
+    t = t .* 2.0
+    t[0]
+}
+fn main() -> i64 {
+    let !x = forge.zeros[f32, [3]]
+    x[0] = 1.0
+    let d = scale(x)
+    (d + x[0] * 100.0) as i64
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 202); // callee saw 2, caller 2
+    }
+
+    #[test]
+    fn jit_mut_model_param_mutates_the_callers_instance() {
+        // The corpus's shape: a free function taking the model by reference and
+        // writing its tensor fields. No copy is emitted — a model value is the
+        // pointer to its field struct — so the caller sees the writes directly,
+        // which is what `Value::Struct`'s shared `Rc<RefCell<..>>` does in the
+        // interpreter.
+        let src = r#"
+model Graph { !kind: Tensor[i64, [4]], !parent: Tensor[i64, [4]] }
+fn alloc_node(!g: Graph, id: i64, k: i64, parent: i64) -> i64 {
+    g.kind[id] = k
+    g.parent[id] = parent
+    id
+}
+fn main() -> i64 {
+    let !g = Graph { kind: forge.zeros[i64, [4]], parent: forge.zeros[i64, [4]] }
+    let a = alloc_node(g, 1, 7, 0)
+    let b = alloc_node(g, 2, 9, a)
+    b * 100000 + g.kind[1] * 1000 + g.kind[2] * 10 + g.parent[2]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 207091); // b=2, kind 7 and 9, parent 1
+    }
+
+    #[test]
+    fn jit_mut_model_param_aliases_rather_than_copies() {
+        // The corner where model and tensor part company. A `!` TENSOR param is
+        // isolated at the call — `f(t, t)` cannot leak the mutation into the
+        // by-value second argument (#249) — but a `!` MODEL param is the same
+        // instance under both names, during the call and after it. Both
+        // backends agree because neither copies a model.
+        let src = r#"
+model Cell { !n: Tensor[i64, [1]] }
+fn poke(!a: Cell, b: Cell) -> i64 {
+    a.n[0] = 5
+    b.n[0]
+}
+fn main() -> i64 {
+    let !c = Cell { n: forge.zeros[i64, [1]] }
+    let seen = poke(c, c)
+    seen * 10 + c.n[0]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 55); // `b` saw the write; so does the caller
+    }
+
+    #[test]
+    fn jit_mut_model_param_on_a_parameterized_model() {
+        // SPEC §3.10 / #474: a `Box[N]` argument binds the parameter's shape
+        // names, and the field it reaches through is re-resolved against those
+        // args at access time. That has to survive the by-reference pass.
+        let src = r#"
+model Box[N] { !vals: Tensor[i64, [N]] }
+fn fill(!b: Box[3], v: i64) -> i64 {
+    b.vals[0] = v
+    b.vals[2] = v * 3
+    v
+}
+fn main() -> i64 {
+    let !b = Box[3] { vals: forge.zeros[i64, [3]] }
+    let r = fill(b, 4)
+    r * 1000 + b.vals[0] * 100 + b.vals[2]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 4412); // 4, vals[0] 4, vals[2] 12
+    }
+
+    #[test]
+    fn jit_mut_tensor_param_passed_on_to_another_mut_param() {
+        // Two frames of copy-in/copy-out. The inner call copies out of the
+        // middle frame's parameter buffer, the middle frame's return copies
+        // that into the buffer it came in on, and the outer call copies THAT
+        // into `main`'s tensor. Any one of the three missing loses the write.
+        let src = r#"
+fn inner(!t: Tensor[i64, [3]], v: i64) -> i64 { t[1] = v  t[1] }
+fn outer(!t: Tensor[i64, [3]], v: i64) -> i64 {
+    t[0] = v * 2
+    inner(t, v)
+}
+fn main() -> i64 {
+    let !t = forge.zeros[i64, [3]]
+    let r = outer(t, 3)
+    r * 1000 + t[0] * 10 + t[1]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 3063); // inner returned 3, t = [6, 3, 0]
+    }
+
+    #[test]
+    fn jit_mut_tensor_param_forwarded_from_a_mut_model_param() {
+        // The two representations composed: a `!` model param whose tensor
+        // field is taken inside the callee as a `let !` alias — SPEC §3.4's one
+        // bind that does not snapshot. By-reference passing has to leave that
+        // alias live, so writes through it reach the CALLER's instance two
+        // frames up.
+        let src = r#"
+model Graph { !heat: Tensor[i64, [3]] }
+fn touch(!g: Graph, by: i64) -> i64 {
+    let !h = g.heat
+    h[0] = h[0] + by
+    h[0]
+}
+fn main() -> i64 {
+    let !g = Graph { heat: forge.zeros[i64, [3]] }
+    let a = touch(g, 4)
+    let b = touch(g, 5)
+    b * 1000 + a * 100 + g.heat[0]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 9409); // 4 then 9, field ends at 9
+    }
+
+    #[test]
+    fn a_mut_tensor_arg_that_is_not_an_identifier_still_diverges() {
+        // A PRE-EXISTING interpreter gap this work surfaced but does not touch,
+        // pinned so it cannot be rediscovered a third time. `interp.rs`'s
+        // `apply_writebacks` only writes back when the argument is a bare
+        // `Expr::Ident`, so a `!` tensor argument written as a model-field read
+        // silently loses the callee's writes. The JIT's writeback targets the
+        // POINTER it passed, so it lands wherever the argument came from — and
+        // SPEC §3.4 (a tensor model field is a live alias) says the JIT's
+        // answer is the conformant one.
+        //
+        // Reachable on `origin/main` through the template path, before `!`
+        // parameters were lowered on plain functions: `dmc run` 400,
+        // `dmc jit` 404 for the shape-generic spelling of this program. Fixing
+        // it is an `interp.rs` change, not a JIT one.
+        let src = r#"
+model Graph { !heat: Tensor[i64, [3]] }
+fn bump(!t: Tensor[i64, [3]], by: i64) -> i64 { t[0] = t[0] + by  t[0] }
+fn main() -> i64 {
+    let !g = Graph { heat: forge.zeros[i64, [3]] }
+    let a = bump(g.heat, 4)
+    a * 100 + g.heat[0]
+}
+"#;
+        assert_eq!(jit_run_i64(src).unwrap(), 404, "the JIT writes back through the pointer");
+        assert_eq!(interp_run_i64(src).unwrap(), 400, "the interpreter drops a non-ident writeback");
+    }
+
+    #[test]
+    fn jit_mut_model_param_passed_on_to_another_mut_model_param() {
+        // Nesting on the pointer path. Nothing is copied at either hop, so the
+        // innermost write is already the caller's.
+        let src = r#"
+model Cell { !n: Tensor[i64, [1]] }
+fn inner(!c: Cell, v: i64) -> i64 { c.n[0] = c.n[0] + v  c.n[0] }
+fn outer(!c: Cell, v: i64) -> i64 { inner(c, v) + inner(c, v) }
+fn main() -> i64 {
+    let !c = Cell { n: forge.zeros[i64, [1]] }
+    let r = outer(c, 3)
+    r * 100 + c.n[0]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 906); // 3 + 6 = 9, cell ends at 6
+    }
+
+    // ─── #667: model-field tensor element types share the ONE table ─────────
+    //
+    // A model FIELD of `Tensor[T, …]` used to be lowered by a hand-rolled copy
+    // of the element-kind table inside `lower_ty_for_model`, separate from
+    // `tensor_elem_kind` (the table a LOCAL tensor and a `forge.*` constructor
+    // both read). The two had drifted: the field-path copy still mapped
+    // `u64` to `ScalarKind::I64`, so a struct literal holding
+    // `forge.zeros[u64, …]` refused to convert into its own field's declared
+    // type ("cannot convert Tensor[u64,[2]] to Tensor[i64,[2]]") even though
+    // the identical tensor as a local lowered and ran fine. The fix routes
+    // the model-field path through `tensor_elem_kind` too, so there is one
+    // table for all three call sites (local, constructor-by-name, model
+    // field), asserted equal by `elem_kind_tables_agree`.
+    //
+    // Each test below drives the full field lifecycle — construct the model,
+    // read the field, element-assign it, and pass the model by `!` reference
+    // into a callee that mutates the field through the pointer — for every
+    // narrow element width the model-field path hand-rolled a case for
+    // (`u64`, `u32`, `u8`, `bool`), pinning a value only a CORRECT lane
+    // produces, and diffing against the interpreter.
+
+    #[test]
+    fn jit_model_field_tensor_u64_constructed_read_assigned_and_mut_param() {
+        // The issue's own defect: a `Tensor[u64, …]` model field. The pinned
+        // value only comes out right if the field's storage lane is unsigned
+        // — `u64::MAX / 2u64` is `i64::MAX` (9223372036854775807); read as a
+        // signed `i64` lane instead, the same bit pattern is -1, and -1 / 2
+        // truncates to 0 on both backends.
+        let src = r#"
+model Ring { !d: Tensor[u64, [2]] }
+fn bump(!r: Ring, v: u64) -> u64 {
+    r.d[0] = v
+    r.d[0] / 2u64
+}
+fn main() -> i64 {
+    let !r = Ring { d: forge.zeros[u64, [2]] }
+    let half = bump(r, 18446744073709551615u64)
+    (half as i64) + (r.d[0] as i64)
+}
+"#;
+        assert_jit_eq_interp(src);
+        // half = u64::MAX / 2 = i64::MAX = 9223372036854775807;
+        // r.d[0] is still u64::MAX, which reads back as i64 == -1.
+        assert_eq!(jit_run_i64(src).unwrap(), 9223372036854775806);
+    }
+
+    #[test]
+    fn jit_model_field_tensor_u32_constructed_read_assigned_and_mut_param() {
+        // `u32` already routed correctly before #667 (only `u64` had drifted),
+        // but the field path had its own copy of this row too — pin it so a
+        // future edit to only one of the two remaining tables is caught here,
+        // not just in `elem_kind_tables_agree`.
+        let src = r#"
+model Box32 { !v: Tensor[u32, [2]] }
+fn bump(!b: Box32, x: u32) -> u32 {
+    b.v[0] = x
+    b.v[0]
+}
+fn main() -> i64 {
+    let !b = Box32 { v: forge.zeros[u32, [2]] }
+    let got = bump(b, 4294967295u32)
+    (got as i64) + (b.v[0] as i64)
+}
+"#;
+        assert_jit_eq_interp(src);
+        // u32::MAX zero-extends to 4294967295 as i64; read twice (return +
+        // field) sums to 8589934590.
+        assert_eq!(jit_run_i64(src).unwrap(), 8589934590);
+    }
+
+    #[test]
+    fn jit_model_field_tensor_u8_constructed_read_assigned_and_mut_param() {
+        let src = r#"
+model Box8 { !v: Tensor[u8, [2]] }
+fn bump(!b: Box8, x: u8) -> u8 {
+    b.v[0] = x
+    b.v[0]
+}
+fn main() -> i64 {
+    let !b = Box8 { v: forge.zeros[u8, [2]] }
+    let got = bump(b, 255u8)
+    (got as i64) + (b.v[0] as i64)
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 510); // 255 read back twice
+    }
+
+    #[test]
+    fn jit_model_field_tensor_bool_constructed_read_assigned_and_mut_param() {
+        let src = r#"
+model Flags { !v: Tensor[bool, [2]] }
+fn bump(!f: Flags, x: bool) -> bool {
+    f.v[0] = x
+    f.v[0]
+}
+fn main() -> i64 {
+    let !f = Flags { v: forge.zeros[bool, [2]] }
+    let got = bump(f, true)
+    (got as i64) + (f.v[0] as i64)
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 2); // true read back twice
+    }
+
+    #[test]
+    fn jit_mut_param_let_bang_copy_inside_the_callee_stays_a_copy() {
+        // SPEC §3.4: `let !y = x` on a plain local is a VALUE COPY on both
+        // backends, and taking the parameter by reference must not turn it into
+        // an alias. Writes through `y` stay inside the callee.
+        let src = r#"
+fn touch(!t: Tensor[i64, [2]]) -> i64 {
+    let !y = t
+    y[0] = 99
+    t[0] = 1
+    y[0]
+}
+fn main() -> i64 {
+    let !t = forge.zeros[i64, [2]]
+    let seen = touch(t)
+    seen * 10 + t[0]
+}
+"#;
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 991); // y kept 99; the caller sees only 1
+    }
+
+    #[test]
+    fn jit_mut_scalar_param_is_refused_outside_grad() {
+        // The one that must NOT be lowered. The interpreter writes a `!` scalar
+        // parameter's final value back into the caller's binding
+        // (`apply_writebacks`); the JIT passes scalars by value and has no
+        // out-parameter to put the result in. Lowering it anyway is a silent
+        // wrong answer — the call returns the right number and the caller's
+        // binding never moves — so this is a refusal until out-params exist.
+        let e = jit_compile_jiterr(
+            "fn bump(!a: i64) -> i64 { a = a + 1  a }\n\
+             fn main() -> i64 { let !a = 10  let r = bump(a)  r * 100 + a }");
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::Signature));
+        assert!(e.msg.contains("`!` parameter of this type"), "{}", e);
+    }
+
+    #[test]
+    fn jit_mut_scalar_param_is_refused_on_the_template_path_too() {
+        // Same rule, other declaration site. Before this change the template
+        // path had no check at all: this program compiled, ran, and printed
+        // 1110 under `dmc jit` against 1111 under `dmc run`.
+        let e = jit_compile_jiterr(
+            "fn bump[N](!a: i64, t: Tensor[i64, [N]]) -> i64 { a = a + 1  a }\n\
+             fn main() -> i64 {\n\
+             let !t = forge.zeros[i64, [2]]\n\
+             let !a = 10\n\
+             let r = bump[2](a, t)\n\
+             r * 100 + a }");
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::Signature));
+        assert!(e.msg.contains("`!` parameter of this type"), "{}", e);
+    }
+
+    #[test]
+    fn jit_mut_str_param_is_refused_outside_grad() {
+        // `str` is the other representation with no copy-out: a `!` str
+        // parameter would rebind a forge pointer the caller never learns about.
+        let e = jit_compile_jiterr(
+            "fn tag(!s: str) -> i64 { s = \"b\"  len(s) }\n\
+             fn main() -> i64 { let !s = \"a\"  tag(s) }");
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::Signature));
+    }
+
+    #[test]
+    fn jit_grad_still_refuses_a_non_tensor_mut_param() {
+        // Opening the outside-`@grad` door must not open the `@grad` one: a
+        // scalar `!` param there is a gradient target the backward pass has no
+        // rule for, and keeps its own `jit-grad` class.
+        let e = jit_compile_jiterr(
+            "@grad fn f(!a: f32) -> f32 { a * a }\n\
+             fn main() -> i64 { f(2.0f32) as i64 }");
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::Grad));
+    }
+
+    // ── the two forms the convention does NOT reach (#650) ───────────────────
+    //
+    // Both are refusals, and both are PINS rather than agreements: the
+    // conformant answer is `dmc run`'s, and each test records it next to the
+    // refusal so the day #650 is ruled on there is a number to implement
+    // against. Neither is reachable through the direct call this PR lowers.
+
+    #[test]
+    fn jit_mut_param_fn_is_refused_as_a_first_class_value() {
+        // The type is the whole problem: `TyKind::Fn` is built from the
+        // parameter types, and `fn(T, T) -> R` carries no `!`. An indirect call
+        // has only that to work from, so it cannot copy the argument in and
+        // back out — `f(t, t)` through the value aliases where the direct call
+        // isolates (#249). Unguarded, `dmc run` says 5 and `dmc jit` says 55,
+        // with no diagnostic on either side.
+        let src = "fn poke(!a: Tensor[i64, [2]], b: Tensor[i64, [2]]) -> i64 { a[0] = 5  b[0] }\n\
+                   fn main() -> i64 {\n\
+                   let !t = forge.zeros[i64, [2]]\n\
+                   let f: fn(Tensor[i64, [2]], Tensor[i64, [2]]) -> i64 = poke\n\
+                   let seen = f(t, t)\n\
+                   seen * 10 + t[0] }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::IndirectCall));
+        assert!(e.msg.contains("first-class value"), "{}", e);
+        // The conformant answer, pinned: the by-value `b` never saw the write,
+        // the caller does. `main` refused this program before `!` parameters
+        // lowered at all.
+        assert_eq!(interp_run_i64(src).unwrap(), 5);
+    }
+
+    #[test]
+    fn jit_mut_param_fn_is_refused_without_a_type_annotation_too() {
+        // The refusal is at the point the VALUE is made, not at the call, so it
+        // does not depend on the annotation that named the `fn(..)` type — and
+        // it also covers handing the function to a higher-order parameter,
+        // where the enclosing function has no call site to inspect.
+        let e = jit_compile_jiterr(
+            "fn poke(!a: Tensor[i64, [2]]) -> i64 { a[0] = 5  0 }\n\
+             fn main() -> i64 { let f = poke  let !t = forge.zeros[i64, [2]]  f(t) }");
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::IndirectCall));
+    }
+
+    #[test]
+    fn a_fn_without_mut_params_is_still_a_first_class_value() {
+        // The guard is exactly as wide as the `!`: the trampoline path is
+        // untouched for every other function.
+        let src = "fn twice(a: i64) -> i64 { a * 2 }\n\
+                   fn main() -> i64 { let f: fn(i64) -> i64 = twice  f(21) }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 42);
+    }
+
+    #[test]
+    fn jit_mut_model_param_rebind_is_refused() {
+        // A `!` model parameter is the caller's POINTER, passed by value. The
+        // callee can write through it — that is the whole convention — but it
+        // cannot hand a different pointer back, because the signature has no
+        // slot for one. `dmc run` rebinds the CALLER's binding here
+        // (`apply_writebacks` on a bare-identifier argument) and answers 99;
+        // an unguarded JIT moves only the callee's own name and answers 90.
+        let src = "model C { !n: Tensor[i64, [1]] }\n\
+                   fn replace(!c: C) -> i64 {\n\
+                   c = C { n: forge.zeros[i64, [1]] }\n\
+                   c.n[0] = 9\n\
+                   c.n[0] }\n\
+                   fn main() -> i64 {\n\
+                   let !c = C { n: forge.zeros[i64, [1]] }\n\
+                   let r = replace(c)\n\
+                   r * 10 + c.n[0] }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::AssignForm));
+        assert!(e.msg.contains("rebinding the `!` parameter"), "{}", e);
+        assert_eq!(interp_run_i64(src).unwrap(), 99, "the conformant answer, pending #650");
+    }
+
+    #[test]
+    fn jit_scalar_field_store_lowers_on_a_local_and_via_a_mut_param() {
+        // #635: a whole-field SCALAR store
+        // `m.f = v` now lowers a slot store instead of falling into the
+        // catch-all `jit-assign-form`. q2 (a local) and q3 (through a `!`
+        // model parameter, visible to the caller) from the design's probe
+        // set — both are also `MUST_LOWER` entries in `tools/jit_probes.py`
+        // (`field_store_scalar_local`, `field_store_scalar_via_mut_param`).
+        assert_jit_eq_interp(
+            "model B { !n: i64 }\n\
+             fn main() -> i64 { let !b = B { n: 1 }\n b.n = 7\n b.n }");
+        assert_eq!(jit_run_i64(
+            "model B { !n: i64 }\n\
+             fn main() -> i64 { let !b = B { n: 1 }\n b.n = 7\n b.n }").unwrap(), 7);
+
+        let src = "model C { !n: i64 }\n\
+                   fn bump(!c: C) -> i64 { c.n = c.n + 1  c.n }\n\
+                   fn main() -> i64 { let !c = C { n: 0 }\n bump(c)\n c.n }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 1);
+    }
+
+    #[test]
+    fn jit_tensor_field_store_is_refused_naming_the_field() {
+        // Slice 0 lowers a SCALAR whole-field store only — a tensor-typed
+        // field's rebind is left refused because its aliasing semantics are
+        // not yet ruled on (#650). The refusal
+        // CLASS alone would already pass on the pre-slice catch-all
+        // ("assignment to non-identifier targets"); what this pins is that
+        // the message now names the field the store targeted.
+        let src = "model M { !t: Tensor[i64, [3]] }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M { t: forge.zeros[i64, [3]] }\n\
+                   let !o = forge.zeros[i64, [3]]\n\
+                   o[0] = 9\n\
+                   m.t = o\n\
+                   m.t[0] }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::AssignForm));
+        assert!(e.msg.contains("field `t`"), "{}", e);
+        assert_eq!(interp_run_i64(src).unwrap(), 9, "dmc run accepts the rebind and answers 9");
+    }
+
+    #[test]
+    fn jit_nested_model_field_store_is_refused_naming_the_field() {
+        // q12 (the nested-model field-read's shape resolve rule): `o.surf = Inner[..]{..}` on an
+        // `Outer[2,2]` — SPEC §3.10 does not shape-check a model-field
+        // assignment (#474), so `--check` accepts it and `dmc run` answers 7
+        // at `[8,8]`. The JIT's field READ re-resolves `surf`'s shape from
+        // the OUTER's `type_args` (see the read at `lower_postfix`'s `Field`
+        // arm), so lowering this store would make a later read misinterpret
+        // the stored buffer at the wrong stride — held for #474's shape
+        // check, per slice 0's ruling, not for lack of a mechanism.
+        let src = "model Inner[H, W] { !px: Tensor[i64, [H, W]] }\n\
+                   model Outer[H, W] { !surf: Inner[H, W] }\n\
+                   fn main() -> i64 {\n\
+                   let !o = Outer[2, 2] { surf: Inner[2, 2] { px: forge.zeros[i64, [2, 2]] } }\n\
+                   o.surf = Inner[9, 9] { px: forge.zeros[i64, [9, 9]] }\n\
+                   let !s = o.surf\n\
+                   s.px[8, 8] = 7\n\
+                   o.surf.px[8, 8] }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::AssignForm));
+        assert!(e.msg.contains("field `surf`"), "{}", e);
+        assert_eq!(interp_run_i64(src).unwrap(), 7, "dmc run answers 7 at [8,8], per q12");
+    }
+
+    #[test]
+    fn jit_colon_eq_field_target_is_refused() {
+        // #635 rework, D1: `:=` is a shadow-rebind, not a write-through — the
+        // interpreter's assign-stmt match handles `ColonEq` only for
+        // `Expr::Ident` (a fresh binding shadowing the old one in the current
+        // scope); a `Postfix{Field}` target with `ColonEq` falls to the
+        // interpreter's `_ =>` no-op arm, so `dmc run` leaves the field
+        // untouched. Before this guard the JIT admitted `ColonEq` alongside
+        // `Eq` in the field-store arm and performed the store anyway — a
+        // genuine divergence this pins shut. The general non-identifier
+        // `:=` case (`t[0] := 7`) is the pre-existing, separately filed #685;
+        // this is the field-target instance of the same rule.
+        let src = "model M { !n: i64 }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M { n: 1 }\n\
+                   m.n := 7\n\
+                   m.n }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::AssignForm));
+        assert!(e.msg.contains(":="), "{}", e);
+        assert_eq!(
+            interp_run_i64(src).unwrap(),
+            1,
+            "dmc run: `:=` on a field target is a no-op, per #685's class"
+        );
+    }
+
+    #[test]
+    fn jit_type_arg_less_generic_receiver_field_store_is_refused() {
+        // #635 rework, D2: a shape-generic model reached through a
+        // type-arg-less binding (`fn poke(!m: M)` for `model M[N]`) keeps the
+        // param-agnostic layout — the `if !type_args.is_empty()` re-resolution
+        // above never runs, so a param-shaped field (`t: Tensor[i64,[N]]`) is
+        // still typed opaque `Scalar(I64)` here, indistinguishable from a
+        // genuinely scalar field. Without this guard the store lowered a raw
+        // pointer write that happened to answer the same as `dmc run` here (9)
+        // — "by luck", not by construction — and a subsequent read inside the
+        // same callee hit an uncoded `jit error` ("indexing requires a tensor
+        // or str, got `i64`") rather than a located refusal. The guard is on
+        // the RECEIVER (its shape args are unknown here), not on the field's
+        // kind — slice 2's per-instantiation receiver is what removes it.
+        let src = "model M[N] {\n\
+                   !t: Tensor[i64, [N]]\n\
+                   }\n\
+                   fn poke(!m: M) -> nil {\n\
+                   let !o = forge.zeros[i64, [4]]\n\
+                   o[0] = 9\n\
+                   m.t = o\n\
+                   nil }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M[4] { t: forge.zeros[i64, [4]] }\n\
+                   poke(m)\n\
+                   m.t[0] }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::AssignForm));
+        assert!(
+            e.msg.contains("shape arguments are not known here"),
+            "{}",
+            e
+        );
+        assert_eq!(
+            interp_run_i64(src).unwrap(),
+            9,
+            "dmc run accepts the rebind and answers 9"
+        );
+    }
+
+    #[test]
+    fn jit_type_arg_less_generic_receiver_field_read_is_refused() {
+        // #706, the READ-side twin of #683's store guard just above. A
+        // shape-generic model reached through a type-arg-less parameter
+        // (`fn first(m: M)` for `model M[N]`) keeps the param-agnostic
+        // layout, where a param-shaped field (`t: Tensor[i64,[N]]`) is typed
+        // opaque `Scalar(I64)` because the `if !type_args.is_empty()`
+        // re-resolution above never runs. Before this guard the read fell
+        // into the default load arm, handed back an `i64` for what is
+        // really a tensor pointer, and `m.t[0]` then hit an uncoded `jit
+        // error: indexing requires a tensor or str, got i64` (#480 class)
+        // instead of a located refusal — this is the exact program from the
+        // issue.
+        let src = "model M[N] {\n\
+                   t: Tensor[i64, [N]]\n\
+                   }\n\
+                   fn first(m: M) -> i64 {\n\
+                   m.t[0]\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M[4]{ t: forge.zeros[i64,[4]] }\n\
+                   m.t[0] = 7\n\
+                   first(m)\n\
+                   }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::TypeForm));
+        assert!(
+            e.msg.contains("field `t` of `M`") && e.msg.contains("shape arguments are not known here"),
+            "{}",
+            e
+        );
+        assert_eq!(
+            interp_run_i64(src).unwrap(),
+            7,
+            "dmc run answers 7, per the issue"
+        );
+    }
+
+    #[test]
+    fn jit_type_arg_less_generic_receiver_view_field_read_is_refused() {
+        // #706: `View` carries a `ShapeSpec` exactly the way `Tensor` does
+        // (and so does `KV`), so a param-shaped `View[i64,[N]]` field must be
+        // refused through this same type-arg-less receiver for the identical
+        // reason a `Tensor[i64,[N]]` field is — before this fix,
+        // `field_ty_mentions_params`'s `_ => false` fallthrough let a `View`
+        // field's opaque-scalar mistype straight through to the same uncoded
+        // `jit error: indexing requires a tensor or str, got i64` the issue
+        // reported for `Tensor`.
+        let src = "model M[N] {\n\
+                   v: View[i64, [N]]\n\
+                   }\n\
+                   fn first(m: M) -> i64 {\n\
+                   m.v[0]\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !t = forge.zeros[i64, [4]]\n\
+                   let !m = M[4]{ v: t }\n\
+                   m.v[0] = 7\n\
+                   first(m)\n\
+                   }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::TypeForm));
+        assert!(
+            e.msg.contains("field `v` of `M`") && e.msg.contains("shape arguments are not known here"),
+            "{}",
+            e
+        );
+        assert_eq!(
+            interp_run_i64(src).unwrap(),
+            7,
+            "dmc run answers 7"
+        );
+    }
+
+    #[test]
+    fn jit_type_arg_less_generic_receiver_scalar_field_read_still_lowers() {
+        // #706: the guard is on the field's declared TYPE reaching for the
+        // receiver's own shape params, not on the receiver being
+        // type-arg-less at all — a genuinely scalar field through the same
+        // type-arg-less path resolved correctly with the empty env already
+        // (it has no dimension to fail to resolve) and must keep lowering.
+        let src = "model M[N] {\n\
+                   n: i64\n\
+                   }\n\
+                   fn get(m: M) -> i64 {\n\
+                   m.n\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let m = M[4]{ n: 5 }\n\
+                   get(m)\n\
+                   }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 5);
+    }
+
+    #[test]
+    fn jit_type_arg_present_generic_receiver_tensor_field_read_lowers() {
+        // #706: confirms the guard is scoped to a type-ARG-LESS receiver —
+        // when the parameter itself carries concrete type args (`m: M[4]`),
+        // the `if !type_args.is_empty()` re-resolution above already runs
+        // and types the field correctly, so this must keep lowering and
+        // agreeing with `dmc run` exactly as it did before this change.
+        let src = "model M[N] {\n\
+                   t: Tensor[i64, [N]]\n\
+                   }\n\
+                   fn first(m: M[4]) -> i64 {\n\
+                   m.t[0]\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M[4]{ t: forge.zeros[i64,[4]] }\n\
+                   m.t[0] = 7\n\
+                   first(m)\n\
+                   }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 7);
+    }
+
+    #[test]
+    fn jit_non_generic_model_tensor_field_read_lowers() {
+        // #706: the guard keys off `model_shape_params` being non-empty for
+        // the receiver's model — a non-generic model maps to an empty shape-
+        // param vec (`Item::Model`'s `m.shape_params` is empty), so this
+        // must be unaffected regardless of the field's own shape.
+        let src = "model M {\n\
+                   t: Tensor[i64, [4]]\n\
+                   }\n\
+                   fn first(m: M) -> i64 {\n\
+                   m.t[0]\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M{ t: forge.zeros[i64,[4]] }\n\
+                   m.t[0] = 7\n\
+                   first(m)\n\
+                   }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 7);
+    }
+
+    #[test]
+    fn jit_non_generic_model_nested_in_generic_field_read_lowers() {
+        // #706: a nested model field whose OWN type carries no type args
+        // (`o: Other` where `Other` is non-generic) resolves identically
+        // whether or not the outer model's shape params are bound — the
+        // field's declared type mentions none of them — so it must not be
+        // caught by the same-shaped guard that catches `attn: Attn[N]`.
+        let src = "model Other {\n\
+                   v: i64\n\
+                   }\n\
+                   model M[N] {\n\
+                   o: Other\n\
+                   }\n\
+                   fn first(m: M) -> i64 {\n\
+                   m.o.v\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M[4]{ o: Other{ v: 9 } }\n\
+                   first(m)\n\
+                   }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 9);
+    }
+
+    #[test]
+    fn jit_type_arg_less_generic_receiver_nested_generic_field_read_is_refused() {
+        // #706: a nested model field whose OWN type args reach for the
+        // outer model's shape params (`a: Attn[N]` inside `model M[N]`)
+        // resolves against the empty env to `Model("Attn", [])` —
+        // `type_named_dims`'s `env.get(name)` miss for the unbound `N` — and
+        // `m.a` itself keeps lowering: `field_ty_mentions_params` no longer
+        // flags a nested model's own type args (see its doc comment), so
+        // that load is not refused here. The chained access `m.a.w[0]`
+        // instead re-runs the same guard one level in, against `Attn`'s own
+        // shape params, and refuses THERE — at the field that actually
+        // mentions the unbound param (`w: Tensor[i64,[N]]`), naming `Attn`
+        // rather than `M`. A better-located message than blaming the outer
+        // field for a gap that is really in the nested one.
+        let src = "model Attn[N] {\n\
+                   w: Tensor[i64, [N]]\n\
+                   }\n\
+                   model M[N] {\n\
+                   a: Attn[N]\n\
+                   }\n\
+                   fn first(m: M) -> i64 {\n\
+                   m.a.w[0]\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M[4]{ a: Attn[4]{ w: forge.zeros[i64,[4]] } }\n\
+                   m.a.w[0] = 3\n\
+                   first(m)\n\
+                   }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::TypeForm));
+        assert!(e.msg.contains("field `w` of `Attn`"), "{}", e);
+        assert_eq!(interp_run_i64(src).unwrap(), 3, "dmc run answers 3");
+    }
+
+    #[test]
+    fn jit_type_arg_less_generic_receiver_nested_generic_field_scalar_read_lowers() {
+        // #706: the flip side of the test just above, and the case that
+        // motivated dropping the `Type::Named` arm from
+        // `field_ty_mentions_params` in the first place — a nested
+        // parameterized model whose OWN fields never mention its shape
+        // param (`v: i64` on `Attn[N]`) must keep lowering all the way
+        // through: `m.a` loads as `Model("Attn", [])` unrefused, and `m.a.v`
+        // then finds nothing param-shaped on `Attn` either, so the whole
+        // chain agrees with `dmc run`. Before this fix, `m.a` alone was
+        // refused as "field `a` of `M`" — the outer field blamed for a
+        // dimension only a *different*, param-shaped field of `Attn` (`w`,
+        // in the test above) would have actually needed.
+        let src = "model Attn[N] {\n\
+                   v: i64\n\
+                   }\n\
+                   model M[N] {\n\
+                   a: Attn[N]\n\
+                   }\n\
+                   fn f(m: M) -> i64 {\n\
+                   m.a.v\n\
+                   }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M[4]{ a: Attn[4]{ v: 6 } }\n\
+                   f(m)\n\
+                   }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 6);
+    }
+
+    #[test]
+    fn jit_enum_field_store_lowers() {
+        // #635 rework, D3: an enum-typed field's whole-value store lowers the
+        // same way a scalar's does — the field READ already decodes an enum
+        // field as a raw i64 (`lower_postfix`'s `Field` arm, the default load
+        // case), and `encode_for_slot`'s `_` arm is identity for `Enum`, so no
+        // new encode/decode logic is needed. Before this fix an enum field
+        // fell into the catch-all that blamed every non-scalar, non-model
+        // field on #650 ("this field's rebind semantics are not yet ruled
+        // on"), which is a `!` **aliasing** question with nothing to do with
+        // an enum's by-value store.
+        let src = "enum Light { Red, Green, Blue }\n\
+                   model M { !c: Light }\n\
+                   fn main() -> i64 {\n\
+                   let !m = M { c: Light.Red }\n\
+                   m.c = Light.Green\n\
+                   m.c as i64 }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 1, "Green is ordinal 1");
+    }
+
+    #[test]
+    fn jit_mut_kv_param_rebind_is_refused() {
+        // Same rule on the other pointer representation. The cache header the
+        // callee was handed is the caller's; a fresh one never reaches it.
+        let src = "fn replace(!c: KV[f32, [1, ~, 2]]) -> i64 {\n\
+                   let !fresh = forge.kv[f32, [1, ~, 2]](capacity = 3)\n\
+                   let !a = forge.zeros[f32, [1, 1, 2]]\n\
+                   a[0, 0, 0] = 9.0\n\
+                   fresh <- a\n\
+                   c = fresh\n\
+                   sum(c) as i64 }\n\
+                   fn main() -> i64 {\n\
+                   let !c = forge.kv[f32, [1, ~, 2]](capacity = 3)\n\
+                   let !a = forge.zeros[f32, [1, 1, 2]]\n\
+                   a[0, 0, 0] = 1.0\n\
+                   c <- a\n\
+                   let r = replace(c)\n\
+                   r * 10 + sum(c) as i64 }";
+        let e = jit_compile_jiterr(src);
+        assert_eq!(e.kind, JitErrorKind::Unsupported);
+        assert_eq!(e.refusal, Some(Refusal::AssignForm));
+        assert_eq!(interp_run_i64(src).unwrap(), 99, "the conformant answer, pending #650");
+    }
+
+    #[test]
+    fn jit_mut_kv_param_append_is_not_a_rebind() {
+        // The refusal is the whole-binding form only. `cache <- frame` writes
+        // THROUGH the pointer and is the reason a `!` KV parameter exists, so
+        // it lowers untouched — and reaches the caller, on both backends.
+        let src = "fn push(!c: KV[f32, [1, ~, 2]], v: f32) -> i64 {\n\
+                   let !a = forge.zeros[f32, [1, 1, 2]]\n\
+                   a[0, 0, 0] = v\n\
+                   c <- a\n\
+                   0 }\n\
+                   fn main() -> i64 {\n\
+                   let !c = forge.kv[f32, [1, ~, 2]](capacity = 3)\n\
+                   let !a = forge.zeros[f32, [1, 1, 2]]\n\
+                   a[0, 0, 1] = 2.0\n\
+                   c <- a\n\
+                   push(c, 5.0f32)\n\
+                   sum(c) as i64 }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 7); // 2.0 from the caller + 5.0 from the callee
+    }
+
+    #[test]
+    fn jit_mut_model_param_rebind_refusal_stops_at_a_shadowing_let() {
+        // The restriction belongs to the PARAMETER, not the name. Once a `let`
+        // shadows it the binding is an ordinary local — the caller's instance
+        // is no longer reachable through that name — so rebinding it lowers.
+        let src = "model C { !n: Tensor[i64, [1]] }\n\
+                   fn touch(!c: C) -> i64 {\n\
+                   c.n[0] = 4\n\
+                   let !c = C { n: forge.zeros[i64, [1]] }\n\
+                   c = C { n: forge.zeros[i64, [1]] }\n\
+                   c.n[0] = 7\n\
+                   c.n[0] }\n\
+                   fn main() -> i64 {\n\
+                   let !c = C { n: forge.zeros[i64, [1]] }\n\
+                   let r = touch(c)\n\
+                   r * 10 + c.n[0] }";
+        assert_jit_eq_interp(src);
+        assert_eq!(jit_run_i64(src).unwrap(), 74); // callee's local 7, caller's instance 4
     }
 
     /// `forge.uninit` followed by element-wise copy from a known tensor.
@@ -31619,8 +43785,17 @@ fn main() -> str {
              "operator `Eq` is not defined for types `Port` and `Port`"),
             (r#"fn main() -> nil { let (p,_) = port_open("lua")  let b = p == "port#1:python" }"#,
              "operator `Eq` is not defined for types `Port` and `str`"),
+            // #751: `len`'s fallback refusal is now the same located,
+            // classed `jit-conversion` every other non-tensor/str/Map/tuple
+            // argument gets (previously an uncoded `err()`, #480's exact
+            // defect class) — a `Port` handle falls through the same arm.
+            // #754 review: the domain widened to include tuple, and the
+            // citation moved from #745 (whose one-type-per-position fix
+            // can't express `len`'s polymorphic domain) to #758.
             (r#"fn main() -> nil { let (p,_) = port_open("lua")  let n = len(p) }"#,
-             "`len` requires a tensor or str argument"),
+             "`len` argument must be a tensor, str, Map, or tuple, got `Port` — len's \
+              argument must be a tensor, str, Map, or tuple; the checker \
+              accepts this (see #758)"),
             (r#"fn main() -> nil { let (p,_) = port_open("lua")  let c = p[0] }"#,
              "indexing requires a tensor or str, got `Port`"),
         ] {
@@ -32018,24 +44193,33 @@ fn main() -> str {
     /// CLIs spell the `=> <ret>` echo differently (the interpreter prefixes a
     /// blank line), which is a presentation difference this is not about.
     fn assert_cli_agree(name: &str, src: &str, want_rc: i32, want_out: &str, want_err: &str) {
-        let bin = dmc_bin();
-        let tmp = std::env::temp_dir().join(format!("dmc_port_{}.dmc", name));
-        std::fs::write(&tmp, src).expect("write temp file");
         let mut seen = Vec::new();
         for mode in ["run", "jit"] {
-            let out = std::process::Command::new(&bin)
-                .args([mode, tmp.to_str().unwrap()])
-                .output().expect("run dmc");
-            let rc = out.status.code();
-            let so = String::from_utf8_lossy(&out.stdout).to_string();
-            let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let (rc, so, se) = cli_run(name, mode, src);
             assert_eq!(rc, Some(want_rc), "[{} {}] stderr: {}", mode, name, se);
             assert_eq!(so, want_out, "[{} {}] stdout", mode, name);
             assert_eq!(se, want_err, "[{} {}] stderr", mode, name);
             seen.push((rc, so, se));
         }
         assert_eq!(seen[0], seen[1], "run/jit divergence for {}", name);
+    }
+
+    /// Run `src` under ONE backend in a fresh process; return
+    /// `(exit code, stdout, trimmed stderr)`. The single-backend half of
+    /// `assert_cli_agree`, for the cases where the two backends are known
+    /// NOT to agree and the test is pinning one of them.
+    fn cli_run(name: &str, mode: &str, src: &str) -> (Option<i32>, String, String) {
+        let bin = dmc_bin();
+        let tmp = std::env::temp_dir().join(format!("dmc_port_{}_{}.dmc", name, mode));
+        std::fs::write(&tmp, src).expect("write temp file");
+        let out = std::process::Command::new(&bin)
+            .args([mode, tmp.to_str().unwrap()])
+            .output().expect("run dmc");
+        let rc = out.status.code();
+        let so = String::from_utf8_lossy(&out.stdout).to_string();
+        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let _ = std::fs::remove_file(&tmp);
+        (rc, so, se)
     }
 
     /// A handle that is nil — what a failed `port_open` hands back — is not a

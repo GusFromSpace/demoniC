@@ -1,0 +1,99 @@
+# generic_model_shape_spellings.dmc — the blessed spellings for a shape-generic
+# model annotation, pinned so the 0.0.6-draft flag day (warning -> error) has a
+# gate.
+#
+# SPEC.md's Models section refuses a type-arg-less annotation of a
+# shape-parameterized model everywhere — parameter, field, return, `let`
+# binding, array element, tuple/fn-type component, alias body, and a
+# model-array allocator's type argument — and names three spellings that are
+# NOT refused:
+#
+#   1. a DIRECT parameter, with the function declaring and spelling its own
+#      shape parameter (`fn f[N](b: Buf[N])`);
+#   2. a type alias with the bracket written into its own body, pinning one
+#      geometry (`type S = Buf[4]`), usable in a parameter annotation and in a
+#      `let` binding annotation alike;
+#   3. a NESTED position — the element type of a fixed-size array, here — where
+#      spelling (1)'s hatch does not reach (the shape parameter cannot be
+#      inferred through the nesting on either backend), so the concrete bracket
+#      must be named directly (`[Surface[2, 3]; 4]`, not `[Surface[H, W]; 4]`).
+
+model Buf[N] {
+    t: Tensor[i64, [N]]
+}
+
+model Surface[H, W] {
+    px: Tensor[i64, [H, W]]
+}
+
+# ── spelling 1: a direct parameter, shape parameter declared and spelled ────
+
+fn cap[N](b: Buf[N]) -> i64 {
+    b.t[0] + b.t[N - 1]
+}
+
+fn direct_parameter_value() -> i64 {
+    let !buf = Buf[4] { t: forge.zeros[i64, [4]] }
+    buf.t[0] = 2
+    buf.t[3] = 3
+    cap(buf)
+}
+
+fn test_direct_parameter_spelling() -> bool {
+    direct_parameter_value() == 5
+}
+
+# ── spelling 2: a type alias pinning the geometry once ──────────────────────
+
+type S = Buf[4]
+
+fn cap_alias(b: S) -> i64 {
+    let box: S = b
+    box.t[0] + box.t[3]
+}
+
+fn alias_annotation_value() -> i64 {
+    let !buf = Buf[4] { t: forge.zeros[i64, [4]] }
+    buf.t[0] = 1
+    buf.t[3] = 4
+    cap_alias(buf)
+}
+
+fn test_alias_pins_geometry_in_param_and_let() -> bool {
+    alias_annotation_value() == 5
+}
+
+# ── spelling 3: a nested array element names the concrete bracket ───────────
+
+fn corner_sum(arr: [Surface[2, 3]; 4]) -> i64 {
+    let !total = 0
+    let !i = 0
+    while i < 4 {
+        total = total + arr[i].px[0, 0]
+        i = i + 1
+    }
+    total
+}
+
+fn nested_array_value() -> i64 {
+    let !arr = forge.uninit[Surface[2, 3], [4]]
+    let !i = 0
+    while i < 4 {
+        let !s = Surface[2, 3] { px: forge.zeros[i64, [2, 3]] }
+        s.px[0, 0] = i
+        arr[i] = s
+        i = i + 1
+    }
+    corner_sum(arr)
+}
+
+fn test_nested_array_needs_the_concrete_bracket() -> bool {
+    nested_array_value() == 6
+}
+
+fn main() -> nil {
+    print(direct_parameter_value())
+    print(alias_annotation_value())
+    print(nested_array_value())
+    nil
+}

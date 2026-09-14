@@ -709,6 +709,160 @@ fn stream_append_inside_loop_over_same_kv_is_check_error() {
 }
 
 #[test]
+fn stream_append_inside_alloc_in_operand_block_is_check_error_819() {
+    // #819: `collect_stream_appends_expr`'s `Expr::AllocIn { .. } => {}` arm
+    // dropped BOTH of `AllocIn`'s operands, so a `c <- …` written inside the
+    // `in` operand's block — `<ctor> in { … }`, #674 slice 3a's
+    // postfix — went unreported here even though the identical append fires
+    // normally when written directly in the loop body (the test above). The
+    // `in` operand parses as a `postfix_expr`, and `postfix_expr`'s own
+    // `primary` alternative admits a `block`, so `forge.zeros[…] in { c <-
+    // …  b }` genuinely parses this way (§2.1 GRAMMAR.ebnf).
+    let errs = check(r#"
+        fn f(b: Budget) -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                forge.ones[f32, [1]] in { c <- forge.ones[f32, [1]]  b }
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error from inside the `in` operand's block, got {:?}",
+            errs);
+}
+
+#[test]
+fn stream_append_inside_budget_block_body_is_check_error_819() {
+    // #819 pinned regression: `Expr::BudgetBlock`'s `body` was already
+    // walked by this collector before this fix (the `AllocIn` gap above was
+    // the only miss) — pinned alongside it so a future edit to this walker
+    // cannot silently regress the `forge.enter` case back to unreported.
+    let errs = check(r#"
+        fn f(b: Budget) -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                forge.enter(b) { c <- forge.ones[f32, [1]] }
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error from inside a `forge.enter` budget block, got {:?}",
+            errs);
+}
+
+#[test]
+fn stream_append_inside_budget_block_operand_block_is_check_error_819() {
+    // #819: `Expr::BudgetBlock`'s own `operand` was the same unwalked gap
+    // this PR fixed for `Expr::AllocIn` — `parse_budget_block` (parser.rs)
+    // parses the `forge.enter(…)` operand with a full `parse_expr()`, so a
+    // block literal there parses fine: `forge.enter({ c <- …  b }) { … }`.
+    // Before this arm walked `bb.operand`, a `<-` written inside it went
+    // unreported by the #403 lint even though it fires normally when
+    // written directly in the budget block's body (the test above).
+    let errs = check(r#"
+        fn f(b: Budget) -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                forge.enter({ c <- forge.ones[f32, [1]]  b }) { nil }
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error from inside a `forge.enter` operand block, got {:?}",
+            errs);
+}
+
+#[test]
+fn stream_append_inside_call_argument_block_is_check_error_826() {
+    // #826: `collect_stream_appends_expr` had no `Expr::Postfix` arm at all,
+    // so a `<-` written inside a block literal passed as a CALL ARGUMENT
+    // went unreported — even though the identical append fires normally
+    // when written directly in the loop body, or inside an `AllocIn`/
+    // `BudgetBlock` operand (#819/#823). The issue's own reduced repro.
+    let errs = check(r#"
+        fn g(x: f32) -> f32 { x }
+
+        fn f() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                g({ c <- forge.ones[f32, [1]]  1.0 })
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error from inside a call argument block, got {:?}",
+            errs);
+}
+
+#[test]
+fn stream_append_inside_plain_call_argument_still_passes_826() {
+    // Contrast case: a call with a plain (non-appending) block argument must
+    // not fire the lint — the walker should not become false-positive-prone
+    // once it descends into call arguments.
+    assert!(passes(r#"
+        fn g(x: f32) -> f32 { x }
+
+        fn f() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                g({ let y: f32 = 1.0  y })
+            }
+            nil
+        }
+    "#));
+}
+
+#[test]
+fn stream_append_inside_call_nested_in_match_arm_in_loop_is_check_error_826() {
+    // Nested-form regression: a call argument's append-carrying block, buried
+    // inside a `match` arm, inside the `for` loop this walker is scanning —
+    // every layer (`Expr::Match` arm body, then `Expr::Postfix`'s call
+    // arguments) must be walked for the lint to still fire.
+    let errs = check(r#"
+        fn g(x: f32) -> f32 { x }
+
+        fn f() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            for v in c {
+                match 1 {
+                    _ => g({ c <- forge.ones[f32, [1]]  1.0 }),
+                }
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error from a call argument nested in a match arm, got {:?}",
+            errs);
+}
+
+#[test]
+fn stream_append_inside_assign_rhs_block_is_check_error_826() {
+    // #826 (found auditing the same walker): `Stmt::Expr`'s previous
+    // `else if assign.is_none()` shape walked `lhs` only when there was no
+    // `assign` at all, so an assign whose RHS carries a block — even one
+    // that is not itself the direct `c <- …` hit — silently dropped that
+    // RHS. `x = { c <- … }` inside the loop went unreported.
+    let errs = check(r#"
+        fn f() -> nil {
+            let !c: KV[f32, [~]] = forge.ones[f32, [4]]
+            let !x: f32 = 0.0
+            for v in c {
+                x = { c <- forge.ones[f32, [1]]  1.0 }
+            }
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("stream-iteration-aliasing") && e.contains("`c`")),
+            "expected stream-aliasing error from an assign's RHS block, got {:?}",
+            errs);
+}
+
+#[test]
 fn stream_append_via_snapshot_iteration_still_passes() {
     // The MEMORY §9.1 sanctioned idiom: iterate a snapshot binding, append to
     // the stream itself. Different binding name — no error. Appending to a
@@ -1197,6 +1351,798 @@ fn shape_param_type_alias_mismatch_fails() {
     "#);
     assert!(errs.iter().any(|e| e.contains("returns") && e.contains("Tensor")),
             "expected alias shape mismatch, got: {:?}", errs);
+}
+
+// ── #761: a top-level `let` literal constant is a real shape dimension,
+// whether it names one directly in an annotation or through a `type` alias.
+// Before the fix, `SymDim::from_expr` turned any identifier in a shape
+// position into a bare `Var`, with nothing resolving it against the module's
+// own constants — so `CAP` stayed symbolic forever, and a symbolic dim
+// compared against a concrete one is `Equiv::Unknown` (`shape.rs`), never a
+// provable mismatch OR a provable match. That cut both ways: a genuine `[9]`
+// vs `CAP`(=4) mismatch went uncaught (this issue's own repro), and a
+// genuinely matching `[4]` vs `CAP`(=4) pair was *wrongly* flagged as one
+// (`let binding has type Tensor[I64, [CAP]] but value has type Tensor[I64,
+// [4]]`) whenever the right-hand side happened to be concretely typed enough
+// for `compatible_with` to even run the comparison.
+
+#[test]
+fn alias_named_dim_resolves_against_module_constant_and_catches_mismatch() {
+    let errs = check(r#"
+        let CAP = 4
+        type Row = Tensor[i64, [CAP]]
+
+        fn takes_row(r: Row) -> i64 { r[0] }
+
+        fn main() -> nil {
+            let bad = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+            let _ = takes_row(bad)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Tensor[i64, [4]]") && e.contains("[9]")),
+            "expected the alias's dim resolved to 4 against a 9-element arg, got: {:?}", errs);
+}
+
+#[test]
+fn alias_named_dim_resolves_against_module_constant_and_passes_a_genuine_match() {
+    // The false-positive half of the same bug: before the fix, this matching
+    // pair was rejected too — `CAP` never resolved to `4`, so it could never
+    // be found EQUAL to a concrete `4` either.
+    assert!(passes(r#"
+        let CAP = 4
+        type Row = Tensor[i64, [CAP]]
+
+        fn takes_row(r: Row) -> i64 { r[0] }
+
+        fn main() -> i64 {
+            let ok = [1, 2, 3, 4]
+            takes_row(ok)
+        }
+    "#));
+}
+
+#[test]
+fn inline_annotation_named_dim_resolves_against_module_constant() {
+    // The same hole, spelled without a `type` alias at all — a plain
+    // annotation naming a top-level constant directly. Confirms the fix is
+    // general to named dimensions, not alias-specific.
+    let errs = check(r#"
+        let CAP = 4
+
+        fn takes_cap(t: Tensor[i64, [CAP]]) -> i64 { t[0] }
+
+        fn main() -> nil {
+            let bad = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+            let _ = takes_cap(bad)
+            nil
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Tensor[i64, [4]]") && e.contains("[9]")),
+            "expected `CAP` resolved to 4 against a 9-element arg, got: {:?}", errs);
+
+    assert!(passes(r#"
+        let CAP = 4
+
+        fn takes_cap(t: Tensor[i64, [CAP]]) -> i64 { t[0] }
+
+        fn main() -> i64 {
+            let ok = [1, 2, 3, 4]
+            takes_cap(ok)
+        }
+    "#));
+}
+
+#[test]
+fn let_annotation_named_dim_mismatch_names_the_resolved_value() {
+    let errs = check(r#"
+        let CAP = 4
+
+        fn make9() -> Tensor[i64, [9]] { forge.zeros[i64, [9]] }
+
+        fn main() -> i64 {
+            let t: Tensor[i64, [CAP]] = make9()
+            t[0]
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Tensor[i64, [4]]") && e.contains("Tensor[i64, [9]]")),
+            "expected the let annotation's `CAP` resolved to 4, got: {:?}", errs);
+}
+
+#[test]
+fn let_annotation_named_dim_genuine_match_is_not_a_false_positive() {
+    assert!(passes(r#"
+        let CAP = 4
+
+        fn make4() -> Tensor[i64, [4]] { forge.zeros[i64, [4]] }
+
+        fn main() -> i64 {
+            let t: Tensor[i64, [CAP]] = make4()
+            t[0]
+        }
+    "#));
+}
+
+#[test]
+fn generic_alias_mixes_its_own_shape_param_with_a_module_constant() {
+    // `type Padded[B] = Tensor[f32, [B, PAD]]` — `B` is the alias's own
+    // (symbolic, substituted per use) shape parameter; `PAD` is a top-level
+    // constant folded in when the alias is cached, same as a non-generic
+    // alias. Both must be honored at once.
+    assert!(passes(r#"
+        let PAD = 2
+        type Padded[B] = Tensor[f32, [B, PAD]]
+
+        fn takes(x: Padded[3]) -> f32 { x[0, 0] }
+
+        fn main() -> f32 {
+            let ok: Tensor[f32, [3, 2]] = forge.zeros[f32, [3, 2]]
+            takes(ok)
+        }
+    "#));
+
+    let errs = check(r#"
+        let PAD = 2
+        type Padded[B] = Tensor[f32, [B, PAD]]
+
+        fn takes(x: Padded[3]) -> f32 { x[0, 0] }
+        fn make() -> Tensor[f32, [3, 9]] { forge.zeros[f32, [3, 9]] }
+
+        fn main() -> f32 { takes(make()) }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Tensor[f32, [3, 2]]") && e.contains("Tensor[f32, [3, 9]]")),
+            "expected the module-constant half (PAD=2) of the generic alias to still be checked, got: {:?}", errs);
+}
+
+#[test]
+fn type_alias_naming_an_undefined_shape_dimension_is_an_error() {
+    // Unlike a `fn` signature (which tolerates an undeclared uppercase name
+    // as an implicit generic shape parameter — the kvcache pattern, see
+    // `implicit_fn_shape_param_is_not_treated_as_undefined` below), a `type`
+    // alias has no such convention (SPEC.md §6.6: "No generics beyond shape
+    // parameters and element type"). A name in its body that is neither its
+    // own declared shape parameter nor a resolvable module constant cannot
+    // mean anything, and is reported once, by name.
+    let errs = check(r#"
+        type Row = Tensor[i64, [TYPO]]
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Row") && e.contains("TYPO")),
+            "expected an undefined-shape-dimension error naming `TYPO`, got: {:?}", errs);
+}
+
+#[test]
+fn implicit_fn_shape_param_is_not_treated_as_undefined() {
+    // Regression guard: an undeclared uppercase name in a plain `fn`
+    // signature (never a `[...]` shape param, never a top-level `let`) is
+    // the kvcache-style implicit generic dimension `check_fn` already
+    // recognizes. The #761 fix must leave this permissive — it only adds a
+    // fallback to a module constant, never a new refusal for a name that is
+    // neither a constant nor a declared parameter, outside a `type` alias's
+    // own (parameter-only, per SPEC §6.6) body.
+    assert!(passes(r#"
+        fn f(x: Tensor[f32, [S]]) -> f32 { x[0] }
+
+        fn main() -> f32 {
+            let a: Tensor[f32, [3]] = forge.zeros[f32, [3]]
+            let b: Tensor[f32, [5]] = forge.zeros[f32, [5]]
+            f(a) + f(b)
+        }
+    "#));
+}
+
+#[test]
+fn imported_alias_exports_its_dims_already_resolved_against_the_private_constant() {
+    // SPEC.md §6.7: a top-level `let`, `pub` or not, never crosses a module
+    // boundary as a name (#724/#731) — but a `pub type` alias naming that
+    // `let` in a dimension position DOES cross, because what crosses is the
+    // alias's own already-RESOLVED shape, not a re-exposure of the `let`'s
+    // name. The importer below never writes `CAP` anywhere and cannot: it
+    // only ever spells `Row`, and still gets a real, checked, resolved-to-4
+    // shape mismatch against it.
+    let dep_src = r#"
+        let CAP = 4
+        pub type Row = Tensor[i64, [CAP]]
+        pub fn make9() -> Tensor[i64, [9]] { forge.zeros[i64, [9]] }
+        pub fn make4() -> Tensor[i64, [4]] { forge.zeros[i64, [4]] }
+    "#;
+    let dep_path = std::env::current_dir().unwrap().join("alias_dims_761_dep_temp.dmc");
+    std::fs::write(&dep_path, dep_src).unwrap();
+    let dep_canonical = dep_path.canonicalize().unwrap();
+
+    let dep_tokens = Lexer::new(dep_src).tokenize().expect("lex failed");
+    let dep_program = Parser::new(dep_tokens).parse_program().expect("parse failed");
+    let mut dep_checker = Checker::new();
+    dep_checker.check_program(&dep_program, Some(&dep_path));
+    assert!(dep_checker.errors.is_empty(), "dependency check failed: {:?}", dep_checker.errors);
+
+    let dep_env = super::check::ModuleEnv {
+        env: dep_checker.env.clone(),
+        aliases: dep_checker.aliases.clone(),
+        resolved_aliases: dep_checker.resolved_aliases.clone(),
+        public_items: super::ast::collect_public_items(&dep_program),
+        top_level_let_names: super::ast::collect_top_level_let_names(&dep_program),
+        transitive_import_lets: dep_checker.import_private_lets.clone(),
+    };
+
+    let importer_path = std::env::current_dir().unwrap().join("alias_dims_761_importer_temp.dmc");
+
+    let bad_src = r#"
+        use "alias_dims_761_dep_temp.dmc"
+        fn takes_row(r: Row) -> i64 { r[0] }
+        fn main() -> i64 { takes_row(make9()) }
+    "#;
+    let tokens = Lexer::new(bad_src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut bad_checker = Checker::new();
+    bad_checker.checked_modules.insert(dep_canonical.clone(), dep_env.clone());
+    bad_checker.check_program(&program, Some(&importer_path));
+    let bad_errs: Vec<String> = bad_checker.errors.iter().map(|e| e.msg.clone()).collect();
+    assert!(bad_errs.iter().any(|e| e.contains("Tensor[i64, [4]]") && e.contains("[9]")),
+            "expected the imported alias's dim resolved to 4, got: {:?}", bad_errs);
+
+    let good_src = r#"
+        use "alias_dims_761_dep_temp.dmc"
+        fn takes_row(r: Row) -> i64 { r[0] }
+        fn main() -> i64 { takes_row(make4()) }
+    "#;
+    let tokens = Lexer::new(good_src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut good_checker = Checker::new();
+    good_checker.checked_modules.insert(dep_canonical.clone(), dep_env.clone());
+    good_checker.check_program(&program, Some(&importer_path));
+    assert!(good_checker.errors.is_empty(), "expected a genuine 4-vs-4 match to pass: {:?}", good_checker.errors);
+
+    // And the private `let` itself never crosses — only `Row`'s already-
+    // resolved shape does (unaffected by this fix; pinned here as the other
+    // half of the same boundary decision).
+    let direct_src = r#"
+        use "alias_dims_761_dep_temp.dmc"
+        fn main() -> i64 { CAP }
+    "#;
+    let tokens = Lexer::new(direct_src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut direct_checker = Checker::new();
+    direct_checker.checked_modules.insert(dep_canonical.clone(), dep_env.clone());
+    direct_checker.check_program(&program, Some(&importer_path));
+    assert!(!direct_checker.errors.is_empty(), "expected `CAP` to stay invisible to the importer");
+
+    let _ = std::fs::remove_file(&dep_path);
+}
+
+// ── #766 (PR #766 review of #761): fold let-to-let chains, distinguish
+// "not a top-level `let`" from "a top-level `let` but not a constant" (and
+// its mutable-binding special case), and refuse a non-positive dimension at
+// the alias/annotation instead of downstream at an unrelated use site.
+
+#[test]
+fn alias_dim_folds_through_a_top_level_let_to_let_name_chain() {
+    // `let A = 4  let B = A` — `B`'s initializer is a bare name, not an int
+    // literal, so the original #761 collector left `B` out of `const_dims`
+    // entirely: `type Row = Tensor[i64,[B]]` was check-clean on base even
+    // though `dmc run`'s own `ConstDim` table folds `B` to `4` (the JIT
+    // folds a name-to-name chain the same way) and refuses at run time.
+    let errs = check(r#"
+        let A = 4
+        let B = A
+        type Row = Tensor[i64, [B]]
+
+        fn takes_row(r: Row) -> i64 { r[0] }
+
+        fn main() -> i64 {
+            let bad = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+            takes_row(bad)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Tensor[i64, [4]]") && e.contains("[9]")),
+            "expected `B` to fold through `A` to 4 and catch the mismatch, got: {:?}", errs);
+
+    assert!(passes(r#"
+        let A = 4
+        let B = A
+        type Row = Tensor[i64, [B]]
+
+        fn takes_row(r: Row) -> i64 { r[0] }
+
+        fn main() -> i64 {
+            let ok = [1, 2, 3, 4]
+            takes_row(ok)
+        }
+    "#));
+}
+
+#[test]
+fn alias_dim_folds_through_a_let_chain_regardless_of_declaration_order() {
+    // The fold is order-independent, exactly like a single literal constant
+    // already was — `Row` is declared, and reads `B`, before either `let`
+    // (top-level `let`s themselves still run in textual order — that's an
+    // unrelated, pre-existing rule this isn't about — but a `type` alias is
+    // pass-1 hoisted regardless of where it sits, so it may forward-reference
+    // both).
+    assert!(passes(r#"
+        type Row = Tensor[i64, [B]]
+        let A = 4
+        let B = A
+
+        fn takes_row(r: Row) -> i64 { r[0] }
+
+        fn main() -> i64 {
+            let ok = [1, 2, 3, 4]
+            takes_row(ok)
+        }
+    "#));
+}
+
+#[test]
+fn alias_dim_naming_a_mutable_top_level_let_says_so() {
+    // Before this, a mutable top-level binding used as an alias dimension
+    // got the same "neither a shape parameter... nor a top-level `let`
+    // constant" text as a name that doesn't exist at all — true in the
+    // letter (a mutable binding is not a *constant*) but misleading: `N` is
+    // very much a top-level `let` here, just not one that can ever fold
+    // into a dimension.
+    let errs = check(r#"
+        let ! N = 4
+        type Row = Tensor[i64, [N]]
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Row") && e.contains("N") && e.contains("mutable")),
+            "expected a message naming `N` as a mutable top-level `let`, got: {:?}", errs);
+    assert!(!errs.iter().any(|e| e.contains("neither a shape parameter")),
+            "expected the mutable-specific message, not the generic undefined one, got: {:?}", errs);
+}
+
+#[test]
+fn fn_annotation_dim_naming_a_mutable_top_level_let_says_so_799() {
+    // #799: a mutable top-level `let !N = 4` is (correctly) never in
+    // `const_dims`, so an implicit `N` in a fn annotation used to fall
+    // through `resolve_dim` all the way to an ordinary unbound `Var` —
+    // silently making the fn fully shape-generic in `N`, with no
+    // diagnostic at all. `let N = 4` (immutable) is concrete on both sides
+    // as of #793/#797, so the `!` was a one-character cliff from "checks
+    // and folds" to "silently accepts anything". Now the fn-annotation
+    // path gets the alias path's own located diagnostic (`resolve_dim_at`),
+    // naming the annotation, not the `let`.
+    let errs = check(r#"
+        let !N = 4
+        fn f(x: Tensor[f32, [N]]) -> i64 { 1 }
+        fn main() -> i64 { f(forge.zeros[f32, [8]]) }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("N") && e.contains("mutable")
+                             && e.contains("never a constant dimension")),
+            "expected the mutable-binding-is-never-a-constant-dimension error, got: {:?}", errs);
+
+    // An immutable top-level `let N = 4`, by contrast, still folds cleanly
+    // (unaffected control — this is #793/#797's own behavior).
+    assert!(passes(r#"
+        let N = 4
+        fn f(x: Tensor[f32, [N]]) -> i64 { 1 }
+        fn main() -> i64 { f(forge.zeros[f32, [4]]) }
+    "#));
+
+    // An explicit `fn f[N](...)` shape param still shadows the mutable
+    // top-level `let` too — declaring it makes it a genuine generic, not a
+    // reference to the unusable binding, so no diagnostic fires.
+    assert!(passes(r#"
+        let !N = 4
+        fn f[N](x: Tensor[f32, [N]]) -> i64 { 1 }
+        fn main() -> i64 { f(forge.zeros[f32, [8]]) }
+    "#));
+}
+
+#[test]
+fn model_method_annotation_dim_naming_a_mutable_top_level_let_says_so_799() {
+    // #799's method-path half: the same silent-generic gap existed for a
+    // method's own parameter/return annotation, reached through `check_
+    // model`'s `check_fn(f)` call (`resolve_type` there funnels through the
+    // same `resolve_dim_at`). Also exercises #798: `check_model`'s own
+    // #151 diagnostic must NOT additionally claim `N` is "unknown" — it
+    // is a known top-level `let`, just not a usable constant, so only the
+    // mutable-specific message should appear.
+    let errs = check(r#"
+        let !N = 4
+        model M {
+            fn m(self, x: Tensor[f32, [N]]) -> i64 { 1 }
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("N") && e.contains("mutable")
+                             && e.contains("never a constant dimension")),
+            "expected the mutable-binding-is-never-a-constant-dimension error, got: {:?}", errs);
+    assert!(!errs.iter().any(|e| e.contains("unknown shape param")),
+            "a mutable top-level let is a known binding, not an unknown shape param — \
+             #151's diagnostic must not also fire, got: {:?}", errs);
+
+    // The model's own explicit shape param still shadows the mutable
+    // top-level `let` inside the model, same as the fn case.
+    assert!(passes(r#"
+        let !N = 4
+        model M[N] {
+            data: Tensor[f32, [N]]
+        }
+        fn make8() -> M[8] {
+            M { data: forge.zeros[f32, [8]] }
+        }
+        fn main() -> i64 {
+            let m = make8()
+            sum(m.data) as i64
+        }
+    "#));
+}
+
+#[test]
+fn allocator_shape_arg_naming_a_mutable_top_level_let_says_so_799() {
+    // PR #824 review follow-up: SPEC.md §6.6 says the mutable-top-level-
+    // `let`-is-never-a-dimension rule applies to "any [type] annotation".
+    // An allocator's own shape argument (`forge.ones[f32, [N]]`) is parsed
+    // as an EXPRESSION, not an `ast::Type` (the shape bracket indexes the
+    // allocator call, same as the element-type argument does — see #728's
+    // type-arg-less-model ruling on this identical bracket), so it never
+    // reached `resolve_dim_at` through the usual annotation walk and
+    // accepted a mutable `N` with no diagnostic at all, inconsistent with
+    // every other annotation position #799 already covers (a local `let`,
+    // an array size, View/KV/Mesh/tuple/fn-type, a model shape arg, a
+    // model field). Fixed by applying the same check structurally to the
+    // allocator's own shape bracket.
+    let errs = check(r#"
+        let !N = 4
+        fn main() -> i64 {
+            let t = forge.ones[f32, [N]]
+            len(t)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("N") && e.contains("mutable")
+                             && e.contains("never a constant dimension")),
+            "expected the mutable-binding-is-never-a-constant-dimension error \
+             for the allocator's own shape argument, got: {:?}", errs);
+
+    // The model-array form of the same allocator set (`MODEL_ARRAY_
+    // ALLOCATOR_METHODS` — `zeros`/`ones`/`uninit`) gets the identical
+    // refusal for its shape argument.
+    let errs = check(r#"
+        let !N = 4
+        model Surface[H] {
+            data: Tensor[f32, [H]]
+        }
+        fn main() -> i64 {
+            let arr = forge.uninit[Surface[2], [N]]
+            0
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("N") && e.contains("mutable")
+                             && e.contains("never a constant dimension")),
+            "expected the mutable-binding-is-never-a-constant-dimension error \
+             for the model-array allocator's own shape argument, got: {:?}", errs);
+
+    // An immutable literal, and a fn's own shape parameter, in the exact
+    // same allocator position are both unaffected controls — this must not
+    // start refusing either of them.
+    assert!(passes(r#"
+        let N = 4
+        fn main() -> i64 {
+            let t = forge.ones[f32, [N]]
+            len(t)
+        }
+    "#));
+    assert!(passes(r#"
+        fn f[N](x: Tensor[f32, [N]]) -> i64 {
+            let t = forge.zeros[f32, [N]]
+            len(t)
+        }
+        fn main() -> i64 { f(forge.zeros[f32, [4]]) }
+    "#));
+}
+
+#[test]
+fn alias_dim_naming_a_non_literal_top_level_let_says_so() {
+    // Same distinction, the other non-constant case: a top-level `let` that
+    // is neither a literal nor a fold-able chain to one.
+    let errs = check(r#"
+        let N = 2 + 2
+        type Row = Tensor[i64, [N]]
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("Row") && e.contains("N") && e.contains("not a literal constant")),
+            "expected a message naming `N` as a non-literal top-level `let`, got: {:?}", errs);
+}
+
+#[test]
+fn alias_dim_resolving_to_a_negative_constant_is_refused_at_the_alias() {
+    // `expr_i64` admits negatives (correctly — the JIT's own `ConstDim`
+    // does too), so `let CAP = -1` used as a dimension folds to `Const(-1)`.
+    // Before this, that rode straight through into `Row`'s shape and only
+    // surfaced far away, at the first place something actually indexed into
+    // a `Row` — a confusing "index N out of bounds for axis 0 of size -1"
+    // nowhere near the real problem. Refused right here instead, with
+    // nothing even using `Row` in this program.
+    let errs = check(r#"
+        let CAP = -1
+        type Row = Tensor[i64, [CAP]]
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("-1") && e.contains("positive")),
+            "expected a located non-positive-dimension error, got: {:?}", errs);
+}
+
+#[test]
+fn negative_dim_refused_the_same_way_in_a_plain_annotation() {
+    // The same fix, spelled without a `type` alias — a direct annotation
+    // naming the same negative top-level constant.
+    let errs = check(r#"
+        let CAP = -1
+        fn f(x: Tensor[i64, [CAP]]) -> i64 { x[0] }
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("-1") && e.contains("positive")),
+            "expected the same refusal for a direct annotation, got: {:?}", errs);
+}
+
+#[test]
+fn implicit_fn_shape_param_matching_a_top_level_constant_resolves_to_it() {
+    // An undeclared uppercase name in a `fn` signature is normally the
+    // kvcache-style implicit generic (`implicit_fn_shape_param_is_not_
+    // treated_as_undefined`, above) — but if it ALSO happens to name a
+    // top-level literal `let`, the REGISTERED signature (what a call site
+    // is actually checked against — see `register_fn`'s own comment on this
+    // precedence rule) folds it to that constant, exactly like a named
+    // alias dimension does. `dmc run`'s own `ConstDim` table folds the same
+    // name the same way, so this call was already refused at run time
+    // before this fix — check now agrees with run instead of being more
+    // permissive than it.
+    let errs = check(r#"
+        let N = 4
+        fn f(x: Tensor[f32, [N]]) -> f32 { x[0] }
+
+        fn main() -> f32 {
+            let a: Tensor[f32, [8]] = forge.zeros[f32, [8]]
+            f(a)
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("[4]") && e.contains("[8]")),
+            "expected the implicit shape param `N` to fold to the top-level \
+             constant 4 and catch the [8] mismatch, got: {:?}", errs);
+
+    assert!(passes(r#"
+        let N = 4
+        fn f(x: Tensor[f32, [N]]) -> f32 { x[0] }
+
+        fn main() -> f32 {
+            let a: Tensor[f32, [4]] = forge.zeros[f32, [4]]
+            f(a)
+        }
+    "#));
+}
+
+// ── #793 (regression from #766): the SAME top-level constant, used as an
+// implicit shape param in TWO fn signatures, must fold the same way on both
+// sides of a call between them. #766 applied the fold in `register_fn` (the
+// registered signature callers check args against) but left `check_fn`
+// binding the implicit name as a free `Var` for the body's own copy of the
+// same types — so a value produced by one folded signature (`inner`'s
+// param type, or `forge.zeros[f32,[N]]`) disagreed with another folded
+// signature (`outer`'s param type) by construction, even though both are
+// `[4]` and every call site is legitimate. `check_fn` now applies the same
+// fold `register_fn` already did (see its own #766/#793 comment).
+
+#[test]
+fn implicit_shape_param_folds_the_same_way_across_two_fn_signatures_793() {
+    // The issue's own reduction: `outer` takes `c` typed `Tensor[f32,[N]]`
+    // and passes it straight to `inner`, which takes the same `Tensor[f32,
+    // [N]]`. Before the fix this was a check error — `expected Tensor[F32,
+    // [4]], got Tensor[F32, [N]]` — because `outer`'s OWN parameter, bound
+    // inside `check_fn`, stayed `[N]` while `inner`'s registered signature
+    // (what the call is checked against) had already folded to `[4]`.
+    assert!(passes(r#"
+        let N = 4
+        fn inner(c: Tensor[f32, [N]]) -> i64 { 1 }
+        fn outer(c: Tensor[f32, [N]]) -> i64 { inner(c) }
+        fn main() -> i64 { outer(forge.zeros[f32, [N]]) }
+    "#));
+}
+
+#[test]
+fn implicit_shape_param_folds_the_same_way_across_two_fn_signatures_typed_let_793() {
+    // Same repro, spelled with a typed/suffixed top-level `let` — the issue
+    // names this as a second site of the same bug, and `collect_const_dims`
+    // folds a typed literal (`expr_i64`) exactly like a bare one.
+    assert!(passes(r#"
+        let DATA_BLOCKS: u64 = 4u64
+        fn inner(c: Tensor[u64, [DATA_BLOCKS]]) -> i64 { 1 }
+        fn outer(c: Tensor[u64, [DATA_BLOCKS]]) -> i64 { inner(c) }
+        fn main() -> i64 { outer(forge.zeros[u64, [DATA_BLOCKS]]) }
+    "#));
+}
+
+#[test]
+fn explicit_fn_shape_param_still_shadows_a_same_named_top_level_constant_793() {
+    // SPEC.md §6.6 (a top-level `let` vs a fn's own shape param): an EXPLICIT `fn f[N](...)` shape param
+    // always wins over a top-level `let` of the same name — the #793 fix
+    // must not touch this half. `f` here is shape-generic in the ordinary
+    // way and `N` never folds to the module's `4`, so an `[8]` argument is
+    // legal.
+    assert!(passes(r#"
+        let N = 4
+        fn f[N](x: Tensor[f32, [N]]) -> i64 { 1 }
+        fn main() -> i64 { f(forge.zeros[f32, [8]]) }
+    "#));
+}
+
+#[test]
+fn model_method_implicit_top_level_constant_folds_like_a_fn_798() {
+    // #798: was pinned KNOWN-DIVERGENT as `model_method_implicit_top_level_
+    // constant_is_still_unknown_shape_param_793` — `check_model`'s own
+    // diagnostic (#151, predating #766) rejected ANY uppercase name in a
+    // method signature that is neither the model's nor the method's own
+    // declared shape param, unconditionally, whether or not that name also
+    // happened to be a top-level constant. SPEC.md §6.6 says a named
+    // dimension in ANY type annotation that is not a declared shape
+    // parameter resolves against a top-level literal `let`, and a method
+    // parameter is such an annotation, exactly like a free fn's (#793/#797)
+    // — so #151's blanket refusal conflicted with §6.6. Fixed by excluding
+    // a `const_dims` name from `check_model`'s `undeclared` set, the same
+    // way `check_fn`'s own implicit-shape-param loop does for a free fn.
+    // This now checks clean and folds `N` to `4`, the same as the two-fn
+    // repro in `implicit_shape_param_folds_the_same_way_across_two_fn_
+    // signatures_793` above, just through a method call instead of a
+    // second fn.
+    assert!(passes(r#"
+        let N = 4
+        model M {
+            fn inner(self, c: Tensor[f32, [N]]) -> i64 { 1 }
+            fn outer(self, c: Tensor[f32, [N]]) -> i64 { self.inner(c) }
+        }
+        fn main() -> i64 {
+            let m = M {}
+            m.outer(forge.zeros[f32, [N]])
+        }
+    "#));
+
+    // The model's own explicitly declared shape param, by contrast, still
+    // shadows a same-named top-level constant inside the model — unaffected
+    // by #798, unchanged from before it.
+    assert!(passes(r#"
+        let N = 4
+        model M[N] {
+            data: Tensor[f32, [N]]
+        }
+        fn make8() -> M[8] {
+            M { data: forge.zeros[f32, [8]] }
+        }
+        fn main() -> i64 {
+            let m = make8()
+            sum(m.data) as i64
+        }
+    "#));
+
+    // An explicit `fn m[N](self, ...)` shape param on the METHOD still
+    // shadows the same-named top-level constant too — the fix must not
+    // touch this half either. `N` here is genuinely shape-generic, so an
+    // `[8]` argument is legal even though a top-level `N = 4` exists.
+    assert!(passes(r#"
+        let N = 4
+        model M {
+            fn m[N](self, x: Tensor[f32, [N]]) -> i64 { 1 }
+        }
+        fn main() -> i64 {
+            let m = M {}
+            m.m(forge.zeros[f32, [8]])
+        }
+    "#));
+
+    // A genuinely undeclared uppercase name — neither a model/method shape
+    // param nor a top-level constant — still gets #151's "unknown shape
+    // param" refusal, and the hint still recommends declaring it as the
+    // method's own shape param (there is no constant here for that spelling
+    // to shadow).
+    let errs = check_full(r#"
+        model M {
+            fn m(self, x: Tensor[f32, [K]]) -> i64 { 1 }
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    let hit = errs.iter().find(|e| e.msg.contains("unknown shape param") && e.msg.contains("`K`"));
+    assert!(hit.is_some(), "expected #151's diagnostic for a genuinely undeclared name, got: {:?}", errs);
+    let hint = hit.unwrap().hint.as_deref().unwrap_or("");
+    assert!(hint.contains("fn m[K](self, ...)"),
+            "hint should still recommend declaring the undeclared, non-constant name, got: {:?}", hint);
+
+    // A name that IS a top-level constant must never appear in the hint's
+    // suggested spelling — that spelling would silently shadow it. Mix one
+    // constant name with one genuinely undeclared name in the same method
+    // signature: only the undeclared one is "unknown", and only it appears
+    // in the hint.
+    let errs = check_full(r#"
+        let N = 4
+        model M {
+            fn m(self, x: Tensor[f32, [N, K]]) -> i64 { 1 }
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    let hit = errs.iter().find(|e| e.msg.contains("unknown shape param"));
+    assert!(hit.is_some(), "expected #151's diagnostic for the undeclared name `K`, got: {:?}", errs);
+    let msg = &hit.unwrap().msg;
+    assert!(!msg.contains('N'), "the error message must not mention the constant `N` at all, got: {:?}", msg);
+    assert!(msg.contains('K') && !msg.contains("`N`"),
+            "the error must name only the genuinely undeclared `K`, not the constant `N`, got: {:?}", msg);
+    let hint = hit.unwrap().hint.as_deref().unwrap_or("");
+    assert!(hint.contains('K') && !hint.contains("[N") && !hint.contains(", N]"),
+            "the hint must not recommend shadowing the constant `N`, got: {:?}", hint);
+}
+
+#[test]
+fn model_method_non_literal_top_level_let_names_it_precisely_798() {
+    // #798's third category, the exact complaint it was filed on: an
+    // uppercase name in a method signature that names a top-level `let`
+    // which is neither a literal constant (`const_dims`) nor mutable
+    // (`mutable_top_level_lets`) — an immutable but non-literal binding like
+    // `let N = 2 + 2` (`expr_i64` folds only a bare literal or a leading
+    // unary `-`, not general arithmetic, so this is genuinely non-literal,
+    // the same repro `alias_dim_naming_a_non_literal_top_level_let_says_so`
+    // uses for the alias path). Before the fix this fell through the
+    // `undeclared` filter (present in neither excluded set) and got #151's
+    // "unknown shape param" plus the shadowing hint recommending `fn
+    // m[N](self, ...)` — a spelling that would silently shadow the real
+    // top-level `N`. Must instead get the located, precise diagnostic
+    // `resolve_alias_body`'s own non-literal branch uses, and must NOT also
+    // get #151's diagnostic for the same name.
+    let errs = check_full(r#"
+        let N = 2 + 2
+        model M {
+            fn m(self, x: Tensor[f32, [N]]) -> i64 { 1 }
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    let hit = errs.iter().find(|e| e.msg.contains("not a literal constant"));
+    assert!(hit.is_some(),
+            "expected the non-literal-top-level-`let` diagnostic naming `N`, got: {:?}", errs);
+    let msg = &hit.unwrap().msg;
+    assert!(msg.contains('N') && msg.contains("top-level `let`") && msg.contains("m") && msg.contains("M"),
+            "expected the method/model-located non-literal-let message, got: {:?}", msg);
+    assert!(!errs.iter().any(|e| e.msg.contains("unknown shape param")),
+            "must not ALSO claim `N` is an unknown shape param — it is a known top-level \
+             binding, just not a literal constant, got: {:?}", errs);
+}
+
+#[test]
+fn model_method_unknown_shape_param_hint_states_model_params_already_in_scope_798() {
+    // The hint on #151's "unknown shape param" diagnostic used to assert
+    // "model-level shape params [H] are not automatically in scope inside
+    // methods" — backwards. SPEC.md §3.10: "A model's own shape parameters
+    // are in scope throughout its methods and bind from the instance." A
+    // model's declared shape params (here `H`) are exactly what
+    // `model_shape_names` excludes from `undeclared` above, in this very
+    // function — this diagnostic can only ever fire for a name that is
+    // NOT one of them, so the old sentence was false every time it printed.
+    let errs = check_full(r#"
+        model M[H] {
+            fn m(self, x: Tensor[f32, [K]]) -> i64 { 1 }
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    let hit = errs.iter().find(|e| e.msg.contains("unknown shape param") && e.msg.contains("`K`"));
+    assert!(hit.is_some(), "expected #151's diagnostic for the undeclared name `K`, got: {:?}", errs);
+    let hint = hit.unwrap().hint.as_deref().unwrap_or("");
+    assert!(hint.contains('H'), "the hint should still list the model's own shape params, got: {:?}", hint);
+    assert!(hint.contains("already in scope"),
+            "the hint must say the model's shape params ARE already in scope inside methods \
+             (SPEC.md §3.10), got: {:?}", hint);
+    assert!(!hint.contains("not automatically in scope"),
+            "the hint must not claim model-level shape params are not automatically in scope \
+             inside methods — SPEC.md §3.10 says the opposite, got: {:?}", hint);
+}
+
+#[test]
+fn grad_fn_implicit_shape_param_folds_the_same_way_as_a_plain_fn_793() {
+    // `@grad fn` is checked through the exact same `check_fn`, so the #793
+    // fold applies to it too — a `@grad fn` calling a plain fn that shares
+    // the same implicit-constant-typed param must check clean, the same way
+    // the two-plain-fn repro does.
+    assert!(passes(r#"
+        let N = 4
+        fn inner(c: Tensor[f32, [N]]) -> f32 { sum(c) }
+        @grad fn outer(!c: Tensor[f32, [N]]) -> f32 { inner(c) }
+        fn main() -> i64 { 0 }
+    "#));
 }
 
 #[test]
@@ -2384,7 +3330,7 @@ fn typechecker_visibility_checking() {
         model PrivateModel { x: i64 }
         pub type PublicAlias = i64
         type PrivateAlias = i64
-        pub let public_val = 1
+        pub fn public_val() -> i64 { 1 }
         let private_val = 2
     "#;
 
@@ -2404,7 +3350,10 @@ fn typechecker_visibility_checking() {
     let dep_env = super::check::ModuleEnv {
         env: checker.env.clone(),
         aliases: checker.aliases.clone(),
+        resolved_aliases: checker.resolved_aliases.clone(),
         public_items,
+        top_level_let_names: super::ast::collect_top_level_let_names(&dep_program),
+        transitive_import_lets: checker.import_private_lets.clone(),
     };
 
     // Test 1: qualified import. Public items should be visible, private items should not.
@@ -2665,22 +3614,36 @@ fn float_literal_suffixes_check() {
         }
     };
 
-    assert_eq!(get_type("let x = 1.0f16"), "F16");
-    assert_eq!(get_type("let x = 1.0bf16"), "Bf16");
-    assert_eq!(get_type("let x = 1.0tf32"), "Tf32");
-    assert_eq!(get_type("let x = 1.0f32"), "F32");
-    assert_eq!(get_type("let x = 1.0f64"), "F64");
-    assert_eq!(get_type("let x = 1.0fp8_e4m3"), "Fp8E4M3");
-    assert_eq!(get_type("let x = 1.0fp8_e5m2"), "Fp8E5M2");
-    // An unconstrained float literal defaults to F64 (#284) — consistent with
+    assert_eq!(get_type("let x = 1.0f16"), "f16");
+    assert_eq!(get_type("let x = 1.0bf16"), "bf16");
+    assert_eq!(get_type("let x = 1.0tf32"), "tf32");
+    assert_eq!(get_type("let x = 1.0f32"), "f32");
+    assert_eq!(get_type("let x = 1.0f64"), "f64");
+    assert_eq!(get_type("let x = 1.0fp8_e4m3"), "fp8_e4m3");
+    assert_eq!(get_type("let x = 1.0fp8_e5m2"), "fp8_e5m2");
+    // An unconstrained float literal defaults to f64 (#284) — consistent with
     // the unconstrained int-literal default of i64, and the conventional
     // double-precision default. A float literal that needs f32 must say so
     // (`let x: f32 = 1.0` or the `1.0f32` suffix).
-    assert_eq!(get_type("let x = 1.0"), "F64");
+    assert_eq!(get_type("let x = 1.0"), "f64");
 
     // Ensure float does not assign to a non-numeric type like bool
     let errs = check("fn main() -> bool { 1.0f64 }");
     assert!(!errs.is_empty(), "expected type mismatch error, got: {:?}", errs);
+}
+
+#[test]
+fn fp8_dtype_admitted_in_ctor_type_arg_818() {
+    // #818: `forge.zeros[fp8_e4m3, [4]]` (and the `fp8_e5m2` twin) used to
+    // fail with `undefined identifier `fp8e4m3`` — the constructor's
+    // type-arg position lost the underscore before the checker ever saw the
+    // name (parser.rs's expression-position scalar-type reconstruction).
+    // The checker already admitted `fp8_e4m3` in annotation position
+    // (`Tensor[fp8_e4m3, [4]]`, #816); both positions must now agree.
+    assert!(passes("fn main() -> nil { let t = forge.zeros[fp8_e4m3, [4]]\n nil }"),
+        "got: {:?}", check("fn main() -> nil { let t = forge.zeros[fp8_e4m3, [4]]\n nil }"));
+    assert!(passes("fn main() -> nil { let t = forge.zeros[fp8_e5m2, [4]]\n nil }"),
+        "got: {:?}", check("fn main() -> nil { let t = forge.zeros[fp8_e5m2, [4]]\n nil }"));
 }
 
 // ── New coverage: @grad, @comptime, dynamic shapes, @cast, lambdas ──────────
@@ -2820,6 +3783,88 @@ fn non_pub_extern_fn_passes() {
 }
 
 #[test]
+fn pub_let_is_error() {
+    // #596: SPEC.md §6.7 exports only `pub fn` / `pub model` / `pub type` — a
+    // top-level `let` never crosses a module boundary. Before this fix, `pub
+    // let` type-checked clean and the `pub` silently did nothing; the failure
+    // only ever surfaced at an importer, as an unrelated "undefined
+    // identifier". This must now fire at the declaration itself.
+    let errs = check(r#"pub let LIMIT: i64 = 7"#);
+    assert!(
+        errs.iter().any(|m| m.starts_with("pub-let:")
+            && m.contains("`pub let LIMIT`")
+            && m.contains("does not export")
+            && m.contains("bindings cross a module")),
+        "expected a pub-let error naming the binding, got {errs:?}"
+    );
+}
+
+#[test]
+fn pub_let_mut_is_also_error() {
+    // The mutable form (`pub let !x`) is the same silent no-op and must be
+    // rejected the same way. Mutability lives on the `LetStmt`, not the
+    // pattern (`l.mutating`), so the rendered message must carry the `!` —
+    // it previously fell off, rendering the bare `` `pub let LIMIT` ``.
+    let errs = check(r#"pub let !LIMIT: i64 = 7"#);
+    assert!(
+        errs.iter().any(|m| m.starts_with("pub-let:") && m.contains("`pub let !LIMIT`")),
+        "expected a pub-let error naming the mutable binding with its `!`, got {errs:?}"
+    );
+}
+
+#[test]
+fn pub_let_tuple_pattern_renders_the_pattern() {
+    // A tuple-pattern `let` isn't a `Pattern::Ident`, so it previously fell
+    // all the way back to the bare `` `pub let` `` with no pattern text at
+    // all. It must render the tuple the way source would.
+    let errs = check(r#"pub let (a, b): (i64, i64) = (1, 2)"#);
+    assert!(
+        errs.iter().any(|m| m.starts_with("pub-let:") && m.contains("`pub let (a, b)`")),
+        "expected a pub-let error rendering the tuple pattern, got {errs:?}"
+    );
+}
+
+#[test]
+fn private_let_passes() {
+    // Near-miss: the same declaration without `pub` is legal file-private
+    // state and must still pass.
+    assert!(
+        passes(r#"let LIMIT: i64 = 7"#),
+        "a non-pub let must pass, got {:?}",
+        check(r#"let LIMIT: i64 = 7"#)
+    );
+}
+
+#[test]
+fn pub_fn_does_not_trip_the_pub_let_diagnostic() {
+    // Near-miss: `pub fn` is the spec's actual export form (SPEC.md §6.7) and
+    // must not be flagged.
+    let errs = check(r#"pub fn limit() -> i64 { 7 }"#);
+    assert!(
+        !errs.iter().any(|m| m.starts_with("pub-let:")),
+        "pub fn must not trip the pub-let diagnostic, got {errs:?}"
+    );
+}
+
+#[test]
+fn pub_model_does_not_trip_the_pub_let_diagnostic() {
+    let errs = check(r#"pub model Thing { x: i64 }"#);
+    assert!(
+        !errs.iter().any(|m| m.starts_with("pub-let:")),
+        "pub model must not trip the pub-let diagnostic, got {errs:?}"
+    );
+}
+
+#[test]
+fn pub_type_does_not_trip_the_pub_let_diagnostic() {
+    let errs = check(r#"pub type Id = i64"#);
+    assert!(
+        !errs.iter().any(|m| m.starts_with("pub-let:")),
+        "pub type must not trip the pub-let diagnostic, got {errs:?}"
+    );
+}
+
+#[test]
 fn comptime_block_passes() {
     assert!(passes(r#"
         fn main() -> i64 {
@@ -2861,13 +3906,13 @@ fn trailing_directive_block_if_value_is_checked_against_return_type() {
     // The value now flows: an `if` yielding bool from an `-> i64` fn is the
     // ordinary body-type mismatch, not a nil.
     let errs = check("fn main() -> i64 { @deterministic { if 3 > 2 { true } else { false } } }");
-    assert!(errs.iter().any(|e| e.contains("body produces") && e.contains("Bool")),
+    assert!(errs.iter().any(|e| e.contains("body produces") && e.contains("bool")),
             "got: {:?}", errs);
 }
 
 // ── #505: `@comptime` v1 — the fold set and what it refuses ─────────────────
 //
-// SPEC.md §7.8 / DIRECTIVES.md §3 / COMPTIME_V1.md §5. Every entry below is a
+// SPEC.md §7.8 / DIRECTIVES.md §3 / the comptime v1 grammar's §5 rule. Every entry below is a
 // rule that was specified and unenforced before #505, so each test is the
 // difference between the directive meaning something and being a no-op.
 
@@ -2926,7 +3971,7 @@ fn comptime_folds_a_loop_that_terminates() {
 
 #[test]
 fn comptime_accepts_a_shape_parameter() {
-    // Tier 2 (COMPTIME_V1.md §4): comptime-known, but constant only per
+    // Tier 2 of the comptime fold set: comptime-known, but constant only per
     // monomorphization, so the pass accepts it and leaves it to the backends.
     let errs = check(r#"
         fn tile[N](x: Tensor[f32, [N]]) -> i64 { @comptime { N * 2 } }
@@ -3041,7 +4086,8 @@ fn an_extern_fn_call_is_forbidden_in_the_three_effect_constructs() {
     //
     // The `@deterministic` row is what makes "no foreign accumulation order
     // inside `@deterministic`" a property of the language rather than of one
-    // kernel-selection arm — see `docs/design/EXTERN_FN_LOWERING.md §3`.
+    // kernel-selection arm — the extern-fn lowering design bakes this in at
+    // the call-classification level, not per backend.
     for (src, what) in [
         ("extern fn c_add(x: i32) -> i32\n\
           fn main() -> i64 { let v = @deterministic { c_add(1) }  v as i64 }",
@@ -3067,6 +4113,175 @@ fn an_extern_fn_call_outside_those_constructs_is_fine() {
     let errs = check("extern fn c_add(x: i32) -> i32\n\
                       fn main() -> i64 { c_add(1) as i64 }");
     assert!(errs.is_empty(), "got: {:?}", errs);
+}
+
+// ─── #785: `Tensor`/`View`/`KV`'s element type must be a scalar type ────────
+//
+// `resolve_type`'s three arms parsed `Tensor[Buf, [4]]` / `View[Buf, [4]]` /
+// `KV[Buf, [4]]` for a model `Buf` and `--check`-passed silently — a model is
+// not a scalar element type (SPEC.md §3.1), and nothing downstream (the
+// interpreter's `DType`, the JIT's `ScalarKind`) has a representation to
+// build such a value in. `RawPtr`'s pointee already enforced the sibling
+// rule at the `extern fn` boundary; these three arms did not, until this fix.
+
+#[test]
+fn tensor_element_type_refuses_a_model_in_param_position() {
+    let errs = check("model Buf { x: f32 }\n\
+                      fn f(t: Tensor[Buf, [4]]) -> nil { nil }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type")
+                             && e.contains("`Tensor`")
+                             && e.contains("`Buf` is a model, not a scalar type")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_refuses_a_model_in_field_position() {
+    let errs = check("model Buf { x: f32 }\n\
+                      model Holder { t: Tensor[Buf, [4]] }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type") && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_refuses_a_model_in_return_position() {
+    let errs = check("model Buf { x: f32 }\n\
+                      fn f() -> Tensor[Buf, [4]] { forge.zeros[f32, [4]] }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type") && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_refuses_a_model_in_let_annotation() {
+    let errs = check("model Buf { x: f32 }\n\
+                      fn main() -> nil { let t: Tensor[Buf, [4]] = forge.zeros[f32, [4]]  nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type") && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_refuses_a_model_in_alias_body() {
+    let errs = check("model Buf { x: f32 }\n\
+                      type Row = Tensor[Buf, [4]]\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type") && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn view_element_type_refuses_a_model() {
+    let errs = check("model Buf { x: f32 }\n\
+                      fn f(t: View[Buf, [4]]) -> nil { nil }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type")
+                             && e.contains("`View`")
+                             && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn kv_element_type_refuses_a_model() {
+    let errs = check("model Buf { x: f32 }\n\
+                      fn f(t: KV[Buf, [4]]) -> nil { nil }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type")
+                             && e.contains("`KV`")
+                             && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_refuses_an_enum() {
+    // An enum is a distinct nominal type (#336), not one of SPEC.md §3.1's
+    // scalar types — same defect class as a model, even though its runtime
+    // representation happens to be an i64 ordinal.
+    let errs = check("enum Color { Red, Green, Blue }\n\
+                      fn f(t: Tensor[Color, [4]]) -> nil { nil }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type")
+                             && e.contains("`Color` is an enum, not a scalar type")),
+        "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_names_an_undefined_type_accurately() {
+    // `Foo` names nothing — no model, enum, or alias declares it — so it
+    // must NOT be misreported as "`Foo` is a model, not a scalar type"
+    // (`resolve_type`'s `Type::Named` fallthrough arm produces the same
+    // `TyType::Named` shape for an undefined name as for a genuine model
+    // reference; only `is_model_name` tells them apart). This was itself
+    // silently accepted before #785 (a pre-existing, broader gap: an
+    // undefined type name anywhere, not just here, checks clean) — #785
+    // does not fix that gap, but must not misdescribe it either now that
+    // this position surfaces it.
+    let errs = check("fn f(t: Tensor[Foo, [4]]) -> nil { nil }\nfn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type")
+                             && e.contains("`Foo` names no model, enum or alias in scope")),
+        "got: {:?}", errs);
+    assert!(!errs.iter().any(|e| e.contains("`Foo` is a model")),
+        "must not claim `Foo` is a model: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_admits_every_spec_3_1_scalar() {
+    // The positive rule, exhaustively: every SPEC.md §3.1 scalar name is a
+    // legal `Tensor`/`View`/`KV` element type, `bool` included (the corpus
+    // itself relies on `View[bool, […]]` for an attention mask —
+    // `examples/fused_attn.dmc`/`examples/rope.dmc`).
+    let errs = check(
+        "fn f(\n\
+            a: Tensor[i8, [1]], b: Tensor[i16, [1]], c: Tensor[i32, [1]], d: Tensor[i64, [1]],\n\
+            e: Tensor[u8, [1]], g: Tensor[u16, [1]], h: Tensor[u32, [1]], i: Tensor[u64, [1]],\n\
+            j: Tensor[int4, [1]], k: Tensor[int8, [1]],\n\
+            l: Tensor[f16, [1]], m: Tensor[bf16, [1]], n: Tensor[tf32, [1]],\n\
+            o: Tensor[f32, [1]], p: Tensor[f64, [1]],\n\
+            q: Tensor[fp8_e4m3, [1]], r: Tensor[fp8_e5m2, [1]],\n\
+            s: Tensor[trit, [1]], t: Tensor[bool, [1]],\n\
+            u: Tensor[str, [1]], v: Tensor[nil, [1]]\n\
+         ) -> nil { nil }\n\
+         fn main() -> nil { nil }"
+    );
+    assert!(errs.is_empty(), "an admissible element type was rejected: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_admits_any() {
+    // `any` resolves to `Unknown`, the checker's conservative match-anything
+    // bottom (#186) — deliberately not flagged, the same "don't cascade onto
+    // an already-⊥ type" rule every other check in this file applies to
+    // `Unknown` (e.g. the `embed`-ids-must-be-integer check).
+    let errs = check("fn f(t: Tensor[any, [4]]) -> nil { nil }\nfn main() -> nil { nil }");
+    assert!(errs.is_empty(), "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_alias_resolves_before_the_check() {
+    // `type E = f32` then `Tensor[E, [3]]` is exactly `Tensor[f32, [3]]` —
+    // the alias must resolve to its scalar target before this check runs,
+    // not be flagged as "`E` is ... not a scalar type" (jit_probes.py's
+    // `type_alias_nested_tensor_element` probe covers the same ground for
+    // the JIT side).
+    let errs = check("type E = f32\n\
+                      fn head(x: Tensor[E, [3]]) -> f32 { x[0] }\n\
+                      fn main() -> nil { nil }");
+    assert!(errs.is_empty(), "got: {:?}", errs);
+}
+
+#[test]
+fn tensor_element_type_error_reports_once_not_twice() {
+    // `resolve_type` runs over a fn's param/return type twice — once in
+    // `register_fn` (pass 1), again in `check_fn` (pass 2) — so without the
+    // span-keyed dedupe (`reported_element_type_spans`) this would report
+    // the same mistake twice for a single bad annotation.
+    let errs = check("model Buf { x: f32 }\n\
+                      fn f(t: Tensor[Buf, [4]]) -> Tensor[Buf, [4]] { t }\n\
+                      fn main() -> nil { nil }");
+    let param_errs: Vec<_> = errs.iter().filter(|e| e.contains("tensor-element-type")).collect();
+    // One for the param's `Buf`, one for the return's `Buf` — two DISTINCT
+    // spans — but neither doubled.
+    assert_eq!(param_errs.len(), 2, "expected exactly 2 (param + return, each once), got: {:?}", errs);
 }
 
 #[test]
@@ -3100,7 +4315,7 @@ fn non_integer_constructs_inside_comptime_are_non_static() {
 
 #[test]
 fn a_non_terminating_comptime_exhausts_the_budget() {
-    // COMPTIME_V1.md §6. Loops are in the fold set, so this is the rule that
+    // The comptime evaluator's step budget. Loops are in the fold set, so this is the rule that
     // stops a `@comptime` from hanging the compiler rather than failing it.
     let errs = check(r#"
         fn main() -> i64 { let x = @comptime { let !i = 0  loop { i += 1 }  i }  0 }
@@ -3139,6 +4354,313 @@ fn cast_expr_passes_typechecker() {
         fn main() -> nil {
             let buf = @cast(u8) { "hello" }
             nil
+        }
+    "#));
+}
+
+// ─── #598: `@cast(Model) { bytes }` overlay layout ──────────────────────────
+//
+// DIRECTIVES.md §4.1 calls the overlay casts "value-transforming by design",
+// but the only wire-layout guarantee SPEC.md §3.10 makes for a model is field
+// ORDER. So the overlay reaches exactly as far as a field's own type fixes a
+// byte extent: a scalar of known width, or a tensor of such scalars at a fully
+// static shape (count × width, row-major). A `str` field's dynamic,
+// arena-backed text, a tensor at a symbolic shape, a nested model, and a
+// `View`/`KV` descriptor over another arena have none, and `check_cast_model_-
+// overlay` refuses the directive at the declaration naming each such field —
+// instead of letting the interpreter materialize a wrong value (a `str` field
+// used to decode as a zero-width slice and come back `Int(0)`).
+
+#[test]
+fn cast_model_overlay_accepts_scalar_only_model_598() {
+    assert!(passes(r#"
+        model DirEntry {
+            inode_id: u64
+            mode: i32
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let d = @cast(DirEntry) { buf }
+            d.inode_id as i64
+        }
+    "#));
+}
+
+#[test]
+fn cast_model_overlay_accepts_every_admitted_scalar_kind_598() {
+    // One field per admitted kind: the fixed-width integers, `bool`, and the
+    // IEEE floats. Each has a byte width its own type states, so each decodes.
+    assert!(passes(r#"
+        model Wide {
+            a: i8
+            b: i16
+            c: i32
+            d: i64
+            e: u8
+            f: u16
+            g: u32
+            h: u64
+            i: bool
+            j: f16
+            k: bf16
+            l: f32
+            m: f64
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [64]]
+            let w = @cast(Wide) { buf }
+            w.d
+        }
+    "#));
+}
+
+#[test]
+fn cast_model_overlay_accepts_fixed_shape_tensor_field_598() {
+    // The shape #598 was filed against: a 32-byte block of `u64` + 24 bytes.
+    // A tensor field whose dims are all static has an unambiguous extent —
+    // element count × element width — so it overlays.
+    assert!(passes(r#"
+        model DirEntry {
+            inode_id: u64
+            name: Tensor[u8, [24]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let d = @cast(DirEntry) { buf }
+            d.inode_id as i64
+        }
+    "#));
+    // …and a multi-axis one, whose element order is the row-major convention.
+    assert!(passes(r#"
+        model Grid {
+            cells: Tensor[i32, [2, 3]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [24]]
+            let g = @cast(Grid) { buf }
+            0
+        }
+    "#));
+}
+
+#[test]
+fn cast_model_overlay_rejects_str_field_598() {
+    let errs = check(r#"
+        model DirEntry {
+            inode_id: u64
+            name: str
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let d = @cast(DirEntry) { buf }
+            d.inode_id as i64
+        }
+    "#);
+    assert!(
+        errs.iter().any(|e| e.contains("no overlay layout")
+            && e.contains("name: str")
+            && e.contains("DIRECTIVES.md §4.1")),
+        "expected an overlay-layout diagnostic naming `name: str`, got: {:?}", errs
+    );
+}
+
+#[test]
+fn cast_model_overlay_rejects_symbolic_tensor_shape_598() {
+    // A tensor field is admitted only when every dim is a constant: a
+    // shape-parameterized one has no byte extent until the parameter binds,
+    // and the overlay sizes every later field from it.
+    let errs = check(r#"
+        model Frame[N] {
+            seq: u32
+            payload: Tensor[u8, [N]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let f = @cast(Frame) { buf }
+            0
+        }
+    "#);
+    assert!(
+        errs.iter().any(|e| e.contains("no overlay layout")
+            && e.contains("payload")
+            && e.contains("static shape")),
+        "expected a static-shape diagnostic naming `payload`, got: {:?}", errs
+    );
+}
+
+#[test]
+fn cast_model_overlay_rejects_unlayoutable_element_type_598() {
+    // The element type has to have a byte form too — `trit` is a packed
+    // ternary storage format with no wire encoding at all.
+    let errs = check(r#"
+        model Weights {
+            packed: Tensor[trit, [8]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let w = @cast(Weights) { buf }
+            0
+        }
+    "#);
+    assert!(
+        errs.iter().any(|e| e.contains("no overlay layout") && e.contains("packed")),
+        "expected an overlay-layout diagnostic naming `packed`, got: {:?}", errs
+    );
+}
+
+#[test]
+fn cast_model_overlay_rejects_scalars_without_a_byte_form_598() {
+    // `trit` (no wire dtype), `int4` (packed 4 bits) and the f32-backed
+    // nominal tags each have no byte storage to read — one diagnostic per
+    // field, naming it.
+    let errs = check(r#"
+        model Odd {
+            t: trit
+            q: int4
+            n: fp8_e4m3
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let o = @cast(Odd) { buf }
+            0
+        }
+    "#);
+    for field in ["t: trit", "q: int4", "n: fp8_e4m3"] {
+        assert!(
+            errs.iter().any(|e| e.contains("no overlay layout") && e.contains(field)),
+            "expected an overlay-layout diagnostic naming `{}`, got: {:?}", field, errs
+        );
+    }
+}
+
+#[test]
+fn cast_model_overlay_rejects_nested_model_field_598() {
+    let errs = check(r#"
+        model Inner {
+            x: i64
+        }
+        model Outer {
+            head: u32
+            inner: Inner
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let o = @cast(Outer) { buf }
+            0
+        }
+    "#);
+    assert!(
+        errs.iter().any(|e| e.contains("no overlay layout") && e.contains("inner")),
+        "expected an overlay-layout diagnostic naming `inner`, got: {:?}", errs
+    );
+}
+
+#[test]
+fn cast_model_overlay_rejects_view_field_598() {
+    // A `View` field is a descriptor over another arena — it owns no bytes of
+    // its own for the overlay to lay down.
+    let errs = check(r#"
+        model Slot {
+            head: u32
+            win: View[u8, [8]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let s = @cast(Slot) { buf }
+            0
+        }
+    "#);
+    assert!(
+        errs.iter().any(|e| e.contains("no overlay layout") && e.contains("win")),
+        "expected an overlay-layout diagnostic naming `win`, got: {:?}", errs
+    );
+}
+
+#[test]
+fn cast_model_overlay_check_fires_in_tail_position_598() {
+    // The trailing-directive-block form (no explicit `let`) goes through a
+    // separate check.rs arm (`check_block_body`'s deferred-last path) from the
+    // `let`-bound expression form above — both must catch the same field.
+    let errs = check(r#"
+        model DirEntry {
+            name: str
+        }
+        fn make(buf: Tensor[u8, [32]]) -> DirEntry {
+            @cast(DirEntry) { buf }
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let d = make(buf)
+            0
+        }
+    "#);
+    assert!(errs.iter().any(|e| e.contains("no overlay layout")), "got: {:?}", errs);
+}
+
+#[test]
+fn cast_model_overlay_rejects_non_byte_source_tensor_598() {
+    // The source of `@cast(Model) { bytes }` is read one byte per ELEMENT, so
+    // a tensor of wider values contributes one truncated byte each and the
+    // overlay runs off the end of a buffer it thinks is 8× longer.
+    let errs = check(r#"
+        model DirEntry {
+            inode_id: u64
+            mode: i32
+        }
+        fn make(src: Tensor[u32, [8]]) -> i64 {
+            let d = @cast(DirEntry) { src }
+            0
+        }
+        fn main() -> i64 { 0 }
+    "#);
+    assert!(
+        errs.iter().any(|e| e.contains("byte tensor read one byte per element")
+            && e.contains("u32")),
+        "expected a byte-source diagnostic naming `u32`, got: {:?}", errs
+    );
+}
+
+#[test]
+fn cast_model_overlay_accepts_a_u8_view_source_598() {
+    // The ordinary source: a `u8` view sliced out of a byte arena. A `Tensor`
+    // of `u8` is the same thing without the view.
+    assert!(passes(r#"
+        model DirEntry {
+            inode_id: u64
+            name: Tensor[u8, [24]]
+        }
+        fn make(src: View[u8, [32]]) -> i64 {
+            let d = @cast(DirEntry) { src }
+            d.inode_id as i64
+        }
+        fn main() -> i64 { 0 }
+    "#));
+    assert!(passes(r#"
+        model DirEntry {
+            inode_id: u64
+            name: Tensor[u8, [24]]
+        }
+        fn make(src: Tensor[u8, [32]]) -> i64 {
+            let d = @cast(DirEntry) { src }
+            d.inode_id as i64
+        }
+        fn main() -> i64 { 0 }
+    "#));
+}
+
+#[test]
+fn cast_model_overlay_unrelated_cast_targets_unaffected_598() {
+    // A plain dtype `@cast` (not naming a model) must not be touched by the
+    // new check at all.
+    assert!(passes(r#"
+        fn main() -> nil {
+            let buf = @cast(u8) { "hello" }
+            nil
+        }
+    "#));
+    assert!(passes(r#"
+        fn main() -> f32 {
+            @cast(bf16) { 1.0f32 }
         }
     "#));
 }
@@ -3462,6 +4984,230 @@ fn indexed_write_through_mut_param_ok() {
     "#);
     assert!(!errs.iter().any(|e| e.contains("immutable binding")),
             "!buf element write should be allowed, got: {:?}", errs);
+}
+
+// ─── #838 (ruling, option C): a `!` tensor/view argument needs a mutable
+// root binding ──────────────────────────────────────────────────────────────
+//
+// `SPEC.md §3.4.1` ¶Argument form: a `!` argument of tensor or view type
+// must be a place whose root binding is mutable — a `let !`/`let mut`
+// local, a `!` parameter, or a field path whose own root binding is one of
+// those. A place rooted at a plain `let` binding is a compile-time error.
+// A `!` argument of model or `KV` type may be any place. `@grad fn` calls,
+// `fwd` and `fwd_bwd` are exempt. Mirrors the #838 probe set:
+// p1/p5/p11/p16/p17/p18/p19 (refused) and the p4/p7/p10/p13/p14/p15 family
+// plus the doc's own negative control (accepted).
+
+fn mut_arg_err(errs: &[String], name: &str) -> bool {
+    errs.iter().any(|e| {
+        e.contains("passing `") && e.contains(&format!("`{name}`")) &&
+        e.contains("to a `!` parameter writes through it")
+    })
+}
+
+#[test]
+fn plain_tensor_by_name_to_bang_param_errors_838() {
+    // p1's shape: a plain `let` tensor handed to a `!` tensor parameter.
+    let errs = check(r#"
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn main() -> nil {
+            let x = forge.ones[f32, [4]]
+            bump(x)
+            nil
+        }
+    "#);
+    assert!(mut_arg_err(&errs, "x"), "expected a #838 mutable-root error naming `x`, got: {:?}", errs);
+}
+
+#[test]
+fn plain_view_to_bang_param_errors_838() {
+    // p18's shape: a plain `let` View (a row of a plain `let` tensor).
+    let errs = check(r#"
+        fn bump(!v: View[f32, [4]]) -> nil { v[0] = 42.0  nil }
+        fn main() -> nil {
+            let x = forge.ones[f32, [2, 4]]
+            let v = x[0, ..]
+            bump(v)
+            nil
+        }
+    "#);
+    assert!(mut_arg_err(&errs, "v"), "expected a #838 mutable-root error naming `v`, got: {:?}", errs);
+}
+
+#[test]
+fn plain_model_field_path_to_bang_param_errors_838() {
+    // p17's shape: `bump(m.w)` roots at `m` (`lhs_root_ident` walks field
+    // chains), and `m` is a plain `let` model — refused for the same reason
+    // `m.w[0] = 42.0` already is (m18/p21).
+    let errs = check(r#"
+        model M { w: Tensor[f32, [4]] }
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn main() -> nil {
+            let m = M { w: forge.ones[f32, [4]] }
+            bump(m.w)
+            nil
+        }
+    "#);
+    assert!(mut_arg_err(&errs, "m"), "expected a #838 mutable-root error naming `m`, got: {:?}", errs);
+}
+
+#[test]
+fn plain_tensor_inside_lambda_body_errors_838() {
+    // p19's shape: a plain `let` declared inside a function literal's own
+    // body, direct call — a lambda body is an ordinary function body, so
+    // `lhs_root_ident`/`is_mutable_binding` read its scope exactly as they
+    // read `main`'s.
+    let errs = check(r#"
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn main() -> nil {
+            let f = fn(n: i64) -> i64 {
+                let x = forge.ones[f32, [4]]
+                bump(x)
+                (x[0] as i64) + n
+            }
+            f(0)
+            nil
+        }
+    "#);
+    assert!(mut_arg_err(&errs, "x"), "expected a #838 mutable-root error naming `x`, got: {:?}", errs);
+}
+
+#[test]
+fn plain_tensor_to_bang_model_method_param_errors_838() {
+    // p11's shape: a plain `let` tensor handed to a `!` parameter of a
+    // model method, not just a free fn.
+    let errs = check(r#"
+        model H {
+            n: i64
+            fn poke(self, !t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        }
+        fn main() -> nil {
+            let h = H { n: 0 }
+            let x = forge.ones[f32, [4]]
+            h.poke(x)
+            nil
+        }
+    "#);
+    assert!(mut_arg_err(&errs, "x"), "expected a #838 mutable-root error naming `x`, got: {:?}", errs);
+}
+
+#[test]
+fn mutable_let_bang_tensor_to_bang_param_ok_838() {
+    // Accepted: a `let !` local satisfies the mutable-root rule.
+    let errs = check(r#"
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn main() -> nil {
+            let !x = forge.ones[f32, [4]]
+            bump(x)
+            nil
+        }
+    "#);
+    assert!(errs.is_empty(), "let ! tensor argument should be allowed, got: {:?}", errs);
+}
+
+#[test]
+fn mutable_let_mut_tensor_to_bang_param_ok_838() {
+    // Accepted: `let mut` is the long form of `let !` (SPEC §3.4) and
+    // satisfies the mutable-root rule the same way.
+    let errs = check(r#"
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn main() -> nil {
+            let mut x = forge.ones[f32, [4]]
+            bump(x)
+            nil
+        }
+    "#);
+    assert!(errs.is_empty(), "let mut tensor argument should be allowed, got: {:?}", errs);
+}
+
+#[test]
+fn bang_param_forwarded_to_bang_param_ok_838() {
+    // Accepted: a `!` parameter is itself a mutable root, so forwarding it
+    // into another `!` parameter is legal.
+    let errs = check(r#"
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn outer(!t: Tensor[f32, [4]]) -> nil { bump(t)  nil }
+        fn main() -> nil { nil }
+    "#);
+    assert!(errs.is_empty(), "!-param forwarding should be allowed, got: {:?}", errs);
+}
+
+#[test]
+fn mutable_model_field_path_to_bang_param_ok_838() {
+    // The negative control §7.1 names for the field-path row: `let !m`'s
+    // own root is mutable, so `bump(m.w)` stays legal — the live-alias
+    // route `SPEC.md §3.4`'s ¶Bindings from model fields and m5 measure.
+    let errs = check(r#"
+        model M { w: Tensor[f32, [4]] }
+        fn bump(!t: Tensor[f32, [4]]) -> nil { t[0] = 42.0  nil }
+        fn main() -> nil {
+            let !m = M { w: forge.ones[f32, [4]] }
+            bump(m.w)
+            nil
+        }
+    "#);
+    assert!(errs.is_empty(), "let !m field-path argument should be allowed, got: {:?}", errs);
+}
+
+#[test]
+fn plain_model_argument_to_bang_param_ok_838() {
+    // p4's shape: a plain `let` model is untouched — a model or `KV`
+    // argument may be any place, mutable or not (the parameter is the
+    // caller's instance either way).
+    let errs = check(r#"
+        model C { n: i64 }
+        fn bump(!c: C) -> nil { c.n = 42  nil }
+        fn main() -> nil {
+            let x = C { n: 1 }
+            bump(x)
+            nil
+        }
+    "#);
+    assert!(errs.is_empty(), "plain model argument should be allowed, got: {:?}", errs);
+}
+
+#[test]
+fn plain_kv_argument_to_bang_param_ok_838() {
+    // p10's shape: a plain `let` `KV` is untouched, same reasoning as model.
+    let errs = check(r#"
+        fn push(!c: KV[f32, [4]]) -> nil { c <- forge.ones[f32, [4]]  nil }
+        fn main() -> nil {
+            let c = forge.kv[f32, [4]]
+            push(c)
+            nil
+        }
+    "#);
+    assert!(errs.is_empty(), "plain KV argument should be allowed, got: {:?}", errs);
+}
+
+#[test]
+fn grad_fn_direct_call_with_plain_tensor_arg_ok_838() {
+    // Inside a `@grad fn`, `!` marks a differentiable input (`AUTODIFF.md
+    // §1`), not a mutation — a direct call is forward-only (SPEC §6.2) and
+    // exempt from this rule, the same as the census's 16 `@grad` sites in
+    // `examples/`.
+    let errs = check(r#"
+        @grad fn reg(!w: Tensor[f32, [4]]) -> f32 { sum(w .* w) }
+        fn main() -> f32 {
+            let w = forge.ones[f32, [4]]
+            reg(w)
+        }
+    "#);
+    assert!(errs.is_empty(), "a @grad fn's direct call should be exempt, got: {:?}", errs);
+}
+
+#[test]
+fn grad_fn_fwd_bwd_with_plain_tensor_arg_ok_838() {
+    // Same exemption at `.fwd_bwd`.
+    let errs = check(r#"
+        @grad fn reg(!w: Tensor[f32, [4]]) -> f32 { sum(w .* w) }
+        fn main() -> nil {
+            let w = forge.ones[f32, [4]]
+            let (l, g) = reg.fwd_bwd(w)
+            nil
+        }
+    "#);
+    assert!(errs.is_empty(), "a @grad fn's .fwd_bwd should be exempt, got: {:?}", errs);
 }
 
 // --- unused-value lint (`\>`-trap, PR #412): a discarded pure expr-statement ---
@@ -3846,7 +5592,7 @@ fn captured_mut_non_float_errors_398() {
     "#);
     assert_eq!(
         errs,
-        vec!["captured mutable binding `steps` has non-differentiable type `I64` \
+        vec!["captured mutable binding `steps` has non-differentiable type `i64` \
               inside a `@grad fn`".to_string()],
         "expected exactly the non-differentiable-type error",
     );
@@ -4021,7 +5767,7 @@ fn body_ending_in_let_gets_targeted_diagnostic() {
     // A genuine type mismatch (real tail expression, wrong type) keeps the
     // original "body produces `T`" wording — the special case must not swallow it.
     let mismatch = check("fn main() -> i64 { true }");
-    assert!(mismatch.iter().any(|e| e.contains("body produces") && e.contains("Bool")),
+    assert!(mismatch.iter().any(|e| e.contains("body produces") && e.contains("bool")),
             "genuine mismatch must keep the produces-T message, got {:?}", mismatch);
 
     // Correctly-formatted code (tail expression present) still checks clean.
@@ -4125,6 +5871,47 @@ fn int_suffix_conflicts_and_ranges_445() {
     // 64-bit hex masks store as i64 bit patterns (#282) — always legal.
     assert!(passes("fn f() -> nil { let m = 0xffff_ffff_ffff_ffffu64  nil }"),
         "u64 mask literal must stay legal");
+}
+
+/// #597: `int_suffix_conflicts_and_ranges_445` above only exercised an
+/// UNANNOTATED `let` — the literal's own suffix is what typed it, and
+/// `check_expr`'s `Literal` arm already exempted a suffixed 64-bit literal
+/// from its range check (#282). A `let` with an explicit `u64` ANNOTATION
+/// takes a different path (`check_int_literal_range`, driven by the
+/// annotation rather than the literal's suffix), which had no such
+/// exemption: it folded the literal down to its raw `i64` bit pattern via
+/// `expr_i64` and rejected anything negative — so `0xffffffffffffffffu64`
+/// read as `-1` and was rejected as "out of range for `u64`" even though it
+/// is the top of the u64 range, not the bottom. A directly-written negative
+/// decimal (`-1u64`, an actual leading `-` in the source) must still error:
+/// that is the program writing down a negative literal for an unsigned type,
+/// which SPEC §3.1 forbids regardless of width.
+#[test]
+fn u64_mask_literal_with_declared_annotation_597() {
+    assert!(passes("fn f() -> nil { let x: u64 = 0xffffffffffffffffu64  nil }"),
+        "an all-ones u64 mask must fit its own declared `u64` annotation");
+    assert!(passes("fn f() -> nil { let x: u64 = 0x8000000000000000u64  nil }"),
+        "a top-bit-set u64 mask must fit its own declared `u64` annotation");
+    assert!(passes(
+        "fn f() -> nil { \
+         let x: u64 = 0b1111111111111111111111111111111111111111111111111111111111111111u64 \
+         nil }"),
+        "an all-ones u64 BINARY mask must fit its own declared `u64` annotation");
+    // A return-typed position is the same `check_int_literal_range` call site
+    // (§3.1's other width-origin: "a suffixed literal, a typed `let`, a typed
+    // parameter, a declared return type").
+    assert!(passes("fn f() -> u64 { 0xffffffffffffffffu64 }"),
+        "an all-ones u64 mask must fit a declared `u64` return type");
+    // An explicit negative decimal literal is still rejected — this is not a
+    // bit-pattern mask, it is the program writing a negative number down for
+    // an unsigned type (§3.1: "a literal that does not fit the width it
+    // adopts is ... a compile-time error, not a wrap").
+    let e = check("fn f() -> nil { let x: u64 = -1u64  nil }");
+    assert!(e.iter().any(|m| m.contains("out of range") && m.contains("u64")),
+        "an explicit -1u64 must still range-error, got {:?}", e);
+    let e = check("fn f() -> nil { let x: u64 = -1  nil }");
+    assert!(e.iter().any(|m| m.contains("out of range") && m.contains("u64")),
+        "an explicit -1 into a `u64` annotation must still range-error, got {:?}", e);
 }
 
 #[test]
@@ -4538,7 +6325,287 @@ fn a_model_and_a_tensor_that_disagree_are_caught_at_check_474() {
         }
         fn main() -> nil { nil }
     "#);
-    assert_eq!(msg, "arg 1: expected Tensor[U32, [2, 2]], got Tensor[U32, [3, 2]]");
+    assert_eq!(msg, "arg 1: expected Tensor[u32, [2, 2]], got Tensor[u32, [3, 2]]");
+}
+
+// ── #792: a model's shape arguments compare like a tensor's ─────────────────
+//
+// `fn mk[N]() -> Buf[N]` has no value parameter to infer `N` from, so an
+// explicit bracket at the call (`mk[8]()`) is the only way to pin it. Nothing
+// consumed that bracket for a *free* function (only a bracketed *method*
+// call did, #474) — `mk[8]()` fell through the general indexing arm and typed
+// `Unknown`, which is compatible with everything, so a mismatched shape
+// argument passed `--check` clean in every position: return, parameter,
+// field initialization, a `let` annotation, and a model-array element.
+
+#[test]
+fn generic_fn_call_return_position_792() {
+    let msg = one_error(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn wrong() -> Buf[4] { mk[8]() }
+        fn main() -> nil { nil }
+    "#);
+    assert_eq!(msg, "fn `wrong` returns `Buf[4]` but body produces `Buf[8]`");
+}
+
+#[test]
+fn generic_fn_call_return_position_matching_shape_passes_792() {
+    assert!(passes(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn ok() -> Buf[4] { mk[4]() }
+        fn main() -> nil { nil }
+    "#));
+}
+
+#[test]
+fn generic_fn_call_parameter_position_792() {
+    let msg = one_error(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn take(b: Buf[4]) -> i64 { 4 }
+        fn main() -> i64 { take(mk[8]()) }
+    "#);
+    assert_eq!(msg, "arg 0: expected Buf[4], got Buf[8]");
+}
+
+#[test]
+fn generic_fn_call_field_init_position_792() {
+    let msg = one_error(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        model Outer { inner: Buf[4] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn main() -> i64 {
+            let o = Outer { inner: mk[8]() }
+            0
+        }
+    "#);
+    assert_eq!(msg, "mismatched type for field `inner` of model `Outer`: \
+                     expected `Buf[4]`, got `Buf[8]`");
+}
+
+#[test]
+fn generic_fn_call_let_annotation_position_792() {
+    let msg = one_error(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn main() -> i64 {
+            let b: Buf[4] = mk[8]()
+            0
+        }
+    "#);
+    assert_eq!(msg, "let binding has type Buf[4] but value has type Buf[8]");
+}
+
+#[test]
+fn generic_fn_call_model_array_element_position_792() {
+    // A model-array parameter's element type is a model type like any other —
+    // the `Array` arm of `compatible_with` already delegated to it (#234), so
+    // this position was caught by the pre-existing `Named` comparison; pinned
+    // here so the whole enumerated set stays covered by one file.
+    let msg = one_error(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn take_arr(arr: [Buf[4]; 2]) -> i64 { 0 }
+        fn main() -> i64 {
+            let arr: [Buf[8]; 2] = forge.zeros[Buf[8], [2]]
+            take_arr(arr)
+        }
+    "#);
+    assert_eq!(msg, "arg 0: expected [Buf[4]; 2], got [Buf[8]; 2]");
+}
+
+#[test]
+fn generic_fn_call_shape_arity_mismatch_792() {
+    // `Buf[4, 4]` vs `Buf[4]` — a different number of shape arguments, not
+    // merely a different value. The `Named` arm's own length check (not the
+    // bracket-instantiation fix) is what catches this.
+    let msg = one_error(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn take(b: Buf[4]) -> i64 { 0 }
+        fn wrong(b: Buf[4, 4]) -> i64 { take(b) }
+        fn main() -> nil { nil }
+    "#);
+    assert_eq!(msg, "arg 0: expected Buf[4], got Buf[4, 4]");
+}
+
+#[test]
+fn generic_fn_call_lowercase_shape_param_call_site_stays_permissive_792() {
+    // SPEC §3.10: a model shape parameter written lowercase is "accepted at
+    // check" — it can only be *supplied* explicitly at the call
+    // (`area[2, 3](b)`), never verified against it. This is not merely #733's
+    // "inference never binds a lowercase name": `jit_shape_arg_inference_
+    // 732_733.rs`'s `a_lowercase_shape_param_spelled_at_the_call_is_never_
+    // checked_against_the_argument` pins that both backends run this exact
+    // shape, in flat contradiction of `b`'s real instance, rather than
+    // refusing — so the same bracket-instantiation path used for `mk[8]()`
+    // must stay just as permissive here: an argument whose actual shape
+    // disagrees with a lowercase-bound bracket is still accepted, same as it
+    // always ran before #792.
+    assert!(passes(r#"
+        model Box[h, w] { cells: Tensor[u32, [h, w]] }
+        fn area[h, w](b: Box[h, w]) -> i64 { h * w }
+        fn wrong_area(b: Box[4, 4]) -> i64 { area[2, 3](b) }
+        fn main() -> nil { nil }
+    "#));
+}
+
+#[test]
+fn generic_fn_call_implicit_inference_still_works_786() {
+    // #786's inference rule must keep working: an unbound shape param on a
+    // function's own parameter (`fn cap[N](b: Buf[N])`) still binds `N` from
+    // a concretely-shaped argument with no bracket at the call at all.
+    assert!(passes(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn cap[N](b: Buf[N]) -> i64 { N }
+        fn main() -> i64 {
+            let b = Buf[8] { t: forge.zeros[i64, [8]] }
+            cap(b)
+        }
+    "#));
+}
+
+// ── #792 rework: every case above uses `model Buf[N]` — the blind spot that
+// shipped both regressions this rework fixes. Tensor/View/KV parameters and a
+// named-constant shape argument at a bracketed free-fn call never appeared in
+// this file until now.
+
+#[test]
+fn generic_fn_bracket_call_accepts_tensor_argument_for_view_param_792() {
+    // SPEC.md §3.3 (~308): "`Tensor[T, S]` is a `View` with contiguous
+    // strides in the arena's natural layout (row-major). Slicing a `Tensor`
+    // yields a `View`." A `Tensor` argument must satisfy a `View`-typed
+    // parameter at an explicit bracketed call.
+    assert!(passes(r#"
+        fn total[N](v: View[u8, [N]]) -> i64 { v[0] as i64 }
+        fn main() -> i64 {
+            let t = [1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8]
+            total[8](t)
+        }
+    "#));
+}
+
+#[test]
+fn generic_fn_bracket_call_accepts_kv_argument_for_view_param_792() {
+    // SPEC.md §3.6 (~446): "A `KV[T, S]` is convertible to `View[T, S]` ...
+    // for any read-only operation. The conversion is free."
+    assert!(passes(r#"
+        fn total(v: View[f32, [4]]) -> i64 { 1 }
+        fn main() -> i64 {
+            let k: KV[f32, [4]] = forge.zeros[f32, [4]]
+            total(k)
+        }
+    "#));
+}
+
+#[test]
+fn generic_fn_unbracketed_call_infers_n_from_a_tensor_argument_for_a_view_param_792() {
+    // The two tests above pin the same-kind and explicit-bracket cases; this
+    // one is the actual gap the reviewer found: `infer_call_shape_bindings`
+    // (check.rs ~7090) had same-kind arms only, so `total[4](t)` (bracket
+    // supplies `N` directly) passed while the unbracketed `total(t)` — the
+    // ordinary call form #786 exists for — was refused with "expected
+    // View[U8, [N]], got Tensor[U8, [4]]" even though the Tensor-for-View
+    // widening this rework adds is otherwise unconditional. Pin that the
+    // (View, Tensor) pair now also binds `N`, not just satisfies
+    // `compatible_with`.
+    assert!(passes(r#"
+        fn total[N](v: View[u8, [N]]) -> i64 { v[0] as i64 }
+        fn main() -> i64 {
+            let t = [1u8, 2u8, 3u8, 4u8]
+            total(t)
+        }
+    "#));
+}
+
+#[test]
+fn generic_fn_unbracketed_call_infers_n_from_a_kv_argument_for_a_view_param_792() {
+    // Same gap, `(View, KV)` side: a KV argument at an unbracketed call to a
+    // shape-generic `View`-typed parameter must also bind `N`.
+    assert!(passes(r#"
+        fn total[N](v: View[u8, [N]]) -> i64 { v[0] as i64 }
+        fn main() -> i64 {
+            let k: KV[u8, [4]] = forge.zeros[u8, [4]]
+            total(k)
+        }
+    "#));
+}
+
+#[test]
+fn view_argument_does_not_satisfy_a_tensor_param_792() {
+    // The reverse direction stays refused: SPEC.md gives `Tensor -> View` and
+    // `KV -> View` as one-directional conversions, never the other way — a
+    // `View` may be non-contiguous, or not backed by a live stream arena, so
+    // it must not satisfy a `Tensor` (or `KV`) parameter.
+    let msg = one_error(r#"
+        fn wants_tensor(v: Tensor[u8, [4]]) -> i64 { v[0] as i64 }
+        fn give_view(v: View[u8, [4]]) -> View[u8, [4]] { v }
+        fn main() -> i64 {
+            let t = forge.zeros[u8, [4]]
+            let vv: View[u8, [4]] = give_view(t)
+            wants_tensor(vv)
+        }
+    "#);
+    assert_eq!(msg, "arg 0: expected Tensor[u8, [4]], got View[u8, [4]]");
+}
+
+#[test]
+fn str_argument_accepted_for_a_view_u8_param_792() {
+    // #809: unspecified by SPEC.md — filed to rule whether the JIT should
+    // gain a lowering for this or the type should refuse it outright. The
+    // interpreter already accepts a `str` argument for a `View[u8, [N]]`
+    // parameter (any `N`, unchecked), so `--check` matches it rather than
+    // being stricter than the backend that actually runs the program, until
+    // that ruling lands.
+    assert!(passes(r#"
+        fn first[N](v: View[u8, [N]]) -> i64 { v[0] as i64 }
+        fn main() -> i64 {
+            first[4]("abcd")
+        }
+    "#));
+    // #809: the non-bracketed, concrete-shape spelling widens the same way.
+    // `main` (pre-#792) refused this call outright — pin it here too, next
+    // to the bracketed case, since it changed for the same reason and the
+    // #809 ruling may flip both at once.
+    assert!(passes(r#"
+        fn first(v: View[u8, [4]]) -> i64 { v[0] as i64 }
+        fn main() -> i64 {
+            first("abcd")
+        }
+    "#));
+}
+
+#[test]
+fn generic_fn_bracket_call_resolves_a_local_let_constant_792() {
+    // `let k = 4` is an immutable local integral constant — a bracketed
+    // free-fn call's shape argument must resolve it to `Const(4)`, not leave
+    // it an unbound `Var` that a concrete `Buf[4]` param can only ever fail
+    // to match (`SymDim::equivalent`'s `Unknown`).
+    assert!(passes(r#"
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn take(b: Buf[4]) -> i64 { 4 }
+        fn main() -> i64 {
+            let k = 4
+            take(mk[k]())
+        }
+    "#));
+}
+
+#[test]
+fn generic_fn_bracket_call_resolves_a_top_level_constant_792() {
+    // Same fold, for a top-level `let` constant (#761/#766's `const_dims`) —
+    // a bracketed free-fn call never consulted either constant table before
+    // this rework.
+    assert!(passes(r#"
+        let CAP = 4
+        model Buf[N] { t: Tensor[i64, [N]] }
+        fn mk[N]() -> Buf[N] { Buf[N] { t: forge.zeros[i64, [N]] } }
+        fn take(b: Buf[4]) -> i64 { 4 }
+        fn main() -> i64 {
+            take(mk[CAP]())
+        }
+    "#));
 }
 
 #[test]
@@ -4580,7 +6647,7 @@ fn bracketed_method_call_checks_its_argument_types_474() {
             }
         }
     "#);
-    assert_eq!(msg, "arg 0: expected Tensor[U32, [2, 2]], got Str");
+    assert_eq!(msg, "arg 0: expected Tensor[u32, [2, 2]], got str");
 }
 
 #[test]
@@ -4600,7 +6667,7 @@ fn bracketed_method_call_has_the_methods_return_type_474() {
             }
         }
     "#);
-    assert_eq!(msg, "let binding has type Bool but value has type I64");
+    assert_eq!(msg, "let binding has type bool but value has type i64");
 }
 
 #[test]
@@ -4790,7 +6857,7 @@ fn a_non_integer_shape_argument_is_a_check_error_474() {
             }
         }
     "#);
-    assert_eq!(msg, "shape argument `SH` of `Box.generic!` must be an integer, got Str");
+    assert_eq!(msg, "shape argument `SH` of `Box.generic!` must be an integer, got str");
 }
 
 #[test]
@@ -4809,7 +6876,7 @@ fn a_named_non_integer_shape_argument_is_caught_too_474() {
             }
         }
     "#);
-    assert_eq!(msg, "shape argument `SH` of `Box.generic!` must be an integer, got Bool");
+    assert_eq!(msg, "shape argument `SH` of `Box.generic!` must be an integer, got bool");
 }
 
 #[test]
@@ -5842,13 +7909,13 @@ fn the_elementwise_tensor_cast_is_legal_and_yields_a_tensor_550() {
     // Typed as the scalar, this was the second half of the soundness hole.
     let errs = check(
         "fn main() -> i64 { let t: Tensor[f32, [2]] = forge.zeros[f32, [2]]  t as i64 }");
-    assert!(errs.iter().any(|e| e.contains("returns `I64`") && e.contains("Tensor[I64, [2]]")),
+    assert!(errs.iter().any(|e| e.contains("returns `i64`") && e.contains("Tensor[i64, [2]]")),
         "an elementwise cast must not type as a scalar, got {errs:?}");
     // …and the same through a bare `let` off a constructor, which reports
     // `Unknown` on purpose (#248) — the shape side-table still knows it is a
     // tensor. This spelling is the second repro in #550.
     let errs = check("fn main() -> i64 { let t = forge.zeros[f32, [2]]  t as i64 }");
-    assert!(errs.iter().any(|e| e.contains("returns `I64`") && e.contains("Tensor[I64, [2]]")),
+    assert!(errs.iter().any(|e| e.contains("returns `i64`") && e.contains("Tensor[i64, [2]]")),
         "the constructor-bound form must be caught too, got {errs:?}");
 }
 
@@ -5918,7 +7985,7 @@ fn cast_legality_holds_inside_a_generic_body_550() {
         "fn g[N](x: Tensor[f32, [N]]) -> i64 { x as i64 }\n\
          fn main() -> i64 { let t = forge.zeros[f32, [2]]  g(t) }\n",
     );
-    assert!(errs.iter().any(|e| e.contains("returns `I64`") && e.contains("Tensor[I64, [N]]")),
+    assert!(errs.iter().any(|e| e.contains("returns `i64`") && e.contains("Tensor[i64, [N]]")),
         "the generic elementwise cast must not type as a scalar, got {errs:?}");
 }
 
@@ -6227,7 +8294,7 @@ fn embed_refuses_a_float_ids_tensor_575() {
     }";
     let errs = check(src);
     assert!(errs.iter().any(|e| e.starts_with(EMBED_INDEX_TYPE_REFUSAL_PREFIX)
-                                 && e.contains("Tensor[F32, [2]]")),
+                                 && e.contains("Tensor[f32, [2]]")),
         "expected an embed-index-type refusal naming the float tensor type, got {errs:?}");
 }
 
@@ -6261,4 +8328,1496 @@ fn embed_leaves_unknown_ids_type_alone_575() {
         nil \
     }";
     assert!(passes(src), "an `any`-typed ids must not be flagged, got {:?}", check(src));
+}
+
+// ── #745: a keyed map builtin's key must be `str`, and its map argument must
+// actually be a map ──────────────────────────────────────────────────────────
+//
+// SPEC.md §264: a map is `str → any`. Every keyed map builtin's arg 1 carried
+// no type at all before this (`types.rs::builtin_sig`'s `mk` gives every
+// builtin param `Unknown`), so `map_set(m, 5, 1)` — an int key, a bool key, a
+// float key, or a tensor key — passed `--check` clean and only failed at
+// `dmc run` ("key must be str, got ..."). The fix gives the key parameter a
+// real `str` type; the existing general call-arg mechanism (`check.rs`'s
+// `TyType::Fn { params, .. }` arm, used for ordinary fn calls too) then
+// reports the mismatch with no map-specific code needed. The map argument
+// itself (arg 0) needs a separate, dedicated check — `TyType::Map` is
+// deliberately match-anything in `compatible_with` (#204), so a
+// `Map`-typed arg-0 slot in the signature enforces nothing on its own.
+
+/// The exact repro from #745: an int-literal key.
+#[test]
+fn map_set_refuses_an_int_key_745() {
+    let src = "fn main() -> i64 { \
+        let !m = map_new() \
+        map_set(m, 5, 1) \
+        0 \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("arg 1") && e.contains("str") && e.contains("integer")),
+        "expected a located str-key refusal naming arg 1, got {errs:?}");
+}
+
+/// A bool key — same rule, different offending type.
+#[test]
+fn map_set_refuses_a_bool_key_745() {
+    let src = "fn main() -> i64 { \
+        let !m = map_new() \
+        map_set(m, true, 1) \
+        0 \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("arg 1") && e.contains("str") && e.contains("bool")),
+        "expected a located str-key refusal naming the bool key, got {errs:?}");
+}
+
+/// A float key — same rule, different offending type.
+#[test]
+fn map_set_refuses_a_float_key_745() {
+    let src = "fn main() -> i64 { \
+        let !m = map_new() \
+        map_set(m, 5.0, 1) \
+        0 \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("arg 1") && e.contains("str") && e.contains("float")),
+        "expected a located str-key refusal naming the float key, got {errs:?}");
+}
+
+/// A tensor key — same rule; a tensor *literal* (not routed through a
+/// constructor-bound local, which the checker deliberately types `Unknown`
+/// regardless of annotation, #248) so the checker actually has a concrete
+/// type to reject.
+#[test]
+fn map_set_refuses_a_tensor_key_745() {
+    let src = "fn main() -> i64 { \
+        let !m = map_new() \
+        map_set(m, [1.0, 2.0], 1) \
+        0 \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("arg 1") && e.contains("str") && e.contains("Tensor")),
+        "expected a located str-key refusal naming the tensor key, got {errs:?}");
+}
+
+/// The rule applies to every keyed map builtin, not just `map_set`.
+#[test]
+fn every_keyed_map_builtin_refuses_a_non_str_key_745() {
+    for call in ["map_get(m, 5)", "map_has(m, 5)", "map_contains(m, 5)", "map_del(m, 5)"] {
+        let src = format!(
+            "fn main() -> i64 {{ let !m = map_new()  map_set(m, \"k\", 1)  {call}  0 }}");
+        let errs = check(&src);
+        assert!(errs.iter().any(|e| e.contains("arg 1") && e.contains("str") && e.contains("integer")),
+            "{call}: expected a located str-key refusal, got {errs:?}");
+    }
+}
+
+/// A non-map arg 0 — the issue's other half. `TyType::Map` is match-anything
+/// in `compatible_with` (#204), so this needs the dedicated check, not the
+/// general per-param mechanism.
+#[test]
+fn map_set_refuses_a_non_map_first_arg_745() {
+    let errs = check("fn main() -> i64 { map_set(5, \"k\", 1)  0 }");
+    assert!(errs.iter().any(|e| e.contains("map_set") && e.contains("first arg must be map")
+                                 && e.contains("integer")),
+        "expected a located non-map-arg refusal, got {errs:?}");
+}
+
+/// Every keyed map builtin gets the non-map-arg-0 check too.
+#[test]
+fn every_keyed_map_builtin_refuses_a_non_map_first_arg_745() {
+    for (call, builtin) in [
+        ("map_get(5, \"k\")", "map_get"),
+        ("map_has(5, \"k\")", "map_has"),
+        ("map_contains(5, \"k\")", "map_contains"),
+        ("map_del(5, \"k\")", "map_del"),
+    ] {
+        let src = format!("fn main() -> i64 {{ {call}  0 }}");
+        let errs = check(&src);
+        assert!(errs.iter().any(|e| e.contains(builtin) && e.contains("first arg must be map")),
+            "{call}: expected a located non-map-arg refusal, got {errs:?}");
+    }
+}
+
+/// A valid `str` key, on a real map, still passes clean — this is a type
+/// check, not a ban on `map_set`/`map_get` gaining new callers.
+#[test]
+fn map_set_and_map_get_still_accept_a_str_key_745() {
+    let src = "fn main() -> i64 { \
+        let !m = map_new() \
+        map_set(m, \"k\", 1) \
+        map_get(m, \"k\") as i64 \
+    }";
+    assert!(passes(src), "a str key on a real map must stay legal, got {:?}", check(src));
+}
+
+/// #742/#743's shape must not regress: a `map_get` result used as a *later*
+/// key types `Unknown` in the checker (only the JIT refuses it, citing #721),
+/// so it must still pass `--check` clean.
+#[test]
+fn map_get_result_used_as_a_later_key_still_passes_check_745() {
+    let src = "fn main() -> i64 { \
+        let !rec = map_new() \
+        map_set(rec, \"name\", \"gus\") \
+        let !defs = map_new() \
+        map_set(defs, map_get(rec, \"name\"), rec) \
+        0 \
+    }";
+    assert!(passes(src),
+        "a map_get result used as a key must stay a checker pass (JIT-only refusal, #721/#742/#743), got {:?}",
+        check(src));
+}
+
+/// An `m: map`-annotated parameter must not trip the non-map-arg-0 check.
+/// `resolve_type` deliberately does NOT resolve `map` to `TyType::Map` (see
+/// its own comment, and `for_in_map_param_does_not_warn` above) — `map` is
+/// match-anything there too, for the same reason the #204 lint stays quiet
+/// on it. Mirrors `examples/demonic_lexer.dmc`'s `fn tok_kind(t: map) -> str
+/// { map_get(t, "k") }`.
+#[test]
+fn map_annotated_param_does_not_trip_the_non_map_arg_check_745() {
+    let src = "fn get_it(m: map) -> i64 { map_get(m, \"k\") as i64 } \
+               fn main() -> i64 { let !m = map_new()  map_set(m, \"k\", 1)  get_it(m) }";
+    assert!(passes(src),
+        "an `m: map`-typed param must not trip the non-map-arg check, got {:?}", check(src));
+}
+
+// ── #758: `len`'s argument is typed against its admissible kind set ─────────
+//
+// STDLIB.md §3.7's own domain row: `len(x)` is `Tensor[T, S] | str | Map |
+// Tuple -> i64`. #745's `mk_typed` mechanism gives a builtin parameter one
+// fixed concrete `TyType` (`map_set`'s key is always `str`), which cannot
+// express a domain spanning four different shapes. `TyType::OneOf` names the
+// admissible `TyKind`s directly; `compatible_with`'s new `OneOf` arm matches
+// by kind rather than structural equality, so the existing general call-arg
+// mechanism (the same `TyType::Fn { params, .. }` arm #745's tests exercise)
+// reports the mismatch with no new checker code, exactly as #745 intended
+// for a builtin with a genuinely fixed parameter type.
+
+/// The issue's exact repro: `len(true)` passed `--check` clean before this
+/// fix and only failed at `dmc run` ("len: requires tensor, tuple, str,
+/// list, or map").
+#[test]
+fn len_refuses_a_bool_argument_758() {
+    let errs = check("fn main() -> i64 { len(true) }");
+    assert!(errs.iter().any(|e|
+        e.contains("arg 0") && e.contains("expected tensor, str, Map, or tuple") && e.contains("bool")),
+        "expected a located domain refusal naming the bool argument, got {errs:?}");
+}
+
+/// An int literal — same rule, different offending type.
+#[test]
+fn len_refuses_an_int_argument_758() {
+    let errs = check("fn main() -> i64 { len(1) }");
+    assert!(errs.iter().any(|e|
+        e.contains("arg 0") && e.contains("expected tensor, str, Map, or tuple") && e.contains("integer")),
+        "expected a located domain refusal naming the int argument, got {errs:?}");
+}
+
+/// A float literal — same rule, different offending type.
+#[test]
+fn len_refuses_a_float_argument_758() {
+    let errs = check("fn main() -> i64 { len(1.5) }");
+    assert!(errs.iter().any(|e|
+        e.contains("arg 0") && e.contains("expected tensor, str, Map, or tuple") && e.contains("float")),
+        "expected a located domain refusal naming the float argument, got {errs:?}");
+}
+
+/// A literal `nil` — same rule, different offending type.
+#[test]
+fn len_refuses_a_nil_argument_758() {
+    let errs = check("fn main() -> i64 { len(nil) }");
+    assert!(errs.iter().any(|e|
+        e.contains("arg 0") && e.contains("expected tensor, str, Map, or tuple") && e.contains("nil")),
+        "expected a located domain refusal naming the nil argument, got {errs:?}");
+}
+
+/// Every admissible kind must still pass clean: tensor, str, map, tuple.
+#[test]
+fn len_accepts_every_admissible_kind_758() {
+    let src = "fn main() -> i64 { \
+        let t = forge.zeros[f32, [4]] \
+        let a = len(t) \
+        let b = len(\"hello\") \
+        let !m = map() \
+        map_set(m, \"k\", 1) \
+        let c = len(m) \
+        let tup = (1, 2, 3) \
+        let d = len(tup) \
+        a + b + c + d \
+    }";
+    assert!(passes(src), "every admissible len argument kind must pass, got {:?}", check(src));
+}
+
+/// A tensor slice (`t[a..b]`) types as `View`, not `Tensor` — `TyKind::Tensor`
+/// must match it too (both reify to the same runtime tensor value; see
+/// `TyKind`'s own doc comment).
+#[test]
+fn len_accepts_a_view_slice_758() {
+    let src = "fn main() -> i64 { \
+        let !t = forge.zeros[f32, [10]] \
+        let v = t[2..6] \
+        len(v) \
+    }";
+    assert!(passes(src), "a View-typed slice must pass len's tensor kind, got {:?}", check(src));
+}
+
+/// A `map_get` result stays `Unknown` in the checker (#721 — typed map
+/// values aren't tracked end to end) — it must still pass `len`'s check the
+/// same way it already passes every other typed builtin parameter (#745's
+/// own `map_get_result_used_as_a_later_key_still_passes_check_745`).
+#[test]
+fn len_accepts_an_unknown_map_get_result_758() {
+    let src = "fn main() -> i64 { \
+        let !d = map() \
+        map_set(d, \"k\", 3) \
+        let x = map_get(d, \"k\") \
+        len(x) \
+    }";
+    assert!(passes(src),
+        "an Unknown map_get result must still pass len's check, got {:?}", check(src));
+}
+
+/// A user-declared top-level fn named `len` shadows the builtin spelling —
+/// the same rule #745's own `user_fn_of_the_same_name_shadows_the_map_builtin_check_745`
+/// establishes for `map_get`. `len(1, 2)` here calls the real 2-arg user fn,
+/// not the builtin, so the 1-arg domain check must not fire on it at all.
+#[test]
+fn user_fn_of_the_same_name_shadows_the_len_builtin_check_758() {
+    let src = "fn len(a: i64, b: i64) -> i64 { a + b } \
+               fn main() -> i64 { len(1, 2) }";
+    assert!(passes(src),
+        "a user-declared `len` must shadow the builtin's domain check, got {:?}", check(src));
+}
+
+/// An `m: map`-annotated parameter must not trip `len`'s `Map` kind check —
+/// `resolve_type` deliberately leaves `map` unresolved as `Named { name:
+/// "map", .. }` rather than `TyType::Map` (see #745's own
+/// `map_annotated_param_does_not_trip_the_non_map_arg_check_745`), and a real
+/// map value reaches `len` through it exactly as it does through `map_get`.
+#[test]
+fn map_annotated_param_passes_len_758() {
+    let src = "fn count(m: map) -> i64 { len(m) } \
+               fn main() -> i64 { let !m = map()  map_set(m, \"k\", 1)  count(m) }";
+    assert!(passes(src),
+        "an `m: map`-typed param must not trip len's domain check, got {:?}", check(src));
+}
+
+/// The downstream-sweep finding: a `-> list`-annotated fn's result types as
+/// `Named { name: "list", .. }` (SPEC has no static `list` type to resolve
+/// to — the same escape hatch `map` gets), not `Unknown`. Before the
+/// dedicated `OneOf` carve-out for this shape, this real pattern from
+/// a downstream file (`len(surface)`, `surface:
+/// parse_introspection(..) -> list`) newly failed `--check` under this fix.
+#[test]
+fn list_annotated_return_passes_len_758() {
+    let src = "fn make_list() -> list { list() } \
+               fn main() -> i64 { len(make_list()) }";
+    assert!(passes(src),
+        "a `-> list`-annotated result must not trip len's domain check, got {:?}", check(src));
+}
+
+/// The `range` counterpart of the same escape hatch.
+#[test]
+fn range_annotated_return_passes_len_758() {
+    let src = "fn make_range() -> range { 0..10 } \
+               fn main() -> i64 { len(make_range()) }";
+    assert!(passes(src),
+        "a `-> range`-annotated result must not trip len's domain check, got {:?}", check(src));
+}
+
+// ── #753: the `Map` wildcard no longer swallows a no-`->` fn's map tail, or
+// a `nil` map key ────────────────────────────────────────────────────────────
+//
+// Before this fix, a fn with no declared return type at all typed its whole
+// body as `nil` (`f.ret_type.unwrap_or(Unit)`), even when its tail expression
+// was a real map — and `compatible_with`'s old `TyType::Map` arm (#204)
+// returned `true` whenever *either* side was `Map`, so the `Unit`-vs-`Map`
+// mismatch that `fn make() { 7 }` gets ("returns `nil` but body produces
+// `i64`") was never even compared for a map-tailed body. That let
+// `examples/package_manifest.dmc`'s `fn dependency(...) { ... dep }` (no
+// arrow, `dep` a real map) pass `--check` while `map_set(dependency(...), ...)`
+// then failed at runtime ("first arg must be map, got nil"). Fixed by scoping
+// `compatible_with` to specifically refuse the `(Unit, Map)` pair (types.rs
+// ~146) — a map-tailed fn must now declare `-> map`. The `(Unit, Map)`
+// carve-out also feeds `unify_if_branches` (`if b { m } else { nil }` is now a
+// check error too, the same predicate `match` arms use — see the test below).
+//
+// Reviewer follow-up on this same PR found two more bugs in the first pass:
+//
+//   - The arg-0 exemption list dropping `Unit` made the DEDICATED non-map-
+//     arg-0 check fire on ANY `Unit`-typed arg 0 — but `compatible_with`'s new
+//     `(Unit, Map)` carve-out means the GENERAL call-arg mechanism
+//     (`inferred_pty.compatible_with`, `PostfixOp::Call`'s `TyType::Fn` arm)
+//     now refuses that same pairing all on its own, so `map_set(nil, "k", 1)`
+//     reported the same span TWICE. `Unit` is back on the dedicated check's
+//     exemption list — not because it is tolerated, but because the general
+//     mechanism now owns reporting it, and reporting it twice is a bug, not
+//     thoroughness (see the "exactly one error" test below).
+//   - The dedicated nil-KEY check (arg 1) gated on the key's static TYPE
+//     (`Unit`) rather than the key EXPRESSION, so it also fired on a
+//     `Unit`-typed key that was never actually `nil` at runtime: a no-`-> T`
+//     helper's return type defaults to `Unit` regardless of its body's real
+//     tail (`f.ret_type.unwrap_or(Unit)`), so `fn key(i: i64) { "k" +
+//     to_str(i) }` (a working, `str`-returning helper — its own
+//     declared-vs-body mismatch is masked by the same `(Unit, Str)` `(T,
+//     Err)`-convention exemption used elsewhere) + `map_set(m, key(1), 5)` (a
+//     real program with a genuine `str` key at runtime) got refused, naming a
+//     type the value never actually had. The key check is now gated on a
+//     literal `nil` at the call site (`Expr::Nil`), not merely a `Unit`-typed
+//     expression. (That helper's OWN declaration arguably deserves its own
+//     `-> str` rule — this fix's sibling finding — but that is a separate,
+//     not-yet-filed issue; this call site must not guess at a callee's real
+//     return type from its body.)
+
+/// The headline repro: a no-`->` fn whose tail is a map now errors at its own
+/// declaration, the same shape `fn make() { 7 }` gets.
+#[test]
+fn map_tailed_fn_without_return_type_is_a_check_error_753() {
+    let src = "fn side() { let !m = map()  map_set(m, \"k\", 1)  m } \
+               fn main() -> i64 { 0 }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("side") && e.contains("returns `nil`")
+                                 && e.contains("body produces `map`")),
+        "expected a located return-type mismatch naming `side`, got {errs:?}");
+}
+
+/// The full #753 repro: the mistyped `side()` result then also trips the
+/// GENERAL call-arg mechanism at the `map_set` call site — not the dedicated
+/// non-map-arg-0 check, which now exempts `Unit` again (see the header
+/// comment above) so the two don't both fire on the same span.
+#[test]
+fn map_tailed_fn_result_used_as_map_set_first_arg_is_also_a_check_error_753() {
+    let src = "fn side() { let !m = map()  map_set(m, \"k\", 1)  m } \
+               fn main() -> i64 { map_set(side(), \"k\", 1)  0 }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("arg 0") && e.contains("expected map")
+                                 && e.contains("got nil")),
+        "expected the general call-arg mechanism to refuse the nil result at arg 0, got {errs:?}");
+}
+
+/// Declaring `-> map` on the same fn fixes it: the tail is a real map, the
+/// return type matches, and the call site sees a real map, not `nil`.
+#[test]
+fn map_tailed_fn_with_declared_return_type_passes_753() {
+    let src = "fn side() -> map { let !m = map()  map_set(m, \"k\", 1)  m } \
+               fn main() -> i64 { map_set(side(), \"k\", 1)  0 }";
+    assert!(passes(src),
+        "a map-tailed fn declaring `-> map` must pass, got {:?}", check(src));
+}
+
+/// A literal `nil` map argument is refused the same way — not just a
+/// mistyped helper result. The refusal comes from the general call-arg
+/// mechanism (`compatible_with`'s `(Unit, Map)` carve-out), not the dedicated
+/// arg-0 check — see the exactly-one-error test just below.
+#[test]
+fn map_set_refuses_a_nil_first_arg_753() {
+    let errs = check("fn main() -> i64 { map_set(nil, \"k\", 1)  0 }");
+    assert!(errs.iter().any(|e| e.contains("arg 0") && e.contains("expected map")
+                                 && e.contains("got nil")),
+        "expected a located non-map-arg refusal for a literal nil, got {errs:?}");
+}
+
+/// Reviewer follow-up: a nil arg 0 must report EXACTLY ONE error, not two.
+/// Before this fix, dropping `Unit` from the dedicated arg-0 check's
+/// exemption list left it firing on the same `Unit` value the general
+/// call-arg mechanism (`compatible_with`'s `(Unit, Map)` carve-out) already
+/// refuses on its own — `map_set(nil, "k", 1)` reported the same span twice
+/// (`map_set: first arg must be map, got nil` AND `arg 0: expected map, got
+/// nil`). `Unit` is back on the dedicated check's exemption list so only the
+/// general mechanism reports it.
+#[test]
+fn map_set_nil_first_arg_reports_exactly_one_error_753() {
+    let errs = check("fn main() -> i64 { map_set(nil, \"k\", 1)  0 }");
+    assert_eq!(errs.len(), 1,
+        "a nil map_set arg 0 must report exactly one error, not a double-report, got {errs:?}");
+}
+
+/// A literal `nil` key is refused: the `(Unit, Str)` compatibility that
+/// exists for the `(T, Err)` convention must not leak into the map-builtin
+/// key position.
+#[test]
+fn map_set_refuses_a_nil_key_753() {
+    let src = "fn main() -> i64 { \
+        let !m = map() \
+        map_set(m, nil, 1) \
+        0 \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("map_set") && e.contains("key must be str")
+                                 && e.contains("nil")),
+        "expected a located nil-key refusal, got {errs:?}");
+}
+
+/// The nil-key rule applies to every keyed map builtin, not just `map_set`.
+#[test]
+fn every_keyed_map_builtin_refuses_a_nil_key_753() {
+    for (call, builtin) in [
+        ("map_get(m, nil)", "map_get"),
+        ("map_has(m, nil)", "map_has"),
+        ("map_contains(m, nil)", "map_contains"),
+        ("map_del(m, nil)", "map_del"),
+    ] {
+        let src = format!(
+            "fn main() -> i64 {{ let !m = map()  map_set(m, \"k\", 1)  {call}  0 }}");
+        let errs = check(&src);
+        assert!(errs.iter().any(|e| e.contains(builtin) && e.contains("key must be str")
+                                     && e.contains("nil")),
+            "{call}: expected a located nil-key refusal, got {errs:?}");
+    }
+}
+
+/// A `map_get` result used as a *later* key must not regress (#742/#743's
+/// shape stays `Unknown` in the checker — JIT-only refusal), and neither must
+/// a genuine `str` key on a real map.
+#[test]
+fn map_753_fixes_do_not_regress_valid_map_code() {
+    let src = "fn main() -> i64 { \
+        let !rec = map() \
+        map_set(rec, \"name\", \"gus\") \
+        let !defs = map() \
+        map_set(defs, map_get(rec, \"name\"), rec) \
+        0 \
+    }";
+    assert!(passes(src),
+        "a map_get result used as a key must stay a checker pass (#742/#743), got {:?}",
+        check(src));
+}
+
+/// Reviewer follow-up (#753's sibling finding): the nil-key check must gate
+/// on a literal `nil` at the call site, not on the key expression's static
+/// TYPE. `fn key(i: i64) { "k" + to_str(i) }` has no `->`, so its return type
+/// defaults to `Unit` regardless of its body's real `str` tail — but it is a
+/// working, `str`-returning helper (its own declared-vs-body mismatch passes
+/// via the `(Unit, Str)` `(T, Err)`-convention exemption, the same one that
+/// lets an `Err`-typed fn return plain `nil`). `map_set(m, key(1), 5)` has a
+/// genuine `str` key at runtime and must not be refused as a nil key just
+/// because the call's static type is `Unit`.
+#[test]
+fn map_set_key_from_a_no_arrow_str_tailed_helper_still_passes_753() {
+    let src = "fn key(i: i64) { \"k\" + to_str(i) } \
+               fn main() -> i64 { \
+        let !m = map() \
+        map_set(m, key(1), 5) \
+        0 \
+    }";
+    assert!(passes(src),
+        "a no-`->` helper whose real tail is `str` must not be refused as a nil map key, got {:?}",
+        check(src));
+}
+
+/// The `(Unit, Map)` `compatible_with` carve-out (types.rs ~146, #753) feeds
+/// `unify_if_branches` too, the same predicate `match` arms use: a real map in
+/// one branch and a literal `nil` in the other must be refused, not silently
+/// typed `map` the way the old match-anything `Map` wildcard allowed.
+#[test]
+fn if_else_map_vs_nil_is_now_a_check_error_753() {
+    let src = "fn main() -> i64 { \
+        let !m = map() \
+        let b = true \
+        let z = if b { m } else { nil } \
+        map_len(z) \
+    }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("`if` branches yield incompatible types")
+                                 && e.contains("map") && e.contains("nil")),
+        "expected a branch-mismatch error for map vs nil, got {errs:?}");
+}
+
+/// A user-declared top-level fn of the same name shadows the builtin, the
+/// same "the thing the program actually declared outranks a builtin
+/// spelling" rule the JIT's #720 review (F2) applies to `map`/`map_new`. The
+/// non-map-arg-0 check must not fire on a call that resolves to the user fn
+/// — a plain `fn map_get(a: i64, b: i64) -> i64 { a + b }` + `map_get(1, 2)`
+/// is a real, `--check`-clean, `dmc run`-answering program (answers `3`) on
+/// the pre-#745 binary, and this check must not regress it.
+#[test]
+fn user_fn_of_the_same_name_shadows_the_map_builtin_check_745() {
+    let src = "fn map_get(a: i64, b: i64) -> i64 { a + b } \
+               fn main() -> i64 { map_get(1, 2) }";
+    assert!(passes(src),
+        "a user fn named `map_get` must shadow the builtin's non-map-arg-0 check, got {:?}",
+        check(src));
+}
+
+// ── #744: a range bound must have an integer type ───────────────────────────
+//
+// #731 (#724) made the `Range` arm in `check_expr` recurse into `start`/`end`
+// so an undefined or import-private name inside a bound is caught — but it
+// left the bound's *type* unconstrained: `for k in 0..("x")` and `0..(1.5)`
+// checked clean and ran as silent zero-iteration loops (`dmc run` gates on
+// `--check`, so a str/float/bool bound never reached the interpreter's own
+// `for`-loop tolerance at all before this fix — see `eval_range_bound`'s
+// "#639" comment in `interp.rs`, which is deliberately unaffected: it stays
+// the fallback for a bound the checker genuinely can't pin down, e.g. a
+// dynamically-str `Unknown` value). The slice site (`t[a..b]`) never even
+// reached the `Range` arm — `classify_index_axis` unpacks its bounds first —
+// so it needed the same constraint applied separately; unfixed, it was
+// worse than silent: `t[0..("x")]` panicked at run time instead
+// (`interp.rs`'s `index_int`, confirmed against the release binary).
+
+#[test]
+fn str_bound_in_for_is_a_check_error_744() {
+    let msg = one_error(r#"fn main() -> nil { for k in 0..("x") { nil } }"#);
+    assert_eq!(msg, "range end must be integer, got str");
+}
+
+#[test]
+fn float_bound_in_for_is_a_check_error_744() {
+    let msg = one_error(r#"fn main() -> nil { for k in 0..(1.5) { nil } }"#);
+    assert_eq!(msg, "range end must be integer, got {float}");
+}
+
+#[test]
+fn bool_bound_in_for_is_a_check_error_744() {
+    let msg = one_error(r#"fn main() -> nil { for k in 0..(true) { nil } }"#);
+    assert_eq!(msg, "range end must be integer, got bool");
+}
+
+#[test]
+fn str_start_bound_in_for_is_a_check_error_744() {
+    let msg = one_error(r#"fn main() -> nil { for k in ("x")..10 { nil } }"#);
+    assert_eq!(msg, "range start must be integer, got str");
+}
+
+#[test]
+fn str_bound_in_slice_is_a_check_error_744() {
+    // The repro from the issue title: `t[0..("x")]` reaches
+    // `classify_index_axis`, not the `Range` arm, so it needs its own check.
+    let msg = one_error(r#"
+        fn main() -> nil {
+            let t = [1.0, 2.0, 3.0, 4.0]
+            let s = t[0..("x")]
+            nil
+        }
+    "#);
+    assert_eq!(msg, "range end must be integer, got str");
+}
+
+#[test]
+fn float_start_bound_in_slice_is_a_check_error_744() {
+    let msg = one_error(r#"
+        fn main() -> nil {
+            let t = [1.0, 2.0, 3.0, 4.0]
+            let s = t[(1.5)..4]
+            nil
+        }
+    "#);
+    assert_eq!(msg, "range start must be integer, got {float}");
+}
+
+#[test]
+fn str_step_in_colon_slice_is_a_check_error_744() {
+    // The colon-form step shares `classify_index_axis`'s `IndexAxis::Slice`
+    // with the `..` spellings (`SPEC.md §4.3`: "both spellings are permanent
+    // surface"), so it is held to the same constraint.
+    let msg = one_error(r#"
+        fn main() -> nil {
+            let t = [1.0, 2.0, 3.0, 4.0]
+            let s = t[0:4:("x")]
+            nil
+        }
+    "#);
+    assert_eq!(msg, "slice step must be integer, got str");
+}
+
+#[test]
+fn bool_bound_in_value_position_range_is_a_check_error_744() {
+    // A range need not sit in a `for` or an index bracket at all — `#724`'s
+    // own repro shape is a bare `let` binding.
+    let msg = one_error(r#"fn main() -> nil { let r = 0..(true)  nil }"#);
+    assert_eq!(msg, "range end must be integer, got bool");
+}
+
+#[test]
+fn str_bound_in_call_arg_position_range_is_a_check_error_744() {
+    let msg = one_error(r#"
+        fn f(r: i64) -> nil { nil }
+        fn main() -> nil { f(0..("x")) }
+    "#);
+    assert_eq!(msg, "range end must be integer, got str");
+}
+
+#[test]
+fn plain_untyped_int_bounds_pass_744() {
+    assert!(passes("fn main() -> nil { for i in 0..10 { nil } }"));
+}
+
+#[test]
+fn matching_narrow_width_bounds_pass_744() {
+    // `dmc run` iterates `0u8..4u8` the same as `0..4` today (confirmed
+    // against the release binary) — a fixed-width integer is still an
+    // integer.
+    assert!(passes("fn main() -> nil { for i in 0u8..4u8 { nil } }"));
+}
+
+#[test]
+fn mixed_untyped_and_narrow_width_bounds_pass_744() {
+    assert!(passes("fn main() -> nil { for i in 0..4u8 { nil } }"));
+}
+
+#[test]
+fn mixed_width_bounds_pass_744() {
+    // `0u8..4i64`: the two bounds don't share a width, but `dmc run` iterates
+    // it the same as any other integer range (confirmed against the release
+    // binary) — this fix constrains each bound to *an* integer type, not to
+    // a common one.
+    assert!(passes("fn main() -> nil { for i in 0u8..4i64 { nil } }"));
+}
+
+#[test]
+fn unknown_typed_bound_passes_744() {
+    // A `map_get` result types as `Unknown` (#742/#743) — genuinely unknown
+    // to the checker, not evidence of a wrong type, so it is accepted (and
+    // remains the interpreter's own responsibility if it turns out not to be
+    // an int at run time — `eval_range_bound`'s documented tolerance).
+    assert!(passes(r#"
+        fn main() -> nil {
+            let m = map_new()
+            map_set(m, "n", 4)
+            let n: i64 = map_get(m, "n")
+            for i in 0..n { nil }
+        }
+    "#));
+}
+
+#[test]
+fn shape_param_bound_passes_744() {
+    // A shape parameter reference types as `Unknown` in a method/fn body
+    // (`Env::shape_param_in_scope`), the same "checker genuinely doesn't
+    // pin this down further" shape as a `map_get` result.
+    assert!(passes(r#"
+        fn f[N](x: Tensor[f32, [N]]) -> nil {
+            for i in 0..N { nil }
+        }
+        fn main() -> nil {
+            let t = [1.0, 2.0, 3.0]
+            f(t)
+        }
+    "#));
+}
+
+#[test]
+fn open_ended_slice_range_still_passes_744() {
+    // `t[1..]` has no end bound at all — nothing to constrain.
+    assert!(passes(r#"
+        fn main() -> nil {
+            let t = [1.0, 2.0, 3.0]
+            let s = t[1..]
+            nil
+        }
+    "#));
+}
+
+// ── #768: a range bound cannot itself be a range ────────────────────────────
+//
+// `check_expr(Expr::Range)` types a bare range `Unknown` (see the `Range` arm
+// in `check_expr`), and `is_integral_shape_arg` waves `Unknown` through on
+// purpose (#474: an expression the checker can't pin down is not evidence of
+// a wrong one) — but a bound that is *syntactically* a range is not
+// undecidable, it's a known wrong shape, and the old code let it through
+// both the slice site and the `for` site. Confirmed against the release
+// binary built from main before #768:
+// `t[(0..2)..3]` passed `--check` and then panicked under `dmc run` with
+// "runtime error at 1:58: range start must be integer, got range"; `for i in
+// (0..4)..8` passed `--check` and silently iterated `0..8` under `dmc run`.
+
+#[test]
+fn range_bound_in_slice_is_a_check_error_768() {
+    let msg = one_error(r#"
+        fn main() -> nil {
+            let t = [1.0, 2.0, 3.0, 4.0]
+            let s = t[(0..2)..3]
+            nil
+        }
+    "#);
+    assert_eq!(msg, "range start must be integer, got range");
+}
+
+#[test]
+fn range_bound_in_for_is_a_check_error_768() {
+    let msg = one_error("fn main() -> nil { for i in (0..4)..8 { nil } }");
+    assert_eq!(msg, "range start must be integer, got range");
+}
+
+// ── #728: warn on a type-arg-less generic-model annotation ──────────────────
+//
+// #728 (ratified
+// 2026-09-09): a shape-parameterized model named without an
+// argument list in a parameter, field, return or binding annotation, or as a
+// builtin's own model type argument (`forge.uninit[Surface, [N]]`), is a
+// warning at 0.0.5-draft and becomes a compile-time error at 0.0.6-draft. A
+// model with no shape parameters is unaffected — its bare name is its only
+// spelling. Follow-up PR (3) of that section's list: the predicate and the
+// diagnostic, landed here as a warning only (PR (4) turns it into an error).
+
+fn type_arg_less_warning<'a>(warns: &'a [super::check::TypeError], model: &str) -> Option<&'a super::check::TypeError> {
+    warns.iter().find(|w| {
+        w.msg.starts_with("bare-generic-model: ")
+            && w.msg.contains(&format!("names `{model}` with no argument list"))
+    })
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_param() {
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               fn cap(b: Buf) -> i64 { b.t[0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Buf").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("parameter `b` of function `cap`"), "{}", w.msg);
+    assert!(w.msg.contains("SPEC.md §3.10"), "{}", w.msg);
+    assert!(w.msg.contains("0.0.6-draft"), "{}", w.msg);
+    assert_eq!((w.span.line, w.span.col), (2, 11));
+    // Reviewer defect 1: param position is the one spot "write it
+    // explicitly" is wrong advice (a bracket-less param check-passes,
+    // silencing this lint forever, and the JIT refuses it identically
+    // either way) — the hint must name the ruling's blessed spelling
+    // instead: declare the shape parameter on the function itself.
+    // Verified `--check` clean and `dmc jit`-lowering (see check.rs's
+    // `type_arg_less_hint` doc comment).
+    assert_eq!(
+        w.hint.as_deref(),
+        Some("declare the shape parameter on the function: `fn cap[N](b: Buf[N])`"),
+    );
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_field() {
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               model Outer[K] { inner: Buf, k: i64 }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Buf").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("field `inner` of model `Outer`"), "{}", w.msg);
+    assert_eq!((w.span.line, w.span.col), (2, 25));
+    // `Outer`'s own shape param is `K`, not `Buf`'s `N` — nothing to reuse,
+    // so the hint is a concrete bracket, not a bare-name spelling that
+    // would be a hard "undefined identifier" error in field position.
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `Buf[4]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_return() {
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               fn make() -> Buf { Buf[4] { t: forge.zeros[i64, [4]] } }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Buf").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("the return type of function `make`"), "{}", w.msg);
+    assert_eq!((w.span.line, w.span.col), (2, 14));
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `Buf[4]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_let_binding() {
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               fn main() -> i64 { let !a = Buf[4] { t: forge.zeros[i64, [4]] } \
+               let x: Buf = a x.t[0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Buf").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("let binding `x` in function `main`"), "{}", w.msg);
+    assert_eq!((w.span.line, w.span.col), (2, 72));
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `Buf[4]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_allocator() {
+    // `forge.uninit[Surface, [4]]` — the sixth annotation position (§2.5):
+    // a builtin's own model type argument, bare.
+    let src = "model Surface[H, W] { !px: Tensor[i64, [H, W]] }\n\
+               fn main() -> i64 { let !arr = forge.uninit[Surface, [4]] \
+               arr[0] = Surface[2, 3] { px: forge.zeros[i64, [2, 3]] } \
+               arr[0].px[0, 0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Surface").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("the element type of `forge.uninit` in function `main`"), "{}", w.msg);
+    assert_eq!((w.span.line, w.span.col), (2, 44));
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `Surface[4, 4]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_reuses_a_shape_param_already_in_scope() {
+    // Reviewer defect 1's third hint form: when the enclosing fn already
+    // declares a shape param matching the model's own (by name), the hint
+    // reuses it rather than a concrete placeholder — `fn make[N]() -> Buf`
+    // already has `N` in scope for the return position.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               fn make[N]() -> Buf { Buf[N] { t: forge.zeros[i64, [N]] } }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Buf").expect("expected a type-arg-less warning");
+    assert_eq!(w.hint.as_deref(), Some("write the shape arguments explicitly: `Buf[N]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_silent_with_explicit_brackets() {
+    // Control: `Buf[N]` spells its own shape argument — the predicate must
+    // not fire on the bracketed spelling, in any of the four positions.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               fn cap[N](b: Buf[N]) -> i64 { b.t[0] }\n";
+    let warns = checked(src).warnings;
+    assert!(type_arg_less_warning(&warns, "Buf").is_none(),
+            "explicit bracket must not warn, got {:?}", warns.iter().map(|w| &w.msg).collect::<Vec<_>>());
+}
+
+#[test]
+fn type_arg_less_generic_model_silent_for_non_generic_model() {
+    // Control: a model with NO shape parameters has only one spelling — its
+    // bare name — so the predicate (shape_params non-empty) must not fire.
+    let src = "model Pt { c: Tensor[i64, [2]] }\n\
+               fn sx(p: Pt) -> i64 { p.c[0] }\n";
+    let warns = checked(src).warnings;
+    assert!(type_arg_less_warning(&warns, "Pt").is_none(),
+            "non-generic model must not warn, got {:?}", warns.iter().map(|w| &w.msg).collect::<Vec<_>>());
+}
+
+// ── #728 rework: reviewer defects 2–5 ────────────────────────────────────
+
+#[test]
+fn type_arg_less_generic_model_warns_on_array_element_in_param() {
+    // Reviewer defect 2: the predicate used to match only `Type::Named`, so
+    // a bare model nested in a fixed-size array's element type escaped in
+    // parameter position (design probe d11, `[Surface; 4]` — SPEC.md §3.10
+    // calls `[M; N]` a field/parameter type same as any other).
+    let src = "model Surface[H, W] { !px: Tensor[i64, [H, W]] }\n\
+               fn sum_two(arr: [Surface; 4]) -> i64 { arr[0].px[0, 0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Surface").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("parameter `arr` of function `sum_two`"), "{}", w.msg);
+    // Nested in an array wrapper: verified at RUNTIME that a freshly
+    // declared shape param does not infer through this position (the
+    // array/tuple/fn-type-nested twin of #739, confirmed by probe — see
+    // `type_arg_less_hint`'s doc comment) — so the hint is a concrete
+    // bracket that preserves the array wrapper (`[Surface[4, 4]; 4]`, not
+    // `Surface[H, W]`, which silently drops it and isn't this parameter's
+    // type at all), not the "declare on the function" spelling a direct
+    // (non-nested) param position gets.
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `[Surface[4, 4]; 4]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_array_element_in_field() {
+    // Reviewer defect 2, field position half: `Type::Named`-only matching
+    // let `[Surface; 4]` escape as a model field's type too.
+    let src = "model Surface[H, W] { !px: Tensor[i64, [H, W]] }\n\
+               model Holder[K] { arr: [Surface; 4], k: i64 }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Surface").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("field `arr` of model `Holder`"), "{}", w.msg);
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `[Surface[4, 4]; 4]`"));
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_zeros_allocator() {
+    // Reviewer defect 3: the allocator check keyed on the literal method
+    // name `uninit`, so `forge.zeros[Surface, [4]]` — an equally legal
+    // model-array allocator (same set `ctor_tensor_ty` matches for a
+    // scalar element) — escaped.
+    let src = "model Surface[H, W] { !px: Tensor[i64, [H, W]] }\n\
+               fn main() -> i64 { let !arr = forge.zeros[Surface, [4]] \
+               arr[0] = Surface[2, 3] { px: forge.zeros[i64, [2, 3]] } \
+               arr[0].px[0, 0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Surface").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("the element type of `forge.zeros` in function `main`"), "{}", w.msg);
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_ones_allocator() {
+    let src = "model Surface[H, W] { !px: Tensor[i64, [H, W]] }\n\
+               fn main() -> i64 { let !arr = forge.ones[Surface, [4]] \
+               arr[0] = Surface[2, 3] { px: forge.zeros[i64, [2, 3]] } \
+               arr[0].px[0, 0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Surface").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("the element type of `forge.ones` in function `main`"), "{}", w.msg);
+}
+
+#[test]
+fn type_arg_less_generic_model_field_before_later_param_warns_in_source_order() {
+    // Reviewer defect 4: `lint_type_arg_less_generic_model_fields` runs as
+    // a trailing post-registration pass (see its own doc comment for why —
+    // a model field's type is resolved once, during registration, and a
+    // forward-referenced model's shape-param count isn't known yet at that
+    // point), so without an explicit sort its warning for a field on line 2
+    // would print AFTER a param warning from line 4, out of source order.
+    // `check_program` sorts `warnings` by source position specifically to
+    // prevent that.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               model Outer[K] { inner: Buf, k: i64 }\n\
+               fn nop() -> i64 { 0 }\n\
+               fn cap(b: Buf) -> i64 { b.t[0] }\n";
+    let warns = checked(src).warnings;
+    let field_idx = warns.iter().position(|w| w.msg.contains("field `inner` of model `Outer`"))
+        .expect("expected the field warning");
+    let param_idx = warns.iter().position(|w| w.msg.contains("parameter `b` of function `cap`"))
+        .expect("expected the param warning");
+    assert!(
+        field_idx < param_idx,
+        "the line-2 field warning must print before the line-4 param warning: {:?}",
+        warns.iter().map(|w| (w.span.line, w.msg.clone())).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn type_arg_less_generic_model_warns_on_alias_body() {
+    // Reviewer defect 5, the alias hatch: `type B = Buf` then `fn cap(b:
+    // B)` warned nothing even after the field/param fixes, since `B`'s own
+    // body is never itself a param/field/return/let annotation — a fifth
+    // position the ratified decision's principle covers all the same.
+    // Design probe g35's equivalent.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               type B = Buf\n\
+               fn cap(b: B) -> i64 { b.t[0] }\n";
+    let warns = checked(src).warnings;
+    let w = type_arg_less_warning(&warns, "Buf").expect("expected a type-arg-less warning");
+    assert!(w.msg.contains("the body of type alias `B`"), "{}", w.msg);
+    assert_eq!(w.hint.as_deref(), Some("write a concrete shape argument: `Buf[4]`"));
+    // The alias body carries the only warning — `b: B` does not ALSO
+    // trigger the param-position lint (`B` is a type-alias name, not a
+    // model name, so `bare_generic_model` never matches it there); one
+    // warning per bare-model site, not two for the same underlying escape.
+    assert_eq!(
+        warns.iter().filter(|w| w.msg.starts_with("bare-generic-model: ")
+            && w.msg.contains("names `Buf` with no argument list")).count(),
+        1,
+    );
+}
+
+#[test]
+fn type_arg_less_generic_model_silent_for_bracketed_alias_body() {
+    // Control (design probe g34): `type S = Buf[4]` pins a concrete
+    // geometry once — the ruling's own blessed hatch for reusing a shape,
+    // not an escape — so the alias-body lint must stay silent on it.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               type S = Buf[4]\n\
+               fn cap(b: S) -> i64 { b.t[0] }\n";
+    let warns = checked(src).warnings;
+    assert!(type_arg_less_warning(&warns, "Buf").is_none(),
+            "a bracketed alias body must not warn, got {:?}", warns.iter().map(|w| &w.msg).collect::<Vec<_>>());
+}
+
+// ── #785: `Tensor`/`View`/`KV`'s own element type is a hard error, not a
+// bare-generic-model warning ────────────────────────────────────────────────
+//
+// `find_bare_generic_models` briefly walked these three arms too (an interim
+// revision of the #728 lint, filed alongside #785 itself), on the theory
+// that a bare generic model there was the only diagnostic a reader would
+// get. That premise died once #785 landed: `resolve_type`'s own `Tensor`/
+// `View`/`KV` arms now hard-refuse ANY non-scalar element outright
+// (`check_tensor_element_scalar`) — model or enum, bracketed or bare — so
+// the lint's recursion into these three arms was pulled back out (matching
+// `RawPtr`, which was never walked for the same reason: a stricter,
+// already-refusing check owns that position). A bare generic model there
+// now gets exactly one diagnostic: the #785 `tensor-element-type` error,
+// not this lint's warning.
+
+#[test]
+fn tensor_element_type_error_fires_instead_of_bare_generic_model_warning() {
+    // `Buf` is both shape-parameterized AND named bare — before #785 this
+    // checked clean; the interim #728 revision made it warn; now it is a
+    // hard type error, and the old warning must not also fire (one
+    // diagnostic, not two).
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               fn cap(b: Tensor[Buf, [4]]) -> i64 { 0 }\n";
+    let checker = checked(src);
+    assert!(checker.errors.iter().any(|e|
+        e.msg.contains("tensor-element-type") && e.msg.contains("`Buf` is a model")),
+        "expected a tensor-element-type error, got errors {:?}",
+        checker.errors.iter().map(|e| &e.msg).collect::<Vec<_>>());
+    assert!(type_arg_less_warning(&checker.warnings, "Buf").is_none(),
+        "bare-generic-model must not ALSO fire for a Tensor element, got warnings {:?}",
+        checker.warnings.iter().map(|w| &w.msg).collect::<Vec<_>>());
+}
+
+#[test]
+fn tensor_element_type_error_fires_for_kv_field_even_when_bracketed() {
+    // Fully bracketed (`Buf[4]`, not bare) never tripped the #728 lint at
+    // all — this position was never that lint's to catch. #785's own check
+    // does not care whether the model reference was bare or bracketed: a
+    // model is not a scalar type either way.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               model Holder[K] { cache: KV[Buf[4], [4]], k: i64 }\n";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("tensor-element-type") && e.contains("`Buf` is a model")),
+        "got: {:?}", errs);
+}
+
+// ── one hint brackets every match in the annotation ──────────────────────
+
+#[test]
+fn type_arg_less_generic_model_hint_brackets_every_match() {
+    // An annotation with two bare-model occurrences used to get two
+    // warnings whose hints each bracketed only their own occurrence —
+    // applying either hint alone left the sibling occurrence still bare,
+    // which still warned. Now every match found in the annotation is
+    // bracketed in each hint, so applying any single one converges to zero
+    // warnings in one edit.
+    let src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+               model Holder[K] { y: ([Buf; 2], (Buf, i64)), k: i64 }\n";
+    let warns = checked(src).warnings;
+    let matches: Vec<_> = warns.iter()
+        .filter(|w| w.msg.starts_with("bare-generic-model: ")
+            && w.msg.contains("names `Buf` with no argument list"))
+        .collect();
+    assert_eq!(matches.len(), 2, "expected two warnings, got {:?}",
+               warns.iter().map(|w| &w.msg).collect::<Vec<_>>());
+    for w in &matches {
+        assert_eq!(
+            w.hint.as_deref(),
+            Some("write a concrete shape argument: `([Buf[4]; 2], (Buf[4], i64))`"),
+        );
+    }
+    // And applying that rendered hint verbatim actually silences the lint.
+    let fixed_src = "model Buf[N] { !t: Tensor[i64, [N]] }\n\
+                     model Holder[K] { y: ([Buf[4]; 2], (Buf[4], i64)), k: i64 }\n";
+    let fixed_warns = checked(fixed_src).warnings;
+    assert!(type_arg_less_warning(&fixed_warns, "Buf").is_none(),
+            "the rendered hint must silence the lint, got {:?}",
+            fixed_warns.iter().map(|w| &w.msg).collect::<Vec<_>>());
+}
+
+// ── #674 slice 3a: arena budgets ─────────────────────────────────────────────
+
+#[test]
+fn budget_ctor_spine_shared_table_674() {
+    // The parser/checker pair over ONE spine table (`parser_tests.rs`'s
+    // `ARENA_CTOR_SPINE_TABLE`) so the two can't silently diverge on which
+    // spellings admit `in b`. A non-`vault`, non-`kv` spine entry, wrapped
+    // in `forge.enter` with an explicit `in b` override, check-passes with
+    // no `budget-arena` — `vault.*` (R3 instance ii) and `.kv` (R3 instance
+    // i, which fires on an explicit override too, not just ambiently) are
+    // exercised on their own below.
+    for (spine, is_spine) in crate::parser_tests::ARENA_CTOR_SPINE_TABLE {
+        if !is_spine { continue; }
+        if spine.starts_with("vault.") { continue; } // R3(ii), below
+        if spine.contains(".kv[") { continue; }       // R3(i), below
+        let src = format!(
+            "fn f(b: Budget) -> nil {{ forge.enter(b) {{ let t = {spine} in b }}\n nil }}");
+        let errs = check(&src);
+        assert!(
+            !errs.iter().any(|e| e.contains("budget-arena")),
+            "`{spine} in b` inside `forge.enter` must not raise budget-arena, got: {errs:?}"
+        );
+    }
+
+    // PR #814 review: the sweep above is negative-only, so a predicate
+    // mutation that NARROWS `arena_ctor_receiver`/`is_arena_ctor_spine` (stops
+    // recognizing a genuine spine as one) survives it undetected — a
+    // mis-recognized entry still produces no `budget-arena` error, exactly
+    // like the correctly-excluded entries this loop actually checks for.
+    // Positive complement, from the SAME table: the two excluded categories
+    // must still be recognized as ctor spines AND still raise their own R3
+    // message, or this narrowing would surface here.
+    for (spine, is_spine) in crate::parser_tests::ARENA_CTOR_SPINE_TABLE {
+        if !is_spine || !spine.starts_with("vault.") { continue; }
+        let src = format!("fn f(b: Budget) -> nil {{ let t = {spine} in b\n nil }}");
+        let errs = check(&src);
+        assert!(
+            errs.iter().any(|e| e.starts_with("budget-arena:") && e.contains("Vault")),
+            "`{spine} in b` must still be recognized as a ctor spine and raise the \
+             Vault R3 message, got: {errs:?}"
+        );
+    }
+    for (spine, is_spine) in crate::parser_tests::ARENA_CTOR_SPINE_TABLE {
+        if !is_spine || !spine.contains(".kv[") || !spine.starts_with("stream.") { continue; }
+        let src = format!("fn f(b: Budget) -> nil {{ let t = {spine} in b\n nil }}");
+        let errs = check(&src);
+        assert!(
+            errs.iter().any(|e| e.starts_with("budget-arena:") && e.contains("Stream")),
+            "`{spine} in b` must still be recognized as a ctor spine and raise the \
+             Stream R3 message, got: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn budget_arena_forge_kv_inside_entered_extent_674() {
+    // R3(i): `forge.kv` ambiently inside a budgeted extent (no `in`
+    // override) — `.kv` always lands in the Stream arena, which no budget
+    // owns.
+    let src = "fn f(b: Budget) -> nil { \
+                 forge.enter(b) { let t = forge.kv[f32, [4]] }\n nil }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.starts_with("budget-arena:") && e.contains("forge.kv")),
+        "expected a budget-arena error naming `forge.kv`, got: {errs:?}");
+}
+
+#[test]
+fn budget_arena_stream_kv_inside_entered_extent_674() {
+    // R3(i)'s second spelling.
+    let src = "fn f(b: Budget) -> nil { \
+                 forge.enter(b) { let t = stream.kv[f32, [4]] }\n nil }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.starts_with("budget-arena:") && e.contains("stream.kv")),
+        "expected a budget-arena error naming `stream.kv`, got: {errs:?}");
+}
+
+#[test]
+fn budget_arena_forge_kv_outside_entered_extent_is_fine_674() {
+    // Same spelling, no enclosing `forge.enter` — must NOT fire (`k1`'s own
+    // must-not-change guarantee: `.kv` outside a budgeted extent).
+    let src = "fn f() -> nil { let t = forge.kv[f32, [4]]\n nil }";
+    assert!(passes(src), "errors: {:?}", check(src));
+}
+
+#[test]
+fn budget_arena_vault_ctor_with_in_override_674() {
+    // R3(ii): `vault.<ctor>[…] in b` — a budget is a region of Forge, so `b`
+    // cannot own vault-charged bytes, for ANY vault allocator method
+    // (not just `kv`).
+    let src = "fn f(b: Budget) -> nil { let t = vault.zeros[f32, [4]] in b\n nil }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.starts_with("budget-arena:") && e.contains("vault.zeros")),
+        "expected a budget-arena error naming `vault.zeros`, got: {errs:?}");
+}
+
+#[test]
+fn budget_arena_forge_kv_with_explicit_in_override_674() {
+    // R3(i) also fires on an EXPLICIT override, not just ambiently: a `.kv`
+    // spine can never be owned by any budget, named or ambient, and this
+    // must report exactly ONCE (`checking_alloc_in_ctor` suppresses the
+    // ambient recheck of the same node).
+    let src = "fn f(b: Budget) -> nil { let t = forge.kv[f32, [4]] in b\n nil }";
+    let errs = check(src);
+    let matches: Vec<_> = errs.iter().filter(|e| e.starts_with("budget-arena:")).collect();
+    assert_eq!(matches.len(), 1, "expected exactly one budget-arena error, got: {errs:?}");
+}
+
+#[test]
+fn budget_arena_nested_kv_inside_ctor_index_args_still_fires_674() {
+    // Nit fix: `checking_alloc_in_ctor` used to be a bare `bool` held across
+    // the WHOLE `check_expr(ctor)` recursion for the outer overridden ctor
+    // spine, which wrongly suppressed the ambient R3(i) check for a
+    // DIFFERENT `.kv` spine nested inside that ctor's own index/shape
+    // arguments too — a real, unreported hole (this program used to
+    // `--check` clean). Narrowed to the exact ctor-spine span being
+    // exempted, so the outer override still reports once (see the test
+    // above) but this inner, unrelated `.kv` spine — ambiently inside the
+    // same `forge.enter` extent, with no override of its own — still fires.
+    let src = "fn f(b: Budget) -> nil { \
+                 forge.enter(b) { let t = forge.zeros[f32, [stream.kv[f32, [4]]]] in b } \n nil }";
+    let errs = check(src);
+    let matches: Vec<_> = errs.iter().filter(|e| e.starts_with("budget-arena:")).collect();
+    assert_eq!(matches.len(), 1,
+        "expected exactly one budget-arena error naming the nested `stream.kv`, got: {errs:?}");
+    assert!(matches[0].contains("stream.kv"), "got: {matches:?}");
+}
+
+#[test]
+fn budget_arena_vault_kv_ctor_with_in_override_674() {
+    // #674 slice 3a fix: `vault.kv […] in b` must hit R3(i)'s Stream-arena
+    // message (`.kv` always lands in Stream regardless of prefix, `MEMORY.md
+    // §9`), NOT R3(ii)'s Vault message — the two sites must agree because
+    // both now route through the one `arena_ctor_receiver` predicate rather
+    // than a hand-rolled `Ident` match that tested `vault` before `kv`.
+    let src = "fn f(b: Budget) -> nil { let t = vault.kv[f32, [4]] in b\n nil }";
+    let errs = check(src);
+    let matches: Vec<_> = errs.iter().filter(|e| e.starts_with("budget-arena:")).collect();
+    assert_eq!(matches.len(), 1, "expected exactly one budget-arena error, got: {errs:?}");
+    assert!(matches[0].contains("vault.kv") && matches[0].contains("Stream"),
+        "expected the Stream-arena message naming `vault.kv`, got: {matches:?}");
+    assert!(!matches[0].contains("Vault"),
+        "must not report the Vault-instance message for `vault.kv`, got: {matches:?}");
+}
+
+#[test]
+fn budget_arena_vault_ctor_no_override_inside_extent_is_fine_674() {
+    // §3.5: a bare `vault.*` (no `in b`) inside an entered extent charges
+    // the root — the spelling says Vault, no budget was named, so this is
+    // NOT an error.
+    let src = "fn f(b: Budget) -> nil { \
+                 forge.enter(b) { let t = vault.zeros[f32, [4]] }\n nil }";
+    assert!(passes(src), "errors: {:?}", check(src));
+}
+
+// ── #674 slice 3a: well-formedness stays check-time ─────────────────────────
+// `forge.carve`/`forge.reap`'s argument typing — the one static slice of
+// R1/R2 a checker with no arena state can still decide. `forge.enter`'s own
+// operand and `in b`'s budget operand are covered by the R3/BudgetBlock
+// tests above; these four pin the two calls neither of those arms reaches.
+
+#[test]
+fn forge_carve_non_budget_parent_is_a_type_error_674() {
+    // The motivating example: `forge.carve("not a budget", -1)` used to pass
+    // `--check` clean — `forge`'s bare-ident type is `Unknown`, so nothing
+    // constrained the call's own arguments.
+    let errs = check("fn main() -> nil { forge.carve(\"not a budget\", -1) \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.carve:") && e.contains("Budget") && e.contains("str")),
+        "expected a Budget-typing error for the parent, got: {errs:?}");
+    assert!(errs.iter().any(|e| e.starts_with("forge.carve:") && e.contains("positive") && e.contains("-1")),
+        "expected a positive-bytes-literal error, got: {errs:?}");
+}
+
+#[test]
+fn forge_carve_non_integer_bytes_is_a_type_error_674() {
+    let errs = check("fn f(b: Budget) -> nil { forge.carve(b, \"four\") \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.carve:") && e.contains("integer") && e.contains("str")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn forge_carve_well_typed_is_fine_674() {
+    let src = "fn f(b: Budget) -> nil { forge.carve(b, 4096) \n nil }";
+    assert!(passes(src), "errors: {:?}", check(src));
+}
+
+#[test]
+fn forge_reap_non_budget_is_a_type_error_674() {
+    let errs = check("fn main() -> nil { forge.reap(\"not a budget\") \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.reap:") && e.contains("Budget") && e.contains("str")),
+        "errors: {errs:?}");
+}
+
+// PR #814 review: `arg_tys.first()`/`.get(1)` are `Option`s that silently
+// no-op on a missing argument, so `forge.carve()`, `forge.carve(root)` and
+// `forge.reap()` all "checked clean" before the arity checks above were
+// added — no argument to type at all is not the same as a well-typed call.
+
+#[test]
+fn forge_carve_no_args_is_an_arity_error_674() {
+    let errs = check("fn main() -> nil { forge.carve() \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.carve:") && e.contains("2") && e.contains("0")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn forge_carve_one_arg_is_an_arity_error_674() {
+    // `root`'s own undefined-identifier error is a separate, expected
+    // complaint here — the arity error must fire independently of it.
+    let errs = check("fn f(root: Budget) -> nil { forge.carve(root) \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.carve:") && e.contains("2") && e.contains("1")),
+        "expected an arity error naming 2 expected / 1 found, got: {errs:?}");
+}
+
+#[test]
+fn forge_carve_three_args_is_an_arity_error_674() {
+    let errs = check("fn f(b: Budget) -> nil { forge.carve(b, 4, 8) \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.carve:") && e.contains("2") && e.contains("3")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn forge_reap_no_args_is_an_arity_error_674() {
+    let errs = check("fn main() -> nil { forge.reap() \n nil }");
+    assert!(errs.iter().any(|e| e.starts_with("forge.reap:") && e.contains("1") && e.contains("0")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn budget_name_is_reserved_against_model_674_s6() {
+    // Probe s6: `model Budget { n: i64 }` must now be a name-reservation
+    // error, not a silently-shadowing user model.
+    let errs = check("model Budget { n: i64 }\nfn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("reserved") && e.contains("Budget")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn budget_name_is_reserved_against_enum_674() {
+    let errs = check("enum Budget { A, B }\nfn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("reserved") && e.contains("Budget")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn budget_name_is_reserved_against_type_alias_674() {
+    let errs = check("type Budget = i64\nfn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("reserved") && e.contains("Budget")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn budget_type_checks_in_return_field_and_array_position_674_s2() {
+    // Probe s2's three positions, all clean: return type, model field,
+    // struct-literal initialiser.
+    let src = "fn mk() -> Budget { forge.root }\n\
+               model Tenant { budget: Budget, id: i64 }\n\
+               fn main() -> nil { \
+                 let r = Tenant { budget: mk(), id: 7 }\n \
+                 nil }";
+    assert!(passes(src), "errors: {:?}", check(src));
+}
+
+#[test]
+fn budget_array_position_674() {
+    let src = "fn f(bs: [Budget; 4]) -> Budget { bs[0] }\nfn main() -> nil { nil }";
+    assert!(passes(src), "errors: {:?}", check(src));
+}
+
+#[test]
+fn budget_is_not_compatible_with_other_types_674() {
+    let errs = check("fn f(b: Budget) -> i64 { b }\nfn main() -> nil { nil }");
+    assert!(!errs.is_empty(), "expected a type mismatch returning a Budget as i64");
+}
+
+#[test]
+fn budget_takes_no_type_arguments_674() {
+    let errs = check("fn f(b: Budget[4]) -> nil { nil }\nfn main() -> nil { nil }");
+    assert!(errs.iter().any(|e| e.contains("Budget") && e.contains("no type argument")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn forge_enter_requires_budget_operand_674() {
+    let errs = check("fn main() -> nil { forge.enter(5) { nil }\n nil }");
+    assert!(errs.iter().any(|e| e.contains("forge.enter") && e.contains("Budget")),
+        "errors: {errs:?}");
+}
+
+#[test]
+fn alloc_in_requires_budget_operand_674() {
+    let errs = check("fn main() -> nil { let t = forge.zeros[f32, [4]] in 5\n nil }");
+    assert!(errs.iter().any(|e| e.contains("Budget")), "errors: {errs:?}");
+}
+
+// ── #674 slice 3d: the typing of the two forms, now that both lower ─────────
+
+#[test]
+fn alloc_in_is_typed_through_its_constructor_674() {
+    // `Expr::AllocIn`'s value IS the constructor's — `in b` names where the
+    // bytes are charged, not what the expression is — and the constructor is
+    // CHECKED, not skipped. Both halves in one pair: an error inside the
+    // spine surfaces identically with and without the `in b` tail, so the
+    // arm neither swallows the constructor nor re-reports it.
+    let with_in = check(
+        "fn f(b: Budget) -> nil { let t = forge.zeros[f32, [undefined_dim_674]] in b\n nil }");
+    let without = check(
+        "fn f(b: Budget) -> nil { let t = forge.zeros[f32, [undefined_dim_674]]\n nil }");
+    assert_eq!(with_in, without,
+        "`in b` must not change what the constructor itself reports");
+    assert_eq!(with_in.len(), 1, "errors: {with_in:?}");
+
+    // And a well-formed spine under a real `Budget` reports nothing.
+    let errs = check(
+        "fn f(b: Budget) -> nil { let t = forge.zeros[f32, [4]] in b\n nil }");
+    assert!(errs.is_empty(), "errors: {errs:?}");
+}
+
+#[test]
+fn budget_block_has_its_bodys_type_674() {
+    // `forge.enter(b) { … }` is a block: its value is its tail, and it is
+    // the block's type the checker hands back (`check_block`), never nil.
+    // The negative half runs through the fn's own return-type check, which
+    // is the one place a block expression's type is actually enforced.
+    let errs = check("fn f(b: Budget) -> i64 { forge.enter(b) { 5 } }");
+    assert!(errs.is_empty(), "errors: {errs:?}");
+
+    let errs = check("fn f(b: Budget) -> i64 { forge.enter(b) { \"s\" } }");
+    assert!(errs.iter().any(|e| e.contains("returns") && e.contains("str")),
+        "a type mismatch through `forge.enter` must be reported: {errs:?}");
+}
+
+#[test]
+fn forge_enter_over_a_budget_field_and_an_array_element_check_674() {
+    // B1: a `Budget` lives in a model field and in a `[Budget; N]`, and both
+    // spellings are `postfix_expr`s the operand position admits (§2.1 point
+    // 3). Slice 3d is the first slice at which either actually runs, so the
+    // typing is worth pinning here rather than only in the parser.
+    let errs = check(
+        "model Tenant { budget: Budget }\n\
+         fn f(r: Tenant) -> nil { forge.enter(r.budget) { nil }\n nil }");
+    assert!(errs.is_empty(), "errors: {errs:?}");
+
+    let errs = check(
+        "fn f(bs: [Budget; 4]) -> nil { forge.enter(bs[0]) { nil }\n nil }");
+    assert!(errs.is_empty(), "errors: {errs:?}");
+}
+
+#[test]
+fn budget_stack_is_separate_from_arena_stack_674() {
+    // §2.3: `forge.enter` must never push onto `arena_stack` — a Vault
+    // write nested inside an entered extent (no enclosing `vault { }`) must
+    // still be refused by #442, exactly as it is outside any `forge.enter`.
+    let src = "fn f(b: Budget) -> nil { \
+                 let !v = vault.zeros[f32, [4]]\n \
+                 forge.enter(b) { v[0] = 1.0 }\n \
+                 nil }";
+    let errs = check(src);
+    assert!(errs.iter().any(|e| e.contains("cross-arena write")),
+        "expected #442's cross-arena write error inside forge.enter, got: {errs:?}");
+}
+
+// ── #844: `TyType`'s `Display` must spell every type the parser accepts ─────
+
+/// Every `ScalarType` variant, round-tripped through `TyType`'s `Display` and
+/// spliced back in as a `let` annotation. Before #844's fix this failed for
+/// every scalar whose `Debug`-derived name isn't a plain case-fold of its
+/// source spelling (`Fp8E4M3` -> `Fp8E4M3` never lexes as `fp8_e4m3`; `I32`,
+/// `F32`, `Bool`, etc. don't lex as anything at all, since demoniC has no
+/// uppercase type keywords). Only *parsing* is asserted — not `--check`
+/// cleanliness — because the point is "the parser accepts what `Display`
+/// prints", not "the value on the right happens to be well-typed".
+#[test]
+fn ty_type_display_of_every_scalar_reparses_as_the_annotation_744() {
+    use super::ast::ScalarType;
+    use super::types::TyType;
+
+    let scalars = [
+        ScalarType::I8, ScalarType::I16, ScalarType::I32, ScalarType::I64,
+        ScalarType::U8, ScalarType::U16, ScalarType::U32, ScalarType::U64,
+        ScalarType::Int4, ScalarType::Int8,
+        ScalarType::F16, ScalarType::Bf16, ScalarType::Tf32, ScalarType::F32, ScalarType::F64,
+        ScalarType::Fp8E4M3, ScalarType::Fp8E5M2,
+        ScalarType::Trit, ScalarType::Bool, ScalarType::Str, ScalarType::Nil,
+    ];
+
+    for s in scalars {
+        let rendered = TyType::Scalar(s.clone()).to_string();
+        assert_eq!(
+            rendered,
+            super::fmt::scalar_type_str(&s),
+            "TyType::Display for {:?} must match fmt::scalar_type_str's canonical table",
+            s,
+        );
+        assert_type_annotation_parses(&rendered);
+    }
+}
+
+/// A handful of composite `TyType` forms, each wrapping a scalar leaf, must
+/// also round-trip: `Display` must print exactly what the parser accepts for
+/// `Tensor[...]`, `View[...]`, `KV[...]`, `fn(...) -> ...`, tuples, fixed
+/// arrays and raw pointers alike, not just the bare scalar case.
+#[test]
+fn ty_type_display_of_composite_types_reparses_as_the_annotation_744() {
+    use super::ast::ScalarType;
+    use super::shape::{Shape, SymDim};
+    use super::types::TyType;
+
+    let dim4 = Shape::new(vec![SymDim::Const(4)]);
+    let kv_shape = Shape::new(vec![SymDim::Const(4), SymDim::Streaming]);
+
+    let composites = vec![
+        TyType::Tensor(Box::new(TyType::Scalar(ScalarType::Fp8E4M3)), dim4.clone()),
+        TyType::View(Box::new(TyType::Scalar(ScalarType::Trit)), dim4.clone()),
+        TyType::KV(Box::new(TyType::Scalar(ScalarType::F32)), kv_shape),
+        TyType::Fn {
+            params: vec![TyType::Scalar(ScalarType::Bool), TyType::Scalar(ScalarType::Str)],
+            ret: Box::new(TyType::Scalar(ScalarType::I32)),
+        },
+        TyType::Tuple(vec![TyType::Scalar(ScalarType::U64), TyType::Scalar(ScalarType::Fp8E5M2)]),
+        TyType::Array(Box::new(TyType::Scalar(ScalarType::Bf16)), SymDim::Const(3)),
+        TyType::RawPtr(Box::new(TyType::Scalar(ScalarType::I64))),
+        // Nested: a tensor of a tuple-free scalar inside a fn's return type.
+        TyType::Fn {
+            params: vec![],
+            ret: Box::new(TyType::Tensor(Box::new(TyType::Scalar(ScalarType::Fp8E5M2)), dim4)),
+        },
+    ];
+
+    for ty in composites {
+        let rendered = ty.to_string();
+        assert_type_annotation_parses(&rendered);
+    }
+}
+
+/// Splice a rendered type back in as a `let` annotation and assert the
+/// resulting program at least *parses* (lexes and parses clean). Whether it
+/// then passes `--check` is irrelevant here — the value `0` is nonsense for
+/// most of these types, and that is fine: `check_int_literal_range` and
+/// friends run well after the parser, so a parse failure can only come from
+/// the annotation's own spelling.
+fn assert_type_annotation_parses(rendered: &str) {
+    let src = format!("fn main() -> nil {{ let x: {} = 0\n nil }}", rendered);
+    let tokens = Lexer::new(&src).tokenize()
+        .unwrap_or_else(|e| panic!("rendered type `{}` failed to lex: {:?}", rendered, e));
+    Parser::new(tokens).parse_program()
+        .unwrap_or_else(|e| panic!("rendered type `{}` failed to parse: {:?}", rendered, e));
 }

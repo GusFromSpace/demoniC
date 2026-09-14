@@ -576,6 +576,24 @@ impl Printer {
                 format!("{} {}", kind, block_str)
             }
 
+            // #674 slice 3a: `forge.enter(b) { … }`.
+            Expr::BudgetBlock(bb) => {
+                let operand = self.expr_to_string(&bb.operand);
+                let saved_indent = self.indent;
+                let saved_buf = std::mem::take(&mut self.buf);
+                self.print_block(&bb.body);
+                let block_str = std::mem::replace(&mut self.buf, saved_buf);
+                self.indent = saved_indent;
+                format!("forge.enter({operand}) {block_str}")
+            }
+
+            // #674 slice 3a: `<ctor_spine> in <budget>`.
+            Expr::AllocIn { expr, budget, .. } => {
+                let e = self.expr_to_string(expr);
+                let b = self.expr_to_string(budget);
+                format!("{e} in {b}")
+            }
+
             Expr::DirectiveBlock { directives, body, .. } => {
                 let mut s = String::new();
                 for (i, d) in directives.iter().enumerate() {
@@ -1016,7 +1034,25 @@ impl Printer {
 fn lit_to_string(lit: &Literal) -> String {
     match lit {
         Literal::Int(n, suffix) => match suffix {
+            // #597: a `u64`-suffixed literal carries the 64-bit PATTERN, so
+            // printing it as a signed i64 rewrote `18446744073709551615u64`
+            // (and its hex/binary twins) to `-1u64` — a program the checker
+            // then REJECTS, because an explicit negative literal for an
+            // unsigned type is an error. Render the unsigned magnitude, which
+            // the lexer now accepts in decimal, so `dmc fmt` round-trips.
+            Some(ScalarType::U64) => format!("{}u64", *n as u64),
+            // #597: `i64::MIN` has no DECIMAL spelling the lexer accepts. It
+            // can only have got into an `IntLit` as a 64-bit mask (#282's rule:
+            // `0x8000000000000000` is a bit pattern), and the lexer scans the
+            // `-` of `-9223372036854775808` as a separate unary minus, leaving
+            // a positive `9223372036854775808` that is out of `i64` range — so
+            // printing the decimal produced a program that no longer lexes.
+            // Print the hex mask it came in as, which re-lexes to the same
+            // pattern and makes the second `dmc fmt` a fixed point.
+            Some(t) if *n == i64::MIN =>
+                format!("0x{:x}{}", *n as u64, scalar_type_str(t)),
             Some(t) => format!("{}{}", n, scalar_type_str(t)),
+            None if *n == i64::MIN => format!("0x{:x}", *n as u64),
             None => n.to_string(),
         },
         Literal::Float(f, suffix) => {
@@ -1204,7 +1240,7 @@ fn binop_is_assoc(op: &BinOp) -> bool {
     )
 }
 
-fn assignop_str(op: &AssignOp) -> &'static str {
+pub(crate) fn assignop_str(op: &AssignOp) -> &'static str {
     match op {
         AssignOp::Eq          => "=",
         AssignOp::ColonEq     => ":=",

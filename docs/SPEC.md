@@ -1,6 +1,6 @@
 # demoniC — Language Specification
 
-**Version:** 0.0.4-draft
+**Version:** 0.0.5-draft
 **Status:** Draft. Breaking changes expected on every revision until 0.1.
 
 This document specifies the behavior implemented by the compiler in this
@@ -154,6 +154,27 @@ All implicit numeric conversions are forbidden. Casts are explicit:
 `x as f32`. Two distinct concrete scalar types are never mutually assignable —
 `i64 → i32`, `f64 → f32`, `f64 → i8` all require an `as` cast.
 
+Conversion to a FLOAT is not a reinterpretation: `as f32` / `as f64` read the
+unsigned magnitude, rounded to the nearest representable float (ties to even)
+— exact only below 2^53. `u64::MAX as f64` is `2^64` (one above `u64::MAX`,
+the nearest representable float at this magnitude), and renders as its
+shortest round-trip decimal, `18446744073709552000`. The reverse saturates
+into the full unsigned range (`-5.0 as u64` is 0, `1e30 as u64` is
+`u64::MAX`). An explicit `as i64` remains a reinterpretation.
+
+Unsigned arithmetic wraps **unsigned**: `0u32 - 1u32` is 4294967295, and the
+wrapped value is what the following `/`, `%`, `>>` and the ordering
+comparisons see. Both backends hold an integer in 64 bits, so a `u64` carries
+the 64-bit two's-complement **pattern** the same way `i64` does — `0u64 -
+1u64`'s bits are `i64`'s `-1`. That pattern is read UNSIGNED wherever the
+operation's answer depends on signedness: `/`, `%`, `>>` and the ordering
+comparisons re-interpret it as `u64`, so `0u64 - 1u64` divides, shifts,
+compares and PRINTS as 18446744073709551615, not as -1. `+ - * << & | ^` need
+no such re-interpretation — two's-complement wraparound is the same bits
+whichever way the pattern is read. An explicit `as i64`/`as u64` is a
+reinterpretation, not this rule: `(0u64 - 1u64) as i64` is still `-1`, on both
+backends.
+
 The exotic float types (`bf16`, `f16`, `tf32`, `fp8_e4m3`, `fp8_e5m2`) are
 f32-backed: values compute in f32 and carry the narrow type as a tag. `int4`
 and `int8` are storage tags with the same convention.
@@ -183,8 +204,13 @@ types the literal concretely, exactly like a suffixed float: it binds an
 unannotated `let` at the suffix type, conflicts with a different
 annotation or parameter type as a normal type error, and is
 range-checked against its own width (`300u8` is a compile-time error).
-The 64-bit suffixes are exempt from the range check: hex and binary
-literals store as 64-bit bit patterns, so any such mask fits.
+All three literal spellings of a `u64` above `i64::MAX` are accepted —
+decimal, hex and binary: `18446744073709551615u64`, `0xffffffffffffffffu64`,
+`0b1111…1u64`. The `u64` suffix is what admits the decimal form: the lexer
+cannot see the binding's annotation, and a bare literal at a 64-bit target is
+taken as a bit pattern, so an unsuffixed `18446744073709551615` stays out of
+range. An explicit negative written for an unsigned type (`-1u64`) is a
+checker error, not a wrap.
 
 **`str` operations:** indexing `s[i]` returns the UTF-8 byte at position `i`
 as `i64`. Concatenation uses `+`. Integer-to-string conversion: `n as str`.
@@ -236,6 +262,10 @@ Shapes may be **static** (`Tensor[f32, [256, 768]]`), **symbolic**
 Shape mismatches between static or symbolic dimensions are compile-time
 errors.
 
+**`T` — a `Tensor`'s, a `View`'s, or a `KV`'s element type — must be one of
+§3.1's scalar types**; anything else (a model, an enum, a tuple, `map`, a
+`Port`, another tensor, …) is a checker error, not a silent acceptance.
+
 ### 3.3 Views
 
 A `View[T, [...]]` is a stack-allocated descriptor pointing into an arena,
@@ -249,24 +279,97 @@ slicing never copies.
 let !w = forge.zeros[f32, [768, 768]]   # mut binding, mut data
 let  w = forge.zeros[f32, [768, 768]]   # immut binding, immut data
 let mut x = ...                          # long form of `let !x`, except at a
-                                         # model field — see below
+                                         # tensor field of a model — see below
 ```
 
 Binding a mutable copy of an existing value (`let !y = x`) copies by value:
 mutating `y` leaves `x` untouched.
 
-**Bindings from model fields.** `let !x = m.field` follows the field's kind:
-a **tensor** field binds a live alias — every write through the binding
-(element write, whole-binding assignment, compound assignment, stream
-append) reaches the field; every other field kind (scalars above all) binds
-its current **value**, a snapshot per the copy rule above.
+**Immutable data, by type.** `let x = …` makes an immutable binding. For a
+**value** type — a tensor, a view, and every scalar — the data is immutable
+too: it cannot be written through directly, and it cannot be passed to a `!`
+parameter, whether by its own name or through a field path rooted at it. For
+a **descriptor** type — a model and a `KV` — the binding is immutable and the
+instance is not: `let !x = m` and `let mut x = m` name the same instance
+(¶Bindings from model instances, below), a plain `let x = m` names it too,
+and a `!` parameter is that same instance (§3.4.1). The comment `# immut
+binding, immut data` above stays as written on the tensor line it annotates;
+the model and `KV` case is stated here, next to the descriptor rule.
+
+**Bindings from model instances.** A model is a stack `View`-like descriptor
+over its own field arena (§3.10, Models), not a value: `let !x = m` and `let
+mut x = m` name the same instance. Neither spelling copies a model.
+
+**Bindings from model fields.** `let !x = m.field` binds a live alias for a
+**tensor** field or a **model**-typed field — every write through the
+binding (element write, whole-binding assignment, compound assignment,
+stream append) reaches the field. `let mut x = m.field` binds that same
+live alias for a **model**-typed field, but for a **tensor** field it
+snapshots the field's current value instead. Every other field kind
+(scalars above all) binds its current **value** under either spelling, a
+snapshot per the copy rule above.
 
 **`!` and `mut` are not interchangeable.** Both spellings make the binding
 and its data mutable, and everywhere else in the language they mean the same
-thing. They part company at exactly one construct — the field binding above.
-`let !x = m.field` takes the alias; `let mut x = m.field` binds the field's
-current **value** for every field kind, tensor included. Take the long form
-when the point is to snapshot a tensor field.
+thing. They part company at exactly one construct: `let mut x = m.field`
+snapshots a **tensor** field where `let !x = m.field` aliases it. A
+**model**-typed field aliases under both spellings, a model being a
+descriptor over its field arena rather than a value, so there is no long
+form that snapshots one.
+
+#### 3.4.1 Mutating parameters (`!`)
+
+A `!` parameter's convention follows its type.
+
+**Tensor.** The callee receives a private copy. On return, the copy replaces
+the argument's place; a whole-binding assignment inside the callee therefore
+reaches the caller with whatever buffer the parameter names at return — a
+tensor `!` parameter may be rebound.
+
+**Model and `KV`.** The parameter is the caller's instance: neither side
+copies it. Writes through it reach the caller as they happen. Assigning the
+whole parameter is a compile-time error — a model or `KV` `!` parameter must
+not be rebound.
+
+**Every other type.** A `!` parameter of any other type is a compile-time
+error.
+
+**Argument form.** A `!` argument must be a place — an identifier, a field
+path, an element, or a slice; any other argument is a compile-time error. A
+`!` argument of **tensor or view type** must, in addition, be a place whose
+root binding is mutable: a `let !` or `let mut` local, a `!` parameter, or a
+field path whose own root binding is one of those. A place rooted at a plain
+`let` binding is a compile-time error — including a tensor field reached
+through a plain `let` model, so `let m = M { w: … }  bump(m.w)` is refused
+for the same reason `m.w[0] = 42.0` already is (§3.4). A `!` argument of
+**model or `KV` type** may be any place, mutable or not — the parameter is
+the caller's instance either way. Inside a `@grad fn`, and at
+`fwd`/`fwd_bwd`, `!` marks a differentiable input rather than a mutation
+(§6.2, `@grad`), and this rule does not apply. A `!`-param function must not
+be used as a `fn(...) -> R` value: that type carries no `!`, so an indirect
+call has no write-back to drive.
+
+**Aliasing.** Passing one object to a `!` parameter and to another argument
+of the same call is legal. The conventions are then distinguishable: a
+tensor argument is isolated for the duration of the call; a model or `KV`
+argument is not. A program's answer can therefore depend on the parameter's
+type — that dependency is documented here, not hidden.
+
+The tensor write-back lands through the argument's place at return, not by
+rebinding whichever name reached the call site, so any live alias of that
+place observes it. Isolation from a by-value argument holds only for the
+duration of the call: a place-alias formed before the call was never a
+by-value argument, it is the storage the parameter's writes are defined to
+reach.
+
+Inside a `@grad fn`, `!` marks a differentiable input (§6.2, `@grad`), not a
+mutation: gradients land in the returned `Grads`, never back through the
+parameter, and `fwd_bwd` passes it uncopied. Tied arguments — the same
+tensor passed to two `!` parameters of one `fwd_bwd` call — are legal.
+
+Exclusivity — forbidding one object from reaching a `!` parameter and
+another argument of the same call — is not adopted, neither syntactically
+nor at runtime.
 
 ### 3.5 Functions
 
@@ -349,7 +452,11 @@ A `KV[T, S]` is convertible to `View[T, S]` (with the current `~` value
 frozen as a concrete dimension) for any read-only operation. The conversion
 is free.
 
-### 3.7 Random as a value
+### 3.7 Meshes and sharded shapes
+
+Reserved; not specified in this release.
+
+### 3.8 Random as a value
 
 ```
 Rng                  # an opaque type
@@ -375,7 +482,7 @@ draw from one process-wide generator and offer none of the linear-value
 replay guarantees. The same `Rng` call sequence with the same seed produces
 bit-identical bytes on the same hardware.
 
-### 3.8 Errors as values
+### 3.9 Errors as values
 
 There is one built-in sum type for fallible operations:
 
@@ -387,7 +494,7 @@ By convention, `Err` is `nil` on success and a `str`-tagged error value on
 failure. Functions returning `(T, Err)` may use `?` to propagate (§4.9). No
 exceptions exist anywhere in the language.
 
-### 3.9 Models
+### 3.10 Models
 
 ```
 model Name[shape_params] {
@@ -401,6 +508,14 @@ model Name[shape_params] {
 A `model` is a struct with:
 
 - **Deterministic field order.** Layout matches source order.
+- **Overlay byte layout.** `@cast(M) { bytes }` (`DIRECTIVES.md §4.1`,
+  Exotic-float casts and stdlib builtins) places each field at the next byte
+  offset: a field's offset is the sum of the declared byte widths of the
+  fields before it. There is no padding and no alignment. A multi-byte scalar
+  is **little-endian**, the one byte order this language fixes
+  (`PORTS.md`). A fixed-shape tensor field occupies element count × element
+  width bytes in row-major order, each element decoded by the same rule. A
+  field whose type fixes no byte extent is refused at `--check`.
 - **An opinionated `forward` slot.** If a `forward` method exists,
   `instance(x, ...)` desugars to `instance.forward(x, ...)`.
 - **Fixed-size model arrays.** `[M; N]` is a field/parameter type holding `N`
@@ -434,28 +549,40 @@ A `model` is a struct with:
   lowercase shape argument (`Box[h, w]`) checks but can only be
   supplied explicitly at the call, since inference binds uppercase-initial
   names only, for models and tensors alike.
+
+  A type-arg-less annotation of a shape-parameterized model is refused too,
+  not just in a literal's field slot: named without an argument list in a
+  parameter, field, return, or `let` binding annotation — including nested
+  as the element type of a fixed-size array (model arrays included), as a
+  tuple or fn-type component, or as a type alias's own body (`type B = Buf`)
+  — or as a builtin's own model-array type argument, both the `forge.*` and
+  `vault.*` forms (`forge.zeros[Surface, [N]]`, `forge.ones[Surface, [N]]`,
+  `forge.uninit[Surface, [N]]`, `vault.zeros[Surface, [N]]`,
+  `vault.ones[Surface, [N]]`, `vault.uninit[Surface, [N]]`), it is refused,
+  naming the annotation and the bracket to write. A model with no shape
+  parameters is unaffected: its bare name is its only spelling. A function's
+  own shape parameter that reuses one of the model's names shadows it for
+  that call, exactly as a method's does above (`fn f[N](b: Buf[N])` binds the
+  function's own `N`, not the model's). The blessed spellings: for a direct
+  parameter, declare the shape parameter where the annotation lives and
+  spell it explicitly (`fn f[N](b: Buf[N])`) — this hatch does not extend to
+  a nested position (an array element, a tuple component): `fn f[H, W](arr:
+  [Surface[H, W]; 4])` fails to infer `H`/`W` on both backends, so a nested
+  position must name the concrete bracket instead (`arr: [Surface[2, 3];
+  4]`); or, to pin a shape once with no parameter to declare it on, a type
+  alias with the bracket written into its own body (`type S = Buf[4]`) — a
+  bracket-less alias body is itself a type-arg-less annotation and is
+  refused under this rule, not a hatch from it. This diagnostic is a
+  warning in the current draft; an error in the next — one version of
+  warning, not zero, not more.
 - **No inheritance, no traits, no methods other than those declared in the
-  model body.** (Exception: UFCS, §4.11.)
+  model body.** (Exception: UFCS, §4.12.)
 
 A `model` introduces both a type (`Name[...]`) and a constructor
 (`Name { field1: ..., field2: ... }`). Field initialization order must match
 declaration order. Models are not heap objects; a `model` value is a
 stack-held descriptor over its field arena. For weight I/O use
 `vault.load` / `vault.load_npz`.
-
-### 3.10 Raw pointers
-
-```
-*i8   *u8   *f32   *f64   ...   *nil
-```
-
-A `*T` is an opaque machine pointer to storage holding values of scalar type
-`T` (or `nil`, for void pointers). Raw pointers exist only to cross the
-foreign-function boundary declared by `extern fn` (§6.7). A `*T` has no
-shape or length; it cannot appear as a tensor or model field element type,
-cannot be bound outside an `extern fn` call site, and cannot be dereferenced
-in source. The JIT materializes `*T` values from demoniC tensors at the call
-site; the source program never constructs one.
 
 ### 3.11 Ports
 
@@ -465,7 +592,7 @@ Port[python]
 
 A `Port[L]` is a handle to a foreign runtime `L`. The foreign language never
 enters demoniC's type system: values cross the boundary as canonical JSON
-strings, through three builtins that return errors as values (§3.8):
+strings, through three builtins that return errors as values (§3.9):
 
 ```
 port_open(lang: str) -> (Port[lang], Err)
@@ -493,6 +620,20 @@ in both backends. A handle may *not* appear in a model field, a tensor element
 type, or a Vault constant; the checker rejects the model-field case, so both
 backends refuse the same program at the same span. Semantics, the value
 boundary, and the error tags are specified in `PORTS.md`.
+
+### 3.12 Raw pointers
+
+```
+*i8   *u8   *f32   *f64   ...   *nil
+```
+
+A `*T` is an opaque machine pointer to storage holding values of scalar type
+`T` (or `nil`, for void pointers). Raw pointers exist only to cross the
+foreign-function boundary declared by `extern fn` (§6.8). A `*T` has no
+shape or length; it cannot appear as a tensor or model field element type,
+cannot be bound outside an `extern fn` call site, and cannot be dereferenced
+in source. The JIT materializes `*T` values from demoniC tensors at the call
+site; the source program never constructs one.
 
 ## 4. Expressions
 
@@ -532,6 +673,10 @@ or `vault` instead.
 A[i]            A[i, j]         A[0:100]
 A[0:100:2]      A[:, 3]         A[.., -1]       A[0..]
 ```
+
+Each bound of a range or slice — start, end, and step, in either spelling, at
+any site a range or slice appears — is an integer expression; a bound with a
+known non-integer type is a check-time error.
 
 Slicing never copies. Negative indices count from the end. Static
 out-of-bounds is a compile-time error; dynamic out-of-bounds is a runtime
@@ -686,7 +831,12 @@ let z = @fuse { x .* g .+ b }
 The block is an expression evaluating to its last expression. Directives may
 stack; stacking order is innermost-first when semantically meaningful.
 
-### 4.11 UFCS (method-call sugar)
+### 4.11 Port calls
+
+The three port builtins, their payload encoding, and their borrow and effect
+rules are specified in §3.11 and `PORTS.md §2`, `§4`, `§5`.
+
+### 4.12 UFCS (method-call sugar)
 
 `x.f(args)` desugars post-parse to `f(x, args)` when `f` names a known free
 function or builtin and the receiver is not a model. Not UFCS: genuine model
@@ -781,14 +931,24 @@ activations, fused `softmax`/`rms_norm`/`layer_norm`/`rope`/`attn`).
 ### 6.3 Arenas as scopes
 
 ```
-vault { ... }      forge { ... }      stream { ... }
+vault { ... }      forge { ... }      stream { ... }      forge.enter(b) { ... }
 ```
 
-Inside such a block, all implicit allocations target the named arena. Outside
-any block the default is `forge`. `forge` is a bump-allocated scratch arena;
-`forge.reset()` frees everything allocated in it since program start (the
-per-training-step idiom). `vault` holds long-lived data (weights);
-`stream` holds streaming (KV) data.
+Inside `vault { ... }` / `forge { ... }` / `stream { ... }`, all implicit
+allocations target the named arena. Outside any block the default is
+`forge`. `forge` is a bump-allocated scratch arena; `forge.reset()` frees
+everything allocated in it since program start (the per-training-step
+idiom). `vault` holds long-lived data (weights); `stream` holds streaming
+(KV) data.
+
+`forge.enter(b) { ... }` joins this family as a fourth scope block, but
+selects a **budget**, not an arena: it pushes `b` as the entered budget for
+allocations inside the block and pops it on **every** exit edge — normal
+exit, `return`, `break`, `continue`, and `?` (an early return, the fifth
+edge) — without reaping anything. `b` outlives the block. A single
+constructor overrides the entered budget with a trailing `in b`
+(`forge.zeros[f32, [N]] in b`), for that constructor only. See
+`MEMORY.md §3.2`.
 
 ### 6.4 Models
 
@@ -806,9 +966,13 @@ model Block[D, H] {
 }
 ```
 
-See §3.9 for model semantics.
+See §3.10 for model semantics.
 
-### 6.5 Type aliases
+### 6.5 `@pp` pipelines
+
+Reserved; not specified in this release.
+
+### 6.6 Type aliases
 
 ```
 type Hidden = Tensor[f32, [768]]
@@ -817,7 +981,13 @@ type Batch[B] = Tensor[f32, [B, 768]]
 
 No newtypes. No traits. No generics beyond shape parameters and element type.
 
-### 6.6 Modules and imports
+A named dimension in an alias's own body, or in any other type annotation,
+that is not a declared shape parameter resolves against a top-level literal
+`let` of that name in the same module. A mutable top-level binding (`let
+!`/`let mut`) is never a dimension — only an immutable, literal top-level
+`let` resolves this way.
+
+### 6.7 Modules and imports
 
 ```
 use "path/to/file.dmc"           # unqualified — all pub items enter scope
@@ -826,11 +996,18 @@ use "path/to/file.dmc" as alias  # qualified — items accessed as alias.name
 
 - Paths are relative to the importing file.
 - Imports resolve statically at compile time; circular imports are a
-  compile-time error (files compile leaf-first over the import DAG).
+  compile-time error (files compile leaf-first over the import DAG). Both
+  failures — a path that resolves to nothing, and a cycle — are located
+  diagnostics of the `resolve` kind, reported at the `use` that caused
+  them rather than as a bare message with no span.
 - Only `pub`-annotated items (`pub fn`, `pub model`, `pub type`) are
   exported; everything else is file-private.
+- A `pub let` is a compile-time error — constants cross a module boundary
+  as a `pub fn` accessor, not a `pub let`. An importer therefore cannot
+  read an imported module's top-level `let` at all; take it as a parameter,
+  or expose it through an accessor.
 
-### 6.7 Foreign function declarations (`extern fn`)
+### 6.8 Foreign function declarations (`extern fn`)
 
 ```
 extern fn cblas_sgemm(order: i32, transA: i32, transB: i32,
@@ -853,7 +1030,7 @@ always visible to importers without `pub` (and `pub` on one is an error). An
 `extern fn` may not be called from `@comptime`, `@grad fn`, `@fuse`, or
 `@deterministic`; autodiff treats any `extern fn` call as a hard
 non-differentiable barrier. Inside `@comptime` the ban is a consequence of
-§7.5's total ban on calls, and is reported as `comptime-non-static` naming
+§7.8's total ban on calls, and is reported as `comptime-non-static` naming
 the `extern fn`.
 
 Both are enforced at check time, under their own diagnostic tags: a
@@ -864,7 +1041,7 @@ an admissible type whose machine width in that backend is not the width the
 annotation names — `str`, and the widths a backend emulates.
 
 **Passing a tensor.** A tensor argument at a `*T` parameter is the
-materialization §3.10 describes. The value passed is the address of element
+materialization §3.12 describes. The value passed is the address of element
 zero of the tensor's data in the Forge, row-major, with no header and no
 padding ahead of it, at the tensor's **storage** width — the width the
 element type has in the running backend, not necessarily the width the `*T`
@@ -913,7 +1090,15 @@ as a batch; nothing runs until the program checks end to end) → lower to a
 typed IR → monomorphize over shape parameters at first call → emit machine
 code through Cranelift.
 
-### 7.1 Mixed-precision scopes (`@cast`)
+### 7.1 Foreign runtime boundary
+
+Reserved; not specified in this release.
+
+### 7.2 Autodiff lowering
+
+Reserved; not specified in this release.
+
+### 7.3 Mixed-precision scopes (`@cast`)
 
 `@cast(t) { expr }` rewrites the IR for `expr` so every op runs in `t`.
 Loads cast in at block entry; stores cast out at block exit; the cost is one
@@ -928,7 +1113,7 @@ fp8 tags are likewise f32-backed no-ops. A tensor `@cast` to an integer type
 interpreter truncates each element toward zero and retags the result as an
 integer tensor — it does not run the enclosed ops in integer arithmetic.
 
-### 7.2 Hardware dispatch (`@host`)
+### 7.4 Hardware dispatch (`@host`)
 
 ```
 @host match {
@@ -950,7 +1135,7 @@ is present or absent for the same reason an ISA flag is: a program's arms
 are chosen by what this machine can actually do. Adding a feature name is
 additive and does not change the meaning of any existing one.
 
-### 7.2b Float accumulation contract
+### 7.4b Float accumulation contract
 
 `f32` **reductions** (`sum`, `mean`, `variance`, the `*_along` family)
 accumulate at f32 width in index order, rounding after every add. `sum(t)` is
@@ -977,7 +1162,7 @@ This is a per-op contract, not a claim that demoniC's float output matches
 another implementation's. `docs/NUMERICS.md` states what is and is not
 promised across versions, including the edges this contract does not cover.
 
-### 7.3 Determinism contract (`@deterministic`)
+### 7.5 Determinism contract (`@deterministic`)
 
 Inside `@deterministic { expr }`: given identical inputs and identical `Rng`
 state, the bytes of every output are bit-exact on repeated execution on the
@@ -995,14 +1180,18 @@ contract, and what it does *not* promise — in particular that it fixes
 demoniC's own accumulation order and says nothing about agreement with an
 external reference implementation.
 
-### 7.4 Forced fusion (`@fuse`)
+### 7.6 Gradient checkpointing (`@recompute`)
+
+Reserved; not specified in this release.
+
+### 7.7 Forced fusion (`@fuse`)
 
 `@fuse { expr }` instructs the JIT to emit `expr` as a single kernel with no
 materialized intermediates. If the contract cannot be honored on the host,
 compilation fails with a `fuse-infeasible` diagnostic citing the operations
 that could not be collapsed.
 
-### 7.5 Comptime evaluation (`@comptime`)
+### 7.8 Comptime evaluation (`@comptime`)
 
 Shape parameters in `[ ]` and integer literals are implicitly comptime: a
 function monomorphizes over its shape parameters, so shape arithmetic folds per
@@ -1031,8 +1220,8 @@ The body admits literals, names the block binds, shape parameters of the
 enclosing `fn` or `model`, arithmetic, comparison, boolean logic, `if`/`else`,
 `while`/`loop`/`for` over integer ranges, and assignment to a binding the
 block itself made. It admits **no calls** — not to a user `fn`, a builtin, a
-port, or an `extern fn`. That total ban is what makes the effect restrictions
-of `docs/PORTS.md §5` and §6.7's `extern fn` rule hold without
+port, or an `extern fn`. That total ban is what makes §6.8's `extern fn` rule
+and the effect restrictions of `docs/PORTS.md §5` hold without
 interprocedural analysis: nothing reachable from a legal body can perform an
 effect.
 

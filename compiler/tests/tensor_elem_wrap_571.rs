@@ -11,16 +11,18 @@
 //! now carries the width (`DType::Int(IW)`) and the elementwise loop calls the
 //! same `int_arith` the scalar path does.
 //!
-//! The JIT refuses integer elementwise ops outright ("elementwise ops are
-//! f32-only"), which is the only reason this was not a two-answer divergence.
-//! `the_jit_still_refuses_integer_elementwise` pins that refusal, so the day it
-//! is lifted, whoever lifts it has a correct interpreter to match — and these
-//! expectations to match it against. Every case asserts the literal number, not
-//! merely that the backends agree: two backends can agree on a wrong answer.
+//! The JIT refused integer elementwise ops outright ("elementwise ops are
+//! f32-only") when this file was written, which is the only reason #571 was not
+//! a two-answer divergence. #632 lifted that refusal — and every element type
+//! whose width is a whole number of bytes — so most of these cases now assert
+//! the SAME literal number under both backends. Every case asserts the literal
+//! number, not merely that the backends agree: two backends can agree on a
+//! wrong answer.
 //!
-//! Tensor element types the JIT can allocate are `f32 f64 i32 i64 bool`, so the
-//! narrower widths are asserted under `dmc run` alone; everything the JIT can
-//! run (element loads, the i64 control) is asserted under both.
+//! What is still `dmc run` only, and why, is stated at each such test: the
+//! sub-byte `int4` element (no storage lane), `.^` on integers (no integer
+//! `pow` in the JIT's scalar lowering), a BROADCAST elementwise op (the JIT's
+//! broadcast kernel is f32), and an elementwise `as` cast of a whole tensor.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -69,13 +71,20 @@ fn assert_both_print(name: &str, src: &str, want: &str) {
     }
 }
 
-/// The program fails under `dmc run` with a message containing `needle`.
-fn assert_run_fails(name: &str, src: &str, needle: &str) {
-    let out = run_src(name, "run", src);
+/// The program fails under `mode` with a message containing `needle`.
+fn assert_fails(name: &str, mode: &str, src: &str, needle: &str) {
+    let out = run_src(name, mode, src);
     let all = format!("{}{}",
         String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(!out.status.success(), "[run {name}] unexpectedly succeeded: {all}");
-    assert!(all.contains(needle), "[run {name}] wanted {needle:?}, got: {all}");
+    assert!(!out.status.success(), "[{mode} {name}] unexpectedly succeeded: {all}");
+    assert!(all.contains(needle), "[{mode} {name}] wanted {needle:?}, got: {all}");
+}
+
+/// Both backends refuse it at run time, with the same message.
+fn assert_both_fail(name: &str, src: &str, needle: &str) {
+    for mode in ["run", "jit"] {
+        assert_fails(name, mode, src, needle);
+    }
 }
 
 /// The issue's repro: the scalar path and the elementwise path over the same
@@ -95,35 +104,14 @@ fn the_571_repro_agrees_with_the_scalar_path() {
     nil
 }
 "#;
-    assert_run_prints("repro571", src, "-2147483648\n-2147483648\n");
-}
-
-/// The refusal that is currently hiding the divergence. If the JIT gains
-/// integer elementwise lowering, this test fails — deliberately: whoever adds
-/// it must come here, delete this test, and gate the rest of this file on both
-/// backends instead.
-#[test]
-fn the_jit_still_refuses_integer_elementwise() {
-    let src = r#"fn main() -> nil {
-    let !a = forge.zeros[i32, [2]]
-    let !b = forge.zeros[i32, [2]]
-    let c = a .+ b
-    print(c[0] as i64)
-    nil
-}
-"#;
-    let out = run_src("jitrefuses", "jit", src);
-    let all = format!("{}{}",
-        String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(!out.status.success(), "[jit] unexpectedly compiled an int elementwise op: {all}");
-    assert!(all.contains("elementwise ops are f32-only"),
-            "[jit] refusal changed shape: {all}");
+    assert_both_print("repro571", src, "-2147483648\n-2147483648\n");
 }
 
 /// Every dotted arithmetic op at `i32`, at the boundary each one can cross.
 /// `.*` is the one that also pins PRECISION: (2^31-1)^2 is 4611686014132420609,
 /// which f64 cannot represent, so the old float path answered ...608 — the
-/// wrapped i32 answer is 1.
+/// wrapped i32 answer is 1. That is also why the JIT cannot compute this one in
+/// f32 lanes and has to run the integer kernel (#632).
 #[test]
 fn every_dotted_arith_op_wraps_at_i32() {
     let src = r#"fn main() -> nil {
@@ -139,16 +127,31 @@ fn every_dotted_arith_op_wraps_at_i32() {
     let sub = lo .- one
     let mul = hi .* hi
     let div = hi ./ two
-    let pow = two .^ two
     print(add[0] as i64)
     print(sub[0] as i64)
     print(mul[0] as i64)
     print(div[0] as i64)
+    nil
+}
+"#;
+    assert_both_print("i32ops", src, "-2147483648\n2147483647\n1\n1073741823\n");
+}
+
+/// `.^` on integer elements stays `dmc run` only: the JIT's scalar integer
+/// lowering has no `pow`, so #632's integer elementwise kernel — which IS the
+/// scalar op, per element — has none either, and the op keeps its refusal.
+#[test]
+fn dotted_pow_on_integers_is_interpreter_only() {
+    let src = r#"fn main() -> nil {
+    let !two = forge.zeros[i32, [1]]
+    two[0] = 2
+    let pow = two .^ two
     print(pow[0] as i64)
     nil
 }
 "#;
-    assert_run_prints("i32ops", src, "-2147483648\n2147483647\n1\n1073741823\n4\n");
+    assert_run_prints("i32pow", src, "4\n");
+    assert_fails("i32pow", "jit", src, "elementwise ops are f32-only");
 }
 
 /// Every signed width, both boundaries, including the packed `int4`/`int8`.
@@ -169,13 +172,6 @@ fn every_signed_width_wraps_elementwise_at_both_boundaries() {
     print((a16 .+ o16)[0] as i64)
     print((a16 .- o16)[1] as i64)
 
-    let !p4 = forge.zeros[int4, [2]]
-    p4[0] = 7       p4[1] = -8
-    let !o4 = forge.zeros[int4, [2]]
-    o4[0] = 1       o4[1] = 1
-    print((p4 .+ o4)[0] as i64)
-    print((p4 .- o4)[1] as i64)
-
     let !p8 = forge.zeros[int8, [2]]
     p8[0] = 127     p8[1] = -128
     let !q8 = forge.zeros[int8, [2]]
@@ -185,8 +181,27 @@ fn every_signed_width_wraps_elementwise_at_both_boundaries() {
     nil
 }
 "#;
-    assert_run_prints("signedwidths", src,
-        "-128\n127\n-32768\n32767\n-8\n7\n-128\n127\n");
+    assert_both_print("signedwidths", src,
+        "-128\n127\n-32768\n32767\n-128\n127\n");
+}
+
+/// The packed 4-bit width stays `dmc run` only: `int4` is the one integer
+/// element type with no byte-aligned storage lane, so #632 left it refused
+/// rather than silently widening it to a byte.
+#[test]
+fn the_packed_int4_width_is_interpreter_only() {
+    let src = r#"fn main() -> nil {
+    let !p4 = forge.zeros[int4, [2]]
+    p4[0] = 7       p4[1] = -8
+    let !o4 = forge.zeros[int4, [2]]
+    o4[0] = 1       o4[1] = 1
+    print((p4 .+ o4)[0] as i64)
+    print((p4 .- o4)[1] as i64)
+    nil
+}
+"#;
+    assert_run_prints("int4width", src, "-8\n7\n");
+    assert_fails("int4width", "jit", src, "element type `int4` is not lowered");
 }
 
 /// Unsigned wraps UNSIGNED (§3.1): `255u8 .+ 1` is 0, `0u8 .- 1` is 255 — never
@@ -217,7 +232,7 @@ fn every_unsigned_width_wraps_unsigned_elementwise() {
     nil
 }
 "#;
-    assert_run_prints("unsignedwidths", src, "0\n255\n0\n65535\n0\n4294967295\n");
+    assert_both_print("unsignedwidths", src, "0\n255\n0\n65535\n0\n4294967295\n");
 }
 
 /// `./` on integer elements is INTEGER division at the element width, with
@@ -243,7 +258,7 @@ fn elementwise_division_follows_the_integer_rule() {
     nil
 }
 "#;
-    assert_run_prints("intdiv", src, "3\n-3\n0\n2147483647\n");
+    assert_both_print("intdiv", src, "3\n-3\n0\n2147483647\n");
 }
 
 /// The one integer case with no wrapped value: `MIN / -1` is a runtime error
@@ -260,7 +275,7 @@ fn elementwise_min_over_minus_one_names_the_width() {
     nil
 }
 "#;
-    assert_run_fails("mindiv", src, "exceeds the i32 range");
+    assert_both_fail("mindiv", src, "exceeds the i32 range");
 }
 
 /// A scalar operand adopts the tensor's element width, the way an untyped
@@ -278,11 +293,14 @@ fn a_scalar_operand_wraps_at_the_tensor_element_width() {
     nil
 }
 "#;
-    assert_run_prints("scalarrhs", src, "-2147483648\n2147483647\n");
+    assert_both_print("scalarrhs", src, "-2147483648\n2147483647\n");
 }
 
 /// Broadcasting does not lose the width: a [1] row against a [2, 1] column
-/// wraps in every lane the broadcast produces.
+/// wraps in every lane the broadcast produces. `dmc run` only: #632's integer
+/// elementwise kernel requires equal shapes, and the JIT's BROADCAST kernel is
+/// still the f32 one, so a broadcast over integer elements keeps its refusal
+/// rather than computing in f32 lanes and losing the wrap.
 #[test]
 fn a_broadcast_elementwise_op_keeps_the_width() {
     let src = r#"fn main() -> nil {
@@ -318,7 +336,7 @@ fn the_wrapped_element_is_what_is_stored_and_compared() {
     nil
 }
 "#;
-    assert_run_prints("roundtrip", src, "-2\ntrue\n");
+    assert_both_print("roundtrip", src, "-2\ntrue\n");
 }
 
 /// An element LOAD carries the element width too — the divergence that made
@@ -371,12 +389,13 @@ fn an_i64_element_tensor_does_not_wrap_narrow() {
     nil
 }
 "#;
-    assert_run_prints("i64add", src, "4294967294\n");
+    assert_both_print("i64add", src, "4294967294\n");
 }
 
 /// A cast that names an integer element type carries that width into the
 /// result, so the elementwise op after it wraps at the cast's width and not at
-/// the source's.
+/// the source's. `dmc run` only: the JIT does not lower an elementwise `as`
+/// cast of a whole tensor at all, at any element type.
 #[test]
 fn a_tensor_cast_names_the_element_width() {
     let src = r#"fn main() -> nil {

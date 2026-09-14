@@ -1,6 +1,6 @@
 # demoniC — Assimilation
 
-**Companion to:** `PORTS.md` (whole), `SPEC.md §3.11`, `§6.7`.
+**Companion to:** `PORTS.md` (whole), `SPEC.md §3.11`, `§6.8`.
 
 Ports are the foreign-runtime boundary. Writing a port wrapper by hand —
 open the runtime, encode the argument vector, call, decode the result,
@@ -326,7 +326,7 @@ generated wrapper is illegal inside a `@grad fn` exactly as a hand-written
 ### 5.2 Extern bindings (compiled boundary)
 
 For `runtime: c`, each descriptor `fn` becomes one `extern fn` declaration
-(`SPEC.md §6.7`). This is the literal "point at a compiler": assimilate a
+(`SPEC.md §6.8`). This is the literal "point at a compiler": assimilate a
 library's declared C ABI into demoniC's foreign-function surface.
 
 ```
@@ -339,8 +339,8 @@ extern fn cblas_sgemm(order: i32, transA: i32, transB: i32,
 ```
 
 The value boundary is the C-ABI scalar set and raw pointers `*T`
-(`SPEC.md §3.10`, `§6.7`), not JSON. `extern fn` carries its own effect
-restrictions (`SPEC.md §6.7`: no `@comptime`, no `@grad fn`); assimilation
+(`SPEC.md §3.12`, `§6.8`), not JSON. `extern fn` carries its own effect
+restrictions (`SPEC.md §6.8`: no `@comptime`, no `@grad fn`); assimilation
 adds none.
 
 `extern fn` bindings hand-written today (BLAS callouts) are the standing
@@ -397,7 +397,7 @@ report `port-call` at call time, and `ret: "?"` says the boundary makes no
 claim about it.
 
 - Code that hides allocation or bypasses the JSON / C ABI.
-- `pub extern fn` — an `extern fn` is always exported (`SPEC.md §6.7`);
+- `pub extern fn` — an `extern fn` is always exported (`SPEC.md §6.8`);
   the marker is a compile-time error, so it is never generated.
 
 ---

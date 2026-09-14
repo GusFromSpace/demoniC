@@ -1,0 +1,93 @@
+# mut_param_type_conventions.dmc — SPEC.md's Mutating parameters (`!`)
+# subsection: a `!` parameter's convention follows its type, and passing the
+# SAME object to a `!` parameter and to another argument of one call is
+# legal. The conventions this file exercises, measured on both `dmc run` and
+# `dmc jit`:
+#
+#   - TENSOR — copy-in/copy-out: a by-value argument bound to the same
+#     tensor is isolated from the callee's write, for the duration of the
+#     call.
+#   - MODEL  — the parameter IS the caller's instance, no copy either side:
+#     a by-value argument bound to the same instance sees the write.
+#   - KV     — shares the model convention (a pointer, no copy), shown here
+#     by forwarding a `!` KV parameter through a second frame, the same
+#     shape `kvcache.dmc` and `mut_params.dmc` use.
+#
+# `mut_params.dmc` already pins the tensor/model half of this same
+# observable difference; this file adds the KV case and restates the other
+# two so the three conventions the Mutating parameters (`!`) subsection
+# groups together read in one place.
+#
+# NOT exercised here — `dmc jit` refuses each of these today, pending the
+# checker-parity follow-up (interpreter/checker changes are out of scope
+# for the PR that adds this file):
+#   - a `!` parameter of scalar (or any non-tensor/model/KV) type — refused
+#     as "a `!` parameter of this type ... refuses the rest rather than drop
+#     the write-back"
+#   - a wholesale rebind of a `!` model or `KV` parameter — refused as
+#     "rebinding the `!` parameter ... the callee has no way to hand a
+#     different one back"
+#   - a `!`-param function used as a `fn(...) -> R` value — refused as
+#     "a `fn(..)` type carries no `!`, so an indirect call could not copy
+#     the argument in and back out"
+#
+# A fourth form is unenforced everywhere, not just the JIT: a `!` argument
+# that is not a place — e.g. `f(forge.zeros[f32, [1]])` — is refused by
+# NEITHER backend today.
+
+model Counter {
+    !n: Tensor[i64, [1]]
+}
+
+fn poke_tensor(!a: Tensor[i64, [1]], b: Tensor[i64, [1]]) -> i64 {
+    a[0] = 5
+    b[0]
+}
+
+fn poke_model(!a: Counter, b: Counter) -> i64 {
+    a.n[0] = 5
+    b.n[0]
+}
+
+fn append_kv(!k: KV[f32, [~]], x: f32) -> nil {
+    let !v = forge.zeros[f32, [1]]
+    v[0] = x
+    k <- v
+}
+
+# `!k` forwarded straight into another `!` parameter: model/KV share one
+# convention (pointer, no copy either side), so the write reaches the caller
+# through however many frames it was forwarded across.
+fn forward_kv(!k: KV[f32, [~]], x: f32) -> nil {
+    append_kv(k, x)
+}
+
+fn test_tensor_by_value_arg_is_isolated_from_the_mut_one() -> bool {
+    let !t = forge.zeros[i64, [1]]
+    let seen = poke_tensor(t, t)
+    # The by-value `b` never saw the write — the copy-in/copy-out convention
+    # isolates it for the call's duration.
+    seen == 0 && t[0] == 5
+}
+
+fn test_model_by_value_arg_aliases_the_mut_one() -> bool {
+    let !c = Counter { n: forge.zeros[i64, [1]] }
+    let seen = poke_model(c, c)
+    # No copy was ever made: `b` names the same instance as `a`, so it sees
+    # the write during the call, not only after it returns.
+    seen == 5 && c.n[0] == 5
+}
+
+fn test_kv_shares_the_model_convention_not_the_tensor_one() -> bool {
+    let !k = forge.kv[f32, [~]](capacity = 8)
+    forward_kv(k, 17.0)
+    forward_kv(k, 32.0)
+    k[0] == 17.0 && k[1] == 32.0
+}
+
+fn main() -> nil {
+    print(test_tensor_by_value_arg_is_isolated_from_the_mut_one())
+    print(test_model_by_value_arg_aliases_the_mut_one())
+    print(test_kv_shares_the_model_convention_not_the_tensor_one())
+    nil
+}

@@ -72,7 +72,7 @@ string, and rejects ill-formed UTF-8 as a parse failure rather than
 passing it through.
 
 The language does not define `import python`, `foreign fn`, or a
-syntax-level module bridge in 0.0.4.
+syntax-level module bridge in 0.0.5-draft.
 
 ---
 
@@ -224,7 +224,7 @@ not caught.
 
 `@comptime` is the exception to that last caveat, and it is stricter
 rather than weaker. Its body admits **no call of any kind**
-(`docs/SPEC.md §7.5` (Comptime evaluation (`@comptime`))), so a port
+(`docs/SPEC.md §7.8` (Comptime evaluation (`@comptime`))), so a port
 call is refused as `port-forbidden` and the transitive case cannot
 arise: there is no call through which a port could be reached.
 Compile-time evaluation therefore performs no effect by construction,

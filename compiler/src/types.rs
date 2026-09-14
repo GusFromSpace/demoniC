@@ -15,6 +15,56 @@ use crate::shape::{Shape, SymDim};
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+/// #758: one admissible kind in a `TyType::OneOf` set — a builtin parameter's
+/// polymorphic domain named by shape rather than by one concrete `TyType`
+/// (see `OneOf`'s own doc comment). `Tensor` deliberately matches `Tensor`,
+/// `View`, and `KV` alike — the same three-variant grouping `as_tensor_like`
+/// already uses — because all three reify to the same runtime tensor value
+/// (`interp.rs`'s `Value::Tensor`); `View`/`KV` are static-only distinctions
+/// with no separate runtime representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TyKind {
+    Tensor,
+    Str,
+    Map,
+    Tuple,
+}
+
+impl TyKind {
+    /// Does `t` belong to this kind, regardless of the element type, shape,
+    /// or arity a concrete `TyType` in this kind might carry?
+    pub fn matches(&self, t: &TyType) -> bool {
+        match self {
+            TyKind::Tensor => t.as_tensor_like().is_some(),
+            TyKind::Str => matches!(t, TyType::Scalar(ScalarType::Str)),
+            // #745/#752's own carve-out, reused here: `resolve_type`
+            // deliberately does NOT resolve an `m: map`-annotated parameter
+            // to `TyType::Map` (a `map`-typed param could receive a list) —
+            // it stays `Named { name: "map", .. }`. Without this second arm,
+            // `fn f(m: map) -> i64 { len(m) }` (real, working code — this
+            // exact annotation style appears in `examples/demonic_lexer.dmc`,
+            // `lispy_vm.dmc`, `translations/lispy.dmc` per #752) would newly
+            // refuse under #758's fix despite `m` genuinely being a map at
+            // runtime.
+            TyKind::Map => matches!(t, TyType::Map)
+                || matches!(t, TyType::Named { name, .. } if name == "map"),
+            TyKind::Tuple => matches!(t, TyType::Tuple(_)),
+        }
+    }
+
+    /// The word this kind is named by in a diagnostic — matching the JIT's
+    /// own `len` refusal (`jit.rs`'s `len_type_refusal`, `EXPECT`), so the
+    /// two backends describe the exact same domain identically.
+    pub fn label(&self) -> &'static str {
+        match self {
+            TyKind::Tensor => "tensor",
+            TyKind::Str => "str",
+            TyKind::Map => "Map",
+            TyKind::Tuple => "tuple",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TyType {
     Scalar(ScalarType),
@@ -37,6 +87,15 @@ pub enum TyType {
     View(Box<TyType>, Shape),
     KV(Box<TyType>, Shape),
     Mesh(Vec<(String, SymDim)>),
+
+    /// `Budget` (#674) — a
+    /// builtin nominal type for an opaque host-lifetime handle on a carved
+    /// region of Forge: one machine word, no arithmetic, no ordering, no
+    /// literal. Storable in a model field, a `[Budget; N]` array, and a fn
+    /// return; no `!` marks one (the ruling's own words — B1). Beside `KV`
+    /// and `Mesh` per the design's own placement: a builtin nominal type
+    /// that is neither a model nor an enum.
+    Budget,
     Fn { params: Vec<TyType>, ret: Box<TyType> },
     Tuple(Vec<TyType>),
     Array(Box<TyType>, SymDim),
@@ -67,7 +126,9 @@ pub enum TyType {
 
     /// Dynamic string-keyed hash map (`map_new()`, or a `m: map` annotation).
     /// Reference-semantic and heterogeneous-valued, so it stays `Unknown`-
-    /// compatible everywhere (see `compatible_with`); the distinct variant
+    /// compatible against everything except `Unit` (see `compatible_with`;
+    /// the `Unit` carve-out is #753 — a map-tailed fn must declare `-> map`,
+    /// and `nil` must not pass as a map); the distinct variant otherwise
     /// exists only so the checker can flag `for … in <map>` — maps are not
     /// iterable (#204).
     Map,
@@ -77,6 +138,25 @@ pub enum TyType {
 
     /// Module namespace type
     Module { alias: String, path: std::path::PathBuf },
+
+    /// #758: a parameter admissible against a *set* of kinds rather than one
+    /// concrete `TyType`. #745's `mk_typed` mechanism gives a builtin
+    /// parameter a single fixed expected type (`map_set`'s key is always
+    /// `str`), which `compatible_with`'s existing structural-equality match
+    /// already checks with no new code. That mechanism cannot express a
+    /// polymorphic domain like `len`'s: its one parameter accepts a tensor
+    /// (any element type/shape), `str`, `Map`, or a tuple (any arity) — four
+    /// different `TyType` shapes, not one. `OneOf` names the admissible
+    /// `TyKind`s directly; `compatible_with` matches by kind (via
+    /// `TyKind::matches`, e.g. any `Tensor`/`View`/`KV` counts as the
+    /// `Tensor` kind regardless of its element type or shape) rather than by
+    /// structural equality, and `Unknown` still passes through the general
+    /// match-anything rule at the top of `compatible_with` — so a
+    /// `map_get` result (#721, still untyped end to end) is unaffected.
+    /// `Display` renders the admissible kinds the same way the JIT's own
+    /// `len` refusal already names this exact domain (`jit.rs`'s
+    /// `len_type_refusal`, `EXPECT`): `"tensor, str, Map, or tuple"`.
+    OneOf(Vec<TyKind>),
 }
 
 impl TyType {
@@ -139,10 +219,52 @@ impl TyType {
     pub fn compatible_with(&self, other: &TyType) -> bool {
         use TyType::*;
         if matches!(self, Unknown) || matches!(other, Unknown) { return true; }
+        // #758: `OneOf` is always the *expected* side (only `builtin_sig`
+        // constructs one) — match by kind rather than falling into the
+        // structural-equality arms below, which know nothing about it. Placed
+        // before every other special case (including the `Map` wildcard just
+        // below) so a `OneOf` that does not admit `Map` still refuses a real
+        // map argument; `len`'s own set happens to include `Map`, but this
+        // must stay correct for whatever polymorphic builtin adopts `OneOf`
+        // next.
+        if let OneOf(kinds) = self {
+            // #758 (downstream sweep, one downstream file
+            // ~347): `fn parse_introspection(text: str) -> list { .. }`
+            // followed by `len(surface)` where `surface` holds that call's
+            // result — real, working, `--check`-clean code before this fix.
+            // SPEC has no static `list` or `range` type (`jit.rs`'s own
+            // len-lowering comment says the same for its `Model(name, _)`
+            // fallback), so `resolve_type` leaves a `-> list`/`-> range`
+            // return annotation as `Named { name: "list"/"range", .. }` —
+            // the exact same deliberately-unresolved escape hatch `m: map`
+            // gets (`TyKind::Map::matches` above). STDLIB.md §3.7 calls
+            // `list`/`range` "interpreter-only dynamic values, not in this
+            // document's scope" for `len` specifically — meaning the checker
+            // has no static domain to hold them to at all, not that they are
+            // refused — so, like `Unknown`, they pass through every `OneOf`
+            // set unconditionally rather than being matched kind-by-kind.
+            if matches!(other, Named { name, .. } if name == "list" || name == "range") {
+                return true;
+            }
+            return kinds.iter().any(|k| k.matches(other));
+        }
+        // #753: `nil` (Unit) must NOT be treated as compatible with `Map`. This
+        // has to sit before the general `Map` wildcard just below, or it would
+        // be swallowed by it — that was exactly the bug: a map-tailed fn body
+        // compared against a declared/defaulted `Unit` return type (the same
+        // `declared_ret.compatible_with(&effective_body_ty)` check that makes
+        // `fn make() { 7 }` error "returns `nil` but body produces `i64`")
+        // passed silently, because the old wildcard returned `true` for ANY
+        // `Unit`-vs-`Map` pair before that mismatch was ever compared. A
+        // map-tailed fn must declare `-> map`. This does not touch map-VALUE
+        // typing (a map's values stay untyped `any` — that's what `map_get`
+        // etc. return, `Unknown`, not anything decided here).
+        if matches!((self, other), (Unit, Map) | (Map, Unit)) { return false; }
         // Maps are heterogeneous-valued and were `Unknown` before #204 gave them
-        // a distinct variant; keep them match-anything so no prior map code newly
-        // errors. The variant exists for the `for … in <map>` lint, not stricter
-        // map type-checking.
+        // a distinct variant; keep them match-anything (aside from the `Unit`
+        // carve-out just above) so no prior map code newly errors. The variant
+        // exists for the `for … in <map>` lint and (#753) the return-type
+        // check, not stricter map type-checking generally.
         if matches!(self, Map) || matches!(other, Map) { return true; }
         // `nil` the type and Unit are the same thing.
         // `nil` is also compatible with `str` in error position: the convention
@@ -192,6 +314,33 @@ impl TyType {
             (Tensor(at, ash), Tensor(bt, bsh))
             | (View(at, ash), View(bt, bsh))
             | (KV(at, ash), KV(bt, bsh)) => at.compatible_with(bt) && ash.same(bsh),
+            // #792 rework: SPEC.md §3.3 (~308) — "`Tensor[T, S]` is a `View`
+            // with contiguous strides in the arena's natural layout
+            // (row-major). Slicing a `Tensor` yields a `View`." — and §3.6
+            // (~446) — "A `KV[T, S]` is convertible to `View[T, S]` ... for
+            // any read-only operation. The conversion is free." Both are
+            // one-directional: a `Tensor` or `KV` argument satisfies a
+            // `View`-typed parameter (self here, since `compatible_with` is
+            // always called as `expected.compatible_with(actual)`), but a
+            // `View` argument does NOT satisfy a `Tensor` or `KV` parameter
+            // — a `View` may be non-contiguous, or not backed by a live
+            // stream arena, so the reverse direction stays refused (falls
+            // through to the `_ => false` arm below). Element type and
+            // shape compare exactly as the same-kind arm above does.
+            (View(at, ash), Tensor(bt, bsh))
+            | (View(at, ash), KV(bt, bsh)) => at.compatible_with(bt) && ash.same(bsh),
+            // #792 rework: a `Str` argument for a `View[u8, [N]]` parameter,
+            // for any `N` (unchecked). Unspecified by SPEC.md — filed as
+            // #809 to rule whether the JIT should gain a lowering for this
+            // (matching the interpreter, which already accepts it as the
+            // string's raw bytes) or whether the type should instead refuse
+            // a `Str` argument outright. Until that ruling lands, `--check`
+            // matches the interpreter's current behaviour — the backend
+            // that actually runs the downstream corpus's programs — rather
+            // than being stricter than it. Deliberately no length check
+            // against `N` here: adding one would itself be a ruling.
+            (View(at, _), Scalar(crate::ast::ScalarType::Str))
+                if matches!(at.as_ref(), Scalar(crate::ast::ScalarType::U8)) => true,
             // #234: fixed-size arrays (`[Model; N]`, `[KV[..]; N]`) — compatible
             // when the element types match and the sizes are provably equal.
             // Without this arm two identical `[Expr; 8]` fell through to `false`,
@@ -229,6 +378,10 @@ impl TyType {
             }
             (Mesh(a), Mesh(b)) => a.len() == b.len()
                 && a.iter().zip(b).all(|((n1, _), (n2, _))| n1 == n2),
+            // #674 slice 3a (§2.2): `Budget` is nominal and unarithmetic —
+            // compatible only with itself. Every other pairing falls to the
+            // `_ => false` below, same as every other nominal type here.
+            (Budget, Budget) => true,
             _ => false,
         }
     }
@@ -238,7 +391,7 @@ impl std::fmt::Display for TyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use TyType::*;
         match self {
-            Scalar(s) => write!(f, "{:?}", s),
+            Scalar(s) => write!(f, "{}", crate::fmt::scalar_type_str(s)),
             IntLit(_) => write!(f, "{{integer}}"),
             FloatLit(_) => write!(f, "{{float}}"),
             Enum(name) => write!(f, "{}", name),
@@ -286,8 +439,23 @@ impl std::fmt::Display for TyType {
             Dim(d) => write!(f, "{}", d),
             Unit => write!(f, "nil"),
             Map => write!(f, "map"),
+            Budget => write!(f, "Budget"),
             Unknown => write!(f, "?"),
             Module { alias, path } => write!(f, "module({} {:?})", alias, path),
+            // #758: an English kind list — "tensor, str, Map, or tuple" for
+            // `len`'s domain — matching the JIT's own `len` refusal wording
+            // (`jit.rs`'s `len_type_refusal`, `EXPECT`) so a caller sees the
+            // same domain named the same way from either backend.
+            OneOf(kinds) => {
+                for (i, k) in kinds.iter().enumerate() {
+                    if i > 0 {
+                        let last = i == kinds.len() - 1;
+                        f.write_str(if !last { ", " } else if kinds.len() == 2 { " or " } else { ", or " })?;
+                    }
+                    f.write_str(k.label())?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -305,13 +473,42 @@ pub struct FnSig {
 /// Returns the declared `FnSig` for a fixed-arity stdlib builtin, or `None`
 /// for truly variadic builtins (`print`, `panic`, `argmax`, `allreduce`, etc.).
 ///
-/// Parameter types are `Unknown` throughout because the type system does not
-/// yet support generic type/shape variables.  Arity is always exact.
+/// Parameter types are `Unknown` throughout by default, because the type
+/// system does not yet support generic type/shape variables — see `mk_typed`
+/// below for the exception.  Arity is always exact.
 pub fn builtin_sig(name: &str) -> Option<FnSig> {
     let mk = |n: usize, ret: TyType| FnSig {
         shape_params: Vec::new(),
         params: (0..n).map(|i| (format!("_{}", i), TyType::Unknown)).collect(),
         ret,
+    };
+    // #745: like `mk`, but for a builtin where one or more positions carry a
+    // concrete expected type instead of `Unknown` — `check.rs`'s call-arg
+    // loop (`PostfixOp::Call`, the `TyType::Fn { params, .. }` arm) already
+    // runs every fixed-arity builtin's args through `compatible_with` against
+    // whatever's here; it just never had anything but `Unknown` to check
+    // against. Only the map builtins' key parameter uses this today (a
+    // fixed, spec-mandated type per SPEC.md §264's `str → any`); any other
+    // builtin with a genuinely fixed parameter type can adopt the same
+    // helper without touching the call checker at all.
+    let mk_typed = |param_tys: &[TyType], ret: TyType| FnSig {
+        shape_params: Vec::new(),
+        params: param_tys.iter().cloned()
+            .enumerate().map(|(i, t)| (format!("_{}", i), t)).collect(),
+        ret,
+    };
+    // #758: like `mk_typed`, but for a builtin whose parameter's admissible
+    // domain is a *set* of kinds rather than one concrete `TyType` — `len`'s
+    // one parameter accepts a tensor (any element type/shape), `str`, `Map`,
+    // or a tuple (any arity), which `mk_typed` cannot name (its slots are one
+    // fixed `TyType` each). `TyType::OneOf`'s own `compatible_with` arm does
+    // the kind matching; this helper only builds the signature.
+    let mk_oneof = |kinds: &[TyKind], ret: TyType| -> FnSig {
+        FnSig {
+            shape_params: Vec::new(),
+            params: vec![("_0".to_string(), TyType::OneOf(kinds.to_vec()))],
+            ret,
+        }
     };
     let u = TyType::Unknown;
     // `(T, Err)` — the fallible convention (SPEC §3.9/§4.9), used by the typed
@@ -341,10 +538,45 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         "file_exists" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::Bool))),
         // chr(n: int) -> str
         "chr" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::Str))),
-        // len(x) -> i64
-        "len" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::I64))),
+        // len(x) -> i64 (#758): STDLIB.md §3.7's own domain row —
+        // `Tensor[T, S] | str | Map | Tuple -> i64` — is the authority here,
+        // matched by `TyKind::Tensor/Str/Map/Tuple` exactly. Deliberately NOT
+        // `list`/`range`: STDLIB's own row calls both "interpreter-only
+        // dynamic values, not in this document's scope". A `list()`-result
+        // expression types `Unknown` and is unaffected either way, but a
+        // `-> list`/`-> range`-annotated fn's result types `Named { name:
+        // "list"/"range", .. }` (no static `list`/`range` type exists to
+        // resolve to — same reasoning as the `m: map` annotation) — found by
+        // this PR's downstream sweep refusing exactly that shape in
+        // a downstream file's `len(surface)`, `surface:
+        // parse_introspection(..) -> list`, real working code. `OneOf`'s own
+        // `compatible_with` arm passes both spellings through unconditionally
+        // for this reason, same as `Unknown`. The interpreter's runtime error
+        // ("len: requires tensor, tuple, str, list, or map", `interp.rs`)
+        // additionally accepts `list`/`Range` values at that same domain
+        // check — a pre-existing runtime/doc wording difference (STDLIB
+        // scopes both out; the interpreter's message names `list` anyway, and
+        // silently accepts a `Range` too with no mention in its own message)
+        // that this PR does not touch; filed as #862.
+        "len" => Some(mk_oneof(
+            &[TyKind::Tensor, TyKind::Str, TyKind::Map, TyKind::Tuple],
+            TyType::Scalar(crate::ast::ScalarType::I64))),
         // Reductions — 1 tensor arg; return is the element type (generic over T).
         // `trace` additionally requires a square 2D tensor (checked at runtime).
+        //
+        // #758 audit: `sum`/`mean`/`trace` read as tensor-only everywhere
+        // STDLIB.md discusses them (§3.8's own reduction prose, §7.4b's
+        // accumulation contract, the "reductions span the full allocation"
+        // footgun callout) — but none of that is the same normative
+        // domain-signature row `len` gets in STDLIB.md §3.7 (`Tensor[T, S] |
+        // str | Map | Tuple -> i64`). Deliberately left `Unknown` here rather
+        // than adopting `mk_oneof(&[TyKind::Tensor], ..)` on prose alone: per
+        // AGENTS.md §3 (the same category-discipline #752's own "Owed"
+        // section cites), a compiler check enforcing a domain STDLIB never
+        // states as a signature would need that signature added first, in
+        // its own doc PR — not invented here to backfill it. #860 (an
+        // interpreter oddity on the same shape) is the tracking issue this
+        // would sit next to once that documentation exists.
         "sum" | "mean" | "trace" => Some(mk(1, u)),
         // `diag` extracts the diagonal of a square 2D tensor: [N,N] -> [N].
         // Return shape is input-dependent (no generic-var support yet, #175),
@@ -378,13 +610,54 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         // The map creators/mutators return the map itself (Value::Map at runtime),
         // so they carry the Map type — this is what lets the #204 for-loop lint
         // see `for … in m` where `m = map_new()`.
+        //
+        // #745: every keyed map builtin's arg 1 is now `str` — SPEC.md §264
+        // says a map is `str → any`, but until now every builtin param was
+        // `Unknown`, so `map_set(m, 5, 1)` (an int key), a bool key, a float
+        // key, and a tensor key all passed `--check` clean and only failed at
+        // `dmc run` ("key must be str, got ..."). Arg 0 (the map itself) is
+        // still typed `TyType::Map` for documentation, but `compatible_with`
+        // treats `Map` as match-anything by design (#204) — and a `m: map`
+        // parameter resolves to `Named { name: "map", .. }`, not `Map` at all
+        // (`resolve_type` deliberately leaves it unresolved; see its own
+        // comment and `for_in_map_param_does_not_warn` in check_tests.rs) —
+        // so there is no way to tell "a real map" from "matches anything"
+        // through this slot alone. The dedicated non-map-arg-0 check lives in
+        // `check.rs` next to the other per-builtin argument checks (`embed`,
+        // the trit wire check), not here, and tolerates both that `Named`
+        // shape and plain `Unknown`. A `map_get` result used as a later key
+        // (#742, #743) stays `Unknown` in the checker (JIT-only refusal), so
+        // it is unaffected: `Unknown` is compatible with `str` by the same
+        // match-anything rule.
+        //
+        // A `nil`/`Unit` exception used to survive on the key slot too, and it
+        // was NOT one of the two above: `compatible_with`'s `(Unit, Str)` /
+        // `(Str, Unit)` arm (~line 153) exists for the `(T, Err)` convention
+        // (`Err = nil | str`), so it fires for ANY `str`-typed parameter, not
+        // just this one. `map_set(m, nil, 1)` (a literal `nil` key, typed
+        // `Unit` per `check.rs`'s `Nil(_) => TyType::Unit`) and a key passed
+        // through a no-`-> T` helper (whose defaulted return is also `Unit`,
+        // regardless of what it actually returns) both used to still pass
+        // `--check` clean despite being a non-`str` key by this rule's own
+        // intent. Fixed by #753: rather than narrow the general `(Unit, Str)`
+        // arm (it is genuinely needed elsewhere, for the `(T, Err)`
+        // convention), a dedicated check next to the arg-0 check in `check.rs`
+        // scopes the carve-out to just this key position.
         "map"          => Some(mk(0, TyType::Map)),
         "map_new"      => Some(mk(0, TyType::Map)),    // alias for map()
-        "map_set"      => Some(mk(3, TyType::Map)),
-        "map_get"      => Some(mk(2, u.clone())),
-        "map_has"      => Some(mk(2, TyType::Scalar(crate::ast::ScalarType::Bool))),
-        "map_contains" => Some(mk(2, TyType::Scalar(crate::ast::ScalarType::Bool))),
-        "map_del"      => Some(mk(2, TyType::Map)),
+        "map_set"      => Some(mk_typed(
+            &[TyType::Map, TyType::Scalar(crate::ast::ScalarType::Str), u.clone()],
+            TyType::Map)),
+        "map_get"      => Some(mk_typed(
+            &[TyType::Map, TyType::Scalar(crate::ast::ScalarType::Str)], u.clone())),
+        "map_has"      => Some(mk_typed(
+            &[TyType::Map, TyType::Scalar(crate::ast::ScalarType::Str)],
+            TyType::Scalar(crate::ast::ScalarType::Bool))),
+        "map_contains" => Some(mk_typed(
+            &[TyType::Map, TyType::Scalar(crate::ast::ScalarType::Str)],
+            TyType::Scalar(crate::ast::ScalarType::Bool))),
+        "map_del"      => Some(mk_typed(
+            &[TyType::Map, TyType::Scalar(crate::ast::ScalarType::Str)], TyType::Map)),
         "map_keys" => Some(mk(1, u.clone())),
         "map_vals" => Some(mk(1, u.clone())),
         "map_len" => Some(mk(1, TyType::Scalar(crate::ast::ScalarType::I64))),
@@ -493,6 +766,11 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
         "date_diff_ms" => Some(mk(2, TyType::Scalar(crate::ast::ScalarType::I64))),
         // Typed print variants
         "print_i64"    => Some(mk(1, TyType::Unit)),
+        // #597: there is deliberately NO `print_u64` row here. The JIT has a
+        // `print_u64` runtime symbol (its `u64` pattern can be a negative
+        // `i64`, which `print_i64` would render signed), but `print(x)`
+        // dispatches to it internally — it is not a name a program may call,
+        // so this bug fix adds no new documented builtin to STDLIB.md.
         "print_f64"    => Some(mk(1, TyType::Unit)),
         "print_bool"   => Some(mk(1, TyType::Unit)),
         "print_nil"    => Some(mk(0, TyType::Unit)),
@@ -570,7 +848,10 @@ pub fn builtin_sig(name: &str) -> Option<FnSig> {
 
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
-    #[allow(dead_code)]
+    /// #728: a model's own shape parameter names, in declaration order —
+    /// read by the type-arg-less generic-model warning to decide whether a
+    /// bare reference to this model is affected (non-empty) and to spell
+    /// the bracket to write (`check.rs`'s `bare_generic_model`).
     pub shape_params: Vec<String>,
     pub fields: HashMap<String, TyType>,
     pub methods: HashMap<String, FnSig>,
@@ -619,6 +900,18 @@ pub struct Env {
     /// dtype, and that is a static property the port primitives must be able to
     /// see. Same scoping discipline as `vault_bindings`.
     trit_bindings: Vec<std::collections::HashSet<String>>,
+    /// #792 rework: local `let NAME = <int literal or a chain to another
+    /// known int constant>` bindings, folded to their value the same way
+    /// `collect_const_dims` folds a *top-level* `let` (#761/#766) — but
+    /// scoped, since a local binding's value depends on control flow the
+    /// top-level collector never has to consider, and the checker sees a
+    /// function body in the same top-to-bottom order it executes in, so
+    /// recording each binding as it is checked is enough (no fixed-point
+    /// closure needed here). A mutable (`let !`/`let mut`) binding is never
+    /// recorded — same rule as the top-level table. Same scoping discipline
+    /// as `vault_bindings`: same-scope rebind to a non-constant masks the
+    /// value in this scope; an inner shadow masks an outer constant.
+    int_let_bindings: Vec<HashMap<String, i64>>,
     /// Symbolic shape parameters in scope, mapped to their declared bounds
     /// (None if unbounded, Some(c) if `= c` was provided).
     pub shape_params: Vec<HashMap<String, Option<SymDim>>>,
@@ -652,6 +945,7 @@ impl Env {
         self.uninit_bindings.push(std::collections::HashSet::new());
         self.vault_bindings.push(std::collections::HashSet::new());
         self.trit_bindings.push(std::collections::HashSet::new());
+        self.int_let_bindings.push(HashMap::new());
     }
     pub fn pop_scope(&mut self)  {
         self.scopes.pop();
@@ -661,6 +955,7 @@ impl Env {
         self.uninit_bindings.pop();
         self.vault_bindings.pop();
         self.trit_bindings.pop();
+        self.int_let_bindings.pop();
     }
 
     /// #533: record (or clear) that a binding holds a packed `trit` tensor.
@@ -683,6 +978,34 @@ impl Env {
             if vals.contains_key(name) { return false; }
         }
         false
+    }
+
+    /// #792 rework: record that a local binding is an integral constant —
+    /// see `int_let_bindings`.
+    pub fn mark_int_const(&mut self, name: impl Into<String>, value: i64) {
+        if let Some(scope) = self.int_let_bindings.last_mut() {
+            scope.insert(name.into(), value);
+        }
+    }
+
+    /// #792 rework: a same-scope rebind to a non-constant masks the value
+    /// in this scope only — same discipline as `unmark_vault_origin_here`.
+    pub fn unmark_int_const_here(&mut self, name: &str) {
+        if let Some(scope) = self.int_let_bindings.last_mut() {
+            scope.remove(name);
+        }
+    }
+
+    /// #792 rework: the value of `name` if it is (transitively) bound to an
+    /// integer literal by an immutable local `let` in scope. Same
+    /// shadow-masked walk as `is_vault_origin`: stops at the first scope
+    /// that binds the name at all, constant or not.
+    pub fn int_const(&self, name: &str) -> Option<i64> {
+        for (vals, consts) in self.scopes.iter().rev().zip(self.int_let_bindings.iter().rev()) {
+            if let Some(&v) = consts.get(name) { return Some(v); }
+            if vals.contains_key(name) { return None; }
+        }
+        None
     }
 
     /// #442 (MEMORY §3.1): record that a binding's value lives in the Vault.

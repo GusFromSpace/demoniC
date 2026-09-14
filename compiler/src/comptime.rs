@@ -14,7 +14,7 @@
 //! `check::TypeError`, seeded into the checker before it runs, so the human
 //! renderer, the exit code and the `--json` stream are unchanged code paths.
 //!
-//! Two tiers (`COMPTIME_V1.md §4`):
+//! Two tiers:
 //!
 //! - **closed** — the body names no free identifier, so it has one value now.
 //!   The whole `DirectiveBlock` node is replaced by an integer or boolean
@@ -27,7 +27,7 @@
 //!   both lower it — the interpreter binds the shape parameter in scope, and
 //!   inside the JIT a shape parameter *is* a constant.
 //!
-//! The v1 fold set is integers and booleans (`COMPTIME_V1.md §2`). The float
+//! The v1 fold set is integers and booleans. The float
 //! cut is the design, not an omission: it makes the #320-class question —
 //! must a folded float equal a computed one? — unaskable rather than
 //! answered. Widening it is a spec amendment, not a patch.
@@ -44,7 +44,7 @@ use crate::check::TypeError;
 use crate::lexer::Span;
 use crate::interp::{ComptimeStop, Interpreter, Value};
 
-/// `COMPTIME_V1.md §6`: evaluator steps one `@comptime` block may take before
+/// The per-block step budget: evaluator steps one `@comptime` block may take before
 /// the compile fails as `comptime-budget`. A body may loop, so the compiler
 /// must not hang on one. Per block, not per program — a program is not
 /// penalized for folding many things. Fixed, not a dial: a fold that needs a
@@ -248,6 +248,11 @@ impl Folder {
             Expr::Match(m) => self.match_expr(m),
             Expr::FnLit(f) => self.block(&mut f.body),
             Expr::ArenaBlock(a) => self.block(&mut a.body),
+            // #674 slice 3a: structural recursion, same shape as `ArenaBlock`
+            // — neither is foldable by this pass, but their nested bodies
+            // may still contain a `@comptime` block to fold.
+            Expr::BudgetBlock(bb) => { self.expr(&mut bb.operand); self.block(&mut bb.body); }
+            Expr::AllocIn { expr, budget, .. } => { self.expr(expr); self.expr(budget); }
             Expr::DirectiveBlock { body, .. } => self.block(body),
             Expr::BinOp { lhs, rhs, .. } => { self.expr(lhs); self.expr(rhs) }
             Expr::UnOp { operand, .. } => self.expr(operand),
@@ -300,8 +305,8 @@ impl Folder {
 
     // ── The static gate ─────────────────────────────────────────────────────
 
-    /// Walk a `@comptime` body against the v1 grammar (`COMPTIME_V1.md §5`),
-    /// recording a diagnostic for every construct outside it. Nothing is
+    /// Walk a `@comptime` body against the v1 grammar, recording a diagnostic
+    /// for every construct outside it. Nothing is
     /// evaluated here: the gate is what guarantees a fold cannot reach an
     /// effect, so it must conclude before the interpreter is handed anything.
     fn gate_block(&mut self, body: &Block) -> Gate {
@@ -325,7 +330,7 @@ impl Folder {
             Ok(Value::Int(n, _)) => Some(Expr::Literal(Literal::Int(n, None), span.clone())),
             Ok(Value::Bool(b)) => Some(Expr::Literal(Literal::Bool(b), span.clone())),
             Ok(other) => {
-                // The backstop of `COMPTIME_V1.md §5` R8. With the gate in
+                // The backstop of the comptime v1 grammar's R8 rule. With the gate in
                 // force this should be unreachable; it is what keeps the fold
                 // set honest if the body grammar is ever widened without
                 // revisiting §2.
@@ -525,6 +530,12 @@ impl GateCx {
             Expr::Match(m) => self.reject_construct("`match`", &m.span),
             Expr::FnLit(l) => self.reject_construct("a lambda", &l.span),
             Expr::ArenaBlock(a) => self.reject_construct("an arena block", &a.span),
+            // #674 slice 3a: neither is in the v1 `@comptime` grammar (no
+            // arena or host-lifetime handle is comptime-static) — same
+            // treatment as every other construct in this "outside the v1
+            // grammar" group below.
+            Expr::BudgetBlock(bb) => self.reject_construct("a budget block", &bb.span),
+            Expr::AllocIn { span, .. } => self.reject_construct("a budget override (`in`)", span),
             Expr::DirectiveBlock { span, .. } =>
                 self.reject_construct("a nested directive", span),
             Expr::Cast { span, .. } => self.reject_construct("`as`", span),

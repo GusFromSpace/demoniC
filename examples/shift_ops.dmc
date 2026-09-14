@@ -22,6 +22,11 @@
 #      shift of 32 bits; `>>` on an `i32` is an arithmetic shift of 32 bits. The
 #      two answers differ for the same bit pattern, so a shift that quietly ran
 #      at 64 bits returns a plausible number and nothing notices.
+#   3. `u64` is the width where 1 and 2 collide: it is unsigned, so its `>>`
+#      must be logical — but it shares the SAME i64-backed register `i64`
+#      does (`u32`/`u16`/`u8`'s zero-extended pattern is already non-negative,
+#      which is why they never separated "unsigned" from "the pattern happens
+#      to look non-negative" the way `u64` does).
 #
 # Every test below states its expected value as a literal computed by hand from
 # the definition, not as a second expression the same lowering could get wrong
@@ -121,6 +126,36 @@ fn test_u32_right_shift_is_logical() -> bool {
     (((z - one) >> two) as i64) == 1073741823
 }
 
+# The u64 mirror of the u32 case above, and the reason `>>` needed unsigned
+# handling at this width specifically. `u32` (and `u16`/`u8`) are zero-extended
+# INTO an i64 slot, so their pattern is already non-negative and a
+# sign-propagating shift happens to zero-fill anyway. `u64` shares the WHOLE
+# i64 slot — there is no wider register to
+# zero-extend into — so its all-ones pattern (u64::MAX) IS the i64 bit
+# pattern -1, and only tagging it unsigned (rather than reusing `i64`'s
+# arithmetic shift) gets the logical answer: 0x7fffffffffffffff
+# (9223372036854775807), not -1.
+fn test_u64_right_shift_is_logical() -> bool {
+    let z: u64 = 0
+    let one: u64 = 1
+    ((z - one) >> one) == 9223372036854775807u64
+}
+
+# The same shift written with UNTYPED literals, which is how anyone would
+# actually write it: a literal adopts the width of the other operand (SPEC
+# §3.1), so `1` and `2` here are u64 and the shift stays logical. Worth its own
+# test because the typed-both-sides spelling above never exercises the JIT's
+# literal-adoption path at this width at all.
+fn test_u64_untyped_literal_operands_adopt_u64() -> bool {
+    let z: u64 = 0
+    ((z - 1) >> 1) == 9223372036854775807u64
+        && ((z - 1) / 2) == 9223372036854775807u64
+        && ((z - 1) % 10) == 5u64
+        && ((z - 1) > 1)
+        && (1 < (z - 1))
+        && ((z + 1) * 3) == 3u64
+}
+
 # `<<` at a narrow width wraps at that width: an i16 1 shifted into its own sign
 # bit is -32768, not 32768.
 fn test_i16_left_shift_lands_in_its_own_sign_bit() -> bool {
@@ -195,6 +230,10 @@ fn main() -> i64 {
     let one: u32 = 1
     let two: u32 = 2
     print_i64(((z - one) >> two) as i64)
+
+    let zu: u64 = 0
+    let oneu: u64 = 1
+    print((zu - oneu) >> oneu)
 
     let h: i16 = 1
     print_i64((h << 15) as i64)

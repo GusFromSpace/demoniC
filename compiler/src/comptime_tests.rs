@@ -122,7 +122,7 @@ fn integer_semantics_are_the_interpreters_own() {
 
 #[test]
 fn a_residual_shape_param_block_is_not_spliced() {
-    // Tier 2 (COMPTIME_V1.md §4). The pass cannot pick a value for `N` — that
+    // Tier 2 of the comptime-fold design. The pass cannot pick a value for `N` — that
     // is fixed per monomorphization — so the node must survive for the
     // backends to lower. Splicing something here would be picking a shape.
     let p = folded(r#"

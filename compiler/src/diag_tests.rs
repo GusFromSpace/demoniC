@@ -90,9 +90,17 @@ fn the_summary_reports_the_exit_code_it_is_about_to_use() {
         warnings: 1,
         passed: None,
         failed: None,
+        tests_ran: None,
         jit_ran: None,
         jit_skipped: None,
         items: Some(7),
+        refusals: None,
+        blockers: None,
+        cascades: None,
+        classes: None,
+        truncated: None,
+        blocker_files: None,
+        blocker_sites: None,
         exit: 1,
     };
     assert_eq!(
@@ -111,9 +119,17 @@ fn a_summary_with_no_item_count_omits_it() {
         warnings: 0,
         passed: None,
         failed: None,
+        tests_ran: None,
         jit_ran: None,
         jit_skipped: None,
         items: None,
+        refusals: None,
+        blockers: None,
+        cascades: None,
+        classes: None,
+        truncated: None,
+        blocker_files: None,
+        blocker_sites: None,
         exit: 0,
     };
     assert_eq!(
@@ -128,7 +144,7 @@ fn a_summary_with_no_item_count_omits_it() {
 fn every_kind_has_a_distinct_wire_name() {
     let all = [
         Kind::Lex, Kind::Parse, Kind::Check, Kind::JitIneligible,
-        Kind::JitError, Kind::Cli, Kind::Unstructured,
+        Kind::JitError, Kind::Resolve, Kind::Cli, Kind::Unstructured,
     ];
     let mut names: Vec<&str> = all.iter().map(|k| k.as_str()).collect();
     names.sort_unstable();
@@ -196,6 +212,11 @@ fn a_passing_test_is_status_name_file_and_nothing_else() {
         message: None,
         jit: None,
         jit_message: None,
+        jit_blockers: None,
+        jit_sites: None,
+        jit_cascades: None,
+        jit_classes: None,
+        jit_truncated: None,
     };
     assert_eq!(
         t.to_json(),
@@ -212,12 +233,74 @@ fn a_failing_test_carries_its_reason_and_the_parity_verdict_rides_along() {
         message: Some("returned false".into()),
         jit: Some(JitVerdict::Fail),
         jit_message: Some("returned false (diverges from interp)".into()),
+        jit_blockers: None,
+        jit_sites: None,
+        jit_cascades: None,
+        jit_classes: None,
+        jit_truncated: None,
     };
     assert_eq!(
         t.to_json(),
         r#"{"schema":1,"kind":"test","status":"fail","name":"test_bad","file":"/t.dmc",\
 "message":"returned false","jit":"fail",\
 "jit_message":"returned false (diverges from interp)"}"#
+            .replace("\\\n", ""),
+    );
+}
+
+#[test]
+fn all_reports_blockers_sites_and_cascades_in_that_order() {
+    let t = TestResult {
+        name: "test_x".into(),
+        file: "/t.dmc".into(),
+        pass: true,
+        message: None,
+        jit: Some(JitVerdict::Skip),
+        jit_message: None,
+        jit_blockers: Some(Some(1)),
+        jit_sites: Some(Some(3)),
+        jit_cascades: Some(Some(2)),
+        jit_classes: Some(r#"{"jit-unknown-fn":1}"#.to_string()),
+        // #684 fixup (F3): a fully-walked file (not a floor) — `truncated`
+        // rides along last, after `jit_classes`.
+        jit_truncated: Some(Some(false)),
+    };
+    assert_eq!(
+        t.to_json(),
+        r#"{"schema":1,"kind":"test","status":"pass","name":"test_x","file":"/t.dmc",\
+"jit":"skip","jit_blockers":1,"jit_sites":3,"jit_cascades":2,\
+"jit_classes":{"jit-unknown-fn":1},"truncated":false}"#
+            .replace("\\\n", ""),
+    );
+}
+
+#[test]
+fn a_jit_init_failure_encodes_as_null_not_a_fabricated_zero_depth() {
+    // #684 R3: `Jit::new()` failing for a file used to collapse onto the same
+    // `0` a genuinely fully-lowered file reports — the two are not the same
+    // fact, and a consumer diffing depths across runs must not read the first
+    // as the second. `Some(None)` (not `Some(Some(0))`, not plain `None` —
+    // that would mean "`--all` wasn't even on") is the distinct marker,
+    // encoded as JSON `null`. `jit_truncated` (F3 fixup) carries the same
+    // tri-state for the same reason: a file whose JIT engine never
+    // initialized has no truncation verdict either.
+    let t = TestResult {
+        name: "test_x".into(),
+        file: "/t.dmc".into(),
+        pass: true,
+        message: None,
+        jit: Some(JitVerdict::Skip),
+        jit_message: None,
+        jit_blockers: Some(None),
+        jit_sites: Some(None),
+        jit_cascades: Some(None),
+        jit_classes: None,
+        jit_truncated: Some(None),
+    };
+    assert_eq!(
+        t.to_json(),
+        r#"{"schema":1,"kind":"test","status":"pass","name":"test_x","file":"/t.dmc",\
+"jit":"skip","jit_blockers":null,"jit_sites":null,"jit_cascades":null,"truncated":null}"#
             .replace("\\\n", ""),
     );
 }
@@ -237,15 +320,23 @@ fn a_test_summary_reports_the_tallies_the_human_lines_print() {
         warnings: 0,
         passed: Some(2),
         failed: Some(1),
+        tests_ran: Some(3),
         jit_ran: Some(1),
         jit_skipped: Some(2),
         items: None,
+        refusals: None,
+        blockers: None,
+        cascades: None,
+        classes: None,
+        truncated: None,
+        blocker_files: None,
+        blocker_sites: None,
         exit: 1,
     };
     assert_eq!(
         s.to_json(),
         r#"{"schema":1,"kind":"summary","command":"test","status":"failed",\
-"errors":0,"warnings":0,"passed":2,"failed":1,"jit_ran":1,"jit_skipped":2,"exit":1}"#
+"errors":0,"warnings":0,"passed":2,"failed":1,"tests_ran":3,"jit_ran":1,"jit_skipped":2,"exit":1}"#
             .replace("\\\n", ""),
     );
 }
@@ -301,6 +392,18 @@ fn every_refusal_class_is_listed() {
         24,
         "a class was added or removed — update the roster and this count",
     );
+}
+
+#[test]
+fn the_jit_error_classes_fallback_key_matches_its_own_kind() {
+    // #684 R3: `jit::blocker_counts` keys a `jit-error` (a `Refusal`-less
+    // defect) in the `classes`/`jit_classes` frequency map by
+    // `jit::JIT_ERROR_CLASS_KEY` rather than a fabricated `code` — no
+    // collected line ever carries `"code":"jit-error"`, but every `jit-error`
+    // line carries `"kind":"jit-error"` (`Kind::JitError.as_str()`), and that
+    // is the string this constant is meant to equal. Pinned here so the two
+    // can never quietly drift apart.
+    assert_eq!(crate::jit::JIT_ERROR_CLASS_KEY, Kind::JitError.as_str());
 }
 
 #[test]

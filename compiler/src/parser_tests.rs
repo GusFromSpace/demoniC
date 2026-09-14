@@ -889,3 +889,233 @@ fn both_slicing_families_still_parse_501() {
         assert_eq!(p.items.len(), 1, "must parse: {src}");
     }
 }
+
+// ── #674 slice 3a: arena budgets — grammar ───────────────────────────────────
+
+/// The shared spine table `check_tests.rs`'s twin test walks too — `parser_
+/// tests.rs`/`check_tests.rs` pair over one table so the parser's `in` arm
+/// and the checker's `is_arena_ctor_spine`-gated sites cannot silently
+/// diverge on which spellings are on the spine.
+pub(crate) const ARENA_CTOR_SPINE_TABLE: &[(&str, bool)] = &[
+    ("forge.zeros[f32, [4]]", true),
+    ("forge.ones[f32, [4]]", true),
+    ("forge.uninit[f32, [4]]", true),
+    ("forge.identity[f32, 4]", true),
+    ("forge.kv[f32, [4]]", true),
+    ("forge.trit[4, 4]", true),
+    ("vault.zeros[f32, [4]]", true),
+    ("stream.kv[f32, [4]]", true),
+    // Not on the spine: wrong base, wrong method, or no bracket at all.
+    ("r.normal[f32, [4]]", false),
+    ("forge.reset()", false),
+    ("forge.root", false),
+    ("forge.carve(forge.root, 4M)", false),
+];
+
+#[test]
+fn budget_alloc_in_shared_spine_table_674() {
+    // Every spine entry produces `Expr::AllocIn` for a trailing `in b`.
+    // #674 slice 3a fix: every non-spine entry is now a LOCATED PARSE ERROR
+    // naming the ctor-spine shape — before this fix `in` there silently
+    // ended the expression one token early and reparsed as its own
+    // (undefined) identifier statement (probe `s3`'s pre-3a shape,
+    // `forge.reshape[…] in b` yielding `undefined identifier `in`` plus a
+    // discarded-value warning); that silent reading is gone.
+    for (spine, is_spine) in ARENA_CTOR_SPINE_TABLE {
+        let src = format!("fn f(b: Budget) -> nil {{ let t = {spine} in b\n nil }}");
+        if *is_spine {
+            let p = parse(&src);
+            let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+            let Stmt::Let(l) = &f.body.stmts[0] else { panic!("expected let") };
+            assert!(matches!(l.value, Expr::AllocIn { .. }),
+                "`{spine} in b`: expected AllocIn, got {:?}", l.value);
+        } else {
+            let msg = parse_err(&src);
+            assert!(
+                msg.contains("applies only to an arena constructor"),
+                "`{spine} in b`: expected the ctor-spine parse error, got: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_spine_in_tail_is_a_located_parse_error_674() {
+    // The motivating example for the grammar's side condition on `in`:
+    // `forge.reshape` is not on the ctor spine (not in
+    // `ARENA_CTOR_ALLOC_METHODS`), so `in b` after it must be refused at
+    // parse time rather than silently read as a second, discarded-value
+    // statement.
+    let msg = parse_err("fn f(b: Budget) -> nil { let t = forge.reshape[f32, [4]] in b\n nil }");
+    assert!(
+        msg.contains("`in` applies only to an arena constructor") && msg.contains("forge.zeros"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn ctor_with_trailing_call_before_in_gets_its_own_message_674() {
+    // PR #814 review: `forge.kv[…](capacity=N) in b` — a genuine ctor
+    // spine, but the trailing call takes `expr` off the spine by the time
+    // this loop reaches `in` (`is_arena_ctor_spine(&expr)` sees the CALL as
+    // the outer node, not the `[…]`). Unlike `forge.reshape[…] in b` above
+    // (never a spine at all), the user here DID write an arena constructor —
+    // the generic "applies only to an arena constructor" message would be
+    // actively misleading, so this shape gets its own, naming the actual
+    // mistake (the call sits between `[…]` and `in`).
+    let msg = parse_err(
+        "fn f(b: Budget) -> nil { let t = forge.kv[f32, [4]](capacity=8) in b\n nil }");
+    assert!(
+        msg.contains("the `in` tail must follow the `[…]` directly"),
+        "got: {msg}"
+    );
+    assert!(
+        !msg.contains("applies only to an arena constructor"),
+        "must not fall back to the generic non-spine message, got: {msg}"
+    );
+}
+
+#[test]
+fn budget_block_parses_as_statement_674() {
+    let p = parse("fn f(b: Budget) -> nil { forge.enter(b) { let t = forge.zeros[f32, [4]] }\n nil }");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    match &f.body.stmts[0] {
+        Stmt::Expr { lhs: Expr::BudgetBlock(bb), .. } => {
+            assert!(matches!(bb.operand.as_ref(), Expr::Ident(n, _) if n == "b"));
+            assert_eq!(bb.body.stmts.len(), 1);
+        }
+        other => panic!("expected a BudgetBlock statement, got {:?}", other),
+    }
+}
+
+#[test]
+fn budget_block_parses_as_expression_674() {
+    // Genuine expression position: a `let` RHS is parsed through
+    // `parse_expr` → … → `parse_primary` directly, never through
+    // `try_parse_keyword_stmt` (whose own guard always wins at STATEMENT
+    // position — the same reason a bare tail-position `forge { … }` is
+    // ALSO always a `Stmt::Expr`, never a block's `tail_expr`, today).
+    let p = parse("fn f(b: Budget) -> nil { let x = forge.enter(b) { 5 }\n nil }");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    let Stmt::Let(l) = &f.body.stmts[0] else { panic!("expected let") };
+    assert!(matches!(l.value, Expr::BudgetBlock(_)), "got {:?}", l.value);
+}
+
+// PR #814 review: `forge.enter`'s arity of exactly 1 (the `Budget` operand)
+// is not a `check.rs` rule at all, unlike `forge.carve`/`forge.reap` —
+// `parse_budget_block` calls `parse_expr` once for the operand and then
+// requires `)`, so 0 or 2+ operands are structurally impossible to parse,
+// not merely a later diagnostic. Pinned here rather than in `check_tests.rs`
+// because that harness's `check()`/`checked()` both `.expect("parse
+// failed")` — a parse failure there is a test-harness panic, not a value to
+// assert on.
+
+#[test]
+fn budget_block_no_operand_is_a_parse_error_674() {
+    let msg = parse_err("fn f() -> nil { forge.enter() { 5 }\n nil }");
+    assert!(msg.contains("expected expression"), "got: {msg}");
+}
+
+#[test]
+fn budget_block_two_operands_is_a_parse_error_674() {
+    // `parse_budget_block` parses exactly one `parse_expr()` between the
+    // parens, then expects `)` outright — a second operand leaves the `,`
+    // itself as the unexpected token.
+    let msg = parse_err("fn f(a: Budget, b: Budget) -> nil { forge.enter(a, b) { 5 }\n nil }");
+    assert!(msg.contains("after budget block operand"), "got: {msg}");
+}
+
+#[test]
+fn plain_forge_block_still_parses_674() {
+    // The pre-existing `forge { … }` arena block must still parse — the new
+    // `Dot`+`Ident("enter")` guard must not swallow it.
+    let p = parse("fn f() -> nil { forge { let t = forge.zeros[f32, [4]] }\n nil }");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    assert!(matches!(&f.body.stmts[0], Stmt::Expr { lhs: Expr::ArenaBlock(_), .. }));
+}
+
+#[test]
+fn for_ctor_in_budget_is_one_reading_674() {
+    // §2.1 point 2 / §6 Q2: `for x in <ctor> in b { }` has exactly one
+    // reading — the loop's own `in` is consumed before the iterable, so the
+    // second `in` is unambiguously the postfix override.
+    let p = parse("fn f(b: Budget) -> nil { for x in forge.zeros[f32, [4]] in b { }\n nil }");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    match &f.body.stmts[0] {
+        Stmt::For { iter, .. } => assert!(matches!(iter, Expr::AllocIn { .. })),
+        other => panic!("expected a for stmt, got {:?}", other),
+    }
+}
+
+#[test]
+fn in_arm_does_not_skip_newlines_674_z2() {
+    // Probe z2's shape: a statement HEADED by `in`, right after a
+    // constructor statement with no `in b` on it, is legal today and must
+    // stay that way — the `in` arm must not `skip_newlines()`, or this
+    // would silently reparse as `forge.zeros[...] in in`.
+    let p = parse("fn f() -> nil {\n    let in = 7\n    let t = forge.zeros[f32, [4]]\n    in\n    nil\n}");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    // `let t = forge.zeros[...]` must NOT have absorbed the next line's `in`.
+    let Stmt::Let(t_let) = &f.body.stmts[1] else { panic!("expected the second let") };
+    assert!(matches!(t_let.value, Expr::Postfix { .. }), "must not be AllocIn: {:?}", t_let.value);
+    // The bare `in` on its own line is its own (discarded-value) statement.
+    match &f.body.stmts[2] {
+        Stmt::Expr { lhs: Expr::Ident(n, _), .. } => assert_eq!(n, "in"),
+        other => panic!("expected a bare `in` ident statement, got {:?}", other),
+    }
+}
+
+#[test]
+fn in_is_still_a_usable_identifier_674_z1() {
+    // Probe z1: `in` is not a reserved word.
+    let p = parse("fn f() -> nil { let in = 5\n print(\"z1 \" + to_str(in))\n nil }");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    let Stmt::Let(l) = &f.body.stmts[0] else { panic!("expected let") };
+    assert!(matches!(&l.pattern, Pattern::Ident(n, _) if n == "in"));
+}
+
+#[test]
+fn alloc_in_operand_is_postfix_not_full_expr_674() {
+    // §2.1 point 3: `b + 1` does not parse as an AllocIn operand — there is
+    // no `Budget` arithmetic. `forge.zeros[f32,[4]] in b + 1` must parse as
+    // `(forge.zeros[f32,[4]] in b) + 1` (an ill-typed but SYNTACTICALLY
+    // valid expression), not as `... in (b + 1)`.
+    let p = parse("fn f(b: Budget) -> nil { let t = forge.zeros[f32, [4]] in b + 1\n nil }");
+    let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+    let Stmt::Let(l) = &f.body.stmts[0] else { panic!("expected let") };
+    match &l.value {
+        Expr::BinOp { op: BinOp::Add, lhs, .. } => {
+            assert!(matches!(lhs.as_ref(), Expr::AllocIn { .. }));
+        }
+        other => panic!("expected `(... in b) + 1`, got {:?}", other),
+    }
+}
+
+#[test]
+fn fp8_scalar_type_keeps_underscore_in_ctor_type_arg_818() {
+    // #818: a scalar-type token in expression position (a constructor's
+    // element-type argument, e.g. `forge.zeros[fp8_e4m3, [4]]`) used to be
+    // reconstructed by Debug-formatting the token kind and lowercasing it
+    // (`Fp8E4M3` -> `fp8e4m3`), silently dropping the underscore — the
+    // checker then saw an `Expr::Ident("fp8e4m3", ..)` that named no scalar
+    // type. Every other scalar-type token happened to survive that
+    // round-trip (`F16` -> `f16`, `Bf16` -> `bf16`, `Trit` -> `trit`, ...);
+    // only the two fp8 kinds have a token-kind spelling that isn't just a
+    // case-fold of the source spelling. Pin both.
+    for (src, want) in [
+        ("fn f() -> nil { let t = forge.zeros[fp8_e4m3, [4]]\n nil }", "fp8_e4m3"),
+        ("fn f() -> nil { let t = forge.zeros[fp8_e5m2, [4]]\n nil }", "fp8_e5m2"),
+    ] {
+        let p = parse(src);
+        let Item::Fn(f) = &p.items[0] else { panic!("expected fn") };
+        let Stmt::Let(l) = &f.body.stmts[0] else { panic!("expected let") };
+        let Expr::Postfix { op: PostfixOp::Index(idxs), .. } = &l.value else {
+            panic!("expected a postfix index ctor, got {:?}", l.value)
+        };
+        let IndexElem::Expr(elem) = &idxs[0] else { panic!("expected an expr index elem") };
+        match elem {
+            Expr::Ident(name, _) => assert_eq!(name, want, "src: {src}"),
+            other => panic!("expected Expr::Ident({want:?}), got {:?}", other),
+        }
+    }
+}

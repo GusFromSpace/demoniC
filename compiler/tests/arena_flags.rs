@@ -22,8 +22,10 @@ fn dmc_binary() -> PathBuf {
     crate_dir.join("target").join(profile).join("dmc")
 }
 
-/// A program that makes one 2 MiB Forge allocation (512×512 f64 in the
-/// interpreter, f32 under the JIT) and prints a marker if it survives.
+/// A program that makes one 1 MiB Forge allocation — 512×512 f32, charged at
+/// its declared element width on both backends (#781; the interpreter's
+/// REAL storage is still 2 MiB of f64, `MEMORY.md §1.1`, but the arena meter
+/// counts requested bytes) — and prints a marker if it survives.
 const ALLOCATES: &str = r#"
 fn main() -> i64 {
     let t = forge.zeros[f32, [512, 512]]
@@ -99,8 +101,10 @@ fn the_jit_honors_the_forge_budget() {
     let out = probe.run(&["jit", "--forge=1K"]);
     assert!(!out.status.success(), "a 1 KiB forge allocated a 1 MiB tensor under the JIT");
     // The whole message, not a substring: the numbers have to add up, and the
-    // wording has to be the interpreter's (`MEMORY.md §1.1`). The JIT stores
-    // this tensor as f32, so it needs 1 MiB where `dmc run` would need 2 MiB.
+    // wording has to be the interpreter's (`MEMORY.md §1.1`). #781: the arena
+    // meter charges the declared element width on both backends, so this f32
+    // tensor needs 1 MiB here regardless of the interpreter's real f64
+    // storage.
     assert_eq!(
         stderr(&out).trim(),
         "runtime error: forge arena exhausted: this allocation needs 1 MiB, \
@@ -127,12 +131,56 @@ fn the_two_backends_word_exhaustion_the_same_way() {
     };
     assert!(interp.trim().starts_with("runtime error at "), "{}", interp);
     assert!(jit.trim().starts_with("runtime error: "), "{}", jit);
-    // Same sentence modulo the element width each backend actually stores.
+    // #781: both backends meter requested bytes at the declared element
+    // width, so the sentence is now identical, not just equal modulo a
+    // per-backend byte count.
     assert_eq!(
-        body(&interp).replace("needs 2 MiB", "needs N"),
-        body(&jit).replace("needs 1 MiB", "needs N"),
+        body(&interp), body(&jit),
         "interp: {}\njit: {}", interp, jit,
     );
+}
+
+/// #805: a budget one byte under 600 MiB, exhausted by a 600 MiB request, used
+/// to print "needs 600 MiB, but only 600.0 MiB ... is free" on both backends —
+/// `fmt_bytes` rounded the free figure up to the very number it was short of.
+/// `src/arena_tests.rs` pins the unit fix directly; this drives the real
+/// binary so a regression shows up as an end-to-end sentence, not just a
+/// helper's return value.
+const ALLOCATES_600_MIB: &str = r#"
+fn main() -> i64 {
+    let t = forge.zeros[f32, [157286400]]
+    print("allocated")
+    0
+}
+"#;
+
+#[test]
+fn the_exhaustion_message_is_not_self_contradictory_at_a_boundary() {
+    let probe = Probe::new(ALLOCATES_600_MIB);
+    // 600 * (1 << 20) - 1: one byte short of the 600 MiB the allocation needs.
+    let budget = "--forge=629145599";
+
+    let interp = stderr(&probe.run(&["run", budget]));
+    let jit = stderr(&probe.run(&["jit", budget]));
+
+    for (backend, err) in [("interp", &interp), ("jit", &jit)] {
+        assert!(
+            err.contains("needs 600 MiB"),
+            "{backend}: expected the exact request, got: {err}"
+        );
+        // The free figure must render as strictly less than the round unit
+        // it is short of — the whole point of #805 — never `600.0 MiB`,
+        // which would claim the free figure equals the amount that didn't
+        // fit.
+        assert!(
+            err.contains("599.9 MiB"),
+            "{backend}: free figure did not truncate below the boundary: {err}"
+        );
+        assert!(
+            !err.contains("600.0 MiB"),
+            "{backend}: the free figure still reads as the boundary it's short of: {err}"
+        );
+    }
 }
 
 /// A directory of `dmc test` files, written for `dmc test --jit`.
@@ -230,6 +278,67 @@ fn one_over_budget_file_fails_without_killing_the_run() {
     // The file *after* the failure still ran, and the one before it still passed.
     assert!(o.contains("test_alloc_1"), "the file before the failure did not run:\n{}", o);
     assert!(o.contains("test_alloc_3"), "the file after the failure did not run:\n{}", o);
+}
+
+/// PR #815 review: `let !t = c` binds a PRIVATE copy of `c` — for a
+/// `Value::Str` the JIT copies a POINTER, not the string's bytes, so it
+/// requests 0 B for the binding. Two programs, differing only in how many
+/// `let !` copies of the same `to_str` result they make, must bisect to the
+/// SAME minimum on each backend — the copies must not move it. (The two
+/// backends do not agree on each other's minimum: the JIT's forge bump
+/// allocator rounds every allocation up to a 64 B multiple, `MEMORY.md
+/// §1.1`, so a 9-byte string costs 64 B there against the interpreter's 9 —
+/// a pre-existing, unrelated divergence. What this test pins is that
+/// NEITHER backend's own minimum changes when the private copies are
+/// added.)
+const STR_NO_COPY: &str = r#"
+fn main() -> i64 {
+    let c = to_str(123456789)
+    len(c) as i64
+}
+"#;
+
+const STR_WITH_COPIES: &str = r#"
+fn main() -> i64 {
+    let c = to_str(123456789)
+    let !t1 = c
+    let !t2 = c
+    len(t2) as i64
+}
+"#;
+
+fn bisect_minimum(probe: &Probe, backend: &str, hi: u64) -> u64 {
+    // `hi` must already succeed and 1 must already fail (true for every
+    // program below: they all charge a positive number of bytes). Binary
+    // search for the lowest budget that still succeeds.
+    let (mut lo, mut hi) = (1u64, hi);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let out = probe.run(&[backend, &format!("--forge={}", mid)]);
+        if out.status.success() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+#[test]
+fn a_private_str_copy_moves_neither_backends_minimum() {
+    for backend in ["run", "jit"] {
+        let base = Probe::new(STR_NO_COPY);
+        let copies = Probe::new(STR_WITH_COPIES);
+        let base_min = bisect_minimum(&base, backend, 128);
+        let copies_min = bisect_minimum(&copies, backend, 128);
+        assert_eq!(
+            base_min, copies_min,
+            "[{}] two private `let !` copies of the same string changed the \
+             minimum forge budget ({} B -> {} B) — a string copy must cost \
+             nothing on either backend",
+            backend, base_min, copies_min,
+        );
+    }
 }
 
 #[test]

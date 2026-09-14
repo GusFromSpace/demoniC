@@ -37,10 +37,46 @@ pub struct RuntimeError {
     pub msg: String,
     pub span: Option<Span>,
     /// Set by the postfix `?` operator on an error value. It is not a real
-    /// error — it carries the `(T, Err)` tuple that the enclosing function
-    /// should return, and is intercepted at the nearest function-call
-    /// boundary (Rust-`?`-style early return). `None` for ordinary errors.
+    /// error — it carries the ERROR HALF (`e`) of the `(T, Err)` tuple that
+    /// tripped, and is intercepted at the nearest function-call boundary
+    /// (SPEC §4.9's `return (default[T], e)`), where the `T` half is rebuilt
+    /// from the ENCLOSING function's declared return type. `None` for
+    /// ordinary errors.
+    ///
+    /// #628: this used to carry the callee's *whole* tuple, which the catch
+    /// site returned verbatim — so the caller's success slot held the
+    /// callee's error-path value (`777`, not `0`), and when the two functions'
+    /// `T` differed it was not even the right type.
+    ///
+    /// "The nearest function-call boundary" above means `call_fn_in_module`
+    /// (the body half of `call_fn_with_shapes`) and `call_lambda` specifically — every OTHER frame this signal might
+    /// cross is not such a boundary and does not catch it. #647 (still open):
+    /// the `@grad` calling conventions (`.fwd_bwd`/`.grad`/`.fwd`, evaluated
+    /// via `eval_block_with_tape`) have no catch of their own, so a `?` inside
+    /// a `@grad fn -> (T, Err)` escapes that frame uncaught and is instead
+    /// rebuilt against whichever named fn or lambda called `.fwd_bwd(...)` —
+    /// the WRONG `T` whenever the two differ. Not fixed here (different
+    /// category/PR); see `call_grad`'s own note near its `eval_block_with_tape`
+    /// call.
     pub propagate: Option<Box<Value>>,
+    /// #639: a `return` / `break` / `continue` that left a block *expression*.
+    /// Like `propagate`, it is not a real error — `eval_expr` can only hand
+    /// back a `Value`, so this is the carrier that lifts an escape out of an
+    /// expression context up to the nearest statement boundary, where
+    /// `eval_stmt` turns it back into the `Flow` an `if` body would have
+    /// produced. Private: only `escaping_flow` builds one, and `catch_flow`
+    /// is the only thing that opens it. `None` for ordinary errors.
+    ///
+    /// #628 × #639: the two carriers are DISJOINT and are caught at different
+    /// boundaries, so neither may be tested for by "is this an error?". A `?`
+    /// signal has `propagate: Some(_), flow: None` and is caught only at a
+    /// function-call boundary (`finish_query_propagation`); a block escape has
+    /// `flow: Some(_), propagate: None` and is caught at the nearest statement
+    /// or block boundary (`catch_flow`), one frame below. Every site that
+    /// intercepts one guards on ITS OWN field — `e.propagate.is_some()` /
+    /// `e.flow.is_some()` — so the other rides through untouched to the
+    /// boundary that owns it.
+    flow: Option<Box<Escape>>,
 }
 
 impl fmt::Display for RuntimeError {
@@ -54,11 +90,80 @@ impl fmt::Display for RuntimeError {
 }
 
 impl RuntimeError {
-    pub fn msg(s: impl Into<String>) -> Self { Self { msg: s.into(), span: None, propagate: None } }
-    pub fn at(s: impl Into<String>, sp: Span) -> Self { Self { msg: s.into(), span: Some(sp), propagate: None } }
-    /// `?`-operator early-return signal carrying the `(T, Err)` tuple to return.
-    fn propagate(value: Value) -> Self {
-        Self { msg: "`?` propagated past a non-(T, Err) function".into(), span: None, propagate: Some(Box::new(value)) }
+    pub fn msg(s: impl Into<String>) -> Self { Self { msg: s.into(), span: None, propagate: None, flow: None } }
+    pub fn at(s: impl Into<String>, sp: Span) -> Self { Self { msg: s.into(), span: Some(sp), propagate: None, flow: None } }
+    /// `?`-operator early-return signal carrying the error half `e` to return
+    /// alongside `default[T]` (SPEC §4.9). The span passed in is whatever
+    /// `PostfixOp::Query`'s eval site hands it — `parse_postfix` (`parser.rs`)
+    /// starts that span at the OPERAND, not the `?` token, so it covers the
+    /// whole `expr?`, not just the operator. Even so, a refusal to build
+    /// `default[T]` points at this postfix expression rather than at the
+    /// call boundary that intercepts it.
+    ///
+    /// `msg` here is a last-resort diagnostic, not the one users actually see:
+    /// every reachable entry point (`main`/`test_*`, always invoked through
+    /// `call_fn`/`call_fn_with_shapes`) guarantees this signal reaches a
+    /// `finish_query_propagation` call before anything ever calls `Display`
+    /// on it — that call either rebuilds `(default[T], e)` or replaces this
+    /// error outright with its own "`?` is only legal inside…" diagnostic. So
+    /// `msg` is intentionally an internal-invariant message, not a duplicate
+    /// of that user-facing one: seeing it would mean a `?` signal escaped
+    /// every enclosing function-call boundary, which is an interpreter bug.
+    ///
+    /// #639's block-flow carrier is a different signal on the same channel:
+    /// this one is `propagate: Some(_), flow: None`, so `catch_flow` (which
+    /// reads `flow`) lets it past every statement and block boundary on its way
+    /// to the function-call boundary that owns it.
+    fn propagate(err_half: Value, sp: Span) -> Self {
+        Self {
+            msg: "internal error: a `?` early-return signal escaped every \
+                  enclosing function-call boundary uncaught (this is an \
+                  interpreter bug, not a `?` misuse — `finish_query_propagation` \
+                  should have intercepted it first)".into(),
+            span: Some(sp),
+            propagate: Some(Box::new(err_half)),
+            flow: None,
+        }
+    }
+    /// #639: the block-flow carrier. Every path that can raise one also
+    /// catches it — `eval_stmt` and `eval_block` between them cover every
+    /// expression position, and `call_fn_with_shapes` / `call_grad` close the
+    /// two entry points that bypass `eval_block` — so the message is a
+    /// backstop for a context that swallows the `Err` instead, and for the one
+    /// position that has no enclosing statement at all: a module-level
+    /// `let G = { return 5 }`. All three wordings are reachable from there, and
+    /// they match what `eval_if` already says about the same three keywords.
+    /// The span is the escaping keyword's own, so the backstop points at the
+    /// `return` / `break` / `continue` rather than at nothing.
+    fn escaping_flow(esc: Escape) -> Self {
+        let (msg, sp) = match &esc {
+            Escape::Return(_, sp) => ("`return` outside a function", sp.clone()),
+            Escape::Break(sp) => ("`break` outside loop", sp.clone()),
+            Escape::Continue(sp) => ("`continue` outside loop", sp.clone()),
+        };
+        Self {
+            msg: msg.into(),
+            span: Some(sp),
+            propagate: None,
+            flow: Some(Box::new(esc)),
+        }
+    }
+}
+
+/// #639: re-open the block-flow carrier. A `return` / `break` / `continue`
+/// that escaped a block expression rides the error channel (the only channel
+/// an `Expr` has) until the nearest statement boundary; here it becomes the
+/// `Flow` again, so the enclosing loop or function sees exactly what it would
+/// have seen from an `if` body. Ordinary errors pass through untouched — and
+/// so does #628's `?` signal, which is a `propagate` carrier with `flow: None`
+/// and belongs to a function-call boundary further up, not to this one.
+fn catch_flow(r: EvalResult<Flow>) -> EvalResult<Flow> {
+    match r {
+        Err(e) => match e.flow {
+            Some(esc) => Ok(esc.into_flow()),
+            None => Err(e),
+        },
+        ok => ok,
     }
 }
 
@@ -99,18 +204,72 @@ pub enum ComptimeStop {
 /// which wraps at 64 bits and so is the identity on everything below it.
 ///
 /// #241: floats track their *width*, because the two widths have different
-/// JIT-parity semantics. `F32` covers f32 and the narrower float-likes
-/// (f16/bf16/tf32/fp8) that the JIT computes as f32 (the cast-no-op
-/// convention, #179): the data stays f64-backed but is rounded through f32
-/// whenever a tensor is produced or an element is stored, so `dmc run`
-/// matches `dmc jit` numerics by default. `F64` keeps full f64, which is what
-/// the JIT does for declared-f64 tensors. `F32` is the default float tag —
-/// tensor literals, op results, and rng constructors are f32 on the JIT too.
-/// `Bool` is f64-backed like everything else (0.0/1.0), but element reads
-/// yield `Value::Bool` and element writes accept one — matching the JIT,
-/// where a bool tensor is a 1-byte 0/1 lane and `m[i,j]` is a real bool.
+/// JIT-parity semantics. `F32` covers f32 and the narrower float-likes that
+/// the JIT computes as f32 (the cast-no-op convention, #179) and that #834
+/// does not give their own declared metering width — `f16`, `bf16`, `tf32`:
+/// the data stays f64-backed but is rounded through f32 whenever a tensor is
+/// produced or an element is stored, so `dmc run` matches `dmc jit` numerics
+/// by default. `F64` keeps full f64, which is what the JIT does for
+/// declared-f64 tensors. `F32` is the default float tag — tensor literals,
+/// op results, and rng constructors are f32 on the JIT too. `Bool` is
+/// f64-backed like everything else (0.0/1.0), but element reads yield
+/// `Value::Bool` and element writes accept one — matching the JIT, where a
+/// bool tensor is a 1-byte 0/1 lane and `m[i,j]` is a real bool.
+///
+/// `Fp8E4M3`/`Fp8E5M2` (#834) are ALSO f32-backed nominal tags computationally
+/// — every arithmetic/rounding decision that keys off `F32` must key off
+/// these two the same way (`DType::rounds_as_f32`), and `default_tensor_dtype`/
+/// `arena_ctor_dtype` build them from the identical `ScalarType` table
+/// (`dtype_for_scalar_elem`) — but they carry their OWN one-byte
+/// `byte_width`, unlike `f16`/`bf16`/`tf32` above: SPEC §3.1 declares
+/// `fp8_e4m3`/`fp8_e5m2` as genuinely 8-bit floats, and #790's metering
+/// charges the DECLARED width, not the arithmetic one. Before #834 the
+/// interpreter had no representation for either at all and silently reused
+/// `F32`'s tag (and so its 4-byte meter) for both — the bug #834 fixes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DType { Int(IW), F32, F64, Trit, Bool }
+pub enum DType { Int(IW), F32, F64, Trit, Bool, Fp8E4M3, Fp8E5M2 }
+
+impl DType {
+    /// Declared element width in bytes (#781) — what `--vault`/`--forge`
+    /// charge per element when a tensor of this dtype is materialized. This
+    /// is the width `T` names in `Tensor[T, …]`, NOT the interpreter's f64
+    /// storage width every `TensorVal` uses regardless of `dtype` (`DType`'s
+    /// own doc comment). Matches the JIT's `ScalarKind::store_bytes`
+    /// (`jit.rs`) element-for-element, so the two backends charge the same
+    /// program the same requested bytes — except `Fp8E4M3`/`Fp8E5M2`, which
+    /// the JIT never lowers at all (refused as an `ElementType` gap), so
+    /// there is no JIT-side kind to match against.
+    fn byte_width(self) -> u64 {
+        match self {
+            DType::F64 => 8,
+            DType::F32 => 4,
+            // #834: fp8's declared width is one byte (SPEC §3.1's 8-bit
+            // floats) — same as `Bool`/`Trit`, just for an unrelated reason.
+            DType::Bool | DType::Trit | DType::Fp8E4M3 | DType::Fp8E5M2 => 1,
+            DType::Int(w) => match w {
+                IW::I64 | IW::U64 => 8,
+                IW::I32 | IW::U32 => 4,
+                IW::I16 | IW::U16 => 2,
+                IW::I8  | IW::U8  | IW::I4 => 1,
+            },
+        }
+    }
+
+    /// Does `self` round through f32 the same way plain `DType::F32` does?
+    /// (#834) `Fp8E4M3`/`Fp8E5M2` are nominal f32-backed tags (SPEC §3.1:
+    /// "computed in f32 and retagged, never rounded to their own narrower
+    /// precision") that differ from `F32` ONLY in declared metering width
+    /// (`byte_width`) — every other site in this file that used to test
+    /// `== DType::F32` to decide "does this tensor's arithmetic round at f32
+    /// precision" widens to this predicate instead, so an fp8 tensor keeps
+    /// computing exactly like an f32 one now tags it distinctly for
+    /// metering. Before #834 fp8 tensors were mistakenly tagged plain
+    /// `DType::F32` outright, so this predicate's `true` answer for them is
+    /// not new behavior — only the separate `byte_width` is.
+    fn rounds_as_f32(self) -> bool {
+        matches!(self, DType::F32 | DType::Fp8E4M3 | DType::Fp8E5M2)
+    }
+}
 
 /// Width of a scalar float (#473) — the scalar counterpart of `DType`'s
 /// `F32`/`F64` split for tensors.
@@ -173,14 +332,18 @@ fn float_width(v: &Value) -> FW {
 /// a zero-extended `u8`/`u16`/`u32` is a non-negative i64, so the signed
 /// operation IS the unsigned one.
 ///
-/// `u64` is the exception and stays `I64`: an i64-backed value cannot hold
-/// 2^63..2^64-1, so a `u64` carries the 64-bit two's-complement PATTERN.
-/// Wrapping at 64 bits — which is all #544 asks of it — is bit-identical
-/// between `i64` and `u64`, so nothing about the wrap rule is lost; what is
-/// not modelled is unsigned division/comparison/rendering above 2^63.
-/// `int8` is a signed 8-bit type (SPEC §3.1) and shares `I8`; `int4` is `I4`.
+/// `u64` (#597) carries the 64-bit two's-complement PATTERN in the same
+/// i64-backed slot `i64` uses — there is no wider machine word to zero-extend
+/// into, so a `u64` value at or above 2^63 is stored as a negative `i64`. The
+/// `U32`/`U16`/`U8` trick above (a signed instruction on a zero-extended,
+/// always-non-negative pattern IS the unsigned one) stops working here: at 64
+/// bits the pattern can be genuinely negative, so `/ % >>` and the ordering
+/// comparisons re-interpret the pattern as `u64` explicitly wherever the width
+/// is unsigned (see `int_arith`, `IW::wrap`'s `BitShr` caller, and
+/// `scalar_compare`) instead of reusing the signed op. `int8` is a signed
+/// 8-bit type (SPEC §3.1) and shares `I8`; `int4` is `I4`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum IW { I64, I32, I16, I8, I4, U32, U16, U8 }
+pub enum IW { I64, I32, I16, I8, I4, U64, U32, U16, U8 }
 
 impl IW {
     /// Width of an integer binary op's result. Unlike `FW::join`, the *narrow*
@@ -193,6 +356,15 @@ impl IW {
     /// runtime tag instead of its lowered kind. Two genuinely different narrow
     /// kinds never meet (the checker refuses `u8 + i16`), so the fall-through
     /// only has to be total, not clever: take the narrower.
+    ///
+    /// #597 (review): "take the narrower" means a hypothetical `u8`-vs-`i64`
+    /// pair joins to `U8`, and any caller that then branches on
+    /// `w.is_signed()` would read a genuine i64 unsigned. `int_arith` is safe
+    /// from that by construction — it `wrap`s both operands into `w` before
+    /// looking at the signedness, so an unsigned `w` always sees a
+    /// zero-extended, non-negative pattern — and `scalar_compare`, which does
+    /// NOT wrap, keys on its operands' own tags instead of on this join. Any
+    /// future signedness decision must do one or the other.
     #[inline]
     fn join(a: IW, b: IW) -> IW {
         if a == b { return a; }
@@ -202,10 +374,20 @@ impl IW {
     }
     /// Wrap a value into this width, two's-complement (#300: overflow wraps).
     /// Unsigned kinds land in `0..2^w`, signed kinds in `-2^(w-1)..2^(w-1)`.
+    ///
+    /// `pub(crate)` (#718 rework, R1): the JIT's shape-dimension fold for a
+    /// local `let` needs to wrap a compile-time-folded initializer at the
+    /// binding's own width exactly as this does, and reusing it directly
+    /// is what keeps the two backends from drifting apart on the rule.
     #[inline]
-    fn wrap(self, x: i64) -> i64 {
+    pub(crate) fn wrap(self, x: i64) -> i64 {
         match self {
-            IW::I64 => x,
+            // #597: `u64` occupies the whole 64-bit slot, same as `i64` — there
+            // is nothing narrower to mask into, so the pattern passes through
+            // unchanged. It is `/ % >>` and the comparisons, not `wrap`, that
+            // read the pattern differently for `U64` (see `int_arith`,
+            // `apply_binop`'s `BitShr` arm, and `scalar_compare`).
+            IW::I64 | IW::U64 => x,
             IW::I32 => x as i32 as i64,
             IW::I16 => x as i16 as i64,
             IW::I8  => x as i8  as i64,
@@ -221,7 +403,7 @@ impl IW {
     #[inline]
     fn bits(self) -> u32 {
         match self {
-            IW::I64 => 64,
+            IW::I64 | IW::U64 => 64,
             IW::I32 | IW::U32 => 32,
             IW::I16 | IW::U16 => 16,
             IW::I8  | IW::U8  => 8,
@@ -251,7 +433,7 @@ impl IW {
             // `i4`, not `int4`: the diagnostic names the WIDTH that overflowed,
             // and the JIT's `__dmc_div_overflow_trap` spells it `i{bits}`.
             IW::I8 => "i8", IW::I4 => "i4",
-            IW::U32 => "u32", IW::U16 => "u16", IW::U8 => "u8",
+            IW::U64 => "u64", IW::U32 => "u32", IW::U16 => "u16", IW::U8 => "u8",
         }
     }
 }
@@ -302,10 +484,12 @@ fn check_port_lang(v: &Value, ty: Option<&Type>, sp: &Span) -> EvalResult<()> {
 }
 
 /// The integer WIDTH a declared scalar type carries at run time (#540, widened
-/// to every fixed-width kind by #544).
+/// to every fixed-width kind by #544; `u64` given its own tag by #597).
 ///
-/// `u64` maps to `I64` because an i64-backed value has no room for the top half
-/// of the u64 range; the 64-bit wrap is identical either way (see `IW`).
+/// `u64` maps to its own `IW::U64` rather than sharing `I64`: the storage is
+/// still one i64-backed slot (there is no wider machine word), but the tag now
+/// records that the pattern is read unsigned by `/ % >>` and the ordering
+/// comparisons (see `IW`'s doc comment).
 /// `int8`/`int4` are the packed signed 8-/4-bit types of SPEC §3.1.
 /// The JIT's `narrow_scalar_kind` is the mirror of this table — the two must
 /// stay in lockstep or the backends wrap at different widths.
@@ -317,10 +501,11 @@ fn scalar_int_width(t: &ScalarType) -> Option<IW> {
         I16 => Some(IW::I16),
         I8 | Int8 => Some(IW::I8),
         Int4 => Some(IW::I4),
+        U64 => Some(IW::U64),
         U32 => Some(IW::U32),
         U16 => Some(IW::U16),
         U8 => Some(IW::U8),
-        I64 | U64 => Some(IW::I64),
+        I64 => Some(IW::I64),
         _ => None,
     }
 }
@@ -342,8 +527,12 @@ fn int_type_name_width(name: &str) -> Option<IW> {
         "u8"  => IW::U8,
         "u16" => IW::U16,
         "u32" => IW::U32,
-        // `u64` shares `I64` for the reason `scalar_int_width` gives.
-        "i64" | "u64" => IW::I64,
+        // #597: `u64` gets its own tag now, matching `scalar_int_width` — a
+        // tensor element's backing store is still f64 (`cast_tensor_to_int_width`
+        // truncates the same way regardless), so this only changes which
+        // width the element is TAGGED, not the stored magnitude.
+        "u64" => IW::U64,
+        "i64" => IW::I64,
         _ => return None,
     })
 }
@@ -357,12 +546,13 @@ fn int_type_name_width(name: &str) -> Option<IW> {
 /// counterpart to the wrapping integer cast. `I4` has no Rust primitive, so it
 /// goes through `i8` and then `IW::wrap`, the one wrap rule.
 ///
-/// `I64` truncates only: the f64 lane cannot represent the whole 64-bit range,
-/// so pushing it through `as i64` would saturate values that survive today.
-/// That is the pre-existing representational limit #544 names, not this fix.
+/// `I64`/`U64` truncate only: the f64 lane cannot represent the whole 64-bit
+/// range, so pushing it through `as i64` would saturate values that survive
+/// today. That is the pre-existing representational limit #544 names, not
+/// this fix.
 fn cast_tensor_to_int_width(data: &ArrayD<f64>, w: IW) -> ArrayD<f64> {
     match w {
-        IW::I64 => data.mapv(|x| x.trunc()),
+        IW::I64 | IW::U64 => data.mapv(|x| x.trunc()),
         IW::I8  => data.mapv(|x| x as i8  as f64),
         IW::I16 => data.mapv(|x| x as i16 as f64),
         IW::I32 => data.mapv(|x| x as i32 as f64),
@@ -392,6 +582,105 @@ fn coerce_scalar_width(v: Value, ty: Option<&Type>) -> Value {
     }
 }
 
+/// The parser builds a 1-element `Tuple` for plain parenthesised grouping, so
+/// `(T)` must read transparently as `T`. `jit.rs`'s `ty_from_ast` peels it the
+/// same way; the two must agree or `?` sees a tuple on one backend and a
+/// scalar on the other.
+fn peel_grouping(ty: &Type) -> &Type {
+    match ty {
+        Type::Tuple(els, _) if els.len() == 1 => peel_grouping(&els[0]),
+        _ => ty,
+    }
+}
+
+/// SPEC §4.9's `default[T]` for a scalar `T`: "0 / 0.0 / false / nil".
+///
+/// `str`'s zero value is `nil`, not `""` — the spec's own enumeration has no
+/// empty string in it, and the JIT gives a `str` slot the NULL pointer, which
+/// IS `nil` in every nilable-`str` position the language has (`s == nil`, a
+/// closed `Port`, a decode's absent error). Widths follow the declared type,
+/// as at every other binding site (#473/#540): `default[f32]` is an f32 zero.
+fn default_scalar_value(st: &ScalarType) -> Value {
+    match st {
+        ScalarType::Str | ScalarType::Nil => Value::Nil,
+        ScalarType::Bool => Value::Bool(false),
+        ScalarType::F64 => Value::Float(0.0, FW::F64),
+        s if scalar_is_f32_family(s) => Value::Float(0.0, FW::F32),
+        // A trit's zero is an ordinary integer 0, inside {-1, 0, +1}.
+        ScalarType::Trit => Value::Int(0, IW::I64),
+        s => Value::Int(0, scalar_int_width(s).unwrap_or(IW::I64)),
+    }
+}
+
+/// The `DType` a scalar type carries as a TENSOR ELEMENT — one table so a
+/// constructor's bracket name (`arena_ctor_dtype`) and a resolved type
+/// annotation (`default_tensor_dtype`, below) can never tag the same
+/// `ScalarType` two different widths (#834, the bug this closes: fp8 used
+/// to silently fall back to `DType::F32`'s 4-byte width in the former and
+/// was grouped into the same fallback in the latter).
+///
+/// Returns `None` for `str`/`nil` only — #817 is an open ruling on whether
+/// either has a real tensor-element representation at all; this table does
+/// not decide it, and `default_tensor_dtype` keeps its own pre-existing
+/// `DType::F32` fallback for the two, unchanged by this fix. `arena_ctor_dtype`
+/// never calls this with `Str`/`Nil` in the first place — its own
+/// `ScalarType::from_ctor_name` table excludes both names in constructor
+/// value position, so they take the `DType::F32` fallback there (the
+/// checker still admits both; #817 is the open ruling).
+fn dtype_for_scalar_elem(st: &ScalarType) -> Option<DType> {
+    match st {
+        ScalarType::Trit => Some(DType::Trit),
+        ScalarType::Bool => Some(DType::Bool),
+        ScalarType::F64 => Some(DType::F64),
+        // #834: fp8's declared metering width is genuinely one byte (SPEC
+        // §3.1) — listed as their own arms rather than folding into the
+        // `F32`-family arm below, which both fp8 kinds would also match
+        // (they are still nominal f32-backed tags computationally,
+        // `DType::rounds_as_f32`), so this table states their width plainly
+        // instead of relying on arm order to pick it out.
+        ScalarType::Fp8E4M3 => Some(DType::Fp8E4M3),
+        ScalarType::Fp8E5M2 => Some(DType::Fp8E5M2),
+        ScalarType::F32 | ScalarType::F16 | ScalarType::Bf16 | ScalarType::Tf32 => Some(DType::F32),
+        // Exhaustive rather than a trailing `s => scalar_int_width(s)...`
+        // catch-all (#834 rework): every fixed-width integer kind is named
+        // here so a future `ScalarType` variant is a compile error, not a
+        // silent fall-through. `scalar_int_width` still supplies the width —
+        // this arm only fixes which variants reach it.
+        ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64
+        | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64
+        | ScalarType::Int4 | ScalarType::Int8 => scalar_int_width(st).map(DType::Int),
+        ScalarType::Str | ScalarType::Nil => None,
+    }
+}
+
+/// The `DType` tag a declared tensor element type carries, for `default[T]`'s
+/// zero tensor. The type-keyed twin of `arena_ctor_dtype` (which reads the
+/// same information off a constructor's bracket name) — both now resolve
+/// through the one shared `dtype_for_scalar_elem` table (#834).
+fn default_tensor_dtype(st: &ScalarType) -> DType {
+    dtype_for_scalar_elem(st).unwrap_or(DType::F32)
+}
+
+/// A short spelling of a declared type, for `?`'s diagnostics. Deliberately
+/// coarse — it names the type well enough to point back at the signature;
+/// `fmt.rs` owns canonical type printing.
+fn type_label(ty: &Type) -> String {
+    match ty {
+        Type::Scalar(s, _) => crate::fmt::scalar_type_str(s).to_string(),
+        Type::Tensor(e, _, _) => format!("Tensor[{}, ..]", type_label(e)),
+        Type::View(e, _, _) => format!("View[{}, ..]", type_label(e)),
+        Type::KV(e, _, _) => format!("KV[{}, ..]", type_label(e)),
+        Type::Tuple(els, _) => {
+            format!("({})", els.iter().map(type_label).collect::<Vec<_>>().join(", "))
+        }
+        Type::Array(e, _, _) => format!("[{}; N]", type_label(e)),
+        Type::RawPtr(e, _) => format!("*{}", type_label(e)),
+        Type::Fn(_, r, _) => format!("fn(..) -> {}", type_label(r)),
+        Type::Mesh(_, _) => "Mesh".to_string(),
+        Type::Named { name, .. } => name.clone(),
+    }
+}
+
 /// Round every element of a tensor's data through f32.
 #[inline]
 fn quantize_f32_arr(data: &mut ArrayD<f64>) {
@@ -417,7 +706,7 @@ fn sum_f32<I: Iterator<Item = f64>>(it: I) -> f64 {
 /// add, everything else accumulates in f64 as before.
 #[inline]
 fn tensor_sum(t: &TensorVal) -> f64 {
-    if t.dtype == DType::F32 { sum_f32(t.iter().copied()) } else { t.iter().sum() }
+    if t.dtype.rounds_as_f32() { sum_f32(t.iter().copied()) } else { t.iter().sum() }
 }
 
 /// `sum(t) / n` at the tensor's width (#481). The JIT converts the count to f32
@@ -427,7 +716,223 @@ fn tensor_sum(t: &TensorVal) -> f64 {
 fn tensor_mean(t: &TensorVal) -> f64 {
     let total = tensor_sum(t);
     let n = t.len() as f64;
-    if t.dtype == DType::F32 { quantize_f32(total / quantize_f32(n)) } else { total / n }
+    if t.dtype.rounds_as_f32() { quantize_f32(total / quantize_f32(n)) } else { total / n }
+}
+
+/// #674: the interpreter's
+/// stamp on a tensor's origin budget. `gen` is the budget's generation AT THE
+/// MOMENT this tensor was stamped; `live` is the table entry's *own*
+/// generation cell, shared by every tensor ever stamped from that entry.
+/// Stale iff `gen != live.get()` — a pure predicate needing no table lookup
+/// and no `&Interpreter`, which is what lets `check_live` run at a walker
+/// (`Debug`, `json_encode_value`) or the AD tape's backward pass, neither of
+/// which holds one.
+///
+/// **PR #821 rework — the tag is held behind an `Rc`, not inlined.** Written
+/// as the design spells it (`origin: Option<BudgetTag>`, two words) it added
+/// **16 B** to `TensorVal` and so to `Value`, which is passed and returned by
+/// value on every one of the interpreter's hot paths: `size_of::<Value>()`
+/// went 120 → 136, and the measured wrapper cost was an order of magnitude
+/// over §3.2's price. `OriginTag` below is the same predicate in **one**
+/// pointer-sized, niche-optimized field: `Value` is 128 B, and the only path
+/// that pays the extra indirection is the *budgeted* one, which is also the
+/// only one §3.2 prices above a tenth of a nanosecond. Cloning the `Rc` is
+/// what propagates the tag to a deep copy of a budgeted tensor — it shares
+/// its source's `live` cell and goes stale at the same reap, exactly the
+/// propagation B6 requires, before a re-stamp site (§6 Q5) updates it to
+/// whatever budget is current at the copy.
+pub struct BudgetTag {
+    pub generation: u32,
+    pub live: Rc<Cell<u32>>,
+}
+
+/// #674 slice 3b: a tensor's stamped origin — `None` for the root (never
+/// stale), `Some` for a budget carved off it. **One** pointer wide: `Rc`'s
+/// non-null niche makes the `Option` free, so this costs `TensorVal` a single
+/// word rather than the two an inlined `BudgetTag` would (see `BudgetTag`'s
+/// doc for the measurement that forced it).
+pub type OriginTag = Option<Rc<BudgetTag>>;
+
+/// #674 slice 3b: the interpreter's per-budget table (`Interpreter::budgets`,
+/// one entry per live budget, laid out below). Entry 0 is `forge.root`,
+/// `parent(0) = 0` (a fixed point `reap` refuses to touch, §4.1), bound to
+/// `--forge` if the flag was given, unbounded otherwise (`extent: None`,
+/// `free: None`).
+struct BudgetEntry {
+    /// Index of the parent budget (`parent(0) = 0`).
+    parent: u32,
+    /// Bytes this budget was carved with. `None` only for entry 0 under no
+    /// `--forge` — "no ceiling" (§4.1): PRE and PRE-A both go vacuous there.
+    extent: Option<u64>,
+    /// Bytes allocated (not carved) directly in this budget so far — what
+    /// `forge_used` used to be, for entry 0.
+    used: u64,
+    /// Remaining capacity, spent by BOTH `allocate` and `carve` alike — the
+    /// table's own `free`, never `ForgeArena::exceeds_budget` (§3.1).  `None`
+    /// iff `extent` is `None`.
+    free: Option<u64>,
+    /// Live-child count; `reap` refuses (`budget-reap`, R2) while this is
+    /// nonzero.
+    children: u32,
+    /// This entry's own generation cell — every `TensorVal` stamped from
+    /// this budget shares it via `BudgetTag::live`. `reap` bumps it, which is
+    /// the whole of B6's invalidation: no table lookup, no walk, one `Cell`
+    /// write reaches every live and future-cloned copy.
+    live: Rc<Cell<u32>>,
+}
+
+impl BudgetEntry {
+    fn root(extent: Option<u64>) -> Self {
+        BudgetEntry {
+            parent: 0,
+            extent,
+            used: 0,
+            free: extent,
+            children: 0,
+            live: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+/// #674 slice 3b: 20 bits of index (1 048 575 live budgets), 44 of
+/// generation, one `i64` — a reaped index is reused without the generation
+/// wrapping. The interpreter's own generation counter is `u32`
+/// (`BudgetTag`/`BudgetEntry::live`), comfortably inside the 44-bit field the
+/// descriptor reserves for it.
+const BUDGET_INDEX_BITS: u32 = 20;
+const BUDGET_INDEX_MASK: i64 = (1i64 << BUDGET_INDEX_BITS) - 1;
+
+fn budget_descriptor(generation: u32, index: u32) -> i64 {
+    ((generation as i64) << BUDGET_INDEX_BITS) | (index as i64 & BUDGET_INDEX_MASK)
+}
+fn budget_index(descriptor: i64) -> usize {
+    (descriptor & BUDGET_INDEX_MASK) as usize
+}
+fn budget_generation(descriptor: i64) -> u32 {
+    ((descriptor >> BUDGET_INDEX_BITS) & 0xFFFF_FFFF) as u32
+}
+
+thread_local! {
+    /// #674: the budget `TensorVal::new`
+    /// stamps a fresh tensor's `origin` from — the single construction
+    /// chokepoint has no `&Interpreter`, only this ambient thread-local,
+    /// which `enter`/`in b`/frame management push and pop (`jit.rs`'s
+    /// `FORGE`/`FORGE_LIMIT` pattern). `None` is entry 0 (root): a tensor so
+    /// tagged can never go stale, because `forge.root` can never be reaped
+    /// (§4.1). Slice 3d is what finally pushes this to `Some` from surface
+    /// syntax: `Expr::BudgetBlock` (`forge.enter(b) { … }`) and
+    /// `Expr::AllocIn` (`<ctor> in b`) both open a `BudgetGuard`, which is
+    /// the only writer outside `VaultTagGuard`'s row-19 clear.
+    static CUR_BUDGET_TAG: RefCell<OriginTag> = const { RefCell::new(None) };
+
+    /// #674: the ENTERED-BUDGET REGISTER —
+    /// the table index PRE-A charges against (`charge_arena`'s Forge arm).
+    /// Thread-local rather than an `Interpreter` field for one reason: B5
+    /// requires it to be restored on **every** exit edge of
+    /// `forge.enter(b) { … }` — normal exit, `return`, `break`, `continue`
+    /// and a `?` early return — and the only shape that covers all five
+    /// without a restore line per path is RAII (`BudgetGuard`, below), whose
+    /// `Drop` has no `&mut Interpreter` to write a field through. It is
+    /// reset to 0 by `Interpreter::new`, so a fresh interpreter on a reused
+    /// thread (`dmc test` runs every file on one) always starts at the root.
+    static CUR_BUDGET: Cell<usize> = const { Cell::new(0) };
+}
+
+/// #674 slice 3d: read the entered-budget register. `0` is `forge.root`.
+#[inline(always)]
+fn cur_budget() -> usize { CUR_BUDGET.with(|c| c.get()) }
+
+/// #674: while live, the entered
+/// budget is the one this guard was opened on; on drop — on **every** exit
+/// edge, the `?`/carrier ones included — the previous budget and its stamp
+/// come back. The design names the trap this shape exists to avoid in as
+/// many words: `Expr::ArenaBlock`'s own arm writes `self.eval_block(&ab.
+/// body)?`, and a copy of that shape with a restore line after it leaks the
+/// register whenever the body raises or escapes. Sibling of
+/// `VaultTagGuard`, which is the same discipline over the stamp alone.
+struct BudgetGuard {
+    saved_index: usize,
+    saved_tag: OriginTag,
+}
+impl BudgetGuard {
+    /// Push `index` (and the stamp every tensor constructed under it
+    /// inherits — `None` for the root, which can never go stale, §4.1).
+    fn enter(index: usize, tag: OriginTag) -> Self {
+        let saved_index = CUR_BUDGET.with(|c| c.replace(index));
+        let saved_tag = CUR_BUDGET_TAG.with(|c| c.replace(tag));
+        BudgetGuard { saved_index, saved_tag }
+    }
+}
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        // The OUTER budget, not the root: an `enter` nested inside another
+        // `enter` restores what it shadowed (the nested-enter restore rule above).
+        CUR_BUDGET.with(|c| c.set(self.saved_index));
+        CUR_BUDGET_TAG.with(|c| *c.borrow_mut() = self.saved_tag.take());
+    }
+}
+
+/// #674: while live,
+/// holds `CUR_BUDGET_TAG` cleared to `None`. `try_arena_constructor`'s Vault
+/// arm keeps one for the rest of the call — see the call site's doc — and
+/// restores the PREVIOUS tag on drop, covering every exit (an early
+/// `return`, a `?` from `charge_ctor`/shape validation) the same way a
+/// `MutexGuard` would.
+struct VaultTagGuard(OriginTag);
+impl VaultTagGuard {
+    fn new() -> Self {
+        VaultTagGuard(CUR_BUDGET_TAG.with(|c| c.borrow_mut().take()))
+    }
+}
+impl Drop for VaultTagGuard {
+    fn drop(&mut self) {
+        CUR_BUDGET_TAG.with(|c| *c.borrow_mut() = self.0.take());
+    }
+}
+
+/// #674 slice 3b: true iff `t`'s stamped generation no longer matches its
+/// origin budget's live generation — the budget was reaped after `t` was
+/// stamped (or cloned from a stamped tensor). A pure predicate: no table
+/// lookup, no `&Interpreter`, so it runs anywhere there is an error channel —
+/// or, for the two walkers (`Debug`, `json_encode_value`), anywhere there
+/// isn't one.
+#[inline(always)]
+fn tensor_is_stale(t: &TensorVal) -> bool {
+    match &t.origin {
+        Some(tag) => tag.generation != tag.live.get(),
+        None => false,
+    }
+}
+
+/// #674 slice 3b: the `budget-stale` error, built out of line. Every caller
+/// is one branch off a hot path — `eval_expr`'s per-node check above all —
+/// so the `String` allocation, the `Span` and the `RuntimeError` all belong
+/// behind a `#[cold]` call the branch predictor never takes. `#[inline(never)]`
+/// as well as `#[cold]`, because `eval_expr` is `#[inline(always)]` and would
+/// otherwise carry this into every one of its callers.
+#[cold]
+#[inline(never)]
+fn stale_error(span: Span) -> RuntimeError {
+    RuntimeError::at(
+        "budget-stale: this tensor was allocated in a budget that \
+         has already been reaped".to_string(),
+        span,
+    )
+}
+
+/// #674: re-stamp `v`'s origin to whatever
+/// budget is current AT THIS COPY SITE, reading the same ambient thread-local
+/// `TensorVal::new` stamps a fresh construction from. `#[derive(Clone)]`
+/// would otherwise carry the SOURCE tensor's tag into a private copy
+/// (`let !y = x`, a `!`-param copy-in) that `charge_intermediate` charges as
+/// a fresh materialization — the copy's origin must match what it is charged
+/// to, not what `x` was built under, or a copy taken OUT of a budget before
+/// it is reaped would incorrectly go stale (or a copy taken at the root of a
+/// tensor built inside a budget would incorrectly survive its reap).
+fn restamp_current_budget(v: &mut Value) {
+    if let Value::Tensor(t) = v {
+        t.origin = CUR_BUDGET_TAG.with(|c| c.borrow().clone());
+    }
 }
 
 /// A tensor value: f64-backed storage plus a coarse dtype tag. Derefs to the
@@ -437,6 +942,12 @@ fn tensor_mean(t: &TensorVal) -> f64 {
 pub struct TensorVal {
     pub data: ArrayD<f64>,
     pub dtype: DType,
+    /// #674 slice 3b: `None` means this tensor was constructed under the
+    /// root (never stale — root can never be reaped); `Some(tag)` means it
+    /// was constructed under a budget `carve`d from the root, and
+    /// `check_live` (every retrieval site the interpreter checks for a live
+    /// budget handle) reports `budget-stale` once that budget is reaped.
+    pub origin: OriginTag,
 }
 
 impl TensorVal {
@@ -448,16 +959,21 @@ impl TensorVal {
         // exceeds the 2p+2 double-rounding bound for f32's 24). Int/Trit are
         // never rounded (an i64 tensor element must round-trip exactly); F64
         // keeps full width, matching the JIT's f64 tensors.
-        if matches!(dtype, DType::F32) {
+        if dtype.rounds_as_f32() {
             quantize_f32_arr(&mut data);
         }
-        TensorVal { data, dtype }
+        // #674 slice 3b: stamp from the ambient thread-local (§3.2 M1) — the
+        // single construction chokepoint, so every op output / literal /
+        // constructor inherits the stamp the same way it inherits f32
+        // rounding above.
+        let origin = CUR_BUDGET_TAG.with(|c| c.borrow().clone());
+        TensorVal { data, dtype, origin }
     }
     /// Width a scalar read out of this tensor carries (#473). Elements of an
     /// `F32` tensor are already f32-rounded by #241's store-time rule; the
     /// width is what keeps them f32 through the arithmetic that follows.
     pub fn float_width(&self) -> FW {
-        if self.dtype == DType::F32 { FW::F32 } else { FW::F64 }
+        if self.dtype.rounds_as_f32() { FW::F32 } else { FW::F64 }
     }
 }
 
@@ -522,6 +1038,9 @@ pub enum Value {
     Lambda {
         lit: std::sync::Arc<crate::ast::FnLit>,
         captured_env: HashMap<String, Value>,
+        /// The file the literal was written in; its body resolves top-level
+        /// names there, not where it is eventually called.
+        module: usize,
     },
     /// Built-in stdlib stub.
     Builtin(String),
@@ -555,11 +1074,25 @@ pub enum Value {
     Map(Rc<RefCell<HashMap<String, Value>>>),
     /// Module reference
     Module { alias: String, path: std::path::PathBuf },
+    /// #674: a host-lifetime budget handle — one opaque machine word, the
+    /// descriptor `(gen << 20) | index`. No arithmetic, no ordering, no
+    /// literal; `Clone` copies the
+    /// descriptor, and both copies name the SAME budget (`MEMORY.md §4`'s
+    /// CoW does not apply — there is no buffer here to copy). `forge.root`
+    /// evaluates to `Value::Budget(0)` (index 0, generation 0 — the root is
+    /// never reaped, so its generation never moves).
+    Budget(i64),
 }
 
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // #597: a `u64` at or above 2^63 is a negative `i64` pattern —
+            // render it as the unsigned magnitude it names, not the signed
+            // reinterpretation (`0u64 - 1u64` prints 18446744073709551615, not
+            // -1). Every other width's pattern is already non-negative, so
+            // this only changes `U64`'s output.
+            Value::Int(n, IW::U64) => write!(f, "{}", *n as u64),
             Value::Int(n, _)   => write!(f, "{}", n),
             // #473: an f32 renders as the f64 expansion of its f32-rounded
             // value ("12.368000030517578"), NOT the shortest f32 form
@@ -572,6 +1105,11 @@ impl fmt::Debug for Value {
             Value::Bool(b)  => write!(f, "{}", b),
             Value::Str(s)   => write!(f, "{:?}", s),
             Value::Nil      => write!(f, "nil"),
+            // #674: a
+            // `fmt` has no error channel and needs none — a rendering that is
+            // not a number cannot BE a wrong number, so a stale tensor prints
+            // a marker instead of stale bytes.
+            Value::Tensor(t) if tensor_is_stale(t) => write!(f, "Tensor<reaped>"),
             Value::Tensor(t) => write!(f, "Tensor{:?} {}",  t.shape(), t),
             Value::Tuple(t) => {
                 write!(f, "(")?;
@@ -585,7 +1123,13 @@ impl fmt::Debug for Value {
                 write!(f, "{{ ")?;
                 for (i, (k, v)) in fields.borrow().iter().enumerate() {
                     if i > 0 { write!(f, ", ")?; }
-                    write!(f, "{}: {:?}", k, v)?;
+                    // The hidden tag holds the model's table key; print the
+                    // name the program wrote.
+                    match v {
+                        Value::Str(tag) if k == "__model__" =>
+                            write!(f, "{}: {:?}", k, bare_name(tag))?,
+                        _ => write!(f, "{}: {:?}", k, v)?,
+                    }
                 }
                 write!(f, " }}")
             }
@@ -599,8 +1143,8 @@ impl fmt::Debug for Value {
             Value::Range { start, end, inclusive } => {
                 write!(f, "{}..{}{}", start, if *inclusive { "=" } else { "" }, end)
             }
-            Value::Fn(n)      => write!(f, "<fn {}>", n),
-            Value::BoundFn { name, .. } => write!(f, "<fn {}>", name),
+            Value::Fn(n)      => write!(f, "<fn {}>", bare_name(n)),
+            Value::BoundFn { name, .. } => write!(f, "<fn {}>", bare_name(name)),
             Value::Lambda { .. } => write!(f, "<lambda>"),
             Value::Builtin(n) => write!(f, "<builtin {}>", n),
             Value::EnumVal { enum_name, variant, payload } => {
@@ -611,7 +1155,7 @@ impl fmt::Debug for Value {
                 }
                 Ok(())
             }
-            Value::Opaque(n)  => write!(f, "<opaque {}>", n),
+            Value::Opaque(n)  => write!(f, "<opaque {}>", bare_name(n)),
             Value::List(vs) => {
                 write!(f, "[")?;
                 for (i, v) in vs.iter().enumerate() {
@@ -629,6 +1173,7 @@ impl fmt::Debug for Value {
                 write!(f, "}}")
             }
             Value::Module { alias, path } => write!(f, "<module {} {:?}>", alias, path),
+            Value::Budget(d) => write!(f, "<budget #{} gen {}>", budget_index(*d), budget_generation(*d)),
         }
     }
 }
@@ -662,7 +1207,19 @@ impl Value {
         match self { Value::Int(n, _) => Some(*n), _ => None }
     }
     fn as_float(&self) -> Option<f64> {
-        match self { Value::Int(n, _) => Some(*n as f64), Value::Float(x, _) => Some(*x), _ => None }
+        match self {
+            // #597: a `u64` value carries the 64-bit PATTERN in an i64-backed
+            // slot, so `*n as f64` read u64::MAX's all-ones pattern as -1 —
+            // `print(x as f64)` printed `-1` instead of 1.8446744073709552e19,
+            // and every f64-mediated builtin (min/max, the mixed int/float
+            // comparison path) inherited the same sign error. The narrower
+            // unsigned widths are stored zero-extended, so their signed and
+            // unsigned readings already coincide and this arm never fires.
+            Value::Int(n, IW::U64) => Some(*n as u64 as f64),
+            Value::Int(n, _) => Some(*n as f64),
+            Value::Float(x, _) => Some(*x),
+            _ => None,
+        }
     }
     fn as_bool(&self) -> Option<bool> {
         match self { Value::Bool(b) => Some(*b), _ => None }
@@ -688,6 +1245,7 @@ impl Value {
             Value::List(_)    => "list",
             Value::Map(_)     => "map",
             Value::Module { .. } => "module",
+            Value::Budget(_)  => "Budget",
         }
     }
 }
@@ -695,12 +1253,65 @@ impl Value {
 // ─── Control-flow signals ────────────────────────────────────────────────────
 
 /// Statements can produce control-flow signals — `break`, `continue`,
-/// `return`. We thread them up through eval_block.
+/// `return`. We thread them up through eval_block. Each signal carries the
+/// span of the keyword that raised it (#639), so a diagnostic reached far from
+/// that keyword — the module-level backstop, say — can still point at it.
+#[derive(Debug, Clone)]
 enum Flow {
     Normal(Value),
-    Break,
-    Continue,
-    Return(Value),
+    Break(Span),
+    Continue(Span),
+    Return(Value, Span),
+}
+
+/// #639: the part of a `Flow` that can *escape a block expression*. A block's
+/// `Normal` case is a value, not control flow, so it is not representable
+/// here — which is why nothing downstream (`escaping_flow`'s message table,
+/// `Escape::into_flow`) needs an unreachable fourth arm.
+#[derive(Debug, Clone)]
+enum Escape {
+    Return(Value, Span),
+    Break(Span),
+    Continue(Span),
+}
+
+impl Escape {
+    fn into_flow(self) -> Flow {
+        match self {
+            Escape::Return(v, sp) => Flow::Return(v, sp),
+            Escape::Break(sp) => Flow::Break(sp),
+            Escape::Continue(sp) => Flow::Continue(sp),
+        }
+    }
+
+    /// The keyword, for a diagnostic that names it.
+    fn keyword(&self) -> &'static str {
+        match self {
+            Escape::Return(..) => "return",
+            Escape::Break(_) => "break",
+            Escape::Continue(_) => "continue",
+        }
+    }
+
+    fn span(&self) -> &Span {
+        match self {
+            Escape::Return(_, sp) | Escape::Break(sp) | Escape::Continue(sp) => sp,
+        }
+    }
+}
+
+impl Flow {
+    /// Split a `Flow` into a block expression's VALUE, or the escape that has
+    /// to leave that expression on the carrier. Total by construction: `Normal`
+    /// is the only case that is a value.
+    fn into_value_or_escape(self) -> Result<Value, Escape> {
+        match self {
+            Flow::Normal(v) => Ok(v),
+            Flow::Return(v, sp) => Err(Escape::Return(v, sp)),
+            Flow::Break(sp) => Err(Escape::Break(sp)),
+            Flow::Continue(sp) => Err(Escape::Continue(sp)),
+        }
+    }
 }
 
 // ─── Op profiling ────────────────────────────────────────────────────────────
@@ -718,9 +1329,13 @@ pub struct OpProfile {
 pub struct InterpModuleEnv {
     pub scopes: Vec<HashMap<String, Value>>,
     pub fns: HashMap<String, FnDecl>,
-    pub models: std::collections::HashSet<String>,
-    pub model_methods: HashMap<String, HashMap<String, FnDecl>>,
+    pub models: HashMap<String, String>,
+    pub enums: HashMap<String, Vec<String>>,
+    pub type_aliases: HashMap<String, TypeAlias>,
     pub public_items: std::collections::HashSet<String>,
+    /// The module number the snapshotted file was loaded under; an importer
+    /// finds the file's `pub` items under `module_key(epoch, name)`.
+    pub epoch: usize,
 }
 
 // ─── Interpreter ─────────────────────────────────────────────────────────────
@@ -777,7 +1392,12 @@ pub struct Interpreter {
     fns: HashMap<String, FnDecl>,
     /// Top-level model declarations — referenced as opaque values at
     /// runtime (e.g. `Transformer[L=24, ...]`), so we just need the name set.
-    models: std::collections::HashSet<String>,
+    /// Model names as each file sees them → the declaring file's key. A
+    /// `pub model` imported under two spellings (`Point`, `math.Point`) maps
+    /// both to one canonical key, which is what instances carry in their
+    /// `__model__` tag and what `model_methods` / `model_fields` /
+    /// `model_shape_params` are keyed by.
+    models: HashMap<String, String>,
     /// Shape parameter names for each model, used to bind them into method scopes.
     /// e.g. `model S[P]` → `model_shape_params["S"] = ["P"]`
     model_shape_params: HashMap<String, Vec<String>>,
@@ -787,9 +1407,42 @@ pub struct Interpreter {
     /// Used by `@cast(Model){bytes}` to overlay a raw byte tensor onto a
     /// struct: it needs the field types to compute byte offsets and sizes.
     model_fields: HashMap<String, Vec<(String, crate::ast::Type)>>,
-    /// #336: top-level enum declarations — name → ordered variant names. A
+    /// #336: top-level enum declarations — ordered variant names, so a
     /// variant's value is its index here (the i64 ordinal).
+    ///
+    /// Keyed by `module_key`, exactly as `fns` and `models` are: an enum is a
+    /// per-file name, and a file sees only the enums it declares plus the
+    /// `pub` ones it imports. One flat map let two files' private `enum E`
+    /// share a slot, so the last file loaded decided what `E`'s variants were
+    /// everywhere — `E.Gamma` in the file that declares it reported `undefined
+    /// identifier E` when another file's two-variant `E` had overwritten it.
     enums: HashMap<String, Vec<String>>,
+    /// Top-level `type` aliases (SPEC §6.6) — name → declaration, collected
+    /// in `collect_item` exactly as `enums` is. An alias is transparent: a
+    /// value annotated `Role` where `type Role = u8` is a `u8`, and SPEC §3.1
+    /// makes a declared integer type a run-time WIDTH. Every site where an
+    /// annotation becomes semantics (`coerce_declared`, `check_declared_port`)
+    /// resolves through this table first; before it existed, `let r: Role =
+    /// 255` kept `r` a full i64 and `r + 1` was 256 under `dmc run` while the
+    /// checker — which already resolves aliases — had accepted the program as
+    /// the `u8` one that wraps to 0.
+    ///
+    /// Keyed by `module_key`, exactly as `fns`, `models` and `enums` are: SPEC
+    /// §9 states ONE visibility rule for every top-level name, so an alias is
+    /// visible where a fn of the same provenance would be — in the file that
+    /// declares it, and in a file that imported it because it was `pub`. One
+    /// flat map made the last-loaded declaration win everywhere, so an
+    /// importer's alias silently re-typed the fn bodies of the library it
+    /// imported — `libbump(255)` ran as `u8` and printed 0 where the checker
+    /// had type-checked it as `i64` and meant 256 (and the reverse orientation
+    /// printed 256 for the `u8` the checker had accepted).
+    ///
+    /// #623 first fixed that with a per-name list filtered by load order
+    /// (`module <= alias_module`, highest wins). That admitted an alias a file
+    /// never imported, merely one declared earlier in the topological order;
+    /// registering it on import instead is the same rule the other three
+    /// tables follow, and it needs no second module field.
+    type_aliases: HashMap<String, TypeAlias>,
     /// Module-level mutable bindings (`let !w = …` / `let mut w = …`), in
     /// declaration order. A `@grad fn` that reads one of these captures it, and
     /// AUTODIFF.md §2 makes that capture a differentiable input: `call_grad`
@@ -806,12 +1459,17 @@ pub struct Interpreter {
     /// bare name, so a `@grad fn` can only ever capture its **own** module's
     /// mut bindings. The tag is what lets the tape agree with that.
     mut_globals: Vec<(usize, String)>,
-    /// Which module each registered fn came from, keyed exactly as `fns` is, so
-    /// `grad_capture_names` can ask "which mut globals were in scope where this
-    /// fn was written?" rather than "what mut global exists anywhere?".
-    fn_module: HashMap<String, usize>,
-    /// The module `load_program` is currently ingesting; bumped once per file.
-    module_epoch: usize,
+    /// The module whose code is executing right now — the one quantity, in one
+    /// field. Every top-level name a body mentions resolves through
+    /// `module_key(cur_module, name)`: a file's own items and its imports are
+    /// registered under the file's number, so a file-private `helper` in two
+    /// files never shares a slot (SPEC §6.7).
+    ///
+    /// `load_program` mints the next number into it (one per file, in the
+    /// resolver's leaf-first order) and it stays there while the file's items
+    /// are collected and its top-level `let`s run; every call then sets it to
+    /// the `module` its decl carries and restores it on the way out.
+    cur_module: usize,
     /// xorshift64 RNG state, advanced by every `rng.normal[...]` /
     /// `rng.uniform[...]`. Seeded from `Rng.seed(N)` at the call site; this
     /// global is the fallback so programs that never call seed still get a
@@ -886,18 +1544,123 @@ pub struct Interpreter {
     arena_limits: crate::arena::ArenaLimits,
     /// Bytes charged against each sized arena so far. The interpreter has no
     /// bump pointer — it hands every tensor to Rust's allocator — so these
-    /// counters *are* the arena watermarks: they meter the explicit `vault.*`
-    /// and `forge.*` constructors at an f64 per element. Both counters are
-    /// monotonic: nothing here reclaims memory, so nothing here returns
-    /// budget. In particular a `forge { … }` block does not rewind
+    /// counters *are* the arena watermarks: they meter every materialized
+    /// tensor — explicit `vault.*`/`forge.*` constructors AND implicit
+    /// intermediates alike (#781) — at its DECLARED element width
+    /// (`DType::byte_width`), not the interpreter's f64 storage width. Both
+    /// counters are monotonic: nothing here reclaims memory, so nothing here
+    /// returns budget. In particular a `forge { … }` block does not rewind
     /// `forge_used` on exit — see `Expr::ArenaBlock` (#400).
+    ///
+    /// `vault_used` stays a flat counter — Vault has no `carve` (§3.5). Forge
+    /// gained per-budget storage in slice 3b: what was `forge_used` is now
+    /// `budgets[0].used`, entry 0 of the table below.
     vault_used: u64,
-    forge_used: u64,
+    /// #674: the interpreter's budget table.
+    /// Entry 0 is `forge.root`, sized by `--forge` (installed by
+    /// `set_arena_limits`) — `budgets[0].used` is what `forge_used` used to
+    /// be, and a program that never carves changes nothing (§3.1, the
+    /// compatibility gate slices 3b/3c hold to). `forge.carve` pushes;
+    /// `forge.reap` bumps a `gen`, credits the parent's `free`, and frees the
+    /// entry for reuse (the descriptor's index, never the `Vec` slot itself).
+    budgets: Vec<BudgetEntry>,
+    /// #674 slice 3b: indices `reap` has freed and not yet handed back out.
+    /// `carve` pops one before growing `budgets` — "entry freed for reuse"
+    /// (§3.1) — reusing the SLOT's own `live` cell (already bumped past the
+    /// generation the reaped occupant's tensors were stamped with), so a
+    /// stale `Value::Budget` descriptor naming the old occupant can never
+    /// match the new one's generation at the same index (§6 Q8's whole
+    /// point: an index is reused, but never its generation).
+    budget_free: Vec<usize>,
+    // #674 slice 3d: the budget every allocation charges (PRE-A,
+    // `charge_arena`'s Forge arm) used to be a field here. It is now the
+    // `CUR_BUDGET` thread-local beside `CUR_BUDGET_TAG` — see that cell's
+    // doc for why B5's five exit edges force RAII, and RAII forces the
+    // register out of `&mut Interpreter`.
+    /// #781 (reviewer rework): true while evaluating a tensor-literal
+    /// expression whose VALUE is consumed by something other than being
+    /// the tensor a `charge_intermediate` call should bill — a row inside
+    /// an enclosing nested literal (`[[16 f32]×4]`: the inner `[16 f32]`
+    /// materializes the row array, but only the assembled outer array is
+    /// the tensor that survives; charging both double-bills it), or a
+    /// bracket list read as a SHAPE (`a.reshape[[4096]]`: `[4096]` never
+    /// becomes a tensor a program can observe — it is consumed for its
+    /// integers and discarded, and the JIT never charges it either). Set
+    /// around exactly those two call sites (`Expr::TensorLit`'s row loop,
+    /// `reshape`'s shape-argument eval) and restored on every path,
+    /// including an `Err` return, so nesting depth cannot leak it.
+    lit_charge_suppressed: bool,
+    /// #781 (reviewer rework): running total of the Forge bytes charged by an
+    /// EXPLICIT constructor — a `forge.*` spelling, or an `rng.*` draw —
+    /// since this interpreter started. Strictly monotonic, and never itself a
+    /// budget: it exists only so a compiler-inserted rewind can subtract two
+    /// snapshots of it and learn how much of the window it is about to
+    /// release was spelled out by the program.
+    ///
+    /// A rewind exists to hand a body's compiler-inserted intermediates back:
+    /// `MEMORY.md §1.1` returns budget only for a temporary *the compiler
+    /// itself* inserted and reclaimed, and a tensor the program asked for by
+    /// name is not one. A constructor's result can escape the body and stay
+    /// live — assigned to a model field (`m.w = forge.zeros[…]`), written
+    /// through a `!` param, stored into a module-level `let !` — at which
+    /// point rewinding past it un-charges memory the program still holds. So
+    /// both AD rewinds (the forward-only `@grad` mark in
+    /// `call_fn_in_module`, and the `.fwd_bwd` epilogue) land at `mark +
+    /// (now − then)` rather than at `mark`.
+    ///
+    /// A monotonic counter read at two points, rather than a scoped
+    /// accumulator: nesting composes with no save/restore (an inner rewind's
+    /// kept bytes are inside the outer window's difference too, which is
+    /// correct — they are live under the outer scope as well), and no error
+    /// path out of a marked body can leave a flag set.
+    ///
+    /// Conservative by construction: it keeps every constructor charged
+    /// inside the window, whether or not that particular result escapes —
+    /// so a scratch constructor used and dropped in the body over-charges
+    /// its full size on every call, unbounded across calls (#796); a
+    /// COMPUTED tensor that escapes is not kept (#795). Both resolve by
+    /// tracking escapes at the assignment/return site.
+    /// Over-keeping bills memory the program named; under-keeping loses
+    /// memory the program still holds, which is the failure `MEMORY.md`'s
+    /// budgets exist to prevent. There is no parity cost — the JIT refuses an
+    /// explicit constructor inside a `@grad` body outright (measured: it
+    /// refuses each of the three escape shapes), so no JIT number moves
+    /// either way.
+    ///
+    /// `vault.*` needs no term here: `vault_used` is never rewound at all.
+    ctor_forge_bytes: u64,
     /// #505: remaining `@comptime` step budget, or `None` when this
-    /// interpreter is executing a program rather than folding a block
-    /// (`COMPTIME_V1.md §6`). Armed by `eval_comptime` and cleared by it, so
-    /// no ordinary run is ever metered. One step is one `eval_expr` entry.
+    /// interpreter is executing a program rather than folding a block. Armed
+    /// by `eval_comptime` and cleared by it, so no ordinary run is ever
+    /// metered. One step is one `eval_expr` entry.
     comptime_fuel: Option<u64>,
+    /// #628 follow-up: the declared return type of every named `fn`/method
+    /// whose body is currently on the (dynamic) call stack. Pushed and popped
+    /// by `call_fn_with_shapes` around its `call_fn_in_module` call — the same
+    /// wrapper shape #652 gave `cur_module`, so it covers every exit that
+    /// function has rather than only the ones spelled out today.
+    ///
+    /// `call_lambda` reads the top of this stack when the lambda itself has
+    /// no declared `(T, Err)` return type, so an untyped `?`-using lambda's
+    /// early return can be rebuilt against the same "enclosing function"
+    /// `check.rs`'s `current_fn_ret` means (`PostfixOp::Query`, `src/check.rs`):
+    /// there, "enclosing" is LEXICAL — the named `fn` whose body textually
+    /// contains the lambda literal, fixed once at check time regardless of
+    /// where the lambda is later called from. This stack is a DYNAMIC stand-in:
+    /// it agrees with the lexical answer whenever the lambda is invoked from
+    /// within the extent of the named fn that (lexically) contains it — true
+    /// for every corpus/test use (a lambda built and called inline) — but can
+    /// disagree if a lambda escapes its definition site (returned or stored)
+    /// and is later invoked while a *different* named fn is on the stack, or
+    /// none at all. There is no lexical alternative available here: the
+    /// interpreter has no per-`FnLit` "enclosing fn" table (unlike `check.rs`,
+    /// which gets it for free from the AST recursion order), and building one
+    /// was out of scope for this fix — `check.rs` already refuses every case
+    /// where the *lexically* enclosing fn is not `(T, Err)` (`in_err_fn`), so
+    /// the escape-hatch programs this stack could get wrong are ones the
+    /// checker already accepted; this stack only has to agree with it, not
+    /// invent legality on its own.
+    named_fn_ret_stack: Vec<Option<Type>>,
 }
 
 struct AxisSelection {
@@ -1342,6 +2105,67 @@ impl Interpreter {
         out
     }
 
+    /// The `type` declaration a name resolves to **from the module whose body
+    /// is running** — the file's own declaration, or the `pub` one it
+    /// imported, which is exactly what `resolve_fn` and `resolve_model` ask of
+    /// their own tables. A name the running file neither declares nor imported
+    /// is not an alias here, which is what stops an importer's `type Role =
+    /// u8` from re-typing the library it imported.
+    fn alias_decl<'a>(&'a self, name: &str) -> Option<&'a TypeAlias> {
+        self.type_aliases.get(&module_key(self.cur_module, name))
+    }
+
+    /// Resolve a declared type through the top-level `type` aliases (SPEC
+    /// §6.6) to the type it spells, chasing a chain (`type A = B  type B =
+    /// u8`). Anything that is not an alias name comes back as itself.
+    ///
+    /// A shape-generic alias resolves only when its target is a SCALAR
+    /// (`type W[N] = u8`): a shape argument cannot change a scalar's width, so
+    /// `let r: W[3] = 255` is the `u8` the checker resolved it to and wraps to
+    /// 0. It printed 256 before, which was the same #540 hole one indirection
+    /// further out. A shape-generic alias over a shaped type
+    /// (`type Batch[B] = Tensor[f32,[B,768]]`) is still left alone:
+    /// substituting `B` here is separate work, and no run-time width hides
+    /// behind it.
+    ///
+    /// The loop bound (rather than a seen-set) is enough to stop a cycle: the
+    /// checker refuses a recursive alias (`check.rs::resolve_type_alias`), so
+    /// this is only a cap for an interpreter run that skipped the check.
+    fn resolve_alias_ty<'a>(&'a self, ty: &'a Type) -> &'a Type {
+        let mut cur = ty;
+        for _ in 0..=self.type_aliases.len() {
+            match cur {
+                Type::Named { name, args, .. } => match self.alias_decl(name) {
+                    Some(alias)
+                        if alias.shape_params.is_empty() && args.is_empty() => cur = &alias.ty,
+                    Some(alias)
+                        if !alias.shape_params.is_empty()
+                            && matches!(alias.ty, Type::Scalar(_, _)) => cur = &alias.ty,
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    /// `coerce_scalar_width` behind alias resolution. This — not the free
+    /// function — is what every annotation site calls (a typed `let`, a typed
+    /// parameter, a declared return, a declared model field), so a width
+    /// spelled through an alias narrows exactly as the direct spelling does.
+    #[inline]
+    fn coerce_declared(&self, v: Value, ty: Option<&Type>) -> Value {
+        coerce_scalar_width(v, ty.map(|t| self.resolve_alias_ty(t)))
+    }
+
+    /// `check_port_lang` behind alias resolution, for the same sites and the
+    /// same reason as `coerce_declared`: `type Py = Port[python]` names a
+    /// runtime just as the direct spelling does.
+    #[inline]
+    fn check_declared_port(&self, v: &Value, ty: Option<&Type>, sp: &Span) -> EvalResult<()> {
+        check_port_lang(v, ty.map(|t| self.resolve_alias_ty(t)), sp)
+    }
+
     /// The declared type of `field` on a struct value, via its hidden
     /// `__model__` tag (#473). `None` when the value carries no model tag or
     /// the model declares no such field.
@@ -1363,11 +2187,6 @@ impl Interpreter {
             .map(|(_, t)| t.clone())
     }
 
-    fn assign_to_tensor(&mut self, arr: &mut ArrayD<f64>, dtype: DType, idx_elems: &[IndexElem], rval: Value, span: Span) -> EvalResult<()> {
-        let idx_vals = self.eval_index_elems(idx_elems, &span)?;
-        Self::assign_to_tensor_resolved(arr, dtype, &idx_vals, rval, span)
-    }
-
     /// Store `rval` into `arr` at already-evaluated indices. Deliberately takes
     /// no `self`, so it cannot re-enter the interpreter: callers may hold a
     /// `RefCell` borrow of the destination across this call (#443).
@@ -1376,7 +2195,9 @@ impl Interpreter {
         // (bypassing TensorVal::new), so round the written value through f32
         // here when the target is an F32 tensor. F64/Int/Trit pass through.
         let rval = match dtype {
-            DType::F32 => match rval {
+            // #834: fp8 elements round through f32 on write exactly like F32
+            // elements do (`DType::rounds_as_f32`).
+            DType::F32 | DType::Fp8E4M3 | DType::Fp8E5M2 => match rval {
                 Value::Float(x, _) => Value::Float(quantize_f32(x), FW::F64),
                 Value::Tensor(mut t) => { quantize_f32_arr(&mut t.data); Value::Tensor(t) }
                 other => other,
@@ -1460,7 +2281,91 @@ impl Interpreter {
         Ok(())
     }
 
+    /// The scalar/elementwise `BinOp` pair a compound-assignment operator
+    /// dispatches to — the same choice the scalar-ident arms (`x += v`, just
+    /// below) and `trace_reassign` make: elementwise (`Dot*`) when either
+    /// side is a tensor, scalar otherwise. Shared here so #693's indexed
+    /// compound-assign path picks exactly the `apply_binop` the scalar path
+    /// would.
+    fn compound_binops(op: &AssignOp) -> (BinOp, BinOp) {
+        match op {
+            AssignOp::PlusEq  => (BinOp::Add, BinOp::DotAdd),
+            AssignOp::MinusEq => (BinOp::Sub, BinOp::DotSub),
+            AssignOp::StarEq  => (BinOp::Mul, BinOp::DotMul),
+            AssignOp::SlashEq => (BinOp::Div, BinOp::DotDiv),
+            other => unreachable!("compound_binops called with non-arithmetic {:?}", other),
+        }
+    }
+
+    /// Compound-assign (`+=`/`-=`/`*=`/`/=`) into a single tensor element at
+    /// already-evaluated indices (#693). Before this, no match arm at all
+    /// handled a compound op against an indexed target: `t[i] += v` fell to
+    /// the catch-all no-op — `--check` accepted it, nothing stored, nothing
+    /// errored, and `t[i]` read back its old value (0 where 5 was expected).
+    ///
+    /// Mirrors the plain indexed store's in-place path (#689/#692): no clone
+    /// of `arr`, mutate through `&mut`. The current element is read out
+    /// dtype-aware exactly as the ordinary index *read* expression does (an
+    /// `Int` tensor yields a width-tagged `Value::Int`, `Bool` a
+    /// `Value::Bool`, else a width-tagged `Value::Float` — see the
+    /// `PostfixOp::Index` read arm), combined via `apply_binop` — the same
+    /// function the scalar `x += v` arm calls — and the result is stored
+    /// back through `assign_to_tensor_resolved`, which already applies the
+    /// same f32-quantize / narrow-int-wrap a plain `t[i] = v` store does.
+    /// That store-time quantization is why this arm's f32 answer matches
+    /// the plain indexed store and the JIT (`0.1f32 += 0.2f32` here reads
+    /// back `0.30000001192092896`) rather than the SCALAR `x += v` arm,
+    /// which skips it and reads back `0.30000000149011613` — a pre-existing
+    /// interp/jit divergence in the scalar path, not something this arm
+    /// reproduces (filed as #713; not fixed here).
+    ///
+    /// Errors — never silently no-ops — when the index does not name a
+    /// single scalar element. Compound assignment to a tensor *slice*
+    /// (`t[.., 0] += v`) is a different, broader feature this fix does not
+    /// add; refusing it loudly beats guessing at elementwise-broadcast
+    /// semantics nobody has specified yet.
+    fn compound_assign_tensor_elem(
+        arr: &mut ArrayD<f64>,
+        dtype: DType,
+        scalar_op: BinOp,
+        dot_op: BinOp,
+        idx_vals: &[IndexVal],
+        rval: Value,
+        span: Span,
+    ) -> EvalResult<()> {
+        let selections = Self::resolve_index_values(arr.shape(), idx_vals, &span)?;
+        if !selections.iter().all(|s| s.reduce_rank) {
+            return Err(RuntimeError::at(
+                "compound assignment to a tensor slice is not supported — index every \
+                 axis so the target is a single element (`t[i] += v`, not a range or \
+                 partial index)".to_string(),
+                span,
+            ));
+        }
+        let coords: Vec<usize> = selections.iter().map(|s| s.indices[0]).collect();
+        let x = arr[IxDyn(&coords)];
+        let cur = match dtype {
+            // #571: width-tagged, matching the plain read arm.
+            DType::Int(w) => Value::Int(w.wrap(x as i64), w),
+            DType::Bool => Value::Bool(x != 0.0),
+            _ => Value::Float(x, if dtype.rounds_as_f32() { FW::F32 } else { FW::F64 }),
+        };
+        let op = if matches!(rval, Value::Tensor(_)) { dot_op } else { scalar_op };
+        let new_val = apply_binop(op, &cur, &rval)?;
+        Self::assign_to_tensor_resolved(arr, dtype, idx_vals, new_val, span)
+    }
+
     pub fn new() -> Self {
+        // #674 slice 3d: the entered-budget register and its stamp are
+        // thread-local (see `CUR_BUDGET`'s doc), and this interpreter's
+        // budget table starts at entry 0 alone — so the register must name
+        // entry 0 too. `BudgetGuard` restores on every exit edge, so a
+        // clean run always leaves it at 0 anyway; this is the belt for a
+        // thread that a previous run left mid-`enter` (a panic, a
+        // `std::process::exit` from a nested harness) rather than a
+        // load-bearing reset.
+        CUR_BUDGET.with(|c| c.set(0));
+        CUR_BUDGET_TAG.with(|c| *c.borrow_mut() = None);
         Self {
             scopes: vec![HashMap::new()],
             shape_param_scopes: vec![std::collections::HashSet::new()],
@@ -1468,13 +2373,13 @@ impl Interpreter {
             kv_capacities: HashMap::new(),
             model_shape_params: HashMap::new(),
             fns: HashMap::new(),
-            models: std::collections::HashSet::new(),
+            models: HashMap::new(),
             model_methods: HashMap::new(),
             model_fields: HashMap::new(),
             enums: HashMap::new(),
+            type_aliases: HashMap::new(),
             mut_globals: Vec::new(),
-            fn_module: HashMap::new(),
-            module_epoch: 0,
+            cur_module: 0,
             rng_state: 0x9E3779B97F4A7C15,  // SplitMix64 golden-ratio seed
             start_time: std::time::Instant::now(),
             argv: Vec::new(),
@@ -1491,8 +2396,12 @@ impl Interpreter {
             float_lit_hint: None,
             arena_limits: crate::arena::ArenaLimits::default(),
             vault_used: 0,
-            forge_used: 0,
+            budgets: vec![BudgetEntry::root(None)],
+            budget_free: Vec::new(),
+            lit_charge_suppressed: false,
+            ctor_forge_bytes: 0,
             comptime_fuel: None,
+            named_fn_ret_stack: Vec::new(),
         }
     }
 
@@ -1503,7 +2412,7 @@ impl Interpreter {
     /// other demoniC expression sees, so a fold cannot disagree with a run on
     /// truncating division, `%` sign, or per-width integer wrapping (#540).
     /// A hand-written const-folder beside the reference implementation is
-    /// exactly the drift `COMPTIME_V1.md §8` is avoiding.
+    /// exactly the drift the single-evaluator design avoids.
     ///
     /// What keeps compile-time evaluation out of runtime state is not this
     /// entry point but `comptime.rs`'s static gate, which admits no call of
@@ -1523,7 +2432,7 @@ impl Interpreter {
         let exhausted = self.comptime_fuel == Some(0);
         self.comptime_fuel = None;
         match r {
-            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => Ok(v),
+            Ok(Flow::Normal(v)) | Ok(Flow::Return(v, _)) => Ok(v),
             Ok(_) => Ok(Value::Nil),
             Err(e) if exhausted => { let _ = e; Err(ComptimeStop::Budget) }
             Err(e) => Err(ComptimeStop::Failed(e)),
@@ -1535,6 +2444,123 @@ impl Interpreter {
     /// program got before the flags were accepted.
     pub fn set_arena_limits(&mut self, limits: crate::arena::ArenaLimits) {
         self.arena_limits = limits;
+        // #674 slice 3b: entry 0's extent/free mirror `--forge` — called
+        // before any allocation, so `used` is still 0 and `free` starts at
+        // the whole limit (or stays `None`, unbounded, absent the flag).
+        self.budgets[0].extent = limits.forge;
+        self.budgets[0].free = limits.forge;
+    }
+
+    // ── #674 slice 3b test-only harness ─────────────────────────────────────
+    //
+    // `forge.enter`/`in b` do not lower until slice 3d (they stay refused,
+    // located, in this slice), so no DEMONIC PROGRAM can stamp a tensor to a
+    // non-root budget yet. The retrieval sites that must check for a stale
+    // budget still need covering NOW, at the mechanism level, which is what
+    // these give
+    // `interp_tests.rs`: the exact push/pop discipline `enter` will use in
+    // 3d, exposed only under `#[cfg(test)]` and not reachable from any
+    // surface syntax. `pub(crate)` (not `pub`) because `interp_tests` is a
+    // sibling module of `interp`, not a descendant — plain field/method
+    // privacy would not reach it.
+
+    /// TEST-ONLY: evaluate `e` directly — `eval_expr`'s wrapper (`check_live`
+    /// included), no source text, no scope setup beyond what the caller has
+    /// already bound.
+    #[cfg(test)]
+    pub(crate) fn eval_expr_for_test(&mut self, e: &Expr) -> EvalResult<Value> {
+        self.eval_expr(e)
+    }
+
+    /// TEST-ONLY: bind `name` in the current (outermost) scope, so a
+    /// hand-built expression string can refer to a `Value` the test
+    /// constructed some other way (typically under `with_budget_for_test`).
+    #[cfg(test)]
+    pub(crate) fn bind_for_test(&mut self, name: &str, v: Value) {
+        self.bind(name, v);
+    }
+
+    /// TEST-ONLY: park `v` as the already-evaluated receiver for the
+    /// expression node `recv_expr`, exactly as `call_bracketed_method`'s
+    /// `NotAMethod` arm does. It is the only way to pin §3.2 hole-table
+    /// row 3's *take* path on its own: reaching it through surface syntax
+    /// means going through `call_bracketed_method`, whose own receiver read
+    /// is expression position and refuses an already-stale tensor first
+    /// (row 1). What this reaches instead is the window row 3 actually owns
+    /// — a receiver parked live and taken stale.
+    #[cfg(test)]
+    pub(crate) fn park_receiver_for_test(&mut self, recv_expr: &Expr, v: Value) {
+        self.park_receiver(recv_expr, v);
+    }
+
+    /// #674 slice 3d: the stamp every tensor constructed under budget
+    /// `index` inherits (`TensorVal::new`, §3.2 M1). `None` for entry 0 —
+    /// the root can never be reaped, so a tensor tagged from it can never go
+    /// stale (§4.1) — and the entry's OWN generation cell otherwise, shared
+    /// so one `reap` reaches every tensor ever stamped from it.
+    fn budget_stamp(&self, index: usize) -> OriginTag {
+        if index == 0 {
+            None
+        } else {
+            let e = &self.budgets[index];
+            Some(Rc::new(BudgetTag { generation: e.live.get(), live: Rc::clone(&e.live) }))
+        }
+    }
+
+    /// #674 slice 3d: resolve a `Budget` handle and open the register on it.
+    /// The one entry point for both `forge.enter(b) { … }`
+    /// (`Expr::BudgetBlock`) and `<ctor> in b` (`Expr::AllocIn`), so the two
+    /// cannot drift on either refusal: a value that is not a `Budget` is a
+    /// well-formedness error naming `what` (the shape `forge.carve`/
+    /// `forge.reap` already use for their own arguments — no new tag, so
+    /// B7's "exactly three refusal classes" count is untouched), and a
+    /// handle whose generation no longer matches its entry is
+    /// **`budget-stale`**, the runtime error §2.3's table lists at
+    /// "carve / reap / enter / `in b`".
+    fn open_budget(&self, v: &Value, span: &Span, what: &str) -> EvalResult<BudgetGuard> {
+        let Value::Budget(d) = v else {
+            return Err(RuntimeError::at(format!(
+                "{what}: the budget operand must be a `Budget`, got {}",
+                v.type_name()), span.clone()));
+        };
+        let index = budget_index(*d);
+        let generation = budget_generation(*d);
+        if index >= self.budgets.len() || generation != self.budgets[index].live.get() {
+            return Err(RuntimeError::at(
+                "budget-stale: this budget handle names a budget that was \
+                 already reaped".to_string(), span.clone()));
+        }
+        Ok(BudgetGuard::enter(index, self.budget_stamp(index)))
+    }
+
+    /// TEST-ONLY: push the entered-budget register and its stamp to `index`,
+    /// run `f`, then restore both — the same `BudgetGuard` `Expr::
+    /// BudgetBlock` and `Expr::AllocIn` open, reached without surface
+    /// syntax for the slice-3b hole-table cases that predate `enter`.
+    #[cfg(test)]
+    pub(crate) fn with_budget_for_test<R>(&mut self, index: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        let guard = BudgetGuard::enter(index, self.budget_stamp(index));
+        let r = f(self);
+        drop(guard);
+        r
+    }
+
+    /// TEST-ONLY: the entered-budget register, for the slice-3d exit-edge
+    /// cases — one per edge, each asserting the register came back to the
+    /// OUTER budget after the block (the required coverage for each exit
+    /// edge).
+    #[cfg(test)]
+    pub(crate) fn cur_budget_for_test() -> usize { cur_budget() }
+
+    /// TEST-ONLY: decode a `Value::Budget`'s table index, for a test that
+    /// carved a budget and needs the raw index to pass to
+    /// `with_budget_for_test`.
+    #[cfg(test)]
+    pub(crate) fn budget_index_for_test(v: &Value) -> usize {
+        match v {
+            Value::Budget(d) => budget_index(*d),
+            other => panic!("expected Value::Budget, got {:?}", other),
+        }
     }
 
     /// Enter a user-function call frame: bump the recursion counter and hand back a
@@ -1591,44 +2617,351 @@ impl Interpreter {
     /// #400: charge `nbytes` against a sized arena, or report exhaustion.
     ///
     /// `arena` is `None` for allocations that land somewhere the sizing flags
-    /// do not reach — the Stream arena (`forge.kv` / `stream.kv`, which carries
-    /// its own `capacity`) and implicit intermediates. Those are never charged.
+    /// do not reach — only the Stream arena (`forge.kv` / `stream.kv`, which
+    /// carries its own `capacity`) is exempt (#781: every OTHER materialized
+    /// tensor, explicit constructor or implicit intermediate, is charged —
+    /// see `charge_intermediate`).
     fn charge_arena(
         &mut self,
         arena: Option<crate::arena::Arena>,
         nbytes: u64,
         span: Option<&Span>,
     ) -> EvalResult<()> {
-        use crate::arena::{fmt_bytes, Arena};
+        use crate::arena::Arena;
         let Some(arena) = arena else { return Ok(()) };
-        let (limit, used) = match arena {
-            Arena::Vault => (self.arena_limits.vault, &mut self.vault_used),
-            Arena::Forge => (self.arena_limits.forge, &mut self.forge_used),
-        };
-        let Some(limit) = limit else {
-            // Unbounded: still track the watermark so a later `--vault`/`--forge`
-            // run reports the same numbers, but never fail.
-            *used = used.saturating_add(nbytes);
+        match arena {
+            // Vault has no `carve` (§3.5) — a flat per-process meter,
+            // unchanged by slice 3b.
+            Arena::Vault => self.charge_vault(nbytes, span),
+            // #674 slice 3b: PRE-A now reads the budget table's `free`
+            // (`charge_budget`), never a bare `forge_used` counter — see
+            // that fn's doc.
+            Arena::Forge => self.charge_budget(cur_budget(), nbytes, span),
+        }
+    }
+
+    /// The Vault half of `charge_arena`, unchanged by slice 3b: a flat
+    /// per-process meter, `vault_used`, never rewound and never part of the
+    /// budget table.
+    fn charge_vault(&mut self, nbytes: u64, span: Option<&Span>) -> EvalResult<()> {
+        use crate::arena::{fmt_bytes, Arena};
+        let Some(limit) = self.arena_limits.vault else {
+            // Unbounded: still track the watermark so a later `--vault` run
+            // reports the same numbers, but never fail.
+            self.vault_used = self.vault_used.saturating_add(nbytes);
             return Ok(());
         };
-        let after = used.saturating_add(nbytes);
+        let after = self.vault_used.saturating_add(nbytes);
         if after > limit {
             let msg = format!(
                 "{} arena exhausted: this allocation needs {}, but only {} of the \
                  {} {} budget is free",
-                arena.name(),
+                Arena::Vault.name(),
                 fmt_bytes(nbytes),
-                fmt_bytes(limit.saturating_sub(*used)),
+                fmt_bytes(limit.saturating_sub(self.vault_used)),
                 fmt_bytes(limit),
-                arena.flag(),
+                Arena::Vault.flag(),
             );
             return Err(match span {
                 Some(sp) => RuntimeError::at(msg, sp.clone()),
                 None => RuntimeError::msg(msg),
             });
         }
-        *used = after;
+        self.vault_used = after;
         Ok(())
+    }
+
+    /// #674: PRE-A — charge `nbytes`
+    /// against budget table entry `index`'s `free`, never `ForgeArena::
+    /// exceeds_budget`'s shape and never a bare counter. Entry 0's
+    /// exhaustion sentence is byte-identical to what `charge_arena`'s Forge
+    /// arm produced before this slice (the compatibility gate slices 3b/3c
+    /// hold to, §3.1); any other entry names "the entered budget" and its
+    /// own extent instead of `--forge`, the §1 correction's PRE-A sentence —
+    /// unreachable from any demoniC program in 3b, since nothing yet pushes
+    /// `cur_budget` off 0, but wired now so 3d's `enter` needs no second
+    /// charging path.
+    fn charge_budget(&mut self, index: usize, nbytes: u64, span: Option<&Span>) -> EvalResult<()> {
+        use crate::arena::{fmt_bytes, Arena};
+        let (free, used, extent) = {
+            let e = &self.budgets[index];
+            (e.free, e.used, e.extent)
+        };
+        let Some(free) = free else {
+            // Unbounded (only entry 0 under no `--forge`, §4.1): still
+            // track the watermark, never fail.
+            self.budgets[index].used = used.saturating_add(nbytes);
+            return Ok(());
+        };
+        if nbytes > free {
+            let msg = if index == 0 {
+                format!(
+                    "{} arena exhausted: this allocation needs {}, but only {} of the \
+                     {} {} budget is free",
+                    Arena::Forge.name(),
+                    fmt_bytes(nbytes),
+                    fmt_bytes(free),
+                    fmt_bytes(extent.unwrap_or(0)),
+                    Arena::Forge.flag(),
+                )
+            } else {
+                format!(
+                    "forge arena exhausted: this allocation needs {}, but only {} of the \
+                     entered budget's {} extent is free",
+                    fmt_bytes(nbytes),
+                    fmt_bytes(free),
+                    fmt_bytes(extent.unwrap_or(0)),
+                )
+            };
+            return Err(match span {
+                Some(sp) => RuntimeError::at(msg, sp.clone()),
+                None => RuntimeError::msg(msg),
+            });
+        }
+        let e = &mut self.budgets[index];
+        e.free = Some(free - nbytes);
+        e.used = used.saturating_add(nbytes);
+        Ok(())
+    }
+
+    /// #674: `forge.carve(parent, bytes)`.
+    /// **(PRE)** `bytes ≤ free(parent)` — vacuous when `parent` is unbounded
+    /// (§4.1: `forge.root` under no `--forge`). Reserves METER, not bytes:
+    /// `free(parent)` falls by `n` and nothing is committed (§3.1's "a
+    /// region carved from the parent's storage is true of the BUDGET, not
+    /// the bytes" — the interpreter has no chunks to commit regardless).
+    fn budget_carve(&mut self, parent: &Value, bytes: &Value, span: &Span) -> EvalResult<Value> {
+        use crate::arena::fmt_bytes;
+        let Value::Budget(pd) = parent else {
+            return Err(RuntimeError::at(format!(
+                "forge.carve: the first argument must be a `Budget`, got {}",
+                parent.type_name()), span.clone()));
+        };
+        let p_index = budget_index(*pd);
+        let p_generation = budget_generation(*pd);
+        if p_index >= self.budgets.len() || p_generation != self.budgets[p_index].live.get() {
+            return Err(RuntimeError::at(
+                "budget-stale: this budget handle names a budget that was \
+                 already reaped".to_string(), span.clone()));
+        }
+        let Some(n) = bytes.as_int() else {
+            return Err(RuntimeError::at(format!(
+                "forge.carve: the second argument must be an integer byte \
+                 count, got {}", bytes.type_name()), span.clone()));
+        };
+        if n < 0 {
+            return Err(RuntimeError::at(
+                "forge.carve: the byte count must not be negative".to_string(),
+                span.clone()));
+        }
+        let n = n as u64;
+        let parent_extent = self.budgets[p_index].extent;
+        if let Some(free) = self.budgets[p_index].free {
+            if n > free {
+                return Err(RuntimeError::at(format!(
+                    "budget-carve: this carve needs {}, but only {} of the \
+                     parent budget's {} extent is free",
+                    fmt_bytes(n), fmt_bytes(free), fmt_bytes(parent_extent.unwrap_or(0))),
+                    span.clone()));
+            }
+        }
+        // (PRE) held (or was vacuous) — apply the transition.
+        if let Some(f) = self.budgets[p_index].free.as_mut() { *f -= n; }
+        self.budgets[p_index].children += 1;
+        let new_index = if let Some(idx) = self.budget_free.pop() {
+            let live = Rc::clone(&self.budgets[idx].live);
+            self.budgets[idx] = BudgetEntry {
+                parent: p_index as u32, extent: Some(n), used: 0, free: Some(n),
+                children: 0, live,
+            };
+            idx
+        } else {
+            let idx = self.budgets.len();
+            if idx > BUDGET_INDEX_MASK as usize {
+                return Err(RuntimeError::at(
+                    "forge.carve: the interpreter's budget table is full \
+                     (1 048 575 live budgets)".to_string(), span.clone()));
+            }
+            self.budgets.push(BudgetEntry {
+                parent: p_index as u32, extent: Some(n), used: 0, free: Some(n),
+                children: 0, live: Rc::new(Cell::new(0)),
+            });
+            idx
+        };
+        let generation = self.budgets[new_index].live.get();
+        Ok(Value::Budget(budget_descriptor(generation, new_index as u32)))
+    }
+
+    /// #674: `forge.reap(b) -> nil`.
+    /// **(LOC)** refused while `b` has a live child (R2, `budget-reap`); the
+    /// root is a fixed point `reap` refuses outright (`parent(0) = 0` would
+    /// otherwise credit the root's `free` to itself and underflow its own
+    /// `children`). Credits `b`'s WHOLE extent — spent and unspent alike —
+    /// to `parent(b)`, because releasing it is what a credit means; bumps
+    /// `b`'s generation, which is the entirety of B6's invalidation (every
+    /// `TensorVal` stamped from `b`, live or already cloned, shares this
+    /// cell via `BudgetTag::live`).
+    fn budget_reap(&mut self, b: &Value, span: &Span) -> EvalResult<Value> {
+        let Value::Budget(bd) = b else {
+            return Err(RuntimeError::at(format!(
+                "forge.reap: the argument must be a `Budget`, got {}",
+                b.type_name()), span.clone()));
+        };
+        let index = budget_index(*bd);
+        let generation = budget_generation(*bd);
+        if index >= self.budgets.len() || generation != self.budgets[index].live.get() {
+            return Err(RuntimeError::at(
+                "budget-stale: this budget handle names a budget that was \
+                 already reaped".to_string(), span.clone()));
+        }
+        if index == 0 {
+            return Err(RuntimeError::at(
+                "budget-reap: `forge.root` can never be reaped".to_string(),
+                span.clone()));
+        }
+        let children = self.budgets[index].children;
+        if children != 0 {
+            return Err(RuntimeError::at(format!(
+                "budget-reap: {}",
+                crate::arena::budget_live_child_clause(children as u64)),
+                span.clone()));
+        }
+        let parent = self.budgets[index].parent as usize;
+        let extent = self.budgets[index].extent.unwrap_or(0);
+        if let Some(f) = self.budgets[parent].free.as_mut() { *f = f.saturating_add(extent); }
+        self.budgets[parent].children = self.budgets[parent].children.saturating_sub(1);
+        let live = &self.budgets[index].live;
+        live.set(live.get().wrapping_add(1));
+        self.budget_free.push(index);
+        Ok(Value::Nil)
+    }
+
+    /// #674 slice 3b: move budget table entry `index`'s `used` DIRECTLY to
+    /// `new_used`, crediting (or charging) the difference to `free` too, so
+    /// (LOC) stays exact. The only two callers are the AD forward-only and
+    /// `fwd_bwd` rewinds (`call_fn_in_module`, `call_grad_in_module`), which
+    /// move what was `forge_used` to a point in the past rather than route a
+    /// fresh allocation through `charge_arena` — see `ctor_forge_bytes`'s
+    /// doc for why the landing point is `mark + kept_ctor_bytes`, not `mark`.
+    fn set_budget_used(&mut self, index: usize, new_used: u64) {
+        let e = &mut self.budgets[index];
+        if new_used <= e.used {
+            let credit = e.used - new_used;
+            if let Some(f) = e.free.as_mut() { *f = f.saturating_add(credit); }
+        } else {
+            let charge = new_used - e.used;
+            if let Some(f) = e.free.as_mut() { *f = f.saturating_sub(charge); }
+        }
+        e.used = new_used;
+    }
+
+    /// #781: charge an EXPLICIT constructor (`vault.zeros[…]`,
+    /// `forge.uninit[…]`, an `rng.*` draw) against its arena.
+    ///
+    /// Identical to `charge_arena` except that a successful Forge charge is
+    /// also added to the `ctor_forge_bytes` running total, so an AD rewind
+    /// can keep these bytes rather than un-charging a tensor the program
+    /// named and may still hold — see that field's doc.
+    fn charge_ctor(
+        &mut self,
+        arena: Option<crate::arena::Arena>,
+        nbytes: u64,
+        span: Option<&Span>,
+    ) -> EvalResult<()> {
+        self.charge_arena(arena, nbytes, span)?;
+        if matches!(arena, Some(crate::arena::Arena::Forge)) {
+            self.ctor_forge_bytes = self.ctor_forge_bytes.saturating_add(nbytes);
+        }
+        Ok(())
+    }
+
+    /// #781: charge a tensor materialized OUTSIDE an explicit `vault.*`/
+    /// `forge.*` constructor — a computed intermediate (`let C = A @ B`, a
+    /// dotted elementwise op, a tensor literal, a transpose, a slice that
+    /// copies, a reshape) — against the Forge arena, at its DECLARED element
+    /// width (`DType::byte_width`), not the interpreter's f64 storage width.
+    ///
+    /// #804: also charges a STRING materialized the same way. Two forms
+    /// reach this arm: `apply_binop`'s `+` (`s + "x"`, `"lit" + to_str(f)`)
+    /// and `apply_cast`'s `as str` (`x as str`) — both string-producing
+    /// forms that live outside `call_builtin` and so miss #802's
+    /// `charge_builtin_result` (whose own `Value::Str` arm charges directly,
+    /// not through here — see that fn's doc for why the two must NOT share
+    /// this suppressible path). Charged at the fresh string's UTF-8 byte
+    /// length, the same number `charge_builtin_result` charges a builtin's
+    /// fresh `Value::Str` result at, so a `Value::Str` is billed identically
+    /// wherever it is produced. `call_str_method` (`.trim`/`.upper`/
+    /// `.lower`/`.replace`/`.split`/`.lines`, …) is a THIRD string-producing
+    /// form outside `call_builtin`; it charges its result through
+    /// `charge_builtin_result` directly rather than through this arm — see
+    /// its call site.
+    ///
+    /// Every such value charges Forge unconditionally, never Vault: an
+    /// implicit intermediate has no `vault.`/`forge.` spelling to derive an
+    /// arena from, and `MEMORY.md §1`'s Forge row — "activations, gradients,
+    /// scratch" — is exactly what these are; only an explicit `vault.*`
+    /// constructor can put bytes in Vault (`charge_arena`'s other caller).
+    /// A no-op for any other value.
+    fn charge_intermediate(&mut self, v: &Value, span: Option<&Span>) -> EvalResult<()> {
+        if self.lit_charge_suppressed {
+            return Ok(());
+        }
+        match v {
+            Value::Tensor(t) => {
+                let nbytes = (t.len() as u64).saturating_mul(t.dtype.byte_width());
+                self.charge_arena(Some(crate::arena::Arena::Forge), nbytes, span)?;
+            }
+            Value::Str(s) => {
+                let nbytes = s.len() as u64;
+                self.charge_arena(Some(crate::arena::Arena::Forge), nbytes, span)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// #781, #650, SPEC §3.4: charge the PRIVATE COPY a `!` binding
+    /// (a `let !y = x` from a bare identifier, a top-level `let !alpha = x`,
+    /// or a `!t` parameter) makes of its bare-identifier source — parity
+    /// with what the JIT actually copies at that binding, NOT with what the
+    /// interpreter itself allocates to give `y` independent identity.
+    ///
+    /// For a `Value::Tensor` those agree: the JIT copies the bytes, so this
+    /// is `charge_intermediate` unchanged. For a `Value::Str` they diverge —
+    /// on the JIT a `str` is a pointer (SPEC §3.1), so `let !t = s` binds a
+    /// second pointer at the private binding and copies nothing; the JIT
+    /// requests 0 bytes for it. The interpreter's `Value::Str` is an owned
+    /// `String`, so cloning it for `t` IS a real interpreter allocation —
+    /// but the rule this charge exists to enforce is parity with the JIT's
+    /// requested bytes, not "charge every interpreter allocation," and the
+    /// JIT requests none here. (PR #815 review: a `read_file` result copied
+    /// by 100 `let !t = c` bindings ran at 21 513 B against the JIT's
+    /// 384 B — 100 phantom copies the JIT never makes, because a comment at
+    /// each of these three call sites asserted "the JIT charges the copy"
+    /// for every mutating binding without carving out the one value kind
+    /// where that is false.) So `Value::Str` is excluded here and left
+    /// uncharged; every other value kind charges exactly as
+    /// `charge_intermediate` would.
+    fn charge_private_copy(&mut self, v: &Value, span: Option<&Span>) -> EvalResult<()> {
+        if matches!(v, Value::Str(_)) {
+            return Ok(());
+        }
+        self.charge_intermediate(v, span)
+    }
+
+    /// Evaluate `expr` with `lit_charge_suppressed` held true for the
+    /// duration — see the field doc. Restores the PREVIOUS value (not
+    /// unconditionally `false`) on every path, `Err` included, so a
+    /// suppressed evaluation nested inside another suppressed evaluation
+    /// (a literal-of-literals row, or a reshape whose shape argument is
+    /// itself a nested literal) leaves the outer suppression intact
+    /// instead of clearing it early.
+    fn eval_expr_lit_charge_suppressed(&mut self, expr: &Expr) -> EvalResult<Value> {
+        let saved = self.lit_charge_suppressed;
+        self.lit_charge_suppressed = true;
+        let result = self.eval_expr(expr);
+        self.lit_charge_suppressed = saved;
+        result
     }
 
     /// Set command-line arguments for `argv()` builtin.
@@ -1662,9 +2995,10 @@ impl Interpreter {
 
     pub fn run(&mut self, program: &Program, path: Option<&std::path::Path>) -> EvalResult<Value> {
         self.load_program(program, path)?;
-        // Pass 3: if main() exists, call it; otherwise return Nil
-        if self.fns.contains_key("main") {
-            let main = self.fns.get("main").unwrap().clone();
+        // Pass 3: if main() exists in the file just loaded, call it; otherwise
+        // return Nil. A `fn main` in a dependency is that file's own.
+        if let Some(key) = self.resolve_fn("main") {
+            let main = self.fns[&key].clone();
             self.call_fn(&main, Vec::new(), main.span.clone())
         } else {
             Ok(Value::Nil)
@@ -1672,13 +3006,23 @@ impl Interpreter {
     }
 
     pub fn load_program(&mut self, program: &Program, path: Option<&std::path::Path>) -> EvalResult<()> {
+        // One epoch per file (#398). Everything this file can name — its own
+        // items and the `pub` items it imports — is registered under this
+        // number, so two files' name tables never overlap; `cur_module` stays
+        // on it while the file's top-level `let`s run and until the next load.
+        self.cur_module += 1;
+        // Files are loaded one after another and every call restores
+        // `cur_module` on its way out, so at the top of a load it still holds
+        // the previously loaded file's number and the bump always mints a
+        // fresh one. A call that leaked its save would hand this file a number
+        // another file already owns and silently merge their name tables; this
+        // is the cheap proof that none does.
+        debug_assert!(
+            self.fns.values().all(|f| f.module < self.cur_module),
+            "module numbering went backwards — a call did not restore `cur_module`",
+        );
         self.public_items = crate::ast::collect_public_items(program);
         self.process_imports(program, path)?;
-        // One epoch per file (#398). Imports are merged above under the
-        // *importing* module's epoch-independent name table; only the items
-        // declared in THIS file are stamped with this epoch, which is what
-        // scopes a `@grad fn`'s captures to the module it was written in.
-        self.module_epoch += 1;
         // Pass 1: collect fn and model decls (forward references)
         for item in &program.items {
             self.collect_item(item);
@@ -1695,8 +3039,10 @@ impl Interpreter {
             scopes: self.scopes.clone(),
             fns: self.fns.clone(),
             models: self.models.clone(),
-            model_methods: self.model_methods.clone(),
+            enums: self.enums.clone(),
+            type_aliases: self.type_aliases.clone(),
             public_items: self.public_items.clone(),
+            epoch: self.cur_module,
         }
     }
 
@@ -1716,27 +3062,50 @@ impl Interpreter {
                         }
                     };
                     if let Some(imported_env) = self.interp_modules.get(&canonical_path).cloned() {
+                        // A `pub` item lives in the imported file's snapshot
+                        // under that file's number; it enters THIS file's
+                        // table under this file's number, bare or under the
+                        // alias. One rule for all four kinds of top-level name
+                        // (SPEC §9): a fn, a model, an enum, a `type` alias.
+                        // Model entries point at the declaring file's key, so
+                        // an instance built here dispatches to the methods
+                        // registered there; methods, fields and shape params
+                        // are looked up through that key only, so they are not
+                        // copied. A fn's own home module travels on its
+                        // `FnDecl` (`f.module`), so both spellings of an
+                        // imported fn still run in the file that wrote it.
+                        let spell = |name: &str| match &us.alias {
+                            Some(alias) => format!("{}.{}", alias, name),
+                            None => name.to_string(),
+                        };
+                        for name in &imported_env.public_items {
+                            let src = module_key(imported_env.epoch, name);
+                            let dst = module_key(self.cur_module, &spell(name));
+                            if let Some(f) = imported_env.fns.get(&src) {
+                                self.fns.insert(dst, f.clone());
+                            } else if let Some(canonical) = imported_env.models.get(&src) {
+                                self.models.insert(dst, canonical.clone());
+                            } else if let Some(variants) = imported_env.enums.get(&src) {
+                                // The checker does not yet carry a `pub enum`
+                                // across a `use` — it refuses the importer's
+                                // `Color.Red` as an undefined identifier — so
+                                // no program reaches this arm today. It is
+                                // here because the loop states one rule for
+                                // all four kinds, and dropping the enum out of
+                                // it would leave the interpreter with a
+                                // different rule than the one it enforces
+                                // everywhere else.
+                                self.enums.insert(dst, variants.clone());
+                            } else if let Some(alias) = imported_env.type_aliases.get(&src) {
+                                self.type_aliases.insert(dst, alias.clone());
+                            }
+                        }
                         if let Some(alias) = &us.alias {
                             self.bind(alias.clone(), Value::Module { alias: alias.clone(), path: canonical_path });
-                            // Qualified imports: register functions, models, methods, variables under alias prefix
-                            for (name, f) in imported_env.fns {
-                                if !imported_env.public_items.contains(&name) {
-                                    continue;
-                                }
-                                self.fns.insert(format!("{}.{}", alias, name), f);
-                            }
-                            for name in imported_env.models {
-                                if !imported_env.public_items.contains(&name) {
-                                    continue;
-                                }
-                                self.models.insert(format!("{}.{}", alias, name));
-                            }
-                            for (mname, methods) in imported_env.model_methods {
-                                if !imported_env.public_items.contains(&mname) {
-                                    continue;
-                                }
-                                self.model_methods.insert(format!("{}.{}", alias, mname), methods);
-                            }
+                            // #623's `fn_module` carry-over onto the `alias.name`
+                            // spelling is unnecessary here: the home module now
+                            // travels on the `FnDecl` itself (`f.module`), which
+                            // the loop above clones under both spellings.
                             if let Some(imported_scope) = imported_env.scopes.get(0) {
                                 for (name, val) in imported_scope {
                                     if !imported_env.public_items.contains(name) {
@@ -1748,25 +3117,6 @@ impl Interpreter {
                                 }
                             }
                         } else {
-                            // Unqualified imports: merge directly
-                            for (name, f) in imported_env.fns {
-                                if !imported_env.public_items.contains(&name) {
-                                    continue;
-                                }
-                                self.fns.insert(name, f);
-                            }
-                            for name in imported_env.models {
-                                if !imported_env.public_items.contains(&name) {
-                                    continue;
-                                }
-                                self.models.insert(name);
-                            }
-                            for (mname, methods) in imported_env.model_methods {
-                                if !imported_env.public_items.contains(&mname) {
-                                    continue;
-                                }
-                                self.model_methods.insert(mname, methods);
-                            }
                             if let Some(imported_scope) = imported_env.scopes.get(0) {
                                 for (name, val) in imported_scope {
                                     if !imported_env.public_items.contains(name) {
@@ -1795,8 +3145,10 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Call a fn by the name the last-loaded file knows it by — a `dmc test`
+    /// entry point, or a harness probe.
     pub fn call_named_fn(&mut self, name: &str, args: Vec<Value>) -> EvalResult<Value> {
-        let f = self.fns.get(name).cloned().ok_or_else(|| {
+        let f = self.resolve_fn(name).map(|k| self.fns[&k].clone()).ok_or_else(|| {
             RuntimeError::msg(format!("undefined fn `{}`", name))
         })?;
         self.call_fn(&f, args, f.span.clone())
@@ -1805,29 +3157,42 @@ impl Interpreter {
     fn collect_item(&mut self, item: &Item) {
         match item {
             Item::Fn(f)       => {
-                self.fns.insert(f.name.clone(), f.clone());
-                self.fn_module.insert(f.name.clone(), self.module_epoch);
+                let mut f = f.clone();
+                f.module = self.cur_module;
+                self.fns.insert(module_key(self.cur_module, &f.name), f);
             }
             Item::ExternFn(e) => { self.extern_fns.insert(e.name.clone()); }
             Item::Model(m) => {
-                self.models.insert(m.name.clone());
+                let key = module_key(self.cur_module, &m.name);
+                self.models.insert(key.clone(), key.clone());
                 let shape_param_names: Vec<String> =
                     m.shape_params.iter().map(|sp| sp.name.clone()).collect();
-                self.model_shape_params.insert(m.name.clone(), shape_param_names);
+                self.model_shape_params.insert(key.clone(), shape_param_names);
                 let mut methods: HashMap<String, FnDecl> = HashMap::new();
                 let mut fields: Vec<(String, crate::ast::Type)> = Vec::new();
                 for member in &m.members {
                     match member {
-                        ModelMember::Method(f) => { methods.insert(f.name.clone(), f.clone()); }
+                        ModelMember::Method(f) => {
+                            let mut f = f.clone();
+                            f.module = self.cur_module;
+                            methods.insert(f.name.clone(), f);
+                        }
                         ModelMember::Field { name, ty, .. } => { fields.push((name.clone(), ty.clone())); }
                     }
                 }
-                self.model_methods.insert(m.name.clone(), methods);
-                self.model_fields.insert(m.name.clone(), fields);
+                self.model_methods.insert(key.clone(), methods);
+                self.model_fields.insert(key, fields);
             }
+            // Under this file's number, like every other top-level name: a
+            // private `enum E` in two files no longer shares one slot.
             Item::Enum(e) => {
                 let variants: Vec<String> = e.variants.iter().map(|v| v.name.clone()).collect();
-                self.enums.insert(e.name.clone(), variants);
+                self.enums.insert(module_key(self.cur_module, &e.name), variants);
+            }
+            // Likewise for a `type` alias, which SPEC §9 makes visible by the
+            // same rule (#623 scoped it by load order instead; see the field).
+            Item::TypeAlias(t) => {
+                self.type_aliases.insert(module_key(self.cur_module, &t.name), t.clone());
             }
             // A module-level mutable binding is what a `@grad fn` can capture
             // (#398). Record the name (and the module's declaration order,
@@ -1837,7 +3202,7 @@ impl Interpreter {
             // list is only ever consulted for names already in scope.
             Item::Let(l) if l.mutating || l.is_mut => {
                 if let Pattern::Ident(name, _) = &l.pattern {
-                    let entry = (self.module_epoch, name.clone());
+                    let entry = (self.cur_module, name.clone());
                     if !self.mut_globals.contains(&entry) {
                         self.mut_globals.push(entry);
                     }
@@ -1853,8 +3218,21 @@ impl Interpreter {
         match item {
             Item::Let(l) => {
                 let v = self.eval_expr(&l.value)?;
-                check_port_lang(&v, l.ty.as_ref(), &l.span)?;
-                let v = coerce_scalar_width(v, l.ty.as_ref());
+                self.check_declared_port(&v, l.ty.as_ref(), &l.span)?;
+                let mut v = self.coerce_declared(v, l.ty.as_ref());
+                // #781, SPEC §3.4: same private-copy charge as the
+                // statement-level `let !y = x` below (`Stmt::Let`) — a
+                // module-level `let !alpha = x` is the same binding form,
+                // just at top-level scope. `charge_private_copy` (not
+                // `charge_intermediate`) excludes `Value::Str` — see that
+                // fn's doc for why a string copy stays uncharged here.
+                if l.mutating && matches!(l.value, Expr::Ident(_, _)) {
+                    self.charge_private_copy(&v, Some(&l.span))?;
+                    // #674: `#[derive(Clone)]`
+                    // carried the SOURCE's origin tag; re-stamp to the budget
+                    // current at THIS copy, which is what it is charged to.
+                    restamp_current_budget(&mut v);
+                }
                 self.bind_pattern(&l.pattern, v);
                 if let Some(axis) = l.ty.as_ref().and_then(streaming_axis_from_type) {
                     self.bind_stream_axis_pattern(&l.pattern, axis);
@@ -1876,18 +3254,19 @@ impl Interpreter {
                     return Err(RuntimeError::at(format!("extern fn `{}` cannot be called by the interpreter — a foreign call crosses an unchecked machine boundary this backend has no pointer representation for, so the spec confines `extern fn` calls to the JIT; run it with `dmc jit`", name), sp));
                 }
                 let f = self.fns.get(&name).cloned().ok_or_else(|| {
-                    RuntimeError::at(format!("undefined fn `{}`", name), sp.clone())
+                    RuntimeError::at(format!("undefined fn `{}`", bare_name(&name)), sp.clone())
                 })?;
                 self.call_fn(&f, args, sp)
             }
             Value::BoundFn { ref name, ref shape_bindings } => {
                 let f = self.fns.get(name).cloned().ok_or_else(|| {
-                    RuntimeError::at(format!("undefined fn `{}`", name), sp.clone())
+                    RuntimeError::at(format!("undefined fn `{}`", bare_name(name)), sp.clone())
                 })?;
                 let bindings = shape_bindings.clone();
                 self.call_fn_with_shapes(&f, args, &bindings, sp)
             }
-            Value::Lambda { lit, captured_env } => self.call_lambda(&lit.clone(), captured_env, args, sp),
+            Value::Lambda { lit, captured_env, module } =>
+                self.call_lambda(&lit.clone(), captured_env, module, args, sp),
             Value::Builtin(name) => self.call_builtin(&name, args, sp),
             Value::Opaque(name) if name == "\\>" || name == "\\<" => {
                 if args.len() != 1 {
@@ -1905,7 +3284,7 @@ impl Interpreter {
         }
     }
 
-    fn call_lambda(&mut self, lit: &crate::ast::FnLit, captured_env: HashMap<String, Value>, args: Vec<Value>, sp: Span) -> EvalResult<Value> {
+    fn call_lambda(&mut self, lit: &crate::ast::FnLit, captured_env: HashMap<String, Value>, module: usize, args: Vec<Value>, sp: Span) -> EvalResult<Value> {
         if args.len() != lit.params.len() {
             return Err(RuntimeError::at(
                 format!("lambda expects {} args, got {}", lit.params.len(), args.len()),
@@ -1920,18 +3299,233 @@ impl Interpreter {
             self.bind(name, val);
         }
         for (p, v) in lit.params.iter().zip(args) {
-            self.bind(&p.name, coerce_scalar_width(v, p.ty.as_ref()));
+            self.bind(&p.name, self.coerce_declared(v, p.ty.as_ref()));
         }
+        let saved = std::mem::replace(&mut self.cur_module, module);
         let result = self.eval_block(&lit.body);
+        // Same `?` rebuild as `call_fn_in_module`, and for the same reason:
+        // the lambda's own declared `(T, Err)` names the `T`, and its scope
+        // has to still be standing to resolve a shape-parametric one.
+        //
+        // #628 follow-up: an UNTYPED lambda (no `-> (T, Err)` of its own) has
+        // no `T` here to rebuild against — but `check.rs`'s `PostfixOp::Query`
+        // validates a `?` inside one against the LEXICALLY enclosing named
+        // fn's declared return type, not the lambda's (a lambda literal never
+        // touches `current_fn_ret`). Left alone, this catch site disagreed
+        // with the checker it is supposed to defend: `dmc --check` accepted
+        // `fn f() -> (str, str) { let c = fn() { g()? }; c() }` reading `?` as
+        // legal against `f`'s `(str, str)`, and then `dmc run` refused it at
+        // the lambda's own (nonexistent) return type. Falling back to
+        // `named_fn_ret_stack`'s top — see its doc comment for exactly how
+        // close a dynamic stand-in gets to that lexical rule — closes the gap.
+        let fallback_ret: Option<Type> = if lit.ret_type.is_none() {
+            self.named_fn_ret_stack.last().cloned().flatten()
+        } else {
+            None
+        };
+        let lambda_ret = lit.ret_type.as_ref().or(fallback_ret.as_ref());
+        let result = self.finish_query_propagation(result, lambda_ret, "<lambda>", &sp);
+        // #652 × #628: restore `cur_module` AFTER the rebuild, not before. The
+        // `T` this rebuilds against comes from the lambda's own signature (or,
+        // untyped, from the named fn on `named_fn_ret_stack`), and a
+        // shape-parametric or aliased `T` resolves its `type` aliases through
+        // `cur_module` — which for a lambda is the file the literal was
+        // WRITTEN in, not the file that called it. Restoring first would look
+        // the alias up in the caller's module and miss it.
+        self.cur_module = saved;
         self.pop_scope();
         match result {
             // #473: a lambda's declared return type binds its width too.
-            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => {
-                Ok(coerce_scalar_width(v, lit.ret_type.as_ref()))
+            Ok(Flow::Normal(v)) | Ok(Flow::Return(v, _)) => {
+                Ok(self.coerce_declared(v, lit.ret_type.as_ref()))
             }
             Ok(_) => Ok(Value::Nil),
-            // `?` early-return: this lambda returns the propagated tuple.
-            Err(e) => match e.propagate { Some(v) => Ok(*v), None => Err(e) },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Turn a `?` propagation signal into the value SPEC §4.9 says the
+    /// enclosing function returns: `(default[T], e)`, with `T` the enclosing
+    /// function's own declared success type and `e` the error that tripped.
+    ///
+    /// #628: the interpreter used to hand back the CALLEE's whole tuple, so
+    /// the caller's success slot carried the callee's error-path value. The
+    /// callee's `T` is not the caller's `T` — when the two differ it was not
+    /// even the right type — and the JIT (`lower_query`) already builds the
+    /// spec's tuple, so the backends disagreed on every `?` error path.
+    ///
+    /// Must be called while the callee's scope is still standing: a
+    /// shape-parametric `T` (`-> (Tensor[f32, [N]], Err)`) resolves `N` out of
+    /// that scope.
+    ///
+    /// Its two callers, `call_fn_in_module` and `call_lambda`, are the only
+    /// two catch sites — NOT every function-call boundary has one.
+    /// `call_grad_in_module`
+    /// (`.fwd_bwd`/`.grad`/`.fwd`) does not call this at all (#647, open,
+    /// deliberately not fixed here): a `?` inside a `@grad fn` escapes that
+    /// frame uncaught and surfaces at whichever of these two catches it next,
+    /// rebuilt against that CALLER's `T` rather than the `@grad fn`'s own.
+    ///
+    /// #639 added a THIRD body-evaluation path with the same shape, inside
+    /// `call_fn_in_module` itself: a `@pp` fn's `stage K:` bodies return
+    /// early, above this call, so a `?` that trips in a stage escapes the
+    /// `@pp` fn uncaught and is likewise rebuilt against its CALLER's `T`
+    /// (`@pp fn -> (i64, Err)` called from a `-> (str, Err)` fn answers `nil`,
+    /// not `0`). Same category as #647 and left with it — #639 made that path
+    /// catch the block-flow carrier, which is a different signal with a
+    /// different owner, and widening it to `?` is a behaviour change belonging
+    /// to #647's fix, not to a merge.
+    fn finish_query_propagation(
+        &mut self,
+        result: EvalResult<Flow>,
+        ret_type: Option<&Type>,
+        owner: &str,
+        sp: &Span,
+    ) -> EvalResult<Flow> {
+        // #639: the guard is on `propagate` specifically, not on "is this an
+        // `Err`?". A block-flow carrier is an `Err` with `propagate: None`, and
+        // it belongs to `catch_flow` at the statement/block boundary below this
+        // one — by the time control reaches here `eval_block` has already
+        // re-opened it, and an uncaught one (the `@pp` stage path) has to keep
+        // travelling rather than be rebuilt as a `?` early return.
+        let signal = match result {
+            Err(e) if e.propagate.is_some() => e,
+            other => return other,
+        };
+        // The `?` operator's own span, set by `RuntimeError::propagate`.
+        let sp = &signal.span.clone().unwrap_or_else(|| sp.clone());
+        let err_half = *signal.propagate.expect("checked just above");
+        // `?` is legal only inside a function whose own return type is
+        // `(_, Err)` (SPEC §4.9), and `check.rs` refuses the rest before
+        // either backend runs — so this arm is a defense, exactly like the
+        // matching fallback in the JIT's `lower_query`.
+        // #652: the signature may spell the whole `(T, Err)` as a top-level
+        // `type` alias, and an alias means what the module whose body is
+        // running spells it — which is why both call sites rebuild before
+        // restoring `cur_module`.
+        let ret_resolved = ret_type.map(|t| self.resolve_alias_ty(peel_grouping(t)).clone());
+        let t = match ret_resolved.as_ref().map(peel_grouping) {
+            Some(Type::Tuple(els, _)) if els.len() == 2 => els[0].clone(),
+            _ => {
+                return Err(RuntimeError::at(
+                    format!(
+                        "`?` is only legal inside a function returning `(T, Err)`; \
+                         `{}` returns `{}`",
+                        owner,
+                        ret_type.map(type_label).unwrap_or_else(|| "nothing".to_string()),
+                    ),
+                    sp.clone(),
+                ))
+            }
+        };
+        let default_t = self.query_default_value(&t, sp)?;
+        // #639 gave `Flow::Return` a span; the one that fits a `?` early return
+        // is the `?` postfix expression's own, which is the `sp` narrowed just
+        // above. Nothing reads it on this path today (both catch sites match
+        // `Flow::Return(v, _)`), but a `Flow` that carries no span is one a
+        // later diagnostic cannot point at.
+        Ok(Flow::Return(Value::Tuple(vec![default_t, err_half]), sp.clone()))
+    }
+
+    /// SPEC §4.9's `default[T]` intrinsic: "the zero value of type `T` (0 /
+    /// 0.0 / false / nil / zero-tensor), used only in the `?` desugaring."
+    ///
+    /// Scoped to exactly that enumeration — scalars, `str`/`Err`/`nil` (whose
+    /// zero value IS `nil`), and an all-zero tensor. A model, an enum, a map,
+    /// a port, an array, a nested tuple has no default the spec defines, so it
+    /// is refused rather than invented. That is the same set `jit.rs`'s
+    /// `default_value_for` constructs and refuses, so the two backends agree
+    /// on what `?` can propagate through; the JIT refuses while lowering, and
+    /// the interpreter — which has no lowering pass — refuses when the error
+    /// path is actually taken.
+    fn query_default_value(&mut self, ty: &Type, sp: &Span) -> EvalResult<Value> {
+        // #652 × #628: `T` may be spelled as a top-level `type` alias
+        // (`pub type Slot = u8` → `-> (Slot, Err)`), and SPEC §6.6 scopes an
+        // alias to the module that declared it. Resolving it here is what
+        // makes `default[Slot]` the `u8` zero rather than a refusal of a name
+        // that is a perfectly good scalar one indirection away — and it is
+        // what makes the ORDER at the two call sites load-bearing: both rebuild
+        // while `cur_module` still names the file whose signature this is, so
+        // the lookup lands in that file's alias table and not the caller's.
+        // Diagnostics below keep the original spelling: `Slot` is what the
+        // signature says, and what the reader has to go and look at.
+        let resolved = self.resolve_alias_ty(peel_grouping(ty)).clone();
+        match peel_grouping(&resolved) {
+            Type::Scalar(st, _) => Ok(default_scalar_value(st)),
+            // `Err` (SPEC §3.9) is `nil` on success and a `str` message on
+            // failure, so its zero value is `nil` — the same value `str` gets,
+            // and the same call `jit.rs` makes (`Err` lowers to `TyKind::Str`).
+            Type::Named { name, .. } if name == "Err" => Ok(Value::Nil),
+            Type::Tensor(elem, shape, _) => {
+                // An aliased ELEMENT type (`type P = f32` → `Tensor[P, [N]]`)
+                // is the same indirection one level in.
+                let elem_resolved = self.resolve_alias_ty(peel_grouping(elem)).clone();
+                let Type::Scalar(est, _) = peel_grouping(&elem_resolved) else {
+                    return Err(RuntimeError::at(
+                        format!("`?`: tensor element type of `{}` is not a scalar", type_label(ty)),
+                        sp.clone(),
+                    ));
+                };
+                let mut dims = Vec::with_capacity(shape.elems.len());
+                for e in &shape.elems {
+                    match e {
+                        // #628 follow-up: this axis is evaluated STRICTLY and
+                        // inline, refusing loudly exactly like the wildcard-
+                        // axis arm just below, rather than through
+                        // `eval_dim` — `default[T]`'s zero tensor has to have
+                        // the shape `T` actually declares, and this call
+                        // site wants its own message (naming `T` and citing
+                        // `?`) and its own span (the `?`'s, not the failing
+                        // sub-expression's) rather than `eval_dim`'s. #839
+                        // made `eval_dim` itself strict too — it no longer
+                        // has a loose default to differ from — so this inline
+                        // copy survives only for its own wording and span,
+                        // not because `eval_dim` would get it wrong.
+                        crate::ast::ShapeElem::Expr(ex) => match self.eval_expr(ex) {
+                            Ok(Value::Int(n, _)) if n >= 0 => dims.push(n as usize),
+                            Ok(Value::Float(x, _)) if x >= 0.0 => dims.push(x as usize),
+                            Ok(v) => return Err(RuntimeError::at(
+                                format!(
+                                    "`?`'s early return needs a concrete non-negative \
+                                     dimension for `{}`, but a shape axis evaluated to \
+                                     `{}` ({})",
+                                    type_label(ty), v, v.type_name(),
+                                ),
+                                sp.clone(),
+                            )),
+                            Err(e) => return Err(e),
+                        },
+                        // A wildcard/spread/streaming axis has no size, so
+                        // there is no zero tensor to build.
+                        _ => {
+                            return Err(RuntimeError::at(
+                                format!(
+                                    "`?`'s early return needs a zero tensor for `{}`, \
+                                     but its declared shape has an axis with no size",
+                                    type_label(ty),
+                                ),
+                                sp.clone(),
+                            ))
+                        }
+                    }
+                }
+                self.prof_alloc();
+                Ok(Value::tensor_dt(
+                    ArrayD::<f64>::zeros(IxDyn(&dims)),
+                    default_tensor_dtype(est),
+                ))
+            }
+            _ => Err(RuntimeError::at(
+                format!(
+                    "`?`'s early return needs a default value for `{}`, which has none: \
+                     SPEC §4.9 defines `default[T]` as 0 / 0.0 / false / nil / zero-tensor, \
+                     so only scalars, `str`/`Err` and tensors have one",
+                    // The signature's own spelling, alias and all — that is
+                    // the line the reader has to go and change.
+                    type_label(peel_grouping(ty)),
+                ),
+                sp.clone(),
+            )),
         }
     }
 
@@ -1994,6 +3588,30 @@ impl Interpreter {
             if let Some(v) = scope.get(name) { return Some(v.clone()); }
         }
         None
+    }
+
+    /// The `fns` key a source-level fn name denotes in the executing file:
+    /// one of its own fns, or a `pub` fn it imported (bare or `alias.name`).
+    fn resolve_fn(&self, name: &str) -> Option<String> {
+        let key = module_key(self.cur_module, name);
+        self.fns.contains_key(&key).then_some(key)
+    }
+
+    /// The declaring file's key for a source-level model name in the
+    /// executing file — what instances are tagged with.
+    fn resolve_model(&self, name: &str) -> Option<String> {
+        self.models.get(&module_key(self.cur_module, name)).cloned()
+    }
+
+    /// Whether `@cast(name)` names a model to overlay rather than a dtype to
+    /// convert to. The two `@cast` sites must ask this and not
+    /// `model_fields.contains_key(name)` directly: `model_fields` is keyed by
+    /// the DECLARING file's key, so a source-level name never matched it and
+    /// the overlay silently fell through to `apply_cast_by_name`, handing back
+    /// the source byte tensor unchanged.
+    fn is_overlay_model(&self, name: &str) -> bool {
+        self.resolve_model(name)
+            .is_some_and(|key| self.model_fields.contains_key(&key))
     }
 
     /// `lookup` + FieldRef resolution (#444): a binding created by
@@ -2170,6 +3788,9 @@ impl Interpreter {
     ///   4. Hand back the gradients for each `!`-marked tensor parameter.
     ///
     /// This is O(forward) — the right complexity for autodiff.
+    /// Same module re-scoping as `call_fn_with_shapes`: a `@grad fn`'s params
+    /// and loss are annotation sites too, and they mean what the module that
+    /// declared the fn spells.
     fn call_grad(
         &mut self,
         fn_name: &str,
@@ -2177,11 +3798,27 @@ impl Interpreter {
         args: Vec<Value>,
         span: Span,
     ) -> EvalResult<Value> {
+        // The taped body resolves names — and its annotations' `type` aliases
+        // — in the fn's own file, like any call.
+        let home = self.fns.get(fn_name).map_or(self.cur_module, |f| f.module);
+        let saved = std::mem::replace(&mut self.cur_module, home);
+        let result = self.call_grad_in_module(fn_name, method, args, span);
+        self.cur_module = saved;
+        result
+    }
+
+    fn call_grad_in_module(
+        &mut self,
+        fn_name: &str,
+        method: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> EvalResult<Value> {
         let f = self.fns.get(fn_name).cloned().ok_or_else(||
-            RuntimeError::at(format!("@grad: undefined fn `{}`", fn_name), span.clone()))?;
+            RuntimeError::at(format!("@grad: undefined fn `{}`", bare_name(fn_name)), span.clone()))?;
         if args.len() != f.params.len() {
             return Err(RuntimeError::at(
-                format!("@grad `{}` expects {} args, got {}", fn_name, f.params.len(), args.len()),
+                format!("@grad `{}` expects {} args, got {}", bare_name(fn_name), f.params.len(), args.len()),
                 span,
             ));
         }
@@ -2226,6 +3863,34 @@ impl Interpreter {
             }
         }
 
+        // #791: the AD boundary this call's activations are reclaimed at, the
+        // interpreter's twin of `jit.rs`'s `grad_call_prologue`/
+        // `grad_call_epilogue` `InternalMark` pair (#614, PR #779). Everything
+        // the tape materializes from here on — forward activations, every
+        // adjoint the backward pass builds — is a compiler-inserted temporary
+        // the user never asked to keep, so it is metered while it is live and
+        // handed back at the epilogue below, leaving only what actually
+        // escapes: the published gradients and the loss.
+        //
+        // Taken before the tape exists so the window covers the whole pass.
+        // `vault_used` is deliberately not part of it — see the same carve-out
+        // in `call_fn_in_module`'s forward-only mark.
+        // #674 slice 3d: the ENTERED budget, not entry 0 — a `.fwd_bwd`
+        // called inside `forge.enter(b) { … }` charges its temporaries to
+        // `b`, so `b` is what this window releases. `BudgetGuard` pops on
+        // every exit edge, so the register reads the same here and at the
+        // matching `set_budget_used` below (the same mark/rewind rule the
+        // JIT's own grad prologue/epilogue pair follows, applied here).
+        let ad_budget = cur_budget();
+        let ad_mark = self.budgets[ad_budget].used;
+        // #781: the same explicit-constructor carve-out the forward-only mark
+        // takes (`call_fn_in_module`, and see `ctor_forge_bytes`). A `forge.*`
+        // constructor written inside a `.fwd_bwd` body is not one of the
+        // pass's own temporaries, and its result can escape the pass — into a
+        // model field, a module-level `let !` — and stay live after the
+        // epilogue. Those bytes are added back at the epilogue rather than
+        // released.
+        let ad_ctor_at_mark = self.ctor_forge_bytes;
         let mut tape = Tape::new();
         let mut var_node: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
@@ -2237,7 +3902,7 @@ impl Interpreter {
         // scalars join the tape: an immutable scalar has no gradient to
         // return, and an integer parameter isn't differentiable.
         for (i, (p, v)) in f.params.iter().zip(&args).enumerate() {
-            let bound = coerce_scalar_width(v.clone(), p.ty.as_ref());
+            let bound = self.coerce_declared(v.clone(), p.ty.as_ref());
             self.bind(&p.name, bound.clone());
             let traced = matches!(bound, Value::Tensor(_))
                 || (p.mutating && matches!(bound, Value::Float(_, _)));
@@ -2301,6 +3966,13 @@ impl Interpreter {
         }
 
         // Forward pass: evaluate the body, recording tensor ops to the tape.
+        //
+        // #647 (open, not fixed here — different category/PR): unlike
+        // `call_fn_in_module`/`call_lambda`, there is no
+        // `finish_query_propagation` call on `result` before the scope pops.
+        // A `?` inside a `@grad fn -> (T, Err)` therefore escapes this frame
+        // uncaught and is rebuilt by whichever of those two catches it next —
+        // against THAT frame's `T`, not this `@grad fn`'s own.
         let result = self.eval_block_with_tape(&f.body, &mut tape, &mut var_node, &span);
         self.pop_scope();
         // Put back whatever the capture masking lifted out, before any `?`
@@ -2312,6 +3984,35 @@ impl Interpreter {
                 scope.insert(name, v);
             }
         }
+        // #639: the tape walker hands a `Expr::Block` to plain `eval_expr`, so
+        // the block-flow carrier can reach this boundary — and a `@grad` body
+        // is a function boundary, the second of the two that bypass
+        // `eval_block`. Without this catch a `return` inside the body rode `?`
+        // straight out of `call_grad` and returned from the CALLER (a
+        // check-clean program silently answered the caller's frame away).
+        //
+        // It is refused rather than honoured: the carrier holds a `Value`, not
+        // a tape node, so a value that left through it never joined the
+        // gradient graph and there is nothing to differentiate. That is the
+        // same line `trace_stmt` already takes on a bare `return` statement in
+        // a `@grad` body, and `.fwd` — which goes through `call_fn` — keeps
+        // running such a body normally. #615's separate rule (a block ON the
+        // gradient path is not traced, so the loss does not participate) has
+        // its own diagnostic below and is untouched.
+        let result = match result {
+            Err(e) if e.flow.is_some() => {
+                let esc = e.flow.expect("just checked");
+                Err(RuntimeError::at(format!(
+                    "@grad `{}`: a `{}` inside the differentiated body is not \
+                     supported — it leaves the body with a value the tape never \
+                     recorded, so there is no gradient to compute. Supported: \
+                     let, reassignment of a named accumulator, while/for loops, \
+                     and if/match expressions; break/continue/return and the \
+                     unbounded `loop` are not wired.",
+                    f.name, esc.keyword()), esc.span().clone()))
+            }
+            other => other,
+        };
         let (loss_value, loss_node) = result?;
 
         // The function's tail must produce a scalar (real-valued loss). The
@@ -2340,7 +4041,18 @@ impl Interpreter {
         // row-sum semantics as the JIT's `$fwd_bwd_bwd` entry.
         let mut grads: Vec<Option<Value>>;
         if method == "fwd_bwd_bwd" {
-            let adj = tape.backward_symbolic(loss_node)?;
+            // #791: `backward_symbolic` replays the backward pass ONTO the
+            // tape, so the nodes it appends carry freshly computed tensors
+            // (`push_dotmul`, `push_negate`, the `ActivationGrad` and mask
+            // nodes) that no interpreter path metered. Everything the
+            // FORWARD pass put on the tape was already charged where it was
+            // computed, so only the appended range is charged here.
+            let symbolic_from = tape.nodes.len();
+            let adj = tape.backward_symbolic(loss_node, &span)?;
+            for i in symbolic_from..tape.nodes.len() {
+                let v = tape.nodes[i].value.clone();
+                self.charge_intermediate(&v, Some(&span))?;
+            }
             let p0 = f.params.iter()
                 .find(|p| p.mutating)
                 .and_then(|p| var_node.get(&p.name).copied().map(|id|
@@ -2375,7 +4087,19 @@ impl Interpreter {
             grads = vec![None; tape.nodes.len()];
             grads[loss_node] = Some(Value::Float(1.0, FW::F64));
         }
-        tape.backward(&mut grads)?;
+        tape.backward(&mut grads, &span)?;
+        // #791: `Tape::backward` builds its adjoints with ndarray directly and
+        // never re-enters the interpreter, so not one of them can reach
+        // `charge_intermediate` where it is made. They are metered here
+        // instead, once the pass is complete — nothing releases an adjoint
+        // while the pass runs, so the set standing at the end IS the pass's
+        // high-water mark and charging it in one go bills the same bytes an
+        // allocation-by-allocation charge would have.
+        for i in 0..grads.len() {
+            if let Some(g) = grads[i].clone() {
+                self.charge_intermediate(&g, Some(&span))?;
+            }
+        }
 
         // Collect gradients for each `!`-marked parameter (tensor, or — since
         // #420 item 2 — f32 scalar).
@@ -2411,6 +4135,31 @@ impl Interpreter {
             });
             grad_struct.push((name.clone(), g));
         }
+        // #791: the AD epilogue — `jit.rs`'s `grad_call_epilogue` rewind,
+        // spelled in the interpreter's own terms. Every byte charged since
+        // `ad_mark` was a compiler-inserted temporary of this pass (forward
+        // activations, the adjoints for nodes nothing publishes), so the whole
+        // window is handed back; then the values that genuinely OUTLIVE the
+        // call are charged again, because they are what the caller now holds:
+        // the published gradients, and the loss when it is a tensor rather
+        // than the usual scalar. That leaves the interpreter charging one
+        // gradient set per `fwd_bwd` — the same monotonic slope the JIT's
+        // `capture_grad` leaves standing outside its own rewind — instead of a
+        // whole pass per step.
+        //
+        // The re-charge cannot fail the budget: it re-bills bytes that were
+        // already inside the window just released, so `forge_used` lands at or
+        // below the peak this pass had already passed the check at. It is
+        // still routed through `charge_intermediate` rather than added
+        // straight to the counter, so one rule keeps deciding what a
+        // materialization costs.
+        self.set_budget_used(ad_budget,
+            ad_mark.saturating_add(self.ctor_forge_bytes.saturating_sub(ad_ctor_at_mark)));
+        for (_, g) in grad_struct.iter() {
+            let g = g.clone();
+            self.charge_intermediate(&g, Some(&span))?;
+        }
+        self.charge_intermediate(&loss_value, Some(&span))?;
         let grad_value = Value::Struct(Rc::new(RefCell::new(grad_struct)));
         // #473's rule reaches the loss too. An ordinary call already narrows
         // its result to the declared return type (`call_fn`, same helper); the
@@ -2421,7 +4170,7 @@ impl Interpreter {
         // is an AUTODIFF §6.1 divergence in the loss (the gradients were always
         // f32 and always agreed), and it is why #422 wall 2's neighbourhood
         // still disagreed after the malformed IR was fixed.
-        let loss_value = coerce_scalar_width(loss_value, f.ret_type.as_ref());
+        let loss_value = self.coerce_declared(loss_value, f.ret_type.as_ref());
         match method {
             "grad" => Ok(grad_value),
             "fwd_bwd" | "fwd_bwd_bwd" => Ok(Value::Tuple(vec![loss_value, grad_value])),
@@ -2444,9 +4193,10 @@ impl Interpreter {
     /// otherwise hand back that capture's body-only half.
     ///
     /// Candidates are drawn from the fn's **own module** only. A `@grad fn` can
-    /// capture nothing else: the checker does not put an imported `pub let !`
-    /// in scope under its bare name, so a cross-module name match was never a
-    /// capture the checker admitted — only one the flat name list invented.
+    /// capture nothing else: the checker does not put an imported module's
+    /// file-private `let !` in scope under its bare name, so a cross-module
+    /// name match was never a capture the checker admitted — only one the
+    /// flat name list invented.
     ///
     /// Result order is the module's declaration order, which fixes the order
     /// the capture fields take in `Grads`.
@@ -2454,11 +4204,8 @@ impl Interpreter {
         if self.mut_globals.is_empty() {
             return Vec::new();
         }
-        // The fn's home module. An unregistered fn (a model method, say) falls
-        // back to the last-loaded module — the root file being run, which is
-        // where such a fn most likely lives; it is a narrowing either way,
-        // never the old cross-module free-for-all.
-        let home = self.fn_module.get(&f.name).copied().unwrap_or(self.module_epoch);
+        // The fn's home module, stamped on the decl when its file was loaded.
+        let home = f.module;
         let params: std::collections::HashSet<&str> =
             f.params.iter().map(|p| p.name.as_str()).collect();
         let refs = crate::check::collect_body_idents(&f.body);
@@ -2610,6 +4357,8 @@ impl Interpreter {
             AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq => {
                 let (rval, rnode) = self.eval_expr_with_tape(rhs, tape, var_node, span)?;
                 let cur = self.lookup(name).unwrap_or(Value::Nil);
+                // #674: `trace_reassign` reads the binding directly too.
+                self.check_live(&cur, span.clone())?;
                 let cur_node = var_node.get(name).copied();
                 // Same scalar-vs-tensor dispatch as eval_stmt's compound assign.
                 let is_tensor = matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_));
@@ -2651,7 +4400,7 @@ impl Interpreter {
     /// the `BinOp` expression arm and compound reassignment. Returns the forward
     /// value and its node id (None when neither operand is tracked).
     fn tape_binop(
-        &self,
+        &mut self,
         tape: &mut Tape,
         op: &BinOp,
         lv: &Value, ln: Option<usize>,
@@ -2659,6 +4408,18 @@ impl Interpreter {
         span: &Span,
     ) -> EvalResult<(Value, Option<usize>)> {
         let out = apply_binop(op.clone(), lv, rv)?;
+        // #791: one of the two places the tape evaluator materializes a
+        // tensor without going through `eval_expr` / `call_builtin` (the
+        // other is `UnOp` in `eval_expr_with_tape`). Every other traced
+        // form — the reductions, the activations, `softmax`, `rms_norm`,
+        // `layer_norm`, `rope`, `attn`, `reshape`, the transpose — computes
+        // its forward value by calling one of those two, so it is already
+        // metered at the choke point they share (`charge_intermediate`,
+        // `charge_builtin_result`); only `apply_binop`/`apply_unop` bypass
+        // it. Charged unconditionally, before the two untracked
+        // early-returns below: a value that leaves the gradient graph still
+        // occupies the bytes.
+        self.charge_intermediate(&out, Some(span))?;
         if ln.is_none() && rn.is_none() {
             return Ok((out, None));
         }
@@ -2742,7 +4503,7 @@ impl Interpreter {
         }
         let (bv, bn) = self.eval_expr_with_tape(base, tape, var_node, span)?;
         let Value::Tensor(arr) = &bv else { return Ok(None) };
-        if arr.dtype != DType::F32 && arr.dtype != DType::F64 {
+        if !arr.dtype.rounds_as_f32() && arr.dtype != DType::F64 {
             return Ok(None);
         }
         if raw_idx.len() != arr.ndim() {
@@ -2799,6 +4560,9 @@ impl Interpreter {
             UnOp { op, operand, .. } => {
                 let (v, n) = self.eval_expr_with_tape(operand, tape, var_node, span)?;
                 let out = apply_unop(op.clone(), &v)?;
+                // #791: the second of the tape evaluator's two direct
+                // materializations — see `tape_binop`'s comment.
+                self.charge_intermediate(&out, Some(span))?;
                 let track = n.is_some();
                 let tape_op = match op {
                     crate::ast::UnOp::ReLU   => Some(TapeOp::ReLU),
@@ -3274,10 +5038,13 @@ impl Interpreter {
         }
     }
 
-    /// #336: the i64 ordinal of `variant` within `enum_name`, or None if either
-    /// is unknown.
+    /// #336: the i64 ordinal of `variant` within `enum_name` **as the running
+    /// file spells it**, or None if the file cannot see such an enum or the
+    /// enum has no such variant. This is the resolution point for every enum
+    /// name, so `resolve_fn` / `resolve_model`'s rule reaches enums here: a
+    /// name the file neither declares nor imported is not an enum to it.
     fn enum_variant_ordinal(&self, enum_name: &str, variant: &str) -> Option<i64> {
-        self.enums.get(enum_name)
+        self.enums.get(&module_key(self.cur_module, enum_name))
             .and_then(|vs| vs.iter().position(|v| v == variant))
             .map(|p| p as i64)
     }
@@ -3300,16 +5067,27 @@ impl Interpreter {
             if self.pattern_matches(&arm.pattern, &scrutinee) {
                 self.push_scope();
                 self.bind_pattern(&arm.pattern, scrutinee.clone());
-                let guard_ok = if let Some(guard) = &arm.guard {
-                    self.eval_expr(guard)?.as_bool().unwrap_or(false)
-                } else {
-                    true
+                // #639: the arm's scope is popped on EVERY exit, error paths
+                // included. A `return` / `break` / `continue` that leaves a
+                // block inside a guard or an arm body travels as an `Err`
+                // carrier and is caught one frame up, so an early `?` here
+                // would leave the arm's scope on the stack and desynchronise
+                // every later `pop_scope`.
+                let guard_ok = match &arm.guard {
+                    Some(guard) => {
+                        let g = self.eval_expr(guard);
+                        match g {
+                            Ok(v) => v.as_bool().unwrap_or(false),
+                            Err(e) => { self.pop_scope(); return Err(e); }
+                        }
+                    }
+                    None => true,
                 };
                 if guard_ok {
                     self.float_lit_hint = self.match_arm_hint(me, idx, inherited);
-                    let val = self.eval_expr(&arm.body)?;
+                    let val = self.eval_expr(&arm.body);
                     self.pop_scope();
-                    return Ok(val);
+                    return val;
                 }
                 self.pop_scope();
             }
@@ -3412,9 +5190,9 @@ impl Interpreter {
                 return Ok(BracketedCall::NotAMethod(recv));
             }
             return Err(RuntimeError::at(format!(
-                "no method `{}` on model `{}`", method, mname), span.clone()));
+                "no method `{}` on model `{}`", method, bare_name(&mname)), span.clone()));
         };
-        let owner = format!("{}.{}", mname, method);
+        let owner = format!("{}.{}", bare_name(&mname), method);
         let explicit = self.bind_shape_bracket(&owner, &f.shape_params, bracket, span)?;
         // The model's own shape args, then the method's. A method that reuses
         // one of the model's shape-param names shadows it with what the call
@@ -3487,7 +5265,9 @@ impl Interpreter {
             Type::Named { name, args, .. } if !args.is_empty() => {
                 let Value::Struct(fields) = v else { return Ok(()); };
                 let Some(model) = struct_model_name(fields) else { return Ok(()); };
-                if &model != name { return Ok(()); }
+                // The annotation names the model as the callee's file spells
+                // it; the instance carries the declaring file's key.
+                if self.resolve_model(name).as_deref() != Some(model.as_str()) { return Ok(()); }
                 let Some(decl) = self.model_shape_params.get(&model) else { return Ok(()); };
                 // The instance tags its dims under the model's *declaration*
                 // names; the parameter type names them positionally.
@@ -3506,7 +5286,38 @@ impl Interpreter {
         Ok(())
     }
 
+    /// A fn body's annotations resolve their `type` aliases in the module the
+    /// fn was DECLARED in, not the one that called it — `f.module` is the
+    /// same tag `grad_capture_names` asks for. Restored on every exit path,
+    /// including the error ones, by wrapping the body rather than threading
+    /// the save through each `return`.
+    ///
+    /// #628 follow-up: `named_fn_ret_stack` is saved and restored the same
+    /// way, and for the same reason. It used to be pushed inside the body and
+    /// popped at each of five `return`s, which is exactly the shape that grows
+    /// a leak the next time someone adds a sixth — the `harvest_shape_params`
+    /// exit was already such a hole. One push here and one pop after
+    /// `call_fn_in_module` returns covers every exit that function has,
+    /// including the ones it does not have yet.
     fn call_fn_with_shapes(&mut self, f: &FnDecl, args: Vec<Value>, explicit_shapes: &[(String, i64)], sp: Span) -> EvalResult<Value> {
+        // The body — and the shape harvest over its parameter types — resolves
+        // top-level names, and its annotations' `type` aliases, in the file the
+        // fn was declared in.
+        let saved = std::mem::replace(&mut self.cur_module, f.module);
+        // See `named_fn_ret_stack`'s doc: a lambda called anywhere in this
+        // fn's dynamic extent (including a `?` in its body) can fall back to
+        // THIS declared return type when the lambda has none of its own.
+        self.named_fn_ret_stack.push(f.ret_type.clone());
+        let result = self.call_fn_in_module(f, args, explicit_shapes, sp);
+        self.named_fn_ret_stack.pop();
+        // Restored LAST: `call_fn_in_module` ends with
+        // `finish_query_propagation`, whose `T` may name a `type` alias
+        // declared in this fn's own file.
+        self.cur_module = saved;
+        result
+    }
+
+    fn call_fn_in_module(&mut self, f: &FnDecl, args: Vec<Value>, explicit_shapes: &[(String, i64)], sp: Span) -> EvalResult<Value> {
         if args.len() != f.params.len() {
             return Err(RuntimeError::at(
                 format!("fn `{}` expects {} args, got {}", f.name, f.params.len(), args.len()),
@@ -3532,7 +5343,18 @@ impl Interpreter {
             if let Some(spec) = type_shape_spec(ty) {
                 collect_idents_in_spec(spec, &mut referenced);
             }
-            self.harvest_shape_params(ty, v, &mut inferred, &f.name, &sp)?;
+            // An exit like the two below it, so it unwinds like them. This was
+            // a bare `?` before, which left this fn's scope standing on the way
+            // out — a pre-existing leak on main, not introduced by `?`'s
+            // rework, but on the very lines that rework restructures, so it is
+            // closed here. Invisible while every error out of here is fatal,
+            // which is exactly how the same hole survived in `eval_match`'s arm
+            // scope until #639; it stops being invisible now that two of the
+            // things travelling this channel are not errors at all.
+            if let Err(e) = self.harvest_shape_params(ty, v, &mut inferred, &f.name, &sp) {
+                self.pop_scope();
+                return Err(e);
+            }
         }
         for sp_decl in &f.shape_params {
             referenced.insert(sp_decl.name.clone());
@@ -3563,11 +5385,44 @@ impl Interpreter {
             // be one. `L` was decoration before this — a `Port[lua]` parameter
             // took a python handle without complaint in either backend, so the
             // signature implied a check that did not exist.
-            if let Err(e) = check_port_lang(&v, p.ty.as_ref(), &sp) {
+            if let Err(e) = self.check_declared_port(&v, p.ty.as_ref(), &sp) {
                 self.pop_scope();
                 return Err(e);
             }
-            self.bind(&p.name, coerce_scalar_width(v, p.ty.as_ref()));
+            let mut coerced = self.coerce_declared(v, p.ty.as_ref());
+            // #781, #650: a `!` param is a PRIVATE COPY, not an
+            // alias of the caller's tensor — the JIT actually copies the
+            // bytes in at the CALL SITE, before the callee's own frame
+            // exists. That placement is why this charge is monotonic on
+            // both backends even where the callee's activations are not:
+            // the buffer belongs to the caller's scope, so no
+            // compiler-inserted rewind inside the callee covers it (the
+            // forward-only `@grad` mark taken below is deliberately taken
+            // AFTER this loop for exactly that reason). The copy-OUT is a
+            // memcpy back into storage the caller already owns — no second
+            // buffer, so nothing to charge for it (#791; see the writeback
+            // loop below).
+            //
+            // An ordinary (non-`!`) param binds no differently from any
+            // other variable read and stays uncharged, exactly as before.
+            //
+            // `charge_private_copy` (not `charge_intermediate`) excludes
+            // `Value::Str`: a `str` is a pointer on the JIT (SPEC §3.1), so
+            // the copy-in at the call site this comment describes for a
+            // tensor is, for a string, a second pointer to the SAME bytes —
+            // the JIT requests 0 bytes for it, where charging here as if it
+            // copied the string's contents charged a copy that never
+            // happens on either backend's wire (PR #815 review).
+            if p.mutating {
+                if let Err(e) = self.charge_private_copy(&coerced, Some(&sp)) {
+                    self.pop_scope();
+                    return Err(e);
+                }
+                // #674: re-stamp — see the
+                // `Item::Let`/`Stmt::Let` sites' doc.
+                restamp_current_budget(&mut coerced);
+            }
+            self.bind(&p.name, coerced);
             if let Some(axis) = p.ty.as_ref().and_then(streaming_axis_from_type) {
                 self.bind_stream_axis(&p.name, axis);
             }
@@ -3576,27 +5431,144 @@ impl Interpreter {
         // to the previous stage's output so the next stage can reference it.
         let is_pp = f.directives.iter().any(|d| d.name == "pp");
         if is_pp {
+            // #639: a stage body is evaluated with `eval_expr`, NOT `eval_block`,
+            // so this is one of the two entry points where the block-flow
+            // carrier would otherwise cross a call frame. It is caught at the
+            // stage boundary because the stage boundary IS a function boundary:
+            // a `return` here returns from the `@pp` fn, exactly as it does
+            // from an ordinary body. Left uncaught, the carrier rode `?` out of
+            // the callee and landed in the CALLER — a `return` returned from
+            // the caller, a `break` broke the caller's loop — and the same `?`
+            // skipped the `pop_scope` below, leaking one frame per escape.
+            //
+            // #628's `?` signal is NOT caught here. It is the other carrier on
+            // the same channel, and this early return sits above the
+            // `finish_query_propagation` call that owns it — so a `?` that
+            // trips in a stage still escapes the `@pp` fn and is rebuilt
+            // against its caller's `T`. That is #647's open category (see
+            // `finish_query_propagation`'s doc), unchanged by this merge; what
+            // IS fixed here is the leak — the signal now pops the scope on its
+            // way out instead of skipping it.
             let mut prev = Value::Nil;
+            let mut escaped: Option<Escape> = None;
             for stmt in &f.body.stmts {
                 if let Stmt::Stage { body, .. } = stmt {
                     self.bind("_", prev.clone());
-                    prev = self.eval_expr(body)?;
+                    match self.eval_expr(body) {
+                        Ok(v) => prev = v,
+                        Err(e) => match e.flow {
+                            Some(esc) => { escaped = Some(*esc); break; }
+                            // #628: not a block escape — a real error, or a `?`
+                            // signal. Either way it leaves this frame, so the
+                            // scope pops on the way out.
+                            None => {
+                                self.pop_scope();
+                                return Err(e);
+                            }
+                        },
+                    }
                 }
             }
             self.pop_scope();
-            return Ok(prev);
+            return match escaped {
+                None => Ok(prev),
+                Some(Escape::Return(v, _)) => Ok(v),
+                // No loop inside the stage to catch these. `call_fn` already
+                // refuses the same thing on an ordinary body; a `@pp` stage is
+                // not a loop either, so it gets the same backstop rather than
+                // reaching out to whatever loop the caller happened to be in.
+                Some(esc) => Err(RuntimeError::at(
+                    "break/continue outside loop", esc.span().clone())),
+            };
         }
+        // #781 (#674 slice 1) / #791: the interpreter-side twin of
+        // `jit.rs`'s `fwd_only_scope` — the forward-only entry of a `@grad
+        // fn` (a plain `f(..)` call, or `f.fwd(..)`, never `.fwd_bwd`) is
+        // wrapped by the JIT in an `InternalMark` whose restore hands back
+        // every byte the body allocated. Its return value is a scalar, so
+        // nothing the body materialized can escape through it, and the
+        // activations are exactly the compiler-reclaimed intermediates
+        // `MEMORY.md §1.1` carves out of the monotonic rule.
+        //
+        // Same gate as the JIT, rule for rule: `@grad` on the fn AND a
+        // declared non-`nil` SCALAR return. An ordinary fn is never
+        // wrapped; a `@grad fn` returning a tensor would hand back a tensor
+        // the rewind had just un-charged.
+        //
+        // Taken here rather than before the parameter loop on purpose: the
+        // `!` copy-in belongs to the CALLER's scope on both backends (see
+        // that loop's comment), so it must sit outside this mark.
+        //
+        // This is NOT a general rewind. It moves `forge_used` only, only
+        // across a compiler-inserted scope, and only on the path that
+        // actually returns. The language-level `forge.restore` stays
+        // monotonic (#614), and `vault_used` is never rewound at all — a
+        // `vault.*` constructor is `MEMORY.md §1`'s persistent store, not a
+        // temporary the compiler is entitled to reclaim.
+        let fwd_only_mark: Option<u64> = if f.directives.iter().any(|d| d.name == "grad")
+            && matches!(f.ret_type, Some(Type::Scalar(ref k, _)) if *k != ScalarType::Nil)
+        {
+            Some(self.budgets[cur_budget()].used)
+        } else {
+            None
+        };
+        // #781: snapshot the explicit-constructor running total alongside the
+        // mark. A constructor's result can ESCAPE the body — into a model
+        // field, through a `!` param, into a module-level `let !` — so the
+        // rewind below must not un-charge it; the difference across the body
+        // is exactly what it has to keep. See `ctor_forge_bytes`.
+        let ctor_at_mark = self.ctor_forge_bytes;
         let result = self.eval_block(&f.body);
+        let kept_ctor_bytes = self.ctor_forge_bytes.saturating_sub(ctor_at_mark);
         // Before popping the fn scope, capture the final values of all `!` params.
         // The call site uses these to write back to the caller's bindings.
-        self.pending_writebacks = f.params.iter().enumerate()
-            .filter(|(_, p)| p.mutating)
-            .filter_map(|(i, p)| {
-                self.scopes.last()
-                    .and_then(|s| s.get(&p.name))
-                    .map(|v| (i, v.clone()))
-            })
-            .collect();
+        // #791: this is the copy-OUT half of #650's private-copy
+        // semantics, and it is NOT charged. The bytes go back into the
+        // buffer the caller already owns and already paid for — the JIT
+        // emits a `memcpy` into the incoming pointer
+        // (`emit_mut_param_copy_out`), not a fresh allocation — so there is
+        // no second materialization to meter. An earlier pass of #781
+        // charged it, which billed every `!`-param call twice; the surviving
+        // charge is the copy-IN, in the parameter loop above.
+        //
+        // #781: captured UNCONDITIONALLY, on every exit path. An `Err` here
+        // is not only a failure — a `?` early-return arrives as one (it
+        // carries `finish_query_propagation`'s marker and is rebuilt into a
+        // normal `(default[T], e)` return a few lines below), and so does a
+        // block-flow escape. Gating this on `result.is_ok()` silently
+        // dropped the writebacks of a fn that wrote a `!` tensor and then
+        // returned early via `?`, so `dmc run` printed the untouched
+        // caller-side value where `dmc jit` — which emits the copy-out on
+        // every path out of the callee — printed the written one.
+        let mut writebacks: Vec<(usize, Value)> = Vec::new();
+        for (i, p) in f.params.iter().enumerate().filter(|(_, p)| p.mutating) {
+            let Some(v) = self.scopes.last().and_then(|s| s.get(&p.name)).cloned() else {
+                continue;
+            };
+            writebacks.push((i, v));
+        }
+        self.pending_writebacks = writebacks;
+        // The rewind itself: after the copy-out has been captured (it reads
+        // the callee's buffer, so it has to happen first — the JIT orders
+        // `emit_mut_param_copy_out` ahead of its own restore for the same
+        // reason) and only when the body actually produced a value.
+        //
+        // #781: the landing point is `mark + kept_ctor_bytes`, not `mark`.
+        // Everything between the two is what an explicit constructor inside
+        // the body charged, and those bytes stay charged — the body's
+        // COMPILER-inserted intermediates are what this scope is entitled to
+        // reclaim, and a tensor the program spelled out is not one of them.
+        if let (Some(mark), true) = (fwd_only_mark, result.is_ok()) {
+            // #674 slice 3d: the entered budget, for the same reason
+            // `call_grad_in_module`'s `ad_budget` is — and it reads the
+            // same value the mark above was taken under, because `enter`
+            // pops on every exit edge.
+            self.set_budget_used(cur_budget(), mark.saturating_add(kept_ctor_bytes));
+        }
+        // `?` early-return: rebuild SPEC §4.9's `(default[T], e)` against THIS
+        // function's declared `T` — before the scope goes, because a
+        // shape-parametric `T` (`-> (Tensor[f32, [N]], Err)`) still needs `N`.
+        let result = self.finish_query_propagation(result, f.ret_type.as_ref(), &f.name, &sp);
         self.pop_scope();
         match result {
             // #473: a declared return type is one of the binding sites where an
@@ -3606,14 +5578,23 @@ impl Interpreter {
             // back an f64 while the JIT — whose signature carries the declared
             // f32 — returns the f32, and the two backends part company on the
             // next operation. A `?` propagation returns a (T, Err) tuple, not a
-            // T, so it is deliberately left alone.
-            Ok(Flow::Normal(v)) | Ok(Flow::Return(v)) => {
-                check_port_lang(&v, f.ret_type.as_ref(), &sp)?;
-                Ok(coerce_scalar_width(v, f.ret_type.as_ref()))
+            // T, so `coerce_scalar_width` (scalar-typed returns only) leaves it
+            // alone by construction.
+            //
+            // #639: the `Flow::Return` a `?` arrives as is built by
+            // `finish_query_propagation` just above, so its span is the `?`'s
+            // own and is not needed again here.
+            Ok(Flow::Normal(v)) | Ok(Flow::Return(v, _)) => {
+                self.check_declared_port(&v, f.ret_type.as_ref(), &sp)?;
+                Ok(self.coerce_declared(v, f.ret_type.as_ref()))
             }
-            Ok(Flow::Break) | Ok(Flow::Continue) => Err(RuntimeError::msg("break/continue outside loop")),
-            // `?` early-return: this function returns the propagated (T, Err) tuple.
-            Err(e) => match e.propagate { Some(v) => Ok(*v), None => Err(e) },
+            Ok(Flow::Break(sp)) | Ok(Flow::Continue(sp)) =>
+                Err(RuntimeError::at("break/continue outside loop", sp)),
+            // Every `?` signal was already turned into `(default[T], e)` by
+            // `finish_query_propagation`; anything still an `Err` here is a
+            // real error (or #639's block-flow carrier, which `eval_block` has
+            // already re-opened, so it cannot be one either).
+            Err(e) => Err(e),
         }
     }
 
@@ -3623,7 +5604,11 @@ impl Interpreter {
         self.push_scope();
         let result = self.eval_block_body(block);
         self.pop_scope();
-        result
+        // #639: a carrier that reached the block boundary is this block's own
+        // escaping control flow — re-open it so every caller of `eval_block`
+        // (a function body, a lambda body, a loop body, an `if` branch, a
+        // `@comptime` fold) keeps seeing a `Flow` and nothing else.
+        catch_flow(result)
     }
 
     /// The statements and value of `block`, evaluated in the CURRENT scope.
@@ -3654,7 +5639,9 @@ impl Interpreter {
         }
         if let Some(tail) = &block.tail_expr {
             self.float_lit_hint = want;
-            Ok(Flow::Normal(self.eval_expr(tail)?))
+            // #639: the tail is an expression like any other, so a block in
+            // tail position may hand back control flow rather than a value.
+            catch_flow(self.eval_expr(tail).map(Flow::Normal))
         } else if deferred_last {
             match &block.stmts[n - 1] {
                 Stmt::DirectiveBlock { directives, body, .. } => {
@@ -3669,7 +5656,7 @@ impl Interpreter {
                     let v = if let Some(cast_dir) = directives.iter().find(|d| d.name == "cast") {
                         if let Some(crate::ast::DArg::Positional(type_expr)) = cast_dir.args.first() {
                             if let Expr::Ident(ty_name, _) = type_expr {
-                                if self.model_fields.contains_key(ty_name) {
+                                if self.is_overlay_model(ty_name) {
                                     self.cast_to_struct(&raw, ty_name)?
                                 } else {
                                     apply_cast_by_name(&raw, ty_name)
@@ -3679,15 +5666,19 @@ impl Interpreter {
                     } else { raw };
                     Ok(Flow::Normal(v))
                 }
-                Stmt::If(ie) => { self.float_lit_hint = want; self.eval_if_flow(ie) }
+                Stmt::If(ie) => { self.float_lit_hint = want; catch_flow(self.eval_if_flow(ie)) }
+                // #639: these three are the value-yielding last statement of a
+                // block, so they are expression positions — control flow that
+                // left a block inside one rides the carrier and is re-opened
+                // here, the same as at any other statement boundary.
                 Stmt::Expr { lhs, assign: None, .. } => {
                     self.float_lit_hint = want;
-                    Ok(Flow::Normal(self.eval_expr(lhs)?))
+                    catch_flow(self.eval_expr(lhs).map(Flow::Normal))
                 }
-                Stmt::Stage { body, .. } => Ok(Flow::Normal(self.eval_expr(body)?)),
+                Stmt::Stage { body, .. } => catch_flow(self.eval_expr(body).map(Flow::Normal)),
                 Stmt::Match(me) => {
                     self.float_lit_hint = want;
-                    Ok(Flow::Normal(self.eval_match(me)?))
+                    catch_flow(self.eval_match(me).map(Flow::Normal))
                 }
                 _ => unreachable!(),
             }
@@ -3698,7 +5689,17 @@ impl Interpreter {
 
     // ── Stmt ──────────────────────────────────────────────────────────────
 
+    /// #639: the statement boundary is where a `Flow` that escaped a block
+    /// *expression* — a `let` initializer, a call argument, an assignment RHS,
+    /// a bare block statement — becomes a `Flow` again. Every statement form
+    /// evaluates expressions somewhere, so catching once here covers all of
+    /// them; `eval_block_body` then propagates it to the enclosing loop or
+    /// function exactly as it does for an `if` body.
     fn eval_stmt(&mut self, stmt: &Stmt) -> EvalResult<Flow> {
+        catch_flow(self.eval_stmt_inner(stmt))
+    }
+
+    fn eval_stmt_inner(&mut self, stmt: &Stmt) -> EvalResult<Flow> {
         match stmt {
             Stmt::Let(l) => {
                 // `let !alias = recv.field` — create a FieldRef so mutations
@@ -3744,8 +5745,29 @@ impl Interpreter {
                     }
                 }
                 let v = self.eval_expr(&l.value)?;
-                check_port_lang(&v, l.ty.as_ref(), &l.span)?;
-                let v = coerce_scalar_width(v, l.ty.as_ref());
+                self.check_declared_port(&v, l.ty.as_ref(), &l.span)?;
+                let mut v = self.coerce_declared(v, l.ty.as_ref());
+                // #781, SPEC §3.4: `let !y = x` binds a PRIVATE, independently
+                // mutable copy of `x` — not an alias — so the JIT charges the
+                // copy for a tensor (a `Value::Str` copy is excluded by
+                // `charge_private_copy` — see that fn's doc: a `str` is a
+                // pointer on the JIT, so the copy the JIT makes there is a
+                // second pointer, not a byte-for-byte copy, and it requests
+                // 0 bytes for it). Narrowed to a bare-identifier RHS (the
+                // paradigm case, and the one the FieldRef branch above
+                // doesn't already handle): `let !y = a + b` etc. already
+                // charged its fresh result as an implicit intermediate
+                // inside `eval_expr` (`BinOp`, a tensor literal, …), so
+                // charging it again here would double-bill a value that was
+                // never aliased in the first place — only a bare `x`
+                // denotes storage that already has an owner and therefore
+                // needs an actual copy to give `y` independent identity.
+                if l.mutating && matches!(l.value, Expr::Ident(_, _)) {
+                    self.charge_private_copy(&v, Some(&l.span))?;
+                    // #674: re-stamp — see
+                    // the identical `Item::Let` site's doc.
+                    restamp_current_budget(&mut v);
+                }
                 self.bind_pattern(&l.pattern, v);
                 // #399: resolve the streaming axis and declared capacity from the
                 // explicit `KV[..~..]` type annotation OR, failing that, the
@@ -3783,7 +5805,7 @@ impl Interpreter {
                     if let (AssignOp::Eq, Expr::Ident(name, _)) = (&*op, &*lhs) {
                         if let Expr::Postfix { expr: callee, op: PostfixOp::Call(cargs), .. } = &*rhs {
                             let callee_is_builtin = matches!(callee.as_ref(),
-                                Expr::Ident(f, _) if is_builtin(f) && !self.fns.contains_key(f));
+                                Expr::Ident(f, _) if is_builtin(f) && self.resolve_fn(f).is_none());
                             let first_arg_is_target = matches!(cargs.first(),
                                 Some(CallArg::Positional(Expr::Ident(a, _))) if a == name);
                             if callee_is_builtin && first_arg_is_target {
@@ -3804,6 +5826,9 @@ impl Interpreter {
                         }
                         (AssignOp::PlusEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             // Tensor ops dispatch to the elementwise variant;
                             // pure-scalar dispatch to the scalar variant. The
                             // language doesn't distinguish += vs .+= at the
@@ -3816,6 +5841,9 @@ impl Interpreter {
                         }
                         (AssignOp::MinusEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             let op = if matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_)) {
                                 BinOp::DotSub
                             } else { BinOp::Sub };
@@ -3828,6 +5856,9 @@ impl Interpreter {
                         // like `+=`/`-=`.
                         (AssignOp::StarEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             let op = if matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_)) {
                                 BinOp::DotMul
                             } else { BinOp::Mul };
@@ -3836,6 +5867,9 @@ impl Interpreter {
                         }
                         (AssignOp::SlashEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             let op = if matches!(cur, Value::Tensor(_)) || matches!(rval, Value::Tensor(_)) {
                                 BinOp::DotDiv
                             } else { BinOp::Div };
@@ -3845,21 +5879,32 @@ impl Interpreter {
                         // Bitwise compound-assign (int only; no tensor variant).
                         (AssignOp::AmpEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             let new = apply_binop(BinOp::BitAnd, &cur, &rval)?;
                             self.assign(name, new).ok();
                         }
                         (AssignOp::BarEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             let new = apply_binop(BinOp::BitOr, &cur, &rval)?;
                             self.assign(name, new).ok();
                         }
                         (AssignOp::CaretEq, Expr::Ident(name, _)) => {
                             let cur = self.lookup_deref(name).unwrap_or(Value::Nil);
+                            // #674: this reads the binding's CURRENT value
+                            // directly, bypassing `eval_expr`'s wrapper.
+                            self.check_live(&cur, span.clone())?;
                             let new = apply_binop(BinOp::BitXor, &cur, &rval)?;
                             self.assign(name, new).ok();
                         }
                         (AssignOp::StreamArrow, Expr::Ident(name, _)) => {
                             let cur = self.lookup(name).unwrap_or(Value::Nil);
+                            // #674: the stream-append slot read.
+                            self.check_live(&cur, span.clone())?;
                             match (cur, rval) {
                                 (Value::Tensor(existing), Value::Tensor(new_data)) => {
                                     let axis = self.lookup_stream_axis(name)
@@ -3914,7 +5959,25 @@ impl Interpreter {
                                     ).map_err(|e| RuntimeError::msg(
                                         format!("<- stream append failed: {}", e)
                                     ))?;
-                                    self.assign(name, Value::tensor_dt(cat, existing.dtype)).ok();
+                                    let grown = Value::tensor_dt(cat, existing.dtype);
+                                    // #781: `name <- rhs` concatenates into a
+                                    // freshly allocated, wider array — an
+                                    // implicit intermediate, EXCEPT when
+                                    // `name` is a declared `forge.kv`/
+                                    // `stream.kv` binding: MEMORY.md §1
+                                    // keeps the Stream arena uncharged by
+                                    // design (it carries its own
+                                    // `capacity`, already enforced above).
+                                    // `kv_capacities` is populated only for
+                                    // such a binding (`extract_kv_capacity`
+                                    // at the `let` site), so its absence
+                                    // here means `name` is an ordinary
+                                    // Forge tensor being grown, and the JIT
+                                    // has no lowering for that yet either.
+                                    if !self.kv_capacities.contains_key(name.as_str()) {
+                                        self.charge_intermediate(&grown, None)?;
+                                    }
+                                    self.assign(name, grown).ok();
                                 }
                                 // `let !q = self.field; q <- x` — q is a FieldRef
                                 // alias. Append through it back into the field.
@@ -3924,7 +5987,12 @@ impl Interpreter {
                                         return Err(RuntimeError::msg(format!("unknown field `{}` in <- append", field)));
                                     };
                                     let (ex_data, dtype, ndim) = match slot {
-                                        Value::Tensor(t) => (t.data.clone(), t.dtype, t.ndim()),
+                                        Value::Tensor(t) => {
+                                            // #674: the
+                                            // other stream-append slot read.
+                                            self.check_tensor_live(t, span.clone())?;
+                                            (t.data.clone(), t.dtype, t.ndim())
+                                        }
                                         other => return Err(RuntimeError::msg(
                                             format!("<- stream-arrow requires a tensor field, got {}", other.type_name()))),
                                     };
@@ -3968,7 +6036,12 @@ impl Interpreter {
                                     format!("unknown field `{}` in <- append", field_name), span.clone()));
                             };
                             let (ex_data, dtype, ndim) = match slot {
-                                Value::Tensor(t) => (t.data.clone(), t.dtype, t.ndim()),
+                                Value::Tensor(t) => {
+                                    // #674: the struct-field
+                                    // spelling's own slot read.
+                                    self.check_tensor_live(t, span.clone())?;
+                                    (t.data.clone(), t.dtype, t.ndim())
+                                }
                                 other => return Err(RuntimeError::at(
                                     format!("<- stream-arrow requires a tensor field, got {}", other.type_name()),
                                     span.clone())),
@@ -3986,13 +6059,56 @@ impl Interpreter {
                         // Tensor element write: t[i] = val  or  t[i, j] = val
                         (AssignOp::Eq, Expr::Postfix { expr: base_expr, op: PostfixOp::Index(idx_elems), .. }) => {
                             if let Expr::Ident(name, _) = base_expr.as_ref() {
+                                // #689: a plain tensor binding takes the in-place path —
+                                // `lookup` below deep-clones a Tensor's backing `ArrayD`
+                                // (unlike `Value::List`, `Tensor` is not `Rc`-wrapped), so
+                                // routing `t[i] = v` through it made every element store
+                                // O(N) in the tensor's size and an N-element fill O(N²).
+                                // Peeking the variant through `lookup_ref` (no clone) lets
+                                // a Tensor skip straight to mutating the scope slot's
+                                // `ArrayD` through `&mut`; List/FieldRef/other keep the
+                                // original lookup-and-reassign shape below (List's "clone"
+                                // there is a cheap `Rc::clone`, not a data copy).
+                                if matches!(self.lookup_ref(name), Some(Value::Tensor(_))) {
+                                    // #674: this fast path
+                                    // mutates the scope slot's `ArrayD`
+                                    // directly, bypassing `eval_expr`.
+                                    if let Some(Value::Tensor(t)) = self.lookup_ref(name) {
+                                        self.check_tensor_live(t, span.clone())?;
+                                    }
+                                    // #443: resolve indices before taking the mutable scope
+                                    // borrow — an index expr can read `name` itself (e.g.
+                                    // `t[t[0] as i64] = 1`), and holding `&mut` on the slot
+                                    // across a re-entrant `eval_expr` would double-borrow.
+                                    let idx_vals = self.eval_index_elems(idx_elems, &span)?;
+                                    for scope in self.scopes.iter_mut().rev() {
+                                        match scope.get_mut(name) {
+                                            Some(Value::Tensor(t)) => {
+                                                let dt = t.dtype;
+                                                Self::assign_to_tensor_resolved(&mut t.data, dt, &idx_vals, rval, span.clone())?;
+                                                break;
+                                            }
+                                            // Not shadowing: the peek above already
+                                            // confirmed `name` was a tensor in this same
+                                            // scope, so a non-tensor here means the index
+                                            // expression we just evaluated (`eval_index_elems`
+                                            // above) retyped this very binding — e.g. an
+                                            // index expr that reassigns the indexed name to
+                                            // a non-tensor. Error like the sibling arms
+                                            // below instead of silently dropping the store.
+                                            Some(other) => {
+                                                return Err(RuntimeError::at(
+                                                    format!("indexed assignment requires a tensor, got {}", other.type_name()),
+                                                    span.clone(),
+                                                ));
+                                            }
+                                            None => continue,
+                                        }
+                                    }
+                                    return Ok(Flow::Normal(Value::Nil));
+                                }
                                 let cur = self.lookup(name).unwrap_or(Value::Nil);
                                 match cur {
-                                    Value::Tensor(mut arr) => {
-                                        let dt = arr.dtype;
-                                        self.assign_to_tensor(&mut arr, dt, idx_elems, rval, span.clone())?;
-                                        self.assign(name, Value::Tensor(arr)).ok();
-                                    }
                                     // #266: model-array (List) write — `arr[i] = instance`
                                     // stores the value into slot i (parity with the JIT's
                                     // ModelArray store). Single scalar index; negatives wrap.
@@ -4093,6 +6209,130 @@ impl Interpreter {
                                 }
                             }
                         }
+                        // #693: compound assignment to a tensor element —
+                        // `t[i] += v`, `t[i, j] -= v`, `m.t[i] *= v`, and
+                        // through a live field alias (`let !y = m.t; y[i] /=
+                        // v`). Before this arm existed, every one of these
+                        // fell to the catch-all no-op below: `--check`
+                        // accepted the form, nothing stored, and the element
+                        // read back unchanged (SPEC §3.4 requires a compound
+                        // assignment through a tensor-field alias to reach
+                        // the field, same as a plain element write).
+                        (AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq,
+                         Expr::Postfix { expr: base_expr, op: PostfixOp::Index(idx_elems), .. }) => {
+                            let (scalar_op, dot_op) = Self::compound_binops(op);
+                            if let Expr::Ident(name, _) = base_expr.as_ref() {
+                                // Same in-place fast path #692 uses for `=`:
+                                // peek the variant with no clone before
+                                // touching the index.
+                                if matches!(self.lookup_ref(name), Some(Value::Tensor(_))) {
+                                    // #674: a compound indexed
+                                    // assign READS the element before
+                                    // writing it back — the paradigm case
+                                    // this check exists for.
+                                    if let Some(Value::Tensor(t)) = self.lookup_ref(name) {
+                                        self.check_tensor_live(t, span.clone())?;
+                                    }
+                                    let idx_vals = self.eval_index_elems(idx_elems, &span)?;
+                                    for scope in self.scopes.iter_mut().rev() {
+                                        match scope.get_mut(name) {
+                                            Some(Value::Tensor(t)) => {
+                                                let dt = t.dtype;
+                                                Self::compound_assign_tensor_elem(
+                                                    &mut t.data, dt, scalar_op, dot_op,
+                                                    &idx_vals, rval, span.clone(),
+                                                )?;
+                                                break;
+                                            }
+                                            // See the `=` arm above: the peek
+                                            // already confirmed a tensor, so a
+                                            // non-tensor here means the index
+                                            // expression itself retyped `name`.
+                                            Some(other) => {
+                                                return Err(RuntimeError::at(
+                                                    format!("indexed assignment requires a tensor, got {}", other.type_name()),
+                                                    span.clone(),
+                                                ));
+                                            }
+                                            None => continue,
+                                        }
+                                    }
+                                    return Ok(Flow::Normal(Value::Nil));
+                                }
+                                let cur = self.lookup(name).unwrap_or(Value::Nil);
+                                match cur {
+                                    // SPEC §3.4: `let !y = m.t` is a live alias
+                                    // into the model field — `y[i] op= v` must
+                                    // reach `m.t`, same as `y[i] = v`.
+                                    Value::FieldRef { rc, field } => {
+                                        let idx_vals = self.eval_index_elems(idx_elems, &span)?;
+                                        let mut borrowed = rc.borrow_mut();
+                                        if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == &field) {
+                                            if let Value::Tensor(arr) = slot {
+                                                // #674: the field's tensor,
+                                                // checked before a compound assign combines it.
+                                                self.check_tensor_live(arr, span.clone())?;
+                                                let dt = arr.dtype;
+                                                Self::compound_assign_tensor_elem(
+                                                    &mut arr.data, dt, scalar_op, dot_op,
+                                                    &idx_vals, rval, span.clone(),
+                                                )?;
+                                            } else {
+                                                return Err(RuntimeError::at(
+                                                    format!("indexed assignment requires a tensor, got {}", slot.type_name()),
+                                                    span.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    // A model-array (List) element, or any
+                                    // other non-tensor binding, has no
+                                    // compound-arithmetic meaning — name it
+                                    // and refuse rather than drop the store.
+                                    other => {
+                                        return Err(RuntimeError::at(
+                                            format!("indexed assignment requires a tensor, got {}", other.type_name()),
+                                            span.clone(),
+                                        ));
+                                    }
+                                }
+                            } else if let Expr::Postfix { expr: struct_expr, op: PostfixOp::Field(field_name), .. } = base_expr.as_ref() {
+                                // m.t[i] op= val — tensor element compound-write
+                                // through a struct field.
+                                let recv = self.eval_expr(struct_expr)?;
+                                if let Value::Struct(fields) = recv {
+                                    let idx_vals = self.eval_index_elems(idx_elems, &span)?;
+                                    let mut borrowed = fields.borrow_mut();
+                                    if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == field_name) {
+                                        if let Value::Tensor(arr) = slot {
+                                            // #674: the field's tensor,
+                                            // checked before a compound assign combines it.
+                                            self.check_tensor_live(arr, span.clone())?;
+                                            let dt = arr.dtype;
+                                            Self::compound_assign_tensor_elem(
+                                                &mut arr.data, dt, scalar_op, dot_op,
+                                                &idx_vals, rval, span.clone(),
+                                            )?;
+                                        } else {
+                                            return Err(RuntimeError::at(
+                                                format!("indexed assignment requires a tensor, got {}", slot.type_name()),
+                                                span.clone(),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    return Err(RuntimeError::at(
+                                        format!("indexed assignment requires a tensor, got {}", recv.type_name()),
+                                        span.clone(),
+                                    ));
+                                }
+                            } else {
+                                return Err(RuntimeError::at(
+                                    "compound assignment to this indexed target is not supported".to_string(),
+                                    span.clone(),
+                                ));
+                            }
+                        }
                         // Direct field write: m.field = expr  (including self.field = expr in methods)
                         (AssignOp::Eq, Expr::Postfix { expr: base_expr, op: PostfixOp::Field(field_name), .. }) => {
                             let recv = self.eval_expr(base_expr)?;
@@ -4104,7 +6344,7 @@ impl Interpreter {
                                 let declared = self.struct_field_ty(&fields, field_name);
                                 let mut borrowed = fields.borrow_mut();
                                 if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == field_name) {
-                                    *slot = coerce_scalar_width(rval, declared.as_ref());
+                                    *slot = self.coerce_declared(rval, declared.as_ref());
                                 }
                             }
                         }
@@ -4112,9 +6352,96 @@ impl Interpreter {
                         (AssignOp::ColonEq, Expr::Ident(name, _)) => {
                             self.bind(name, rval);
                         }
-                        // Field / index assignments on non-ident bases — no-op
+                        // #693 audit, follow-up: the only OTHER target shape
+                        // reachable by this arm's own operator family (`+= -=
+                        // *= /=`) was a direct field compound-assign with no
+                        // index — `m.field += v` (incl. `self.field += v` in
+                        // a method, and through a live struct alias / nested
+                        // `o.i.n += v`, both of which resolve here the same
+                        // way `eval_expr(base_expr)` resolves any other field
+                        // chain). This used to name the operator with `{:?}`
+                        // and refuse outright ("assignment `PlusEq` to a
+                        // struct field is not supported" — leaking the Rust
+                        // enum variant to users) on every shape, including
+                        // the ordinary scalar case a bare compound-assign
+                        // targets almost every time.
+                        //
+                        // Coordinator decision on the #693 follow-up review:
+                        // compute it instead, mirroring the `(Eq,
+                        // Postfix{Field})` arm just above — read the field's
+                        // current value, combine via `apply_binop` (the same
+                        // dispatch the plain-ident compound arms and #693's
+                        // indexed-tensor-element arm use), and store back
+                        // through the same slot the `=` arm writes, coerced
+                        // to the field's declared width so `m.x += 1` rounds
+                        // an f32 field exactly as `m.x = m.x + 1` would
+                        // (SPEC §3.4: compound assignment must reach the
+                        // field, same as a plain write, including through an
+                        // alias binding). A tensor-typed field with a
+                        // whole-tensor RHS is the same trivial elementwise
+                        // replace the plain-ident `y += tensor` arms already
+                        // do; a tensor field combined with a non-tensor RHS
+                        // has no established broadcast semantics here, so
+                        // that shape is refused with a clear, non-leaking
+                        // message (`assignop_str`, not `{:?}`) rather than
+                        // guessed at.
+                        (AssignOp::PlusEq | AssignOp::MinusEq | AssignOp::StarEq | AssignOp::SlashEq,
+                         Expr::Postfix { expr: base_expr, op: PostfixOp::Field(field_name), .. }) => {
+                            let (scalar_op, dot_op) = Self::compound_binops(op);
+                            let recv = self.eval_expr(base_expr)?;
+                            if let Value::Struct(fields) = recv {
+                                let declared = self.struct_field_ty(&fields, field_name);
+                                let mut borrowed = fields.borrow_mut();
+                                if let Some((_, slot)) = borrowed.iter_mut().find(|(k, _)| k == field_name) {
+                                    match (&*slot, &rval) {
+                                        (Value::Tensor(_), Value::Tensor(_)) => {
+                                            // #674: the field's tensor,
+                                            // checked before a compound assign combines it.
+                                            self.check_live(slot, span.clone())?;
+                                            let cur = slot.clone();
+                                            *slot = apply_binop(dot_op, &cur, &rval)?;
+                                        }
+                                        (Value::Tensor(_), _) => {
+                                            return Err(RuntimeError::at(
+                                                format!(
+                                                    "compound assignment `{}` to a whole tensor-typed \
+                                                     field needs a tensor on the right (broadcasting a \
+                                                     scalar into a field this way is not supported) — \
+                                                     got {}",
+                                                    crate::fmt::assignop_str(op), rval.type_name()
+                                                ),
+                                                span.clone(),
+                                            ));
+                                        }
+                                        _ => {
+                                            let cur = slot.clone();
+                                            let new_val = apply_binop(scalar_op, &cur, &rval)?;
+                                            *slot = self.coerce_declared(new_val, declared.as_ref());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Every other combination reaching here — `:=` on a
+                        // non-ident target (#685's sibling bug, deliberately
+                        // NOT fixed here: one bug category per PR, AGENTS.md
+                        // §3), bitwise compound (`&= |= ^=`) against a
+                        // field/index target (a *silent no-op* under `dmc
+                        // run` — same defect class as #693, different
+                        // operator family, filed as #714 and deliberately
+                        // not fixed here: one bug category per PR), and `<-`
+                        // stream-append to an INDEXED local (`caches[i] <-
+                        // frame`, #176's KV-array append — real,
+                        // JIT-supported, exercised by
+                        // `jit_kv_array_indexed_append_advances_len` /
+                        // `jit_kv_array_literal_and_pass`, which is why this
+                        // is not hardened into an error alongside the arm
+                        // above; the interpreter has no arm for it at all —
+                        // a silent no-op under `dmc run` against a real JIT
+                        // append, an unresolved #176-family divergence filed
+                        // as #715) — is unrelated to #693 and left exactly as
+                        // it was: evaluate the lhs for side effects, no-op.
                         _ => {
-                            // Evaluate lhs for side-effects only
                             let _ = self.eval_expr(lhs)?;
                         }
                     }
@@ -4134,9 +6461,9 @@ impl Interpreter {
                     let r = self.eval_block(body);
                     self.pop_scope();
                     match r? {
-                        Flow::Break => break,
-                        Flow::Continue | Flow::Normal(_) => continue,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break(_) => break,
+                        Flow::Continue(_) | Flow::Normal(_) => continue,
+                        Flow::Return(v, rsp) => return Ok(Flow::Return(v, rsp)),
                     }
                 }
                 Ok(Flow::Normal(Value::Nil))
@@ -4146,8 +6473,8 @@ impl Interpreter {
                     let c = self.eval_expr(cond)?;
                     if !c.as_bool().unwrap_or(false) { break; }
                     match self.eval_block(body)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break(_) => break,
+                        Flow::Return(v, rsp) => return Ok(Flow::Return(v, rsp)),
                         _ => {}
                     }
                 }
@@ -4156,8 +6483,8 @@ impl Interpreter {
             Stmt::Loop { body, .. } => {
                 loop {
                     match self.eval_block(body)? {
-                        Flow::Break => break,
-                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break(_) => break,
+                        Flow::Return(v, rsp) => return Ok(Flow::Return(v, rsp)),
                         _ => {}
                     }
                 }
@@ -4171,14 +6498,19 @@ impl Interpreter {
             Stmt::DirectiveBlock { body, .. } => {
                 // Treat as evaluating the inner block; result discarded
                 // unless this is the tail (handled in eval_block).
-                let _ = self.eval_block(body)?;
-                Ok(Flow::Normal(Value::Nil))
+                // #639: a directive block is a block, so a `return` / `break` /
+                // `continue` inside it belongs to the enclosing fn or loop; the
+                // VALUE is what gets discarded here, never the control flow.
+                match self.eval_block(body)? {
+                    Flow::Normal(_) => Ok(Flow::Normal(Value::Nil)),
+                    other => Ok(other),
+                }
             }
-            Stmt::Break(_)    => Ok(Flow::Break),
-            Stmt::Continue(_) => Ok(Flow::Continue),
-            Stmt::Return { value, .. } => {
+            Stmt::Break(sp)    => Ok(Flow::Break(sp.clone())),
+            Stmt::Continue(sp) => Ok(Flow::Continue(sp.clone())),
+            Stmt::Return { value, span } => {
                 let v = if let Some(e) = value { self.eval_expr(e)? } else { Value::Nil };
-                Ok(Flow::Return(v))
+                Ok(Flow::Return(v, span.clone()))
             }
         }
     }
@@ -4202,9 +6534,9 @@ impl Interpreter {
                 Value::Float(_, fw) => Some(*fw),
                 _ => None,
             },
-            Expr::Cast { ty: Type::Scalar(s, _), .. } => match s {
-                _ if scalar_is_f32_family(s) => Some(FW::F32),
-                ScalarType::F64 => Some(FW::F64),
+            Expr::Cast { ty, .. } => match self.resolve_alias_ty(ty) {
+                Type::Scalar(s, _) if scalar_is_f32_family(s) => Some(FW::F32),
+                Type::Scalar(ScalarType::F64, _) => Some(FW::F64),
                 _ => None,
             },
             Expr::UnOp { op: UnOp::Neg, operand, .. } => self.static_float_width(operand),
@@ -4305,18 +6637,94 @@ impl Interpreter {
     /// an error here because break/continue/return don't make sense as values.
     fn eval_if(&mut self, ie: &IfExpr) -> EvalResult<Value> {
         match self.eval_if_flow(ie)? {
-            Flow::Normal(v) | Flow::Return(v) => Ok(v),
-            Flow::Break    => Err(RuntimeError::at("`break` outside loop".to_string(), ie.span.clone())),
-            Flow::Continue => Err(RuntimeError::at("`continue` outside loop".to_string(), ie.span.clone())),
+            Flow::Normal(v) | Flow::Return(v, _) => Ok(v),
+            Flow::Break(sp)    => Err(RuntimeError::at("`break` outside loop".to_string(), sp)),
+            Flow::Continue(sp) => Err(RuntimeError::at("`continue` outside loop".to_string(), sp)),
         }
     }
 
     // ── Expr ──────────────────────────────────────────────────────────────
 
+    /// #674: the single
+    /// expression evaluator, wrapped in a liveness check total over
+    /// expression position. `eval_expr_lit_charge_suppressed`,
+    /// `eval_expr_tolerant` and `@grad`'s `eval_expr_with_tape` all delegate
+    /// to THIS fn for every value-producing form — there is no second
+    /// expression evaluator — so a `budget-stale` tensor is caught here
+    /// before it can reach any of the container/postfix routes the hole
+    /// table (§3.2) closes "by construction": the routes all bottom out in
+    /// expression position, so this one check covers every one of them.
+    ///
+    /// **PR #821 rework — the shape of the wrapper is the price, not the
+    /// predicate.** Spelled as §3.2's edit-list item 4 writes it —
+    /// `let v = self.eval_expr_inner(e)?; self.check_live(&v, e.span_of())?;
+    /// Ok(v)` — this cost **+34 % to +66 %** wall-clock on `dmc run`, ~450 ×
+    /// the +0.028 ns/node the table prices. None of it was the compare.
+    /// Three things were, and this spelling removes all three:
+    ///
+    ///   1. **A frame.** An out-of-line `eval_expr` between every caller and
+    ///      `eval_expr_inner` is a call, a prologue and an epilogue per node.
+    ///      `#[inline(always)]` puts the wrapper back inside its caller; the
+    ///      body it guards, `eval_expr_inner`, stays out of line exactly as
+    ///      before, so nothing else about code size moves.
+    ///   2. **Two moves of a `Value`.** `let v = …?` moves the returned
+    ///      `Value` out of the `Result`, and `Ok(v)` moves it back in — at
+    ///      128 B a piece, twice per node. Reading the value *through* the
+    ///      `Result` by reference and returning `r` itself is a check that
+    ///      moves nothing.
+    ///   3. **A `Span` per node.** `expr.span_of()` is a 19-arm match plus a
+    ///      32 B copy, and the old spelling ran it on **every** node to build
+    ///      an argument only the error path ever reads. It now runs only on
+    ///      the stale path, inside `stale_error`.
+    ///
+    /// What is left in the hot path is one discriminant test against
+    /// `Value::Tensor` and, for a tensor, one null test on `origin` — the
+    /// `nontensor` and `root` arms `gencheck.rs` prices at +0.028 and
+    /// +0.041 ns. The `budget-stale` construction itself is `#[cold]` and
+    /// out of line.
+    #[inline(always)]
     fn eval_expr(&mut self, expr: &Expr) -> EvalResult<Value> {
+        let r = self.eval_expr_inner(expr);
+        if let Ok(Value::Tensor(t)) = &r {
+            if tensor_is_stale(t) {
+                return Err(stale_error(expr.span_of()));
+            }
+        }
+        r
+    }
+
+    /// #674 slice 3b: `budget-stale` iff `v` is a tensor whose stamped
+    /// generation no longer matches its origin budget's live generation
+    /// (`tensor_is_stale`) — the check `eval_expr`'s wrapper runs at every
+    /// expression, and the assignment family / stream-append slot reads run
+    /// directly, since neither passes through expression position.
+    ///
+    /// Unlike `eval_expr`'s own inlined form above, this one takes the `Span`
+    /// eagerly: its callers run once per statement, per render or per
+    /// backward pass, never once per node, so the 19-arm `span_of` match is
+    /// not on any hot path here.
+    fn check_live(&self, v: &Value, span: Span) -> EvalResult<()> {
+        if let Value::Tensor(t) = v {
+            self.check_tensor_live(t, span)?;
+        }
+        Ok(())
+    }
+
+    /// #674 slice 3b: `check_live`'s predicate, callable directly on a
+    /// `&TensorVal` — the assignment family and the two stream-append slot
+    /// reads (§3.2 hole-table rows 1, 13) hold a `TensorVal` without first
+    /// wrapping it in a `Value`, so they call this instead of `check_live`.
+    fn check_tensor_live(&self, t: &TensorVal, span: Span) -> EvalResult<()> {
+        if tensor_is_stale(t) {
+            return Err(stale_error(span));
+        }
+        Ok(())
+    }
+
+    fn eval_expr_inner(&mut self, expr: &Expr) -> EvalResult<Value> {
         // #505: the `@comptime` step budget. Armed only by `eval_comptime`, so
         // `dmc run` pays one predictable branch on a `None` field and nothing
-        // else. A `@comptime` body may loop (`COMPTIME_V1.md §5`), so this is
+        // else. A `@comptime` body may loop, so this is
         // what turns a non-terminating fold into a failed compile instead of a
         // hung one. The message never reaches a user: `eval_comptime` sees the
         // exhausted counter and reports `comptime-budget` against the block.
@@ -4355,7 +6763,14 @@ impl Interpreter {
                     self.prof_alloc();
                     return Ok(Value::tensor(ArrayD::zeros(IxDyn(&[0]))));
                 }
-                let first = self.eval_expr(&elems[0])?;
+                // #781: suppress charging while evaluating `elems[0]` — if it
+                // turns out to be a tensor (the `Value::Tensor(first_row)` arm
+                // below), it is a ROW of this literal, not an independent
+                // materialization, and only the assembled outer array should
+                // be charged (see `lit_charge_suppressed`'s doc). Harmless for
+                // the `Int`/`Float` arms: a scalar element never reaches
+                // `charge_intermediate`.
+                let first = self.eval_expr_lit_charge_suppressed(&elems[0])?;
                 let result = match first {
                     Value::Tensor(first_row) => {
                         // 2D+ nested tensor literal: stack rows along a new leading axis.
@@ -4367,7 +6782,10 @@ impl Interpreter {
                         let first_std = first_row.as_standard_layout();
                         data.extend_from_slice(first_std.as_slice().unwrap_or(&[]));
                         for e in elems.iter().skip(1) {
-                            let v = self.eval_expr(e)?;
+                            // #781: same suppression as `elems[0]` above — a
+                            // later row is not an independent materialization
+                            // either.
+                            let v = self.eval_expr_lit_charge_suppressed(e)?;
                             match v {
                                 Value::Tensor(row) => {
                                     // Every row must match the first row's shape;
@@ -4427,15 +6845,32 @@ impl Interpreter {
                         format!("tensor literal element must be numeric, got {}", other.type_name())
                     )),
                 };
-                if result.is_ok() { self.prof_alloc(); }
+                if let Ok(v) = &result {
+                    // #781: a tensor literal is an implicit intermediate — no
+                    // `vault.`/`forge.` spelling names an arena for it — so it
+                    // charges Forge at its DECLARED element width. Charged
+                    // only for the OUTERMOST literal: a nested literal's rows
+                    // reach this same arm through the suppressed evals above,
+                    // so `charge_intermediate` is a no-op for them, and only
+                    // the assembled `[[..]×n]` array (or a shape-argument
+                    // list evaluated through `eval_expr_lit_charge_suppressed`
+                    // by its caller) is skipped — the ordinary top-level call
+                    // still charges once, here.
+                    self.charge_intermediate(v, Some(lit_span))?;
+                    self.prof_alloc();
+                }
                 result
             }
             Expr::Block(b) => {
                 self.float_lit_hint = want;
-                match self.eval_block(b)? {
-                    Flow::Normal(v) | Flow::Return(v) => Ok(v),
-                    _ => Ok(Value::Nil),
-                }
+                // #639: a block is not a function boundary and not a loop
+                // boundary. Its VALUE is its tail — but a `return` / `break` /
+                // `continue` inside it belongs to the enclosing fn or loop, so
+                // it leaves on the carrier instead of collapsing into the
+                // block's value (`return`) or into nil (`break`/`continue`),
+                // which is what the JIT has always done.
+                self.eval_block(b)?.into_value_or_escape()
+                    .map_err(RuntimeError::escaping_flow)
             }
             Expr::ArenaBlock(ab) => {
                 self.float_lit_hint = want;
@@ -4451,10 +6886,48 @@ impl Interpreter {
                 // — `ForgeArena::restore` rewinds the cursor but never returns
                 // committed bytes to the budget — so metering is monotonic on
                 // both backends and the flag means what it says.
-                match self.eval_block(&ab.body)? {
-                    Flow::Normal(v) | Flow::Return(v) => Ok(v),
-                    _ => Ok(Value::Nil),
-                }
+                //
+                // #639: an arena block is a block, so control flow leaves it
+                // the same way — on the carrier, to the enclosing fn or loop.
+                self.eval_block(&ab.body)?.into_value_or_escape()
+                    .map_err(RuntimeError::escaping_flow)
+            }
+            // #674: `forge.
+            // enter(b) { … }` pushes `b` as the entered budget and pops it on
+            // EVERY exit edge — normal exit, `return`, `break`, `continue`
+            // and a `?` early return. Nothing is reaped; `b` outlives the
+            // block.
+            //
+            // The push/pop is a `BudgetGuard`, not a restore line after the
+            // body, and the trap that forces it is one arm up: `Expr::
+            // ArenaBlock` writes `self.eval_block(&ab.body)?`, so a restore
+            // written after that `?` would be skipped by the error path AND
+            // by all three carriers (a `return`/`break`/`continue` leaves a
+            // block expression as `Err(escaping_flow)`, #639) — the register
+            // would leak into the rest of the program and mis-charge it with
+            // no diagnostic. The guard drops on all five, and restores the
+            // OUTER budget rather than the root, so `enter` nests.
+            Expr::BudgetBlock(bb) => {
+                let operand = self.eval_expr(&bb.operand)?;
+                let _guard = self.open_budget(&operand, &bb.operand.span_of(), "forge.enter")?;
+                self.float_lit_hint = want;
+                // #639, exactly as `Expr::ArenaBlock` above: a budget block
+                // is a block, so control flow leaves it on the carrier.
+                self.eval_block(&bb.body)?.into_value_or_escape()
+                    .map_err(RuntimeError::escaping_flow)
+            }
+            // #674 slice 3d: `<ctor> in b` overrides the entered budget for
+            // exactly one constructor (B3). The same guard as `enter`, held
+            // across the constructor's whole evaluation, so BOTH halves land
+            // in `b`: PRE-A (`charge_arena`'s Forge arm reads `cur_budget()`)
+            // and the stamp (`TensorVal::new` reads `CUR_BUDGET_TAG`). The
+            // budget operand is evaluated FIRST and outside the guard — it is
+            // not part of the allocation it names.
+            Expr::AllocIn { expr, budget, .. } => {
+                let b = self.eval_expr(budget)?;
+                let _guard = self.open_budget(&b, &budget.span_of(), "`in`")?;
+                self.float_lit_hint = want;
+                self.eval_expr(expr)
             }
             Expr::If(ie) => { self.float_lit_hint = want; self.eval_if(ie) }
             Expr::Match(me) => { self.float_lit_hint = want; self.eval_match(me) }
@@ -4470,16 +6943,25 @@ impl Interpreter {
                 Ok(Value::Lambda {
                     lit: std::sync::Arc::new((**lit).clone()),
                     captured_env,
+                    module: self.cur_module,
                 })
             }
             Expr::StructLit { name, type_args, fields, .. } => {
+                // The declaring file's key for this model — what method
+                // dispatch, field types and shape params are registered under.
+                // An unregistered name keeps its spelling: a plain struct.
+                let name = &self.resolve_model(name).unwrap_or_else(|| name.clone());
                 let mut field_vals: Vec<(String, Value)> = Vec::with_capacity(fields.len() + 1);
                 // Store model name as a hidden tag so method dispatch can find it.
                 field_vals.push(("__model__".to_string(), Value::Str(name.clone())));
                 // Store shape param bindings (e.g. P=5) so methods can use them at runtime.
                 if let Some(param_names) = self.model_shape_params.get(name).cloned() {
                     for (pname, arg_expr) in param_names.iter().zip(type_args.iter()) {
-                        if let Ok(v) = self.eval_expr(arg_expr) {
+                        // #639: a shape argument that does not evaluate is
+                        // simply not recorded — but the block-flow carrier is
+                        // not "does not evaluate", it is the enclosing fn's
+                        // control flow passing through, and it keeps going.
+                        if let Some(v) = self.eval_expr_tolerant(arg_expr)? {
                             field_vals.push((format!("__shape_{}__", pname), v));
                         }
                     }
@@ -4496,16 +6978,16 @@ impl Interpreter {
                     let declared = field_tys.as_ref()
                         .and_then(|fs| fs.iter().find(|(n, _)| n == fname))
                         .map(|(_, t)| t);
-                    field_vals.push((fname.clone(), coerce_scalar_width(v, declared)));
+                    field_vals.push((fname.clone(), self.coerce_declared(v, declared)));
                 }
                 Ok(Value::Struct(Rc::new(RefCell::new(field_vals))))
             }
             Expr::DirectiveBlock { directives, body, .. } => {
                 self.float_lit_hint = want;
-                let v = match self.eval_block(body)? {
-                    Flow::Normal(v) | Flow::Return(v) => v,
-                    _ => Value::Nil,
-                };
+                // #639: control flow leaves a directive block the way it leaves
+                // any other block — on the carrier, unchanged by `@cast`.
+                let v = self.eval_block(body)?.into_value_or_escape()
+                    .map_err(RuntimeError::escaping_flow)?;
                 // Apply @cast directive to the block result if present.
                 if let Some(cast_dir) = directives.iter().find(|d| d.name == "cast") {
                     if let Some(crate::ast::DArg::Positional(type_expr)) = cast_dir.args.first() {
@@ -4514,7 +6996,7 @@ impl Interpreter {
                             _ => None,
                         };
                         if let Some(ty_name) = target {
-                            if self.model_fields.contains_key(ty_name) {
+                            if self.is_overlay_model(ty_name) {
                                 return self.cast_to_struct(&v, ty_name);
                             }
                             return Ok(apply_cast_by_name(&v, ty_name));
@@ -4557,6 +7039,12 @@ impl Interpreter {
                 let l = self.eval_expr(lhs)?;
                 let r = self.eval_expr(rhs)?;
                 let result = apply_binop(op.clone(), &l, &r)?;
+                // #781: a binop that produces a NEW tensor (matmul, a dotted
+                // elementwise op) is an implicit intermediate — `let C = A @
+                // B` names no `vault.`/`forge.` arena — so it charges Forge
+                // at its declared element width, the same as any other
+                // materialized tensor.
+                self.charge_intermediate(&result, Some(span))?;
                 // Profile: count tensor ops vs scalar ops.
                 match op {
                     BinOp::Matmul | BinOp::DotAdd | BinOp::DotSub | BinOp::DotMul | BinOp::DotDiv
@@ -4596,25 +7084,68 @@ impl Interpreter {
                 apply_unop(op.clone(), &v)
             }
             Expr::Postfix { expr, op, span } => self.eval_postfix(expr, op, span.clone()),
-            Expr::Cast { expr, ty, .. } => {
+            Expr::Cast { expr, ty, span } => {
                 let v = self.eval_expr(expr)?;
                 // #336: `Color.Red as i64` (or any numeric) → the variant ordinal.
                 // Resolve to an Int here, where the enum registry is in scope,
                 // then let the generic cast widen/narrow it.
+                // An `as` cast is a width origin (SPEC §3.1), and an alias
+                // (§6.6) is transparent: `300 as Role` where `type Role = u8`
+                // wraps to 44 exactly as `300 as u8` does.
+                let ty = self.resolve_alias_ty(ty);
                 if let Value::EnumVal { enum_name, variant, .. } = &v {
                     let ord = self.enum_variant_ordinal(enum_name, variant).unwrap_or(0);
                     return Ok(apply_cast(&Value::Int(ord, IW::I64), ty));
                 }
-                Ok(apply_cast(&v, ty))
+                let out = apply_cast(&v, ty);
+                // #781: a tensor `as` cast materializes a new element array
+                // at the target width (`apply_cast`'s `Value::Tensor` arm
+                // always allocates — `cast_tensor_to_int_width` or
+                // `t.data.clone()`) — an implicit intermediate like any
+                // other. Uncharged on the JIT too today; it refuses tensor
+                // `as` casts outright, so there is nothing to stay in parity
+                // with yet — this charges ahead of the JIT lowering it.
+                self.charge_intermediate(&out, Some(&span))?;
+                Ok(out)
             }
             Expr::Range { start, end, inclusive, .. } => {
-                let s = start.as_ref().and_then(|e| self.eval_expr(e).ok())
-                    .and_then(|v| v.as_int()).unwrap_or(0);
-                let e = end.as_ref().and_then(|e| self.eval_expr(e).ok())
-                    .and_then(|v| v.as_int()).unwrap_or(0);
+                // A bound that does not evaluate to an int reads as 0 — the
+                // range is still a well-formed value. #639: that tolerance is
+                // for *values*, and must not eat the block-flow carrier, or a
+                // `return` written inside a bound would silently become a 0
+                // bound instead of leaving the enclosing function.
+                let s = self.eval_range_bound(start.as_deref())?;
+                let e = self.eval_range_bound(end.as_deref())?;
                 Ok(Value::Range { start: s, end: e, inclusive: *inclusive })
             }
         }
+    }
+
+    /// Evaluate `e` in one of the few positions that TOLERATE an ordinary
+    /// failure and carry on: a range bound that is not an integer, a model
+    /// shape argument that does not evaluate, a `.split` piece count that has
+    /// its own diagnostic. `None` is "this expression did not produce a
+    /// value"; the caller supplies its own fallback or message.
+    ///
+    /// #639: the block-flow carrier is the one failure that is never absorbed.
+    /// It is not an error *about this expression* — it is the enclosing
+    /// function's or loop's control flow passing through — so swallowing it
+    /// either loses a `return` silently or, worse, reports it as this
+    /// position's own complaint (`.split` blamed a bad piece count for a
+    /// `return` that should have left the function).
+    fn eval_expr_tolerant(&mut self, e: &Expr) -> EvalResult<Option<Value>> {
+        match self.eval_expr(e) {
+            Ok(v) => Ok(Some(v)),
+            Err(err) if err.flow.is_some() => Err(err),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// One bound of a `a..b` range: its integer value, or 0 for an absent or
+    /// non-integer bound (see `eval_expr_tolerant` for what is not absorbed).
+    fn eval_range_bound(&mut self, bound: Option<&Expr>) -> EvalResult<i64> {
+        let Some(e) = bound else { return Ok(0) };
+        Ok(self.eval_expr_tolerant(e)?.and_then(|v| v.as_int()).unwrap_or(0))
     }
 
     fn eval_ident(&mut self, name: &str, span: Span) -> EvalResult<Value> {
@@ -4629,7 +7160,7 @@ impl Interpreter {
             }
             return Ok(v);
         }
-        if self.fns.contains_key(name) { return Ok(Value::Fn(name.to_string())); }
+        if let Some(key) = self.resolve_fn(name) { return Ok(Value::Fn(key)); }
         if self.extern_fns.contains(name) { return Ok(Value::Fn(name.to_string())); }
         // `pi` is a well-known math constant
         if name == "pi"  { return Ok(Value::Float(std::f64::consts::PI, FW::F64)); }
@@ -4637,10 +7168,10 @@ impl Interpreter {
         if name == "e"   { return Ok(Value::Float(std::f64::consts::E, FW::F64)); }
         if name == "inf" { return Ok(Value::Float(f64::INFINITY, FW::F64)); }
         if name == "nan" { return Ok(Value::Float(f64::NAN, FW::F64)); }
-        if self.models.contains(name) {
+        if let Some(key) = self.resolve_model(name) {
             // Model names appear in `Transformer[L=24, ...].load(...)` patterns;
             // the interpreter doesn't realize methods, so it's opaque-but-known.
-            return Ok(Value::Opaque(name.to_string()));
+            return Ok(Value::Opaque(key));
         }
         if is_builtin(name) { return Ok(Value::Builtin(name.to_string())); }
         // Type-level / arena / mesh-axis names — opaque at runtime.
@@ -4736,7 +7267,22 @@ impl Interpreter {
                             match self.call_bracketed_method(
                                 recv_expr, method, &bracket, &arg_vals, &span)?
                             {
-                                BracketedCall::Dispatched(v) => return Ok(v),
+                                BracketedCall::Dispatched(v) => {
+                                    // #671: a method dispatched through a shape
+                                    // bracket (`b.fillg![2](o2)`) used to return
+                                    // here without the write-back step the plain
+                                    // method-call and forward-desugar paths both
+                                    // perform (#475). The receiver occupies
+                                    // callee param 0 with no call-arg slot, same
+                                    // offset (`self_params = 1`) as those paths.
+                                    apply_writebacks(
+                                        &mut self.scopes,
+                                        &mut self.pending_writebacks,
+                                        args,
+                                        1,
+                                    );
+                                    return Ok(v);
+                                }
                                 // Not a method after all. The receiver is
                                 // already evaluated; hand it to the ordinary
                                 // path below instead of running it again.
@@ -4751,7 +7297,20 @@ impl Interpreter {
                 if let Expr::Postfix { expr: inner_expr, op: PostfixOp::Field(method), .. } = expr {
                     let recv = self.eval_expr(inner_expr)?;
                     if let Value::Str(s) = &recv {
-                        return call_str_method(s, method, arg_vals, span);
+                        let v = call_str_method(s, method, arg_vals, span.clone())?;
+                        // #804 review (PR #815): `.trim`/`.upper`/`.lower`/
+                        // `.replace` materialize a fresh string and `.split`/
+                        // `.lines` a fresh list of them — this call sat
+                        // outside `call_builtin` and so missed #802's
+                        // choke point entirely (0 B charged on `dmc run` for
+                        // any of them; the JIT refuses all but
+                        // `.starts_with`, so there was no parity to break,
+                        // only a real materialization going uncounted).
+                        // `charge_builtin_result` already recurses into a
+                        // `List` result, so `.split`/`.lines` charge every
+                        // piece, not just the list itself.
+                        self.charge_builtin_result(&v, &span)?;
+                        return Ok(v);
                     }
                     // `nil` has no methods. This used to fall through to the
                     // forward-compat "unknown receiver" path and hand back
@@ -4825,7 +7384,7 @@ impl Interpreter {
                             if matches!(method.as_str(), "save" | "load") {
                                 return Err(RuntimeError::at(format!(
                                     "model serialization `{}.{}` is specified \
-                                     but not yet implemented", mname, method), span));
+                                     but not yet implemented", bare_name(&mname), method), span));
                             }
                             // #441: no such method on this model. A field of
                             // that name may still hold a callable, so only
@@ -4835,7 +7394,7 @@ impl Interpreter {
                                 .any(|(k, _)| k == method.as_str());
                             if !has_field {
                                 return Err(RuntimeError::at(format!(
-                                    "no method `{}` on model `{}`", method, mname), span));
+                                    "no method `{}` on model `{}`", method, bare_name(&mname)), span));
                             }
                         }
                     }
@@ -4861,7 +7420,7 @@ impl Interpreter {
                             base = b.as_ref();
                         }
                         if let Expr::Ident(name, _) = base {
-                            if self.models.contains(name) {
+                            if self.resolve_model(name).is_some() {
                                 return Err(RuntimeError::at(format!(
                                     "model serialization `{}.{}` is specified \
                                      but not yet implemented", name, method), span));
@@ -4885,15 +7444,35 @@ impl Interpreter {
                         }
                     }
                 }
+                // #674: `forge.carve(...)`
+                // / `forge.reap(...)` — intercepted here, before the generic
+                // ghost-opaque no-op every unrecognized method call on an
+                // `Opaque` receiver would otherwise fall to, the same
+                // syntactic spot 3a's not-yet-implemented refusal used.
+                if let Expr::Postfix { expr: inner, op: PostfixOp::Field(method), .. } = expr {
+                    if let Expr::Ident(fname, _) = inner.as_ref() {
+                        if fname == "forge" && method == "carve" {
+                            let nil = Value::Nil;
+                            let parent = arg_vals.first().unwrap_or(&nil);
+                            let bytes = arg_vals.get(1).unwrap_or(&nil);
+                            return self.budget_carve(parent, bytes, &span);
+                        }
+                        if fname == "forge" && method == "reap" {
+                            let nil = Value::Nil;
+                            let b = arg_vals.first().unwrap_or(&nil);
+                            return self.budget_reap(b, &span);
+                        }
+                    }
+                }
                 // @grad call patterns: `<fn>.fwd_bwd(args)` or `<fn>.grad(args)`.
                 // Intercept before generic field-access, since `.fwd_bwd` on a
                 // Value::Fn would otherwise just yield Opaque.
                 if let Expr::Postfix { expr: inner, op: PostfixOp::Field(method), .. } = expr {
                     if let Expr::Ident(fn_name, _) = inner.as_ref() {
-                        if matches!(method.as_str(), "fwd_bwd" | "grad" | "fwd" | "fwd_bwd_bwd")
-                            && self.fns.contains_key(fn_name)
-                        {
-                            return self.call_grad(fn_name, method, arg_vals, span);
+                        if matches!(method.as_str(), "fwd_bwd" | "grad" | "fwd" | "fwd_bwd_bwd") {
+                            if let Some(key) = self.resolve_fn(fn_name) {
+                                return self.call_grad(&key, method, arg_vals, span);
+                            }
                         }
                         // `Rng.seed(N)` seeds the interpreter's PRNG and returns
                         // an opaque rng handle. State is process-global rather
@@ -4920,7 +7499,7 @@ impl Interpreter {
                             return Err(RuntimeError::at(format!("extern fn `{}` cannot be called by the interpreter — a foreign call crosses an unchecked machine boundary this backend has no pointer representation for, so the spec confines `extern fn` calls to the JIT; run it with `dmc jit`", name), span));
                         }
                         let f = self.fns.get(&name).cloned().ok_or_else(|| {
-                            RuntimeError::at(format!("undefined fn `{}`", name), span.clone())
+                            RuntimeError::at(format!("undefined fn `{}`", bare_name(&name)), span.clone())
                         })?;
                         let result = self.call_fn(&f, arg_vals, span)?;
                         apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args, 0);
@@ -4928,14 +7507,15 @@ impl Interpreter {
                     }
                     Value::BoundFn { ref name, ref shape_bindings } => {
                         let f = self.fns.get(name).cloned().ok_or_else(|| {
-                            RuntimeError::at(format!("undefined fn `{}`", name), span.clone())
+                            RuntimeError::at(format!("undefined fn `{}`", bare_name(name)), span.clone())
                         })?;
                         let bindings = shape_bindings.clone();
                         let result = self.call_fn_with_shapes(&f, arg_vals, &bindings, span)?;
                         apply_writebacks(&mut self.scopes, &mut self.pending_writebacks, args, 0);
                         Ok(result)
                     }
-                    Value::Lambda { lit, captured_env } => self.call_lambda(&lit.clone(), captured_env, arg_vals, span),
+                    Value::Lambda { lit, captured_env, module } =>
+                        self.call_lambda(&lit.clone(), captured_env, module, arg_vals, span),
                     Value::Builtin(name) => {
                         self.release_move_target(move_hint.as_deref(), args.first(), &arg_vals);
                         self.call_builtin(&name, arg_vals, span)
@@ -4998,24 +7578,46 @@ impl Interpreter {
                         return Ok(Value::EnumVal { enum_name: base.clone(), variant: name.clone(), payload: Vec::new() });
                     }
                 }
+                // #674: `forge.root`
+                // is entry 0 of the budget table — a `Budget` value, so
+                // `forge.carve(forge.root, n)` runs. Its generation is always
+                // `budgets[0].live.get()` (root is never reaped, so that
+                // cell never moves off 0), read rather than hard-coded so
+                // this stays correct if that ever changes. Intercepted here,
+                // syntactically, before it would otherwise fall through to
+                // the generic ghost-opaque field fallback below.
+                if let Expr::Ident(base, _) = expr {
+                    if base == "forge" && name == "root" {
+                        return Ok(Value::Budget(budget_descriptor(self.budgets[0].live.get(), 0)));
+                    }
+                }
                 // #474: a shape-bracketed call that turned out not to be a
                 // method already evaluated this very node. Reuse that value —
                 // evaluating it again would repeat every side effect.
                 let recv = match self.take_parked_receiver(expr) {
-                    Some(v) => v,
+                    // #674 slice 3b, PR #821 review: §3.2's hole-table row 3
+                    // closed this arm with "`take_parked_receiver` (4496)
+                    // feeds `eval_expr`" — it does not. It hands the parked
+                    // value straight to the member dispatch below, so a
+                    // receiver that was live when it was parked and stale by
+                    // the time it is taken would answer `.shape` / `.rank`
+                    // off a reaped tensor with no diagnostic. The `None` arm
+                    // is expression position and checks itself; this one has
+                    // to say so.
+                    Some(v) => { self.check_live(&v, expr.span_of())?; v }
                     None => self.eval_expr(expr)?,
                 };
                 match (&recv, name.as_str()) {
                     (Value::Module { alias, .. }, _) => {
                         let qual_name = format!("{}.{}", alias, name);
-                        if self.fns.contains_key(&qual_name) {
-                            return Ok(Value::Fn(qual_name));
+                        if let Some(key) = self.resolve_fn(&qual_name) {
+                            return Ok(Value::Fn(key));
                         }
                         if let Some(v) = self.lookup(&qual_name) {
                             return Ok(v.clone());
                         }
-                        if self.models.contains(&qual_name) {
-                            return Ok(Value::Opaque(qual_name));
+                        if let Some(key) = self.resolve_model(&qual_name) {
+                            return Ok(Value::Opaque(key));
                         }
                         Err(RuntimeError::at(format!("no member `{}` in module `{}`", name, alias), span))
                     }
@@ -5068,7 +7670,11 @@ impl Interpreter {
                     if n >= 2 {
                         let mut axes: Vec<usize> = (0..n).collect();
                         axes.swap(n - 1, n - 2);
-                        return Ok(Value::tensor_dt(t.data.clone().permuted_axes(IxDyn(&axes)), t.dtype));
+                        let out = Value::tensor_dt(t.data.clone().permuted_axes(IxDyn(&axes)), t.dtype);
+                        // #781: a transpose materializes a new, permuted copy
+                        // of the backing storage — an implicit intermediate.
+                        self.charge_intermediate(&out, Some(&span))?;
+                        return Ok(out);
                     }
                     Ok(Value::Tensor(t))
                 } else {
@@ -5083,9 +7689,15 @@ impl Interpreter {
                             // No error → unwrap to the value.
                             Value::Nil => Ok(elems[0].clone()),
                             // Error set → early-return the enclosing function
-                            // with this whole (T, Err) tuple (Rust-`?` style).
-                            // The signal is caught at the function-call boundary.
-                            _ => Err(RuntimeError::propagate(val)),
+                            // with `(default[T], e)` (SPEC §4.9), where `T` is
+                            // the ENCLOSING function's declared success type.
+                            // Only `e` travels; the `T` half is built at the
+                            // function-call boundary, which is the only place
+                            // that knows the enclosing signature. The callee's
+                            // own error-path value is deliberately dropped here
+                            // (#628) — it is not the caller's value, and when
+                            // the two `T`s differ it is not even its type.
+                            e => Err(RuntimeError::propagate(e.clone(), span)),
                         }
                     }
                     other => Err(RuntimeError::at(
@@ -5118,7 +7730,7 @@ impl Interpreter {
                 // falling through to the opaque stand-in would silently poison
                 // the trailing call (the `<opaque bracket(...)>` failure mode).
                 if let Expr::Ident(fn_name, _) = expr {
-                    if let Some(f) = self.fns.get(fn_name).cloned() {
+                    if let Some(f) = self.resolve_fn(fn_name).map(|k| self.fns[&k].clone()) {
                         if !f.shape_params.is_empty() {
                             // A spread is not a shape argument; the pre-#474
                             // loop skipped it and this keeps that.
@@ -5133,7 +7745,8 @@ impl Interpreter {
                             let shape_bindings =
                                 self.bind_shape_bracket(fn_name, &f.shape_params, &bracket, &span)?;
                             if !shape_bindings.is_empty() {
-                                return Ok(Value::BoundFn { name: fn_name.clone(), shape_bindings });
+                                let name = module_key(f.module, &f.name);
+                                return Ok(Value::BoundFn { name, shape_bindings });
                             }
                         }
                     }
@@ -5179,8 +7792,15 @@ impl Interpreter {
                     if method == "reshape" {
                         let recv = self.eval_expr(inner)?;
                         if let Value::Tensor(t) = recv {
+                            // #781: `[4096]` here is a shape spec, not a
+                            // tensor — it is consumed for its integers and
+                            // discarded, never returned to the program, and
+                            // the JIT never charges it either. Suppress the
+                            // literal's own charge (`eval_expr` would
+                            // otherwise route it through `Expr::TensorLit`
+                            // and bill it as an implicit intermediate).
                             let shape_val = match elems.first() {
-                                Some(IndexElem::Expr(e)) => self.eval_expr(e)?,
+                                Some(IndexElem::Expr(e)) => self.eval_expr_lit_charge_suppressed(e)?,
                                 _ => return Err(RuntimeError::at(
                                     "reshape: expected shape list in brackets", span)),
                             };
@@ -5198,10 +7818,14 @@ impl Interpreter {
                                     "reshape: shape must be a list of integers", span)),
                             };
                             let dtype = t.dtype;
-                            return t.data.clone().into_shape_with_order(ndarray::IxDyn(&new_shape))
+                            let out = t.data.clone().into_shape_with_order(ndarray::IxDyn(&new_shape))
                                 .map(|a| Value::tensor_dt(a, dtype))
                                 .map_err(|e| RuntimeError::at(
-                                    format!("reshape failed: {}", e), span));
+                                    format!("reshape failed: {}", e), span.clone()))?;
+                            // #781: reshape clones the backing storage into
+                            // the new shape — an implicit intermediate.
+                            self.charge_intermediate(&out, Some(&span))?;
+                            return Ok(out);
                         }
                     }
                 }
@@ -5263,7 +7887,12 @@ impl Interpreter {
                             for &i in &idx {
                                 view = view.index_axis_move(Axis(0), i);
                             }
-                            Ok(Value::tensor_dt(view.to_owned().into_dyn(), arr.dtype))
+                            let out = Value::tensor_dt(view.to_owned().into_dyn(), arr.dtype);
+                            // #781: a partial index copies a sub-tensor's
+                            // backing storage — an implicit intermediate
+                            // ("slices that copy").
+                            self.charge_intermediate(&out, Some(&span))?;
+                            Ok(out)
                         } else {
                             Err(RuntimeError::at(
                                 format!("index has {} dims but tensor has {}", idx.len(), arr.ndim()),
@@ -5300,7 +7929,11 @@ impl Interpreter {
                     Value::Tensor(arr) if !all_scalar => {
                         let selections = self.resolve_index_selection(arr.shape(), elems, span.clone())?;
                         let result = self.read_tensor_selection(&arr, &selections);
-                        Ok(Value::tensor_dt(result, arr.dtype))
+                        let out = Value::tensor_dt(result, arr.dtype);
+                        // #781: a multi-axis slice copies the selected
+                        // elements into a new tensor — "slices that copy".
+                        self.charge_intermediate(&out, Some(&span))?;
+                        Ok(out)
                     }
                     // `s[i]` on a string — return the byte value at index i.
                     // Matches JIT behaviour: returns an i64 ASCII/UTF-8 byte.
@@ -5347,56 +7980,80 @@ impl Interpreter {
         }
     }
 
-    /// Evaluate an expression as a dimension count. Falls back to a small
-    /// default for symbols that can't be resolved (e.g. streaming-axis `~`,
-    /// unbound shape params), so we always get a concrete shape.
-    fn eval_dim(&mut self, e: &Expr) -> usize {
-        match self.eval_expr(e) {
-            Ok(Value::Int(n, _))   if n >= 0 => n as usize,
-            Ok(Value::Float(x, _)) if x >= 0.0 => x as usize,
-            _ => 4,
+    /// Evaluate an expression as a dimension count. #839: this used to
+    /// substitute a bare 4 on ANY error, so `forge.zeros[f32, [n()]]` with a
+    /// raising `n()` — an arena exhaustion, a `budget-stale` retrieval, any
+    /// runtime error in user code — silently built a wrong-sized tensor with
+    /// no diagnostic. That default served no live caller: the one legitimate
+    /// symbol it was meant to catch, the KV streaming axis `~`, is resolved
+    /// by the caller (the `is_kv` check in `try_arena_constructor`) before
+    /// `eval_dim` is ever reached, and an unbound shape param already errors
+    /// earlier, in `call_fn_with_shapes`'s inference pass. So a real
+    /// evaluation error now propagates, located at the failing sub-
+    /// expression's own span, and a value that evaluates cleanly but isn't a
+    /// usable dimension (negative, or not a number) is its own located error
+    /// rather than a silent 4.
+    fn eval_dim(&mut self, e: &Expr) -> EvalResult<usize> {
+        match self.eval_expr(e)? {
+            Value::Int(n, _)   if n >= 0 => Ok(n as usize),
+            Value::Float(x, _) if x >= 0.0 => Ok(x as usize),
+            v => Err(RuntimeError::at(
+                format!("a tensor shape dimension must be a non-negative number, \
+                         got `{}` ({})", v, v.type_name()),
+                e.span_of())),
         }
     }
 
-    /// Byte size of a field type for `@cast(Model)` overlay. Scalars use their
-    /// declared width; tensors are element-size × element-count.
-    fn type_byte_size(&mut self, ty: &crate::ast::Type) -> EvalResult<usize> {
-        use crate::ast::Type;
-        match ty {
-            Type::Scalar(st, _) => Ok(scalar_byte_size(st)),
-            Type::Tensor(elem, shape, _) => {
-                let elem_sz = self.type_byte_size(elem)?;
-                let count: usize = self.shape_dims(shape)?.iter().product();
-                Ok(elem_sz * count)
-            }
-            other => Err(RuntimeError::msg(format!("@cast: unsupported field type {:?}", other))),
-        }
-    }
-
-    /// Concrete dimensions of a shape spec (each axis must evaluate to an int).
-    fn shape_dims(&mut self, shape: &crate::ast::ShapeSpec) -> EvalResult<Vec<usize>> {
+    /// Concrete dimensions of a `@cast(Model)` tensor field's shape. Every axis
+    /// must be a static non-negative integer: the overlay's byte extent is
+    /// element count × element width, so a dimension that is not pinned has no
+    /// extent to size (#598). Unlike `eval_dim` this never substitutes a
+    /// default — guessing an axis here would mis-size every field after it.
+    fn overlay_dims(&mut self, shape: &crate::ast::ShapeSpec, model: &str, field: &str)
+        -> EvalResult<Vec<usize>>
+    {
         use crate::ast::ShapeElem;
         let mut dims = Vec::with_capacity(shape.elems.len());
         for e in &shape.elems {
-            match e {
-                ShapeElem::Expr(ex) => dims.push(self.eval_dim(ex)),
-                _ => return Err(RuntimeError::msg("@cast: tensor field shape must be concrete")),
-            }
+            let n = match e {
+                ShapeElem::Expr(ex) => match self.eval_expr(ex) {
+                    Ok(Value::Int(n, _)) if n >= 0 => n as usize,
+                    _ => return Err(overlay_no_layout(model, field,
+                        "a tensor field overlays only at a static shape")),
+                },
+                _ => return Err(overlay_no_layout(model, field,
+                    "a tensor field overlays only at a static shape")),
+            };
+            dims.push(n);
         }
         Ok(dims)
     }
 
     /// Overlay a raw byte tensor onto a model's fields (`@cast(Model){bytes}`).
-    /// Fields are read in declaration order at successive byte offsets. Scalars
-    /// are decoded big-endian (network byte order — `@cast(Struct)` parses wire
-    /// formats; the only corpus user is a packet header). Returns a struct value
-    /// whose fields can then be read like any model instance.
+    /// Fields are read in declaration order at successive byte offsets, each at
+    /// the width its DECLARED type states, and each decoded back INTO that type
+    /// — an `f32` field is an f32, a `bool` field is a bool, a
+    /// `Tensor[u8,[24]]` field is a 24-byte row-major tensor (#598). Returns a
+    /// struct value whose fields read like any model instance's.
+    ///
+    /// Byte order: multi-byte fields are assembled little-endian (#606,
+    /// `SPEC.md §3.10`) — the one byte order this language fixes
+    /// (`PORTS.md`), and the same order every other byte path in this crate
+    /// already used.
     fn cast_to_struct(&mut self, raw: &Value, model_name: &str) -> EvalResult<Value> {
         use crate::ast::Type;
-        let fields_def = match self.model_fields.get(model_name) {
+        let key = self.resolve_model(model_name);
+        let fields_def = match key.as_ref().and_then(|k| self.model_fields.get(k)) {
             Some(f) => f.clone(),
             None => return Err(RuntimeError::msg(format!("@cast: `{}` is not a known model", model_name))),
         };
+        // The instance carries the DECLARING file's key — that is what method
+        // dispatch and field types are registered under — while every
+        // diagnostic below keeps the name the program actually wrote.
+        let tag = key.unwrap_or_else(|| model_name.to_string());
+        // One byte per ELEMENT: `u8` tensors and views are the ordinary source,
+        // and `read_bytes` hands back the same stream as one i64 per byte
+        // (STDLIB.md). `--check` refuses a source of wider elements.
         let bytes: Vec<u8> = match raw {
             Value::Tensor(t) => t.data.iter().map(|&x| x as i64 as u8).collect(),
             other => return Err(RuntimeError::msg(format!(
@@ -5404,35 +8061,63 @@ impl Interpreter {
         };
         let mut offset = 0usize;
         let mut out: Vec<(String, Value)> =
-            vec![("__model__".to_string(), Value::Str(model_name.to_string()))];
+            vec![("__model__".to_string(), Value::Str(tag))];
         for (fname, fty) in &fields_def {
+            // #598: the spec's only wire-layout guarantee for a model is field
+            // ORDER (SPEC.md §3.10), so the overlay reaches exactly as far as
+            // each field's own type fixes a byte extent — a scalar of known
+            // width, or a tensor of such scalars at a static shape.
+            // `--check` refuses everything else at the `@cast` site
+            // (`check_cast_model_overlay`); these arms are the interpreter's
+            // own backstop for a caller that skipped the checker, so an
+            // unlayoutable field fails loud here instead of silently reading
+            // as a corrupted `Int(0)` (the old behavior, since
+            // `ScalarType::Str` had a byte size of 0).
             let val = match fty {
-                Type::Scalar(_, _) => {
-                    let sz = self.type_byte_size(fty)?;
-                    let slice = read_overlay_bytes(&bytes, offset, sz, model_name, fname)?;
-                    offset += sz;
-                    Value::Int(be_bytes_to_i64(slice), IW::I64)
+                Type::Scalar(st, _) => {
+                    let Some(w) = st.overlay_byte_width() else {
+                        return Err(overlay_no_layout(model_name, fname,
+                            st.overlay_refusal_reason().unwrap_or("no byte layout")));
+                    };
+                    let slice = read_overlay_bytes(&bytes, offset, w, model_name, fname)?;
+                    offset += w;
+                    decode_overlay_scalar(st, slice)
                 }
                 Type::Tensor(elem, shape, _) => {
-                    let elem_sz = self.type_byte_size(elem)?;
-                    let dims = self.shape_dims(shape)?;
+                    let Type::Scalar(est, _) = &**elem else {
+                        return Err(overlay_no_layout(model_name, fname,
+                            "a tensor field overlays only with a scalar element type"));
+                    };
+                    let Some(w) = est.overlay_byte_width() else {
+                        return Err(overlay_no_layout(model_name, fname,
+                            est.overlay_refusal_reason().unwrap_or("no byte layout")));
+                    };
+                    let dims = self.overlay_dims(shape, model_name, fname)?;
                     let count: usize = dims.iter().product();
+                    // Row-major, the one element order the spec's tensor
+                    // convention states — `ArrayD::from_shape_vec` reads this
+                    // vector in exactly that order.
                     let mut data: Vec<f64> = Vec::with_capacity(count);
                     for _ in 0..count {
-                        let slice = read_overlay_bytes(&bytes, offset, elem_sz, model_name, fname)?;
-                        offset += elem_sz;
-                        data.push(be_bytes_to_i64(slice) as f64);
+                        let slice = read_overlay_bytes(&bytes, offset, w, model_name, fname)?;
+                        offset += w;
+                        data.push(overlay_scalar_as_f64(est, slice));
                     }
                     let arr = ArrayD::from_shape_vec(IxDyn(&dims), data)
                         .map_err(|e| RuntimeError::msg(format!("@cast({}): {}", model_name, e)))?;
-                    // I64 like the scalar field twin above: the overlay
-                    // assembles each element from its bytes big-endian, and
-                    // narrowing that here would be a different question than
-                    // #571's (it would re-sign values, not just wrap them).
-                    Value::tensor_dt(arr, DType::Int(IW::I64))
+                    let field_val = Value::tensor_dt(arr, overlay_elem_dtype(est)?);
+                    // #781: the overlay reads raw bytes into a freshly
+                    // allocated element array per tensor field — an implicit
+                    // intermediate. No span reaches this decode loop (the
+                    // `@cast` call site's is not threaded through); charged
+                    // unlocated, the same as any other unbounded-arena
+                    // watermark update. Uncharged on the JIT too today; it
+                    // refuses the `@cast` overlay outright.
+                    self.charge_intermediate(&field_val, None)?;
+                    field_val
                 }
-                other => return Err(RuntimeError::msg(format!(
-                    "@cast({}): field `{}` has unsupported type {:?}", model_name, fname, other))),
+                other => return Err(overlay_no_layout(model_name, fname,
+                    &format!("a field of type {:?} has no byte layout", other))),
             };
             out.push((fname.clone(), val));
         }
@@ -5481,8 +8166,15 @@ impl Interpreter {
             other => return Err(RuntimeError::at(
                 format!("`.split` expects a tensor, got {}", other.type_name()), span)),
         };
-        let n = positional.first()
-            .and_then(|e| self.eval_expr(e).ok())
+        // #639: the piece count has a diagnostic of its own for anything that
+        // is not a positive integer — but an escaping `return` / `break` /
+        // `continue` is not a bad piece count, so it travels on rather than
+        // being reported as one.
+        let count = match positional.first() {
+            Some(e) => self.eval_expr_tolerant(e)?,
+            None => None,
+        };
+        let n = count
             .and_then(|v| v.as_int())
             .filter(|&n| n > 0)
             .ok_or_else(|| RuntimeError::at(
@@ -5511,7 +8203,12 @@ impl Interpreter {
             let slice = t.data
                 .slice_axis(Axis(axis), ndarray::Slice::from((i * w)..((i + 1) * w)))
                 .to_owned();
-            pieces.push(Value::Tensor(TensorVal::new(slice, dtype)));
+            let piece = Value::Tensor(TensorVal::new(slice, dtype));
+            // #781: each piece is its own copied-out backing array — an
+            // implicit intermediate, one per piece. Uncharged on the JIT
+            // too today; it refuses `.split` outright.
+            self.charge_intermediate(&piece, Some(&span))?;
+            pieces.push(piece);
         }
         Ok(Value::Tuple(pieces))
     }
@@ -5536,10 +8233,14 @@ impl Interpreter {
             return Err(RuntimeError::at(format!(
                 "rng.uniform_int: high ({}) must be greater than low ({})", hi, lo), span));
         }
-        let dims: Vec<usize> = bracket_args.iter().find_map(|e| match e {
-            Expr::TensorLit(d, _) => Some(d.iter().map(|x| self.eval_dim(x)).collect()),
+        let dims: Vec<usize> = match bracket_args.iter().find_map(|e| match e {
+            Expr::TensorLit(d, _) =>
+                Some(d.iter().map(|x| self.eval_dim(x)).collect::<EvalResult<Vec<usize>>>()),
             _ => None,
-        }).unwrap_or_default();
+        }) {
+            Some(r) => r?,
+            None => Vec::new(),
+        };
         let nelems = checked_shape_elems(&dims).ok_or_else(|| RuntimeError::at(format!(
             "uniform_int: tensor shape {:?} is too large — its element count \
             overflows the address space", dims), span.clone()))?;
@@ -5582,16 +8283,49 @@ impl Interpreter {
 
         // #400: which sized arena this constructor charges against. `vault.*`
         // is Vault, `forge.*` is Forge; `.kv` on either lands in the Stream
-        // arena (`MEMORY.md §9`), which has no sizing flag, and an `rng.*` draw
-        // has no arena base at all. See `charge_arena`.
-        let charge_to = match inner.as_ref() {
-            Expr::Ident(base, _) if method != "kv" => match base.as_str() {
-                "vault" => Some(crate::arena::Arena::Vault),
-                "forge" => Some(crate::arena::Arena::Forge),
+        // arena (`MEMORY.md §9`), which has no sizing flag. An `rng.*` draw
+        // (`r.normal[…]`) has no arena base in its spelling either — `r` names
+        // the RNG value, not an arena — but it still materializes a fresh
+        // tensor; #781 charges it to Forge unconditionally, the same as any
+        // other implicit intermediate (`charge_intermediate`'s reasoning:
+        // `MEMORY.md §1`'s Forge row is "activations, gradients, scratch").
+        // See `charge_arena`.
+        let charge_to = if is_rng_ctor {
+            Some(crate::arena::Arena::Forge)
+        } else {
+            match inner.as_ref() {
+                Expr::Ident(base, _) if method != "kv" => match base.as_str() {
+                    "vault" => Some(crate::arena::Arena::Vault),
+                    "forge" => Some(crate::arena::Arena::Forge),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            }
         };
+        // #674: the Vault
+        // and Forge arms both route through the same `Value::tensor_dt` →
+        // `TensorVal::new` chokepoint the budget stamp is applied at, so a
+        // `vault.zeros[…]` evaluated while a budget is current would
+        // otherwise inherit that budget's tag and read `budget-stale` once
+        // the budget is reaped — though its bytes live in `vault_used`,
+        // never the budget's.
+        //
+        // Reviewer edit (slice 3d, §3.5): this is a flag, not a guard held
+        // for the rest of the call. The earlier shape opened the guard HERE,
+        // before the shape arguments below are evaluated, so a forge tensor
+        // allocated inside `vault.zeros[f32, [n()]]`'s own argument — with
+        // `n()` allocating — was charged to the entered budget by
+        // `charge_arena` (which reads `cur_budget`) but stamped ROOT by
+        // `TensorVal::new` (which reads the cleared `CUR_BUDGET_TAG`): index
+        // and stamp disagreed, so the tensor's bytes died at `reap(b)` while
+        // it still read as live. §3.5 splits the two: the CONSTRUCTOR's own
+        // allocation charges root and stamps root; its ARGUMENTS are
+        // ordinary code in the entered budget and charge `b` and stamp `b`.
+        // So the guard is now opened at each of the three points the
+        // constructor's own bytes are charged and built, below, and never
+        // over argument evaluation. It is the interpreter's half of the same
+        // seam `Jit::forge_alloc_root` closes on the JIT.
+        let vault_stamps_root = matches!(charge_to, Some(crate::arena::Arena::Vault));
 
         // Collect args once so we can read both the element type (for the
         // dtype tag) and the shape literal. The element type is the leading
@@ -5606,12 +8340,15 @@ impl Interpreter {
         // fall through to the numeric path below.
         if matches!(method.as_str(), "zeros" | "ones" | "uninit") {
             if let Some(base) = pos_vec.first().and_then(|e| model_ctor_base_name(e)) {
-                if self.models.contains(base) {
-                    let n = pos_vec.iter().find_map(|e| match e {
+                if self.resolve_model(base).is_some() {
+                    let n = match pos_vec.iter().find_map(|e| match e {
                         Expr::TensorLit(dims, _) => dims.first().map(|d| self.eval_dim(d)),
                         _ => None,
-                    }).ok_or_else(|| RuntimeError::msg(format!(
-                        "`{}[{}, [N]]` requires a 1D size", method, base)))?;
+                    }) {
+                        Some(r) => r?,
+                        None => return Err(RuntimeError::msg(format!(
+                            "`{}[{}, [N]]` requires a 1D size", method, base))),
+                    };
                     self.prof_alloc();
                     return Ok(Some(Value::list(vec![Value::Nil; n])));
                 }
@@ -5620,26 +8357,37 @@ impl Interpreter {
 
         // Random draws are float-valued by definition regardless of the
         // declared type; everything else inherits the declared element type.
-        let dtype = if is_rng_ctor { DType::F32 } else { arena_ctor_dtype(&pos_vec) };
+        let dtype = if is_rng_ctor { DType::F32 } else { arena_ctor_dtype(&pos_vec, &expr.span_of())? };
 
         // `identity` builds an N×N matrix with 1.0 on the diagonal. It accepts
         // either a scalar dimension (`vault.identity[T, N]`) or a square shape
         // literal (`vault.identity[T, [N, N]]`). Completes the zeros/ones/
         // identity additive-and-multiplicative-identity triple.
         if method == "identity" {
-            let n = pos_vec.iter().find_map(|e| match e {
+            let n = match pos_vec.iter().find_map(|e| match e {
                 Expr::TensorLit(dims, _) => dims.first().map(|d| self.eval_dim(d)),
-                Expr::Literal(Literal::Int(k, _), _) if *k >= 0 => Some(*k as usize),
+                Expr::Literal(Literal::Int(k, _), _) if *k >= 0 => Some(Ok(*k as usize)),
                 _ => None,
-            }).unwrap_or(0);
+            }) {
+                Some(r) => r?,
+                None => 0,
+            };
             if checked_shape_elems(&[n, n]).is_none() {
                 return Err(RuntimeError::msg(format!(
                     "identity: size {} is too large — the {}×{} element count overflows the address space",
                     n, n, n)));
             }
-            self.charge_arena(
+            // #781: charge at the DECLARED element width, not the
+            // interpreter's f64 storage width — an f32 `identity` bills half
+            // what an f64 one does, matching the JIT.
+            // #674 slice 3d (§3.5): the constructor's OWN bytes — charged
+            // to Vault's flat meter and stamped ROOT, whatever budget is
+            // entered. Opened here, after the shape arguments above were
+            // evaluated in the entered budget.
+            let _vault_tag_guard = vault_stamps_root.then(VaultTagGuard::new);
+            self.charge_ctor(
                 charge_to,
-                (n as u64).saturating_mul(n as u64).saturating_mul(8),
+                (n as u64).saturating_mul(n as u64).saturating_mul(dtype.byte_width()),
                 Some(&expr.span_of()),
             )?;
             let mut a = ArrayD::<f64>::zeros(IxDyn(&[n, n]));
@@ -5658,8 +8406,17 @@ impl Interpreter {
             let trit_elems = checked_shape_elems(&trit_dims).ok_or_else(|| RuntimeError::msg(
                 format!("trit: shape {:?} is too large — its element count overflows the address space",
                         trit_dims)))?;
-            self.charge_arena(
-                charge_to, (trit_elems as u64).saturating_mul(8), Some(&expr.span_of()))?;
+            // #781: declared width, not f64 storage width (`DType::Trit` is
+            // one byte per element, matching an unpacked trit lane).
+            // #674 slice 3d (§3.5): the constructor's OWN bytes — charged
+            // to Vault's flat meter and stamped ROOT, whatever budget is
+            // entered. Opened here, after the shape arguments above were
+            // evaluated in the entered budget.
+            let _vault_tag_guard = vault_stamps_root.then(VaultTagGuard::new);
+            self.charge_ctor(
+                charge_to,
+                (trit_elems as u64).saturating_mul(DType::Trit.byte_width()),
+                Some(&expr.span_of()))?;
             let arr = ArrayD::from_elem(IxDyn(&trit_dims), 0.0_f64);
             self.prof_alloc();
             return Ok(Some(Value::tensor_dt(arr, DType::Trit)));
@@ -5676,12 +8433,12 @@ impl Interpreter {
             // capacity is tracked separately and grows via `<-` append.
             if is_kv {
                 if let Expr::Ident(name, _) = e {
-                    if name == "~" { return 0; }
+                    if name == "~" { return Ok(0); }
                 }
                 // Also handle UnOp::BitNot used as ~ in expressions
             }
             self.eval_dim(e)
-        }).collect());
+        }).collect::<EvalResult<Vec<usize>>>()).transpose()?;
         let dims = shape_dims.unwrap_or_default();
         let shape_span = pos_vec.iter().find_map(|e| match e {
             Expr::TensorLit(_, sp) => Some(sp.clone()),
@@ -5702,18 +8459,31 @@ impl Interpreter {
         // Reject a shape that can't possibly fit in RAM before touching it (the
         // interpreter backs every element with an f64). Overcommit lets the
         // allocation itself succeed, so this pre-check is what averts a silent
-        // OOM-kill; the `try_reserve` below is the remaining backstop.
+        // OOM-kill; the `try_reserve` below is the remaining backstop. This is
+        // the REAL host allocation size, always f64 per element regardless of
+        // `dtype` — kept separate from `nbytes` below (#781), the DECLARED
+        // width charged against the arena budget.
         const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-        let nbytes = (nelems as u64).saturating_mul(8);
+        let real_alloc_bytes = (nelems as u64).saturating_mul(8);
+        // #781: the arena budget is requested bytes at the declared element
+        // width (`DType::byte_width`), not the interpreter's f64 storage
+        // width — an f32 tensor bills half what an f64 one does, matching
+        // the JIT.
+        let nbytes = (nelems as u64).saturating_mul(dtype.byte_width());
         // #400: the declared arena budget is checked before the machine's, so a
         // program run under `--forge=2G` hears about its own limit rather than
         // about the host's RAM.
-        self.charge_arena(charge_to, nbytes, shape_span.as_ref())?;
+        // #674 slice 3d (§3.5): the constructor's OWN bytes — charged
+        // to Vault's flat meter and stamped ROOT, whatever budget is
+        // entered. Opened here, after the shape arguments above were
+        // evaluated in the entered budget.
+        let _vault_tag_guard = vault_stamps_root.then(VaultTagGuard::new);
+        self.charge_ctor(charge_to, nbytes, shape_span.as_ref())?;
         if let Some(total) = total_system_memory_bytes() {
-            if nbytes > total {
+            if real_alloc_bytes > total {
                 return Err(located(format!(
                     "{}: tensor shape {:?} needs {:.1} GiB but the system has {:.1} GiB of RAM",
-                    method, dims, nbytes as f64 / GIB, total as f64 / GIB)));
+                    method, dims, real_alloc_bytes as f64 / GIB, total as f64 / GIB)));
             }
         }
         let mut data: Vec<f64> = Vec::new();
@@ -5802,23 +8572,63 @@ fn model_ctor_base_name(e: &Expr) -> Option<&str> {
     }
 }
 
-fn arena_ctor_dtype(pos: &[&Expr]) -> DType {
-    for e in pos {
-        if let Expr::Ident(name, _) = e {
-            // #571: the constructor names the element type, so it names the
-            // element WIDTH — `forge.zeros[i32, [N]]` is 32 bits wide at every
-            // element read, write and elementwise op over it.
-            if let Some(w) = int_type_name_width(name) { return DType::Int(w); }
-            if is_trit_type_name(name) { return DType::Trit; }
-            if name == "f64"           { return DType::F64; }
-            if name == "bool"          { return DType::Bool; }
-        }
+/// #571: the constructor names the element type, so it names the element
+/// WIDTH — `forge.zeros[i32, [N]]` is 32 bits wide at every element read,
+/// write and elementwise op over it.
+///
+/// #834: this used to be its own ad hoc lexical table (an `int_type_name_
+/// width`/`is_trit_type_name`/`"f64"`/`"bool"` chain checked in a loop over
+/// EVERY positional arg) that fell back to `DType::F32` for anything outside
+/// it — silently mistagging `fp8_e4m3`/`fp8_e5m2` (not in the old table at
+/// all) at four bytes instead of one, and doing the same for a genuinely
+/// bogus name like `qqq_not_a_type` that the checker should have refused
+/// before `dmc run` ever got here. Now it anchors on `pos[0]` specifically —
+/// exactly the position `check.rs`'s own `ctor_tensor_ty` requires the
+/// element-type name to be at for every ctor form that reaches here with a
+/// dtype that matters (`zeros`/`ones`/`uninit`/`identity`/`kv`) — and
+/// resolves through `ScalarType::from_ctor_name`, the SAME table the checker
+/// resolves the same name through. A name that table recognizes but
+/// `dtype_for_scalar_elem` cannot represent is an internal error naming the
+/// type (unreachable today); a name the table does not recognize at all —
+/// a generic dim like `R`, or `str`/`nil`, which the checker admits here
+/// pending #817 — keeps the pre-#834 `DType::F32` fallback.
+///
+/// `pos[0]` not being a RECOGNIZED type name — not an `Ident` at all
+/// (`forge.trit[4, 3]`'s bare integer dims; an `rng.*` draw, already routed
+/// around this function by its own `is_rng_ctor` check before it is ever
+/// called; a generic dim ident like `R` in `forge.trit[R, C]`), or an
+/// `Ident` `ScalarType::from_ctor_name` does not recognize at all (`str`/
+/// `nil` — #817 is an OPEN owner ruling on whether either has a tensor-
+/// element representation, which `check.rs`'s `ctor_tensor_ty` today still
+/// ADMITS in constructor position, so this function must not preempt that
+/// ruling; also a genuinely bogus name like `qqq_not_a_type`) — is not a
+/// name to blame. `DType::F32` there is base's pre-existing default for all
+/// of these, unchanged by this fix, and callers that do not use it (`trit`
+/// hardcodes its own `DType::Trit`) simply ignore it.
+///
+/// The internal-error arm below is reserved for a name `from_ctor_name`
+/// *does* recognize but `dtype_for_scalar_elem` cannot represent. Per the
+/// #834 rework review this is unreachable today: `from_ctor_name`'s 19
+/// spellings map onto every `ScalarType` variant `dtype_for_scalar_elem`
+/// returns `Some` for (everything except `Str`/`Nil`, which `from_ctor_name`
+/// does not recognize as ctor spellings in the first place) — so the arm
+/// only guards against the two tables drifting apart in the future.
+fn arena_ctor_dtype(pos: &[&Expr], span: &Span) -> EvalResult<DType> {
+    match pos.first() {
+        Some(Expr::Ident(name, _)) => match ScalarType::from_ctor_name(name) {
+            Some(st) => dtype_for_scalar_elem(&st).ok_or_else(|| RuntimeError::at(
+                format!(
+                    "internal error: `{name}` is a recognized constructor \
+                     element-type name with no `DType` representation — \
+                     `ScalarType::from_ctor_name` and `dtype_for_scalar_elem` \
+                     have fallen out of sync (#834)"
+                ),
+                span.clone(),
+            )),
+            None => Ok(DType::F32),
+        },
+        _ => Ok(DType::F32),
     }
-    DType::F32
-}
-
-fn is_trit_type_name(name: &str) -> bool {
-    name == "trit"
 }
 
 // ─── Literal → Value ─────────────────────────────────────────────────────────
@@ -5840,6 +8650,16 @@ fn has_untyped_float_lit(e: &Expr) -> bool {
         Expr::Block(b) => block_has_untyped_float_lit(b),
         Expr::DirectiveBlock { body, .. } => block_has_untyped_float_lit(body),
         Expr::ArenaBlock(ab) => block_has_untyped_float_lit(&ab.body),
+        // #674 slice 3a: `forge.enter(b) { … }`'s tail value is a value
+        // position exactly like `ArenaBlock`'s, above — the hint must reach
+        // through it the same way.
+        Expr::BudgetBlock(bb) => block_has_untyped_float_lit(&bb.body),
+        // #674 slice 3a (PR #814 review): `AllocIn` (`<ctor> in b`) gained no
+        // arm here when `BudgetBlock` did, above — walk BOTH of its own
+        // operands, `expr` (the ctor spine) and `budget` (the `in` target),
+        // the same way `BudgetBlock` walks its operand and body.
+        Expr::AllocIn { expr, budget, .. } =>
+            has_untyped_float_lit(expr) || has_untyped_float_lit(budget),
         Expr::If(ie) => if_has_untyped_float_lit(ie),
         Expr::Match(me) => me.arms.iter().any(|a| has_untyped_float_lit(&a.body)),
         _ => false,
@@ -6002,18 +8822,27 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
         BitShr => {
             let a = l.as_int().ok_or_else(|| RuntimeError::msg(format!(">> requires int, got {}", l.type_name())))?;
             let b = r.as_int().ok_or_else(|| RuntimeError::msg(format!(">> requires int, got {}", r.type_name())))?;
-            // Arithmetic (sign-propagating) shift, matching the JIT's `sshr`:
-            // `-8 >> 1` is -4 and `-1 >> 63` is -1, not 0. #215: the shift
-            // amount is range-guarded exactly as `<<` is — Rust's `>>` panics
-            // in debug and masks mod-width in release outside the range. #540
-            // made that range the operands' joined width, so an i32 shift is
-            // judged against 0..=31.
+            // Arithmetic (sign-propagating) shift for a SIGNED width, matching
+            // the JIT's `sshr`: `-8 >> 1` is -4 and `-1 >> 63` is -1, not 0.
+            // #597: an UNSIGNED width shifts logically (zero-fill) instead —
+            // `OPERATORS.md §8a` names arithmetic `>>` for signed operands and
+            // logical for unsigned. `U8`/`U16`/`U32` never told the two apart
+            // because their zero-extended pattern is already non-negative, so
+            // Rust's sign-propagating `>>` on it happened to zero-fill anyway;
+            // `U64` is the first width where a negative i64 pattern (the top
+            // bit set) can occur, so it needs the explicit unsigned shift.
+            // #215: the shift amount is range-guarded exactly as `<<` is —
+            // Rust's `>>` panics in debug and masks mod-width in release
+            // outside the range. #540 made that range the operands' joined
+            // width, so an i32 shift is judged against 0..=31.
             let w = IW::join(int_width(l), int_width(r));
             if !(0..w.bits() as i64).contains(&b) {
                 Err(RuntimeError::msg(format!(
                     ">> shift amount {} out of range (expected 0..={})", b, w.bits() - 1)))
-            } else {
+            } else if w.is_signed() {
                 Ok(Value::Int(w.wrap(w.wrap(a) >> b), w))
+            } else {
+                Ok(Value::Int(w.wrap(((w.wrap(a) as u64) >> b) as i64), w))
             }
         }
     }
@@ -6031,7 +8860,14 @@ fn apply_binop(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
 /// does not overflow, which `**` reports rather than wrapping (the JIT does not
 /// lower integer `**` at all, so nothing diverges). `/` and `%` cannot leave the
 /// range their operands are already in, except `MIN / -1`, guarded at the width.
-fn int_arith(op: BinOp, a: i64, b: i64, w: IW) -> EvalResult<i64> {
+///
+/// `pub(crate)` (#718 rework, R1): `jit.rs`'s local-`let` shape-dimension fold
+/// (`fold_shape_expr_at_width`) calls this directly for a binding whose width
+/// isn't `i64`, rather than re-deriving the wrap rule — a local literal `let`
+/// used as a shape dimension must fold in the SAME width `dmc run` computes
+/// in, and the one implementation this comment already insists on is the way
+/// to guarantee that instead of hoping a second one stays in sync.
+pub(crate) fn int_arith(op: BinOp, a: i64, b: i64, w: IW) -> EvalResult<i64> {
     use BinOp::*;
     let (a, b) = (w.wrap(a), w.wrap(b));
     // Integer power needs fallible handling (#215): the exponent was cast via
@@ -6057,24 +8893,36 @@ fn int_arith(op: BinOp, a: i64, b: i64, w: IW) -> EvalResult<i64> {
         Sub => a.wrapping_sub(b),
         Mul => a.wrapping_mul(b),
         // #544: `MIN / -1` is a SIGNED-only overflow. At an unsigned width
-        // both operands are zero-extended and non-negative, so `-1` can
-        // never be the divisor and the signed `wrapping_div` on two
-        // non-negative i64s IS the unsigned division.
+        // narrower than 64 bits both operands are zero-extended and
+        // non-negative, so `-1` can never be the divisor there and the signed
+        // `wrapping_div` on two non-negative i64s IS the unsigned division.
+        // #597: `U64` breaks that equivalence — its pattern can be a negative
+        // i64 (the top bit set), so an unsigned width now divides/rems by
+        // re-interpreting both operands as `u64` explicitly rather than
+        // reusing the signed op. `u64::wrapping_div`/`wrapping_rem` have no
+        // `MIN / -1` case (unsigned has no most-negative value to overflow),
+        // matching `is_signed`'s guard staying off for every unsigned width.
         Div => {
             if b == 0 { 0 }
-            else if w.is_signed() && a == w.min() && b == -1 {
-                return Err(RuntimeError::msg(format!(
-                    "integer overflow: {} / {} exceeds the {} range", a, b, w.name())));
+            else if w.is_signed() {
+                if a == w.min() && b == -1 {
+                    return Err(RuntimeError::msg(format!(
+                        "integer overflow: {} / {} exceeds the {} range", a, b, w.name())));
+                }
+                a.wrapping_div(b)
             }
-            else { a.wrapping_div(b) }
+            else { (a as u64).wrapping_div(b as u64) as i64 }
         },
         Mod => {
             if b == 0 { 0 }
-            else if w.is_signed() && a == w.min() && b == -1 {
-                return Err(RuntimeError::msg(format!(
-                    "integer overflow: {} % {} exceeds the {} range", a, b, w.name())));
+            else if w.is_signed() {
+                if a == w.min() && b == -1 {
+                    return Err(RuntimeError::msg(format!(
+                        "integer overflow: {} % {} exceeds the {} range", a, b, w.name())));
+                }
+                a.wrapping_rem(b)
             }
-            else { a.wrapping_rem(b) }
+            else { (a as u64).wrapping_rem(b as u64) as i64 }
         },
         _ => unreachable!(),
     };
@@ -6115,12 +8963,41 @@ fn scalar_compare(op: BinOp, l: &Value, r: &Value) -> EvalResult<Value> {
     // below) loses precision above 2^53 and disagrees with the JIT's integer
     // compare (#296): e.g. 9007199254740993 == 9007199254740992 wrongly
     // returned true. Mixed int/float still falls through to the f64 path.
-    if let (Value::Int(a, _), Value::Int(b, _)) = (l, r) {
-        return Ok(Value::Bool(match op {
-            Eq    => a == b, NotEq => a != b,
-            Lt    => a < b,  Gt    => a > b,
-            LtEq  => a <= b, GtEq  => a >= b,
-            _ => unreachable!(),
+    //
+    // #597: equality is bit-for-bit either way, but ORDERING is not — a `u64`
+    // at or above 2^63 is a negative `i64` pattern, so a signed `<`/`>` gets it
+    // backwards (`(-1 as u64) > (1 as u64)` must be true: u64::MAX > 1). Narrower
+    // unsigned widths (`u8`/`u16`/`u32`) never showed this because their
+    // zero-extended pattern is already non-negative, so comparing the pattern
+    // as `u64` here changes nothing for them and fixes it for `u64`.
+    if let (Value::Int(a, wa), Value::Int(b, wb)) = (l, r) {
+        // #597 (review): key the unsigned reading on the operands' OWN tags,
+        // not on `IW::join`. `join` resolves an untyped literal's `I64` against
+        // a narrow operand by taking the NARROWER width, so a genuine `i64` met
+        // by a `u8` would join to `U8` and compare here as unsigned — on the
+        // RAW patterns, since (unlike `int_arith`) this path does not `wrap`
+        // its operands first, which would make `-1 > 200` true. §3.1's ban on
+        // mixed widths means the checker rejects that pairing before it ever
+        // gets here, so it is latent rather than live; keying on `U64` closes
+        // it anyway. Nothing else changes: `u8`/`u16`/`u32` are stored
+        // zero-extended, so the signed comparison of their pattern already IS
+        // the unsigned one, and equality is bit-for-bit at every width.
+        let unsigned = *wa == IW::U64 || *wb == IW::U64;
+        return Ok(Value::Bool(if !unsigned {
+            match op {
+                Eq    => a == b, NotEq => a != b,
+                Lt    => a < b,  Gt    => a > b,
+                LtEq  => a <= b, GtEq  => a >= b,
+                _ => unreachable!(),
+            }
+        } else {
+            let (ua, ub) = (*a as u64, *b as u64);
+            match op {
+                Eq    => ua == ub, NotEq => ua != ub,
+                Lt    => ua < ub,  Gt    => ua > ub,
+                LtEq  => ua <= ub, GtEq  => ua >= ub,
+                _ => unreachable!(),
+            }
         }));
     }
     if let (Some(a), Some(b)) = (l.as_float(), r.as_float()) {
@@ -6263,7 +9140,10 @@ fn scalar_lhs(op: BinOp, s: f64, b: &ArrayD<f64>) -> ArrayD<f64> {
 /// (non-tensor) operands follow the tensor side.
 fn float_result_dtype(operands: &[&Value]) -> DType {
     let narrow = |v: &&Value| match v {
-        Value::Tensor(t) => matches!(t.dtype, DType::F32 | DType::Trit),
+        // #834: fp8 operands narrow to a plain `F32` result exactly like
+        // `Trit` operands already did — the specific narrow tag never
+        // survives a binop, only whether the operands were narrow at all.
+        Value::Tensor(t) => matches!(t.dtype, DType::F32 | DType::Trit | DType::Fp8E4M3 | DType::Fp8E5M2),
         _ => true,
     };
     if operands.iter().all(narrow) { DType::F32 } else { DType::F64 }
@@ -6874,6 +9754,35 @@ fn type_arg_shape_var(arg: &TypeArg) -> Option<&str> {
     }
 }
 
+/// The table key for `name` as file number `module` sees it. Every fn, model,
+/// enum and `type` alias a file declares or imports is registered under the
+/// file's number, so a name resolves only against the file that mentions it
+/// (SPEC §6.7, §9). `#` opens a comment and so cannot occur in an identifier
+/// or alias; the key never collides with a source name, and `bare_name`
+/// recovers the name.
+///
+/// This allocates a `String` on every resolution — once per call, per model
+/// literal, per enum-variant test. Measured against the flat-`HashMap` path it
+/// costs nothing at the sizes the interpreter runs at (`fib(29)` 1.89 s →
+/// 1.86 s, `tictactoe` 14.1 s → 13.5 s), so it is left plain rather than
+/// traded for a `(usize, &str)` key or an interned symbol; the tree walk
+/// itself dominates by orders of magnitude. Revisit only behind a measurement
+/// that shows otherwise.
+fn module_key(module: usize, name: &str) -> String {
+    format!("{}#m{}", name, module)
+}
+
+/// The source name inside a `module_key`, for diagnostics and display. Only
+/// the exact `#m<digits>` suffix is stripped: other runtime strings carry a
+/// `#` of their own (a port handle prints as `port#1:python`) and pass
+/// through unchanged.
+fn bare_name(key: &str) -> &str {
+    match key.rsplit_once("#m") {
+        Some((name, digits)) if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => key,
+    }
+}
+
 /// The `__model__` tag on a struct value, if it carries one.
 fn struct_model_name(fields: &Rc<RefCell<Vec<(String, Value)>>>) -> Option<String> {
     fields.borrow().iter()
@@ -7016,24 +9925,141 @@ fn gelu(x: f64) -> f64 {
     quantize_f32(activation_f64("gelu", x))
 }
 
-/// Cast by type name string — used when the directive carries the type as an identifier.
-/// Declared byte width of a scalar type, for `@cast(Model)` overlay.
-fn scalar_byte_size(st: &ScalarType) -> usize {
-    use ScalarType::*;
-    match st {
-        I8 | U8 | Int4 | Int8 | Trit | Bool | Fp8E4M3 | Fp8E5M2 => 1,
-        I16 | U16 | F16 | Bf16 => 2,
-        I32 | U32 | F32 | Tf32 => 4,
-        I64 | U64 | F64 => 8,
-        Str | Nil => 0,
+/// Combine bytes into an i64, least significant byte first.
+///
+/// #606: little-endian, ratified — `SPEC.md §3.10`. The one byte order this
+/// language fixes (`PORTS.md`), and the order every other byte path in
+/// `compiler/src` already used; this was the sole big-endian decode of a
+/// multi-byte scalar. Renamed from `be_bytes_to_i64`.
+fn le_bytes_to_i64(slice: &[u8]) -> i64 {
+    let mut acc: i64 = 0;
+    for (i, &b) in slice.iter().enumerate() { acc |= (b as i64) << (8 * i); }
+    acc
+}
+
+/// The `@cast(Model)` refusal, worded the same wherever it is raised (#598).
+fn overlay_no_layout(model: &str, field: &str, reason: &str) -> RuntimeError {
+    RuntimeError::msg(format!(
+        "@cast({}): model field `{}` has no overlay layout — {} \
+         (DIRECTIVES.md §4.1, SPEC.md §3.10)", model, field, reason))
+}
+
+/// IEEE 754 binary16 → f32. `mant * 2^-24` is the subnormal value exactly, and
+/// the normal case rebiases the exponent (15 → 127) and left-shifts the
+/// mantissa into binary32's 23 bits.
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x03ff) as u32;
+    if exp == 0 {
+        sign * (mant as f32) * f32::powi(2.0, -24)
+    } else if exp == 0x1f {
+        f32::from_bits(((h as u32 & 0x8000) << 16) | (0xff << 23) | (mant << 13))
+    } else {
+        f32::from_bits(((h as u32 & 0x8000) << 16) | ((exp + 112) << 23) | (mant << 13))
     }
 }
 
-/// Combine bytes big-endian (network byte order) into an i64.
-fn be_bytes_to_i64(slice: &[u8]) -> i64 {
-    let mut acc: i64 = 0;
-    for &b in slice { acc = (acc << 8) | (b as i64); }
-    acc
+/// Decode one `@cast(Model)` field's bytes into a value of its DECLARED type
+/// (#598). `slice` is exactly `st.overlay_byte_width()` bytes long.
+///
+/// Every admitted kind lands in its own `Value` shape: an integer keeps its
+/// declared WIDTH (`IW::wrap` sign-extends a narrow signed field, so an `i8`
+/// byte `0xFF` is `-1`), a float is reinterpreted from its IEEE bit pattern at
+/// its storage width, and a `bool` follows the interpreter's one bool rule —
+/// `apply_cast`'s `Bool` arm, where any nonzero number is `true`. Before this,
+/// every field came back `Value::Int(_, I64)` whatever it was declared, which
+/// is #598's own signature: a `bool` or `f32` field read as an integer.
+fn decode_overlay_scalar(st: &ScalarType, slice: &[u8]) -> Value {
+    use ScalarType::*;
+    match st {
+        Bool => Value::Bool(slice[0] != 0),
+        F64 => Value::Float(f64::from_bits(le_bytes_to_i64(slice) as u64), FW::F64),
+        F32 => Value::Float(f32::from_bits(le_bytes_to_i64(slice) as u32) as f64, FW::F32),
+        // bf16 is binary32's top 16 bits (PORTS.md's element table).
+        Bf16 => Value::Float(
+            f32::from_bits((le_bytes_to_i64(slice) as u32) << 16) as f64, FW::F32),
+        F16 => Value::Float(f16_bits_to_f32(le_bytes_to_i64(slice) as u16) as f64, FW::F32),
+        _ => {
+            // Every remaining admitted kind is an integer: `scalar_int_width`
+            // answers for all of them (`u64` shares `I64` — see its note).
+            let w = scalar_int_width(st).unwrap_or(IW::I64);
+            Value::Int(w.wrap(le_bytes_to_i64(slice)), w)
+        }
+    }
+}
+
+/// The same decode, as the f64 a tensor element is stored in.
+fn overlay_scalar_as_f64(st: &ScalarType, slice: &[u8]) -> f64 {
+    match decode_overlay_scalar(st, slice) {
+        Value::Bool(b) => if b { 1.0 } else { 0.0 },
+        Value::Float(x, _) => x,
+        Value::Int(n, _) => n as f64,
+        _ => 0.0,
+    }
+}
+
+/// The tensor dtype a `@cast(Model)` tensor field carries — its DECLARED
+/// element type, so a `Tensor[u8,[24]]` field is a u8 tensor rather than the
+/// i64 one every overlay used to produce (#598).
+///
+/// Exhaustive over `ScalarType` (#852 — no trailing `_ =>`), so a future
+/// variant is a compile error here too. Its ONLY caller (the tensor-field
+/// arm of `@cast(Model)`'s decode loop, above) already checked
+/// `est.overlay_byte_width()` (`ast.rs`) is `Some` before calling this —
+/// that table answers `None`, and the field is refused with
+/// `overlay_no_layout` before this function is ever reached, for exactly
+/// seven kinds: `str`/`nil` (dynamic/zero-sized — #817 is an open ruling on
+/// whether either has a tensor-ELEMENT representation elsewhere in the
+/// interpreter, e.g. `dtype_for_scalar_elem`, but their exclusion from the
+/// BYTE overlay specifically is not that open question — it is unconditional,
+/// stated in `DIRECTIVES.md §4.1`), `trit`/`int4` (packed formats with no
+/// stated byte encoding), and `tf32`/`fp8_e4m3`/`fp8_e5m2` (f32-backed
+/// NOMINAL tags per `SPEC.md §3.1` and the #179 convention — computed in f32
+/// and retagged, with no distinct byte storage of their own to decode out
+/// of; `DIRECTIVES.md §4.1` names this exclusion explicitly: "`@cast(Model)`
+/// is defined for a model whose fields are scalars with byte storage (not
+/// `str`, `nil`, `trit`, `int4`, or the f32-backed `tf32`/`fp8` kinds)").
+///
+/// #852 found the old `_ => DType::Int(scalar_int_width(st).unwrap_or(IW::
+/// I64))` fallback would have decoded any of those seven as an 8-byte
+/// integer had it ever run — but with `overlay_byte_width` gating every
+/// call site, it never could: a non-exhaustive table with no live input,
+/// not a reachable mis-decode. Kept as a catchable internal error rather
+/// than `unreachable!()` because the invariant crosses this file and
+/// `ast.rs`'s table, the same shape of guard `arena_ctor_dtype` keeps
+/// against `dtype_for_scalar_elem` drifting from `ScalarType::from_ctor_name`
+/// (#834) — if the two ever fall out of sync, this names the type instead
+/// of silently mis-decoding it.
+fn overlay_elem_dtype(st: &ScalarType) -> EvalResult<DType> {
+    use ScalarType::*;
+    Ok(match st {
+        Bool => DType::Bool,
+        F64 => DType::F64,
+        F32 | F16 | Bf16 => DType::F32,
+        I8 | Int8 => DType::Int(IW::I8),
+        I16 => DType::Int(IW::I16),
+        I32 => DType::Int(IW::I32),
+        I64 => DType::Int(IW::I64),
+        U8 => DType::Int(IW::U8),
+        U16 => DType::Int(IW::U16),
+        U32 => DType::Int(IW::U32),
+        U64 => DType::Int(IW::U64),
+        Str | Nil | Trit | Int4 | Tf32 | Fp8E4M3 | Fp8E5M2 => return Err(RuntimeError::msg(format!(
+            "internal error: overlay_elem_dtype called with `{:?}`, which \
+             `ScalarType::overlay_byte_width` excludes from `@cast(Model)` \
+             admission (DIRECTIVES.md §4.1) — the two tables have fallen out \
+             of sync (#852)", st))),
+    })
+}
+
+/// TEST-ONLY: `overlay_elem_dtype` for `interp_tests.rs` — a sibling module
+/// of `interp` (not a descendant), so plain fn privacy would not reach it,
+/// the same reason the `#674` harness above (`eval_expr_for_test` etc.) is
+/// `pub(crate)` under `#[cfg(test)]` rather than `pub`.
+#[cfg(test)]
+pub(crate) fn overlay_elem_dtype_for_test(st: &ScalarType) -> EvalResult<DType> {
+    overlay_elem_dtype(st)
 }
 
 /// Bounds-checked slice of `sz` bytes at `offset` for `@cast(Model)` overlay.
@@ -7064,7 +10090,16 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
             // Widening retag — no value change (f32-rounded data is exact in f64).
             return Value::tensor_dt(t.data.clone(), DType::F64);
         }
-        if matches!(ty_name, "f16" | "bf16" | "tf32" | "f32" | "fp8_e4m3" | "fp8_e5m2") {
+        // #834: fp8 targets get their own one-byte-metered `DType` — same
+        // arithmetic rounding as the rest of the f32-family below
+        // (`DType::rounds_as_f32`), but a distinct declared width.
+        if matches!(ty_name, "fp8_e4m3") {
+            return Value::tensor_dt(t.data.clone(), DType::Fp8E4M3);
+        }
+        if matches!(ty_name, "fp8_e5m2") {
+            return Value::tensor_dt(t.data.clone(), DType::Fp8E5M2);
+        }
+        if matches!(ty_name, "f16" | "bf16" | "tf32" | "f32") {
             // Trit→float: values are already stored as -1.0/0.0/1.0 f64, just
             // retag. F64→f32-family narrows via the F32 construction rounding.
             return Value::tensor_dt(t.data.clone(), DType::F32);
@@ -7104,6 +10139,12 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
                    if let Some(n) = v.as_float() { return Value::Int(n as i32 as i64, IW::I32); } }
         "i64" => {
             if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
+            // #597: an INTEGER source reinterprets its 64-bit pattern
+            // (`u64::MAX as i64` is -1), so read the pattern directly instead
+            // of routing through `as_float`, which now reports a `u64`'s
+            // unsigned magnitude. This also stops a large `i64` from
+            // round-tripping through f64 and losing bits above 2^53.
+            if let Some(n) = v.as_int() { return Value::Int(n, IW::I64); }
             if let Some(n) = v.as_float() { return Value::Int(n as i64, IW::I64); }
         }
         "u16" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U16); }
@@ -7112,9 +10153,10 @@ fn apply_cast_by_name(v: &Value, ty_name: &str) -> Value {
         "u32" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U32); }
                    if let Some(n) = v.as_int() { return Value::Int((n as u32) as i64, IW::U32); }
                    if let Some(n) = v.as_float() { return Value::Int(n as u32 as i64, IW::U32); } }
-        "u64" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
-                   if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64, IW::I64); }
-                   if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64, IW::I64); } }
+        // #597: tagged `IW::U64`, not `IW::I64` — see `apply_cast`'s `U64` arm.
+        "u64" => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U64); }
+                   if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64, IW::U64); }
+                   if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64, IW::U64); } }
         "f64" => {
             if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F64); }
             if let Some(n) = v.as_float() { return Value::Float(n, FW::F64); }
@@ -7156,7 +10198,12 @@ fn apply_cast(v: &Value, ty: &Type) -> Value {
                     Value::tensor_dt(cast_tensor_to_int_width(&t.data, w), DType::Int(w))
                 }
                 F64 => Value::tensor_dt(t.data.clone(), DType::F64),
-                F16 | Bf16 | Tf32 | F32 | Fp8E4M3 | Fp8E5M2 =>
+                // #834: fp8 targets keep their own one-byte-metered `DType`,
+                // mirroring `apply_cast_by_name` — same f32 rounding as the
+                // rest of the f32-family arm below, distinct declared width.
+                Fp8E4M3 => Value::tensor_dt(t.data.clone(), DType::Fp8E4M3),
+                Fp8E5M2 => Value::tensor_dt(t.data.clone(), DType::Fp8E5M2),
+                F16 | Bf16 | Tf32 | F32 =>
                     Value::tensor_dt(t.data.clone(), DType::F32),
                 _ => v.clone(),
             };
@@ -7189,6 +10236,9 @@ fn apply_cast(v: &Value, ty: &Type) -> Value {
                      if let Some(n) = v.as_float() { return Value::Int(n as i32 as i64, IW::I32); } }
             I64 | Trit => {
                 if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
+                // #597: see `apply_cast_by_name`'s `"i64"` arm — an integer
+                // source reinterprets its pattern, it does not go through f64.
+                if let Some(n) = v.as_int() { return Value::Int(n, IW::I64); }
                 if let Some(n) = v.as_float() { return Value::Int(n as i64, IW::I64); }
             }
             U8  => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U8); }
@@ -7200,9 +10250,11 @@ fn apply_cast(v: &Value, ty: &Type) -> Value {
             U32 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U32); }
                      if let Some(n) = v.as_int() { return Value::Int((n as u32) as i64, IW::U32); }
                      if let Some(n) = v.as_float() { return Value::Int(n as u32 as i64, IW::U32); } }
-            U64 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::I64); }
-                     if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64, IW::I64); }
-                     if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64, IW::I64); } }
+            // #597: tagged `IW::U64` so the value's `/ % >>` and ordering
+            // comparisons read unsigned from here on (see `IW`'s doc comment).
+            U64 => { if let Value::Bool(b) = v { return Value::Int(if *b { 1 } else { 0 }, IW::U64); }
+                     if let Some(n) = v.as_int() { return Value::Int((n as u64) as i64, IW::U64); }
+                     if let Some(n) = v.as_float() { return Value::Int(n as u64 as i64, IW::U64); } }
             F64 => {
                 if let Value::Bool(b) = v { return Value::Float(if *b { 1.0 } else { 0.0 }, FW::F64); }
                 if let Some(n) = v.as_float() { return Value::Float(n, FW::F64); }
@@ -7416,13 +10468,20 @@ fn port_handle_id(v: Option<&Value>) -> Option<i64> {
 /// `ports::wire_dtype_for`. `Trit` has no wire dtype at all: a packed ternary
 /// weight is a demoniC storage format, not a portable element type, so it is
 /// refused rather than silently widened to bytes no foreign runtime can read.
+///
+/// `Fp8E4M3`/`Fp8E5M2` (#834) cross the wire as `F32`, exactly as they did
+/// before this fix (when the interpreter mistagged them as plain `DType::F32`
+/// outright): both are nominal f32-backed tags with no distinct byte storage
+/// of their own (`ScalarType::overlay_byte_width`'s reasoning, same as
+/// `tf32`) — unlike `Trit`'s packed-ternary format, an f32-backed value is
+/// unambiguously portable as f32 bytes, so there is no reason to newly refuse it.
 fn wire_dtype_of(dt: DType) -> Option<crate::ports::WireDType> {
     use crate::ports::WireDType as W;
     Some(match dt {
         // The wire protocol carries integers as 64-bit lanes at every element
         // width; the narrow value already fits (#571).
         DType::Int(_) => W::I64,
-        DType::F32 => W::F32,
+        DType::F32 | DType::Fp8E4M3 | DType::Fp8E5M2 => W::F32,
         DType::F64 => W::F64,
         DType::Bool => W::Bool,
         DType::Trit => return None,
@@ -7523,7 +10582,18 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 
 impl Interpreter {
     fn call_builtin(&mut self, name: &str, mut args: Vec<Value>, sp: Span) -> EvalResult<Value> {
-    match name {
+    // #781 (reviewer rework): the ONE choke point for every builtin
+    // dispatched through this match — softmax, sum_along, argmax,
+    // rms_norm, embed, diag, solve, and the rest of the free-function
+    // builtin set (arena constructors like `vault.zeros[..]` are a
+    // separate dispatch and already charge at their own call sites; see
+    // `charge_arena`'s other caller). Held here, cloned, rather than
+    // reused from `sp` after the match: many arms below consume `sp` by
+    // value on their own success/error paths, and a partial move inside
+    // one arm would make the ORIGINAL `sp` unusable after the match ends
+    // even on paths that never touched it.
+    let charge_span = sp.clone();
+    let result = match name {
         "print" => {
             let parts: Vec<String> = args.iter().map(|v| format!("{}", v)).collect();
             // #211: print is line-oriented — it appends a trailing newline (like
@@ -7655,6 +10725,12 @@ impl Interpreter {
             .ok_or_else(|| RuntimeError::msg("log: numeric"))?
             .ln(), FW::F64)),
         "abs" => match args.first() {
+            // #597: `u64` has no negative values — the magnitude IS the
+            // pattern, so `abs` is the identity at this width. Taking
+            // `i64::abs` of the pattern turned `abs(u64::MAX)` (pattern -1)
+            // into 1. The result keeps its `U64` tag so what follows still
+            // divides, shifts and compares unsigned.
+            Some(Value::Int(n, IW::U64)) => Ok(Value::Int(*n, IW::U64)),
             Some(Value::Int(n, _)) => Ok(Value::Int(n.abs(), IW::I64)),
             Some(v) => Ok(Value::Float(v.as_float().unwrap_or(0.0).abs(), FW::F64)),
             None => Err(RuntimeError::msg("abs: needs arg")),
@@ -7910,6 +10986,24 @@ impl Interpreter {
             if args.len() < 3 {
                 return Err(RuntimeError::at("clamp: requires (value, lo, hi)", sp));
             }
+            // #597: an all-integer clamp involving a `u64` compares in the
+            // unsigned domain and never goes through f64 — u64::MAX's pattern
+            // reads as -1 signed (so `clamp(u64::MAX, 0, 10)` returned 0
+            // instead of 10) and is not exactly f64-representable either. The
+            // `lo > hi` guard is the same check the f64 path below does, done
+            // on the same unsigned reading.
+            if let (Value::Int(x, wx), Value::Int(lo, wlo), Value::Int(hi, whi)) =
+                (&args[0], &args[1], &args[2])
+            {
+                if *wx == IW::U64 || *wlo == IW::U64 || *whi == IW::U64 {
+                    let (ux, ulo, uhi) = (*x as u64, *lo as u64, *hi as u64);
+                    if ulo > uhi {
+                        return Err(RuntimeError::at(
+                            format!("clamp: lo ({}) must be <= hi ({})", ulo, uhi), sp.clone()));
+                    }
+                    return Ok(Value::Int(ux.clamp(ulo, uhi) as i64, IW::U64));
+                }
+            }
             // #210: std `clamp` panics (aborting the interpreter) if lo > hi or on
             // a NaN bound. Validate via an f64 view of the bounds first and return
             // a clean RuntimeError. Non-numeric bounds fall through to the match's
@@ -7980,7 +11074,7 @@ impl Interpreter {
                     // the JIT does not lower `trace` — but an f32 trace that
                     // disagreed with an f32 sum would be the same defect.)
                     let diag = (0..n).map(|i| t[[i, i]]);
-                    let diag_sum = if t.dtype == DType::F32 { sum_f32(diag) } else { diag.sum() };
+                    let diag_sum = if t.dtype.rounds_as_f32() { sum_f32(diag) } else { diag.sum() };
                     Ok(Value::Float(diag_sum, t.float_width()))
                 }
                 _ => Err(RuntimeError::at("trace: expected a 2D tensor argument", sp)),
@@ -8031,6 +11125,23 @@ impl Interpreter {
                 }
                 acc
             };
+            // #597: an all-integer variadic `min`/`max` with a `u64` operand
+            // must select in the UNSIGNED domain and must not touch f64 at
+            // all: u64::MAX's pattern reads as -1 when taken signed (so
+            // `min(u64::MAX, 1)` returned -1 and `max` returned 1, both
+            // backwards), and u64::MAX is not exactly representable in an f64
+            // anyway. Only this width takes the integer path — `u8`/`u16`/
+            // `u32` are stored zero-extended and exactly f64-representable, so
+            // their long-standing float-tagged result is left alone.
+            if args.len() >= 2
+                && args.iter().all(|v| matches!(v, Value::Int(..)))
+                && args.iter().any(|v| matches!(v, Value::Int(_, IW::U64)))
+            {
+                let mut it = args.iter().filter_map(|v| v.as_int()).map(|n| n as u64);
+                let first = it.next().unwrap_or(0);
+                let acc = it.fold(first, |a, b| if name == "max" { a.max(b) } else { a.min(b) });
+                return Ok(Value::Int(acc as i64, IW::U64));
+            }
             if let Some(Value::Tensor(t)) = args.first() {
                 if args.len() == 1 {
                     // #481: no accumulation to round — max/min just select an
@@ -9881,6 +12992,65 @@ impl Interpreter {
             If this is a stdlib function, add a real implementation in call_builtin or remove it from the builtin set.",
             other), sp,
         )),
+    };
+    // #781: charge every tensor this builtin call materialized, at the ONE
+    // choke point instead of a per-builtin patch — see the comment above
+    // the match. Recurses into a `Tuple`/`List` result (e.g. `trit_pack`
+    // returns two tensors) so a builtin that hands back more than one
+    // fresh tensor is not undercharged.
+    if let Ok(v) = &result {
+        self.charge_builtin_result(v, &charge_span)?;
+    }
+    result
+}
+
+/// #781/#802: walk a `call_builtin` result and charge every `Value::Tensor`
+/// and `Value::Str` found in it (including nested inside a `Tuple`/`List`).
+/// Under `dmc jit`, a builtin's fresh string result (`read_file`'s content,
+/// for instance) is bump-allocated in the Forge arena by
+/// `forge_str_from_rust` and billed there; before #802, the interpreter never
+/// charged that string against anything, so the same program needed a
+/// `--forge` budget under `dmc jit` it did not need under `dmc run`.
+/// Recurses into a `Tuple`/`List` result so a builtin returning more than one
+/// fresh string or tensor (a `(content, err)` pair included) is not
+/// undercharged.
+///
+/// The `Value::Tensor` arm routes through `charge_intermediate` — this IS
+/// that choke point for a builtin's tensor result. The `Value::Str` arm does
+/// NOT: a `call_builtin` result is never itself a literal element (a tensor
+/// literal's elements are numeric or nested-tensor, never a bare builtin
+/// call folded into the literal's own suppression), but it can be REACHED
+/// from inside one — a tensor literal element that calls a fn which calls
+/// `to_str` 1000 times, say — and `charge_intermediate`'s
+/// `lit_charge_suppressed` early return exists to stop a literal's OWN rows
+/// from double-billing, not to swallow an unrelated builtin's string result
+/// that happens to be materialized while a literal element is being
+/// evaluated (PR #815 review: routing this arm through `charge_intermediate`
+/// made exactly that string vanish — 2898 B collapsed to 8 B on a tensor
+/// literal whose single element called such a fn). So this arm calls
+/// `charge_arena` directly, unconditionally, the same way `charge_ctor` does
+/// for an explicit constructor — a builtin's fresh string is never a
+/// literal's row, so it is never a candidate for that suppression at all.
+fn charge_builtin_result(&mut self, v: &Value, span: &Span) -> EvalResult<()> {
+    match v {
+        Value::Tensor(_) => self.charge_intermediate(v, Some(span)),
+        Value::Str(s) => {
+            let nbytes = s.len() as u64;
+            self.charge_arena(Some(crate::arena::Arena::Forge), nbytes, Some(span))
+        }
+        Value::Tuple(vs) => {
+            for item in vs {
+                self.charge_builtin_result(item, span)?;
+            }
+            Ok(())
+        }
+        Value::List(vs) => {
+            for item in vs.iter() {
+                self.charge_builtin_result(item, span)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 }
@@ -9979,7 +13149,7 @@ fn builtin_variance(args: &[Value], sp: Span) -> EvalResult<Value> {
     // squared deviations. Same shape as the JIT's `lower_builtin_variance`.
     let mean = tensor_mean(t);
     let devs = t.iter().map(|v| { let d = v - mean; d * d });
-    let var = if t.dtype == DType::F32 {
+    let var = if t.dtype.rounds_as_f32() {
         quantize_f32(sum_f32(devs.map(quantize_f32)) / quantize_f32(n))
     } else {
         devs.sum::<f64>() / n
@@ -10031,7 +13201,7 @@ fn builtin_reduce_along(args: &[Value], sp: Span, name: &str, mean: bool) -> Eva
     // same width too. `Value::tensor` would have retagged it F32 regardless,
     // but only AFTER an f64 accumulation — rounding the answer, not producing
     // the f32 one.
-    let f32_width = t.dtype == DType::F32;
+    let f32_width = t.dtype.rounds_as_f32();
     let summed = fold_lanes(&t, axis, f32_width);
     let out = if mean {
         let n = t.shape()[axis] as f64;
@@ -10088,7 +13258,7 @@ fn builtin_variance_along(args: &[Value], sp: Span) -> EvalResult<Value> {
     // algebraically equivalent `mean(x²) - mean(x)²`, which is a different
     // computation in floating point (catastrophic cancellation when the mean
     // dominates the spread) and diverged from the JIT independently of width.
-    let f32_width = t.dtype == DType::F32;
+    let f32_width = t.dtype.rounds_as_f32();
     let nq = if f32_width { quantize_f32(n) } else { n };
     let means = {
         let summed = fold_lanes(&t, axis, f32_width);
@@ -10827,10 +13997,37 @@ impl Tape {
         self.push(TapeNode { op: TapeOp::Const, inputs: Vec::new(), value: v })
     }
 
+    /// #674: one pass over
+    /// every node's forward value before the backward walk touches any of
+    /// them. `backward`/`backward_symbolic` take `&self`/no interpreter
+    /// access and re-enter no interpreter method (#791's own doc on
+    /// `backward`, just below), so no reap can interleave with the walk once
+    /// this prepass has passed — the whole point of checking liveness here.
+    /// Located at the
+    /// `@grad` call site (`call_grad_in_module`'s span): "`forge.reap` inside
+    /// `@grad` is legal, and the doc owes no fourth refusal" — a budget
+    /// reaped mid-pass fails the BACKWARD pass here, not the carve/reap
+    /// itself.
+    fn check_live(&self, span: &Span) -> EvalResult<()> {
+        for n in &self.nodes {
+            if let Value::Tensor(t) = &n.value {
+                if tensor_is_stale(t) {
+                    return Err(RuntimeError::at(
+                        "budget-stale: this tensor was allocated in a budget \
+                         that has already been reaped".to_string(),
+                        span.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Walk the tape in reverse, propagating gradients via per-op VJP rules.
     /// `grads[id]` holds the accumulated dL/d(node id) value, or None if no
     /// gradient has reached the node yet.
-    fn backward(&self, grads: &mut Vec<Option<Value>>) -> EvalResult<()> {
+    fn backward(&self, grads: &mut Vec<Option<Value>>, span: &Span) -> EvalResult<()> {
+        self.check_live(span)?;
         for i in (0..self.nodes.len()).rev() {
             let n = &self.nodes[i];
             let Some(g_out) = grads[i].clone() else { continue; };
@@ -11348,7 +14545,10 @@ impl Tape {
     /// (and the nodes appended along the way) form a differentiable extension
     /// of the tape: seed an ordinary `backward()` at one of them to get the
     /// second derivative.
-    fn backward_symbolic(&mut self, loss_node: usize) -> EvalResult<Vec<Option<usize>>> {
+    fn backward_symbolic(&mut self, loss_node: usize, span: &Span) -> EvalResult<Vec<Option<usize>>> {
+        // #674: see
+        // `backward`'s doc.
+        self.check_live(span)?;
         let n = self.nodes.len();
         let mut adj: Vec<Option<usize>> = vec![None; n];
         let seed = self.push_const(Value::Float(1.0, FW::F64));
@@ -11559,7 +14759,10 @@ impl Tape {
 /// `capture_type_is_differentiable` is the static counterpart.
 fn value_is_differentiable(v: &Value) -> bool {
     match v {
-        Value::Tensor(t) => matches!(t.dtype, DType::F32 | DType::F64),
+        // #834: fp8 tensors are nominal f32-backed tags, differentiable
+        // exactly like plain `F32` (unchanged from before this fix, when the
+        // interpreter mistagged them AS `DType::F32` outright).
+        Value::Tensor(t) => matches!(t.dtype, DType::F32 | DType::F64 | DType::Fp8E4M3 | DType::Fp8E5M2),
         Value::Float(..) => true,
         _ => false,
     }
@@ -11699,6 +14902,9 @@ pub(crate) fn json_encode_value(v: &Value) -> String {
     match v {
         Value::Nil       => "null".to_string(),
         Value::Bool(b)   => if *b { "true".to_string() } else { "false".to_string() },
+        // #597: encode a `u64`'s unsigned magnitude, not its signed pattern —
+        // see the identical carve-out in `Value`'s `Debug` impl.
+        Value::Int(n, IW::U64) => (*n as u64).to_string(),
         Value::Int(n, _)    => n.to_string(),
         Value::Float(x, _)  => {
             // Produce a compact representation; avoid trailing .0 for whole numbers
@@ -11727,6 +14933,11 @@ pub(crate) fn json_encode_value(v: &Value) -> String {
             let parts: Vec<String> = vs.iter().map(json_encode_value).collect();
             format!("[{}]", parts.join(","))
         }
+        // #674: no error
+        // channel here either — a stale tensor falls to the SAME "null" the
+        // fallback arm already uses for every unencodable value, rather than
+        // encoding stale bytes as a number.
+        Value::Tensor(t) if tensor_is_stale(t) => "null".to_string(),
         Value::Tensor(t) => {
             // Serialize as a flat JSON array of its elements (row-major). Reuses
             // the scalar float formatting so 1.5 -> "1.5", 2.0 -> "2" (#190).

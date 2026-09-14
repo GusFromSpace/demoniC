@@ -30,11 +30,14 @@ fn main() -> i64 {
     let H = 120
     let W = 160
 
-    # Scene: one sphere.
-    let scx = 0.0
-    let scy = 0.0
-    let scz = -3.0
-    let rad = 1.0
+    # Scene: one sphere. `sdf_sphere`'s scalar params are `f32` (SPEC §3.1:
+    # all implicit numeric conversions are forbidden, `f64 -> f32` included),
+    # so these need the suffix — an unannotated `let` binds a bare float
+    # literal to its `f64` default.
+    let scx = 0.0f32
+    let scy = 0.0f32
+    let scz = -3.0f32
+    let rad = 1.0f32
 
     # ── 1. Ray generation (pinhole camera at origin, looking down -z) ──
     # Vertical coords 1.0..-1.0, horizontal -aspect..aspect.
@@ -176,10 +179,10 @@ fn test_sdf_sphere_inside() -> bool {
 fn test_hitmask_is_binary() -> bool {
     let H = 120
     let W = 160
-    let scx = 0.0
-    let scy = 0.0
-    let scz = -3.0
-    let rad = 1.0
+    let scx = 0.0f32
+    let scy = 0.0f32
+    let scz = -3.0f32
+    let rad = 1.0f32
     let !ys = forge.zeros[f32, [120]]
     let !ri = 0
     while ri < H { ys[ri] = 1.0 - (ri as f32) * (2.0 / 119.0); ri = ri + 1 }
@@ -225,10 +228,10 @@ fn test_hitmask_is_binary() -> bool {
 fn test_hitmask_pixel_count_plausible() -> bool {
     let H = 120
     let W = 160
-    let scx = 0.0
-    let scy = 0.0
-    let scz = -3.0
-    let rad = 1.0
+    let scx = 0.0f32
+    let scy = 0.0f32
+    let scz = -3.0f32
+    let rad = 1.0f32
     let !ys = forge.zeros[f32, [120]]
     let !ri = 0
     while ri < H { ys[ri] = 1.0 - (ri as f32) * (2.0 / 119.0); ri = ri + 1 }

@@ -156,12 +156,17 @@ fn unsigned_widths_wrap_unsigned_and_stay_unsigned() {
         "255\n65535\n4294967295\n2147483647\n1073741823\ntrue\n");
 }
 
-/// `u64` is the one width an i64-backed value cannot fully hold, so it carries
-/// the 64-bit two's-complement PATTERN. Wrapping at 64 bits is bit-identical to
-/// `i64`'s — which is all §3.1's rule asks of it — but a value above 2^63
-/// renders signed. Pinned so the limitation is on record on both backends.
+/// `u64` shares the one 64-bit i64-backed slot with `i64` (there is no wider
+/// machine word), so it carries the 64-bit two's-complement PATTERN, and
+/// wrapping at 64 bits is bit-identical to `i64`'s — which is all §3.1's rule
+/// asks of it. An EXPLICIT `as i64` cast is still a signed reinterpretation of
+/// that pattern (#597 leaves `as i64`/`as u64` alone, per SPEC §3.1's "a cast
+/// is a compile-time type reinterpretation") — the case this test pins. What
+/// #597 changed is everything that reads the pattern WITHOUT an explicit
+/// cast: bare `u64` arithmetic (`/ % >>`, the ordering comparisons, and
+/// printing) now reads it unsigned; see `tests/u64_unsigned_597.rs`.
 #[test]
-fn u64_wraps_at_64_bits_as_a_signed_pattern() {
+fn u64_wraps_at_64_bits_as_a_twos_complement_pattern() {
     let src = r#"fn main() -> nil {
     let z: u64 = 0
     let o: u64 = 1

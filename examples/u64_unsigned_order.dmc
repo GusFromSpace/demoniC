@@ -1,0 +1,56 @@
+# u64_unsigned_order.dmc — `min`, `max` and `clamp` order a `u64` operand
+# UNSIGNED, and are interpreter-only at this width.
+#
+# `abs`, `min`, `max` and `clamp` all read a `u64` operand unsigned (see
+# `u64_semantics.dmc` for `abs` and the float-cast boundary). This file
+# covers `min`/`max`/`clamp` specifically because, unlike `abs`, their
+# scalar forms do not lower under the JIT:
+#
+#   * the JIT lowers the 1-argument TENSOR form of `min`/`max` only, so the
+#     2-argument scalar form here refuses as `jit-arg-form`;
+#   * `clamp` has no JIT lowering at all and refuses as `jit-unknown-fn`.
+#
+# Because the JIT compiles a file's `test_*` functions along with `main`,
+# keeping these three properties out of `u64_semantics.dmc` is what lets
+# that file be fully JIT-lowerable; putting them here instead means this
+# file — and only this file — lands in `diff_backends.py`'s
+# `jit-unsupported` bucket, and `dmc test --jit` reports every test below
+# as SKIPPED (not failed): the JIT can't run them, so there's nothing to
+# compare against the interpreter.
+#
+# Run:
+#   dmc test examples/u64_unsigned_order.dmc
+#   dmc test --jit examples/u64_unsigned_order.dmc   # all skipped, not failed
+
+# ─── one property per test, so a failure names something ────────────────────
+
+fn test_u64_min_orders_unsigned() -> bool {
+    let m: u64 = 18446744073709551615u64   # u64::MAX
+    let one: u64 = 1u64
+    min(m, one) == one   # unsigned order, not i64's (-1 < 1)
+}
+
+fn test_u64_max_orders_unsigned() -> bool {
+    let m: u64 = 18446744073709551615u64
+    let one: u64 = 1u64
+    max(m, one) == m
+}
+
+fn test_u64_clamp_orders_unsigned() -> bool {
+    let m: u64 = 18446744073709551615u64
+    let lo: u64 = 0u64
+    let hi: u64 = 10u64
+    clamp(m, lo, hi) == hi
+}
+
+fn main() -> i64 {
+    let m: u64 = 18446744073709551615u64
+    let one: u64 = 1u64
+    let lo: u64 = 0u64
+    let hi: u64 = 10u64
+
+    print(min(m, one))
+    print(max(m, one))
+    print(clamp(m, lo, hi))
+    0
+}

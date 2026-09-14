@@ -1,0 +1,77 @@
+# u64_semantics.dmc — `u64` at the float boundary: cast, saturate, `abs`.
+#
+# The compiler shipped four behaviours that the corpus never numerically
+# gated:
+#
+#   1. `u64 as f64` reads the unsigned MAGNITUDE, not the 64-bit pattern —
+#      `u64::MAX as f64` is one above `u64::MAX` (2^64), the nearest
+#      representable double at this magnitude, and renders plain-decimal:
+#      18446744073709552000. This is a rounded rendering of that magnitude,
+#      not a third value distinct from the 2^64 it renders.
+#   2. The reverse, `f64 as u64`, SATURATES into the full unsigned range
+#      rather than wrapping or reinterpreting bits: a float too large
+#      saturates to `u64::MAX`, a negative float saturates to 0.
+#   3. `abs` reads a `u64` operand UNSIGNED: it is the identity at this
+#      width (an unsigned type has no negative values).
+#   4. `min`, `max` and `clamp` are ALSO sign-sensitive on `u64` and order
+#      unsigned, but they are interpreter-only at this width — see
+#      `u64_unsigned_order.dmc`. Cast, saturation and `abs` are covered
+#      here instead because they lower on both backends; splitting the two
+#      groups is what lets this file's `main` be byte-parity-pinned by
+#      `diff_backends.py` (see below), which a mixed file cannot be: the
+#      JIT compiles a file's `test_*` functions along with `main`, so a
+#      single unlowerable call anywhere in the file — even in a `test_*`
+#      `main` never touches — refuses the whole file, not just that call.
+#
+# `shift_ops.dmc` is the closest existing file and covers `u64` only through
+# `>>`, `/`, `%` — none of the above.
+#
+# Run:
+#   dmc test examples/u64_semantics.dmc
+#   dmc test --jit examples/u64_semantics.dmc   # fully in the JIT subset:
+#                                                 # every test below runs
+#                                                 # under both backends.
+
+# ─── one property per test, so a failure names something ────────────────────
+
+fn test_u64_max_as_f64_is_the_rounded_magnitude() -> bool {
+    let m: u64 = 18446744073709551615u64   # u64::MAX
+    (m as f64) == 18446744073709552000.0   # magnitude, rounded to the nearest f64
+}
+
+fn test_f64_as_u64_saturates_high() -> bool {
+    let m: u64 = 18446744073709551615u64
+    let too_big: f64 = 1.0e30
+    (too_big as u64) == m
+}
+
+fn test_f64_as_u64_saturates_low() -> bool {
+    let negative: f64 = 0.0 - 5.0
+    (negative as u64) == 0u64
+}
+
+fn test_u64_abs_is_the_identity() -> bool {
+    let m: u64 = 18446744073709551615u64
+    abs(m) == m   # unsigned: no negative values at this width
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+#
+# `diff_backends.py` compiles this file under BOTH backends and diffs
+# `main`'s output byte-for-byte. Every call `main` makes here — the two
+# casts and `abs` — lowers under the JIT, and every `test_*` above is in the
+# same JIT-lowerable set, so nothing in this file routes it out of the
+# subset: this is measured byte-identical between `dmc run` and `dmc jit`.
+fn main() -> i64 {
+    let m: u64 = 18446744073709551615u64
+    print(m as f64)
+
+    let too_big: f64 = 1.0e30
+    print(too_big as u64)
+
+    let negative: f64 = 0.0 - 5.0
+    print(negative as u64)
+
+    print(abs(m))
+    0
+}

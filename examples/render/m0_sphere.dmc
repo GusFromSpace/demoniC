@@ -30,11 +30,14 @@ fn main() -> nil {
     let H = 120
     let W = 160
 
-    # Scene: one sphere.
-    let scx = 0.0
-    let scy = 0.0
-    let scz = -3.0
-    let rad = 1.0
+    # Scene: one sphere. `sdf_sphere`'s scalar params are `f32` (SPEC §3.1:
+    # all implicit numeric conversions are forbidden, `f64 -> f32` included),
+    # so these need the suffix — an unannotated `let` binds a bare float
+    # literal to its `f64` default.
+    let scx = 0.0f32
+    let scy = 0.0f32
+    let scz = -3.0f32
+    let rad = 1.0f32
 
     # ── 1. Ray generation (pinhole camera at origin, looking down -z) ──
     # Vertical coords 1.0..-1.0, horizontal -aspect..aspect.
@@ -232,10 +235,10 @@ fn test_sdf_symmetry() -> bool {
 # closely match: nx/|n| ≈ 1.0, ny/|n| ≈ 0.0, nz/|n| ≈ 0.0.
 fn test_surface_normal_points_outward() -> bool {
     let e = 0.0015
-    let cx = 0.0
-    let cy = 0.0
-    let cz = -3.0
-    let r  = 1.0
+    let cx = 0.0f32
+    let cy = 0.0f32
+    let cz = -3.0f32
+    let r  = 1.0f32
 
     # query point on surface: (1,0,-3)
     let !px = forge.zeros[f32, [1, 1]]

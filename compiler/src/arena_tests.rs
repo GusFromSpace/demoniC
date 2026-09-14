@@ -2,7 +2,7 @@
 /// Parsing and rendering only; the metering itself is covered in
 /// `interp_tests.rs` and `tests/arena_flags.rs`.
 
-use super::arena::{flag_arena, fmt_bytes, parse_size, Arena, ArenaLimits};
+use super::arena::{budget_live_child_clause, flag_arena, fmt_bytes, parse_size, Arena, ArenaLimits};
 
 #[test]
 fn bare_byte_counts() {
@@ -86,4 +86,41 @@ fn byte_rendering_round_trips_through_the_parser() {
     assert_eq!(fmt_bytes(1536 * 1024 * 1024), "1.5 GiB");
     // Exact renderings are valid flag values again.
     assert_eq!(parse_size("16GiB"), Ok(16 * 1024 * 1024 * 1024));
+}
+
+#[test]
+fn byte_rendering_truncates_rather_than_rounds_at_a_boundary() {
+    // #805: round-to-nearest could display a figure one byte under a unit
+    // boundary as the boundary itself (`600.0 MiB` for `600 MiB - 1`),
+    // which reads as self-contradictory in an exhaustion message. Truncate
+    // instead — the displayed figure never exceeds the real one.
+    assert_eq!(fmt_bytes(0), "0 B");
+    assert_eq!(fmt_bytes(1023), "1023 B");
+    assert_eq!(fmt_bytes(1024), "1 KiB");
+    assert_eq!(fmt_bytes(600 * (1 << 20)), "600 MiB");
+    assert_eq!(fmt_bytes(600 * (1 << 20) - 1), "599.9 MiB");
+    assert_eq!(fmt_bytes((1 << 30) - 1), "1023.9 MiB");
+}
+
+#[test]
+fn budget_reap_live_child_clause_conjugates_by_count() {
+    // #842: `interp.rs` and `jit.rs` both build `budget-reap`'s live-child
+    // refusal through this one formatter now, so the two backends cannot
+    // drift on it again — one live child reads singular throughout, more
+    // than one reads plural throughout. The three conjugated positions (the
+    // noun's `s`, the object pronoun, the possessive) all switch together
+    // on the SAME test, which is what the old `interp.rs` string got wrong:
+    // it conditioned the `s` and hardcoded both pronouns plural.
+    assert_eq!(
+        budget_live_child_clause(1),
+        "this budget has 1 live child budget; reap it before reaping its parent",
+    );
+    assert_eq!(
+        budget_live_child_clause(2),
+        "this budget has 2 live child budgets; reap them before reaping their parent",
+    );
+    assert_eq!(
+        budget_live_child_clause(3),
+        "this budget has 3 live child budgets; reap them before reaping their parent",
+    );
 }

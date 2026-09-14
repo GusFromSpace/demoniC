@@ -1,0 +1,11 @@
+# Probe 60 (entry) — SPEC §6.7 (#15): `use "..." as a` makes items reachable as
+# `a.name`. An aliased call arrives as a postfix chain — `Field` then `Call` —
+# not a bare call, which is the same shape a cross-file UFCS call has (#627).
+# The merge tells them apart by whether the base identifier is bound to a module
+# by a `use ... as`, never by the shape of the chain.
+use "p60_multifile_alias_mod.dmc" as u
+fn main() -> nil {
+    let p = u.mk(1, 3)
+    if p.a + p.b == 4 { print("Run OK") } else { print("FAIL: alias import") }
+    nil
+}

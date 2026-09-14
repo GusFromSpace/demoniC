@@ -470,6 +470,15 @@ fn run_interp(program: &crate::ast::Program) -> Interp {
 /// JIT-compile and run a single program. Mirrors `dmc jit`: no pre-check, the
 /// JIT does its own per-fn validation. A clean "not lowered" compile error is a
 /// gap; a Rust panic is caught and reported as an error.
+///
+/// The third `compile_program` caller, and the one the whole-program merge
+/// deliberately left alone: the other two now hand it a *merged*
+/// program, this one hands it a `Program` the fuzzer **generated** — scalar
+/// arithmetic, casts and control flow, built in memory and never parsed from a
+/// file. It cannot contain a `use` and there is no resolver to merge from, so
+/// `Jit::set_merge` is not called here and the merged→source map stays empty,
+/// which makes the demangling on the error path a no-op. Nothing to do until
+/// the fuzzer starts generating import DAGs.
 fn run_jit(program: &crate::ast::Program) -> JitOut {
     let res = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut jit = match Jit::new() {

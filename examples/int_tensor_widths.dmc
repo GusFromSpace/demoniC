@@ -21,13 +21,12 @@
 # reused shows up as a wrong total rather than as a shape mismatch.
 #
 # Elementwise DOTTED ops on these tensors are covered by the sibling file
-# `int_tensor_dotted_widths.dmc`, and they live there rather than here for one
-# mechanical reason: the JIT refuses integer elementwise ops outright
-# ("elementwise ops are f32-only"), and it compiles a file as a unit — so a
-# single dotted `.+` anywhere in THIS file would drop every test in it out of
-# the JIT half of the gate, including the ten that run there today. Keeping the
-# two apart is what lets each be gated as far as its backend support goes. When
-# the JIT gains integer elementwise lowering the two files can merge.
+# `int_tensor_dotted_widths.dmc`, which lives apart from this one because the
+# JIT compiles a file as a unit: any construct it declines drops every test in
+# the file out of the JIT half of the gate. The refusal that originally split
+# them — integer elementwise ops — is lifted now, but the sibling still holds
+# two tests the JIT declines for other reasons, so the split earns its keep
+# until those are separated out.
 #
 # Run:
 #   dmc test examples/int_tensor_widths.dmc

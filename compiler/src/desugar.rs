@@ -162,6 +162,10 @@ impl Ctx {
             Expr::Match(m) => self.matchexpr(m),
             Expr::FnLit(f) => self.block(&mut f.body),
             Expr::ArenaBlock(a) => self.block(&mut a.body),
+            // #674 slice 3a: structural recursion, same shape as `ArenaBlock`
+            // — a UFCS receiver could still be nested inside either.
+            Expr::BudgetBlock(bb) => { self.expr(&mut bb.operand); self.block(&mut bb.body); }
+            Expr::AllocIn { expr, budget, .. } => { self.expr(expr); self.expr(budget); }
             Expr::DirectiveBlock { body, .. } => self.block(body),
             Expr::BinOp { lhs, rhs, .. } => { self.expr(lhs); self.expr(rhs); }
             Expr::UnOp { operand, .. } => self.expr(operand),

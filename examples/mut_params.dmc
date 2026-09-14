@@ -1,0 +1,171 @@
+# mut_params.dmc — `!` parameters: mutating a caller's value through a call.
+#
+# SPEC.md §3.4 (Mutability) makes `!` the grant of mutation, and a `!` parameter
+# carries that grant across a call boundary: writes the callee makes through
+# the parameter are visible to the caller when the call returns. Both backends
+# implement that, by two different means, and this file pins the observable
+# behaviour they have to share rather than the means.
+#
+# The two representations are not interchangeable, and the third test is where
+# they part company:
+#
+#   - a `!` TENSOR parameter is copy-in / copy-out. The callee works on a
+#     private buffer and the writes are copied back on return, so a tensor
+#     passed to BOTH a `!` and a by-value parameter of the same call is
+#     isolated: the by-value one keeps the values it was called with.
+#   - a `!` MODEL parameter is the instance itself. Nothing is copied, so the
+#     same instance passed twice is one instance under two names, and the write
+#     is visible through both DURING the call.
+#
+# This is the calling convention behind free functions that mutate a structure
+# by reference — `fn alloc_node(!g: Graph, ...)`, `fn link(!g: Graph, ...)` —
+# which is how a graph, an allocator or a virtual machine is written when the
+# language has no methods on a `model` beyond the ones declared in its body.
+
+# A structure of parallel arrays: the shape a graph takes when every node is an
+# index and every field is a column. `kind` says what a node is, `parent` is the
+# structural skeleton, `heat` is a per-node accumulator.
+model Graph {
+    !kind: Tensor[i64, [8]]
+    !parent: Tensor[i64, [8]]
+    !heat: Tensor[i64, [8]]
+}
+
+fn new_graph() -> Graph {
+    Graph {
+        kind: forge.zeros[i64, [8]],
+        parent: forge.zeros[i64, [8]],
+        heat: forge.zeros[i64, [8]],
+    }
+}
+
+# The constructor. Takes the graph by reference, writes two columns, returns the
+# id it used — the shape almost every mutating free function has.
+fn alloc_node(!g: Graph, id: i64, kind: i64, parent: i64) -> i64 {
+    g.kind[id] = kind
+    g.parent[id] = parent
+    id
+}
+
+# A second one, so the nesting below has something to chain into.
+fn touch(!g: Graph, id: i64, by: i64) -> i64 {
+    g.heat[id] = g.heat[id] + by
+    g.heat[id]
+}
+
+# Nesting: `!g` handed straight on to another `!` parameter. Whatever the
+# backend does at each hop, the caller two frames up has to see the write.
+fn visit(!g: Graph, id: i64, parent: i64) -> i64 {
+    let node = alloc_node(g, id, 1, parent)
+    touch(g, node, 3)
+}
+
+fn test_mut_model_param_writes_reach_the_caller() -> bool {
+    let !g = new_graph()
+    let a = alloc_node(g, 1, 7, 0)
+    let b = alloc_node(g, 2, 9, a)
+    a == 1 && b == 2 && g.kind[1] == 7 && g.kind[2] == 9 && g.parent[2] == 1
+}
+
+fn test_mut_model_param_nests() -> bool {
+    let !g = new_graph()
+    let h1 = visit(g, 1, 0)
+    let h2 = visit(g, 1, 0)
+    # Each visit adds 3 to the same node's heat, through two frames of `!`.
+    h1 == 3 && h2 == 6 && g.heat[1] == 6 && g.kind[1] == 1
+}
+
+# ── where the two representations differ ────────────────────────────────────
+
+# A model is never copied at a call, so `b` is `a`.
+fn poke_model(!a: Graph, b: Graph, id: i64) -> i64 {
+    a.heat[id] = 5
+    b.heat[id]
+}
+
+# A tensor IS copied, so the by-value `b` keeps what it was called with.
+fn poke_tensor(!a: Tensor[i64, [8]], b: Tensor[i64, [8]], id: i64) -> i64 {
+    a[id] = 5
+    b[id]
+}
+
+fn test_a_mut_model_arg_aliases_a_by_value_one() -> bool {
+    let !g = new_graph()
+    let seen = poke_model(g, g, 3)
+    seen == 5 && g.heat[3] == 5
+}
+
+fn test_a_mut_tensor_arg_is_isolated_from_a_by_value_one() -> bool {
+    let !t = forge.zeros[i64, [8]]
+    let seen = poke_tensor(t, t, 3)
+    # The by-value `b` never saw the 5 — but the caller does, after the return.
+    seen == 0 && t[3] == 5
+}
+
+# ── tensor out-parameters ───────────────────────────────────────────────────
+
+# The other half of the convention: the result is written into a buffer the
+# caller owns, and the return value carries only how much of it was filled.
+fn collect_kinds(g: Graph, !out: Tensor[i64, [8]]) -> i64 {
+    let !n = 0
+    let !i = 0
+    while i < 8 {
+        if g.kind[i] != 0 {
+            out[n] = g.kind[i]
+            n = n + 1
+        }
+        i = i + 1
+    }
+    n
+}
+
+fn test_tensor_out_param_is_filled_for_the_caller() -> bool {
+    let !g = new_graph()
+    alloc_node(g, 1, 7, 0)
+    alloc_node(g, 3, 9, 1)
+    let !out = forge.zeros[i64, [8]]
+    let n = collect_kinds(g, out)
+    n == 2 && out[0] == 7 && out[1] == 9 && out[2] == 0
+}
+
+# SPEC.md §3.4 (Mutability): `let !y = x` on a plain local is a VALUE COPY.
+# Taking the parameter by reference must not quietly promote that copy to an
+# alias — the scratch buffer a callee makes for itself stays the callee's.
+fn scratch(!t: Tensor[i64, [8]]) -> i64 {
+    let !y = t
+    y[0] = 99
+    t[0] = 1
+    y[0]
+}
+
+fn test_a_let_bang_copy_inside_the_callee_stays_a_copy() -> bool {
+    let !t = forge.zeros[i64, [8]]
+    let seen = scratch(t)
+    seen == 99 && t[0] == 1
+}
+
+# A `!` parameter the callee REBINDS wholesale still writes back: what the
+# caller gets is the buffer the parameter names when the callee returns, not
+# the one it was handed.
+fn double(!t: Tensor[f32, [8]]) -> f32 {
+    t[0] = 4.0
+    t = t .* 2.0
+    t[0]
+}
+
+fn test_a_rebound_mut_param_writes_back_what_it_names_at_return() -> bool {
+    let !t = forge.zeros[f32, [8]]
+    let seen = double(t)
+    seen == 8.0 && t[0] == 8.0
+}
+
+fn main() -> nil {
+    print(test_mut_model_param_writes_reach_the_caller())
+    print(test_mut_model_param_nests())
+    print(test_a_mut_model_arg_aliases_a_by_value_one())
+    print(test_a_mut_tensor_arg_is_isolated_from_a_by_value_one())
+    print(test_tensor_out_param_is_filled_for_the_caller())
+    print(test_a_let_bang_copy_inside_the_callee_stays_a_copy())
+    print(test_a_rebound_mut_param_writes_back_what_it_names_at_return())
+    nil
+}

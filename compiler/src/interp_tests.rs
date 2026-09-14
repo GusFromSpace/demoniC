@@ -25,6 +25,17 @@ fn run_err(src: &str) -> String {
     Interpreter::new().run(&program, None).err().expect("expected runtime error").msg
 }
 
+/// A runtime error's message together with the `line:col` it points at, for
+/// the tests that care that a diagnostic points *somewhere* — a message with
+/// `span: None` prints bare `runtime error:` and leaves the reader hunting.
+fn run_err_at(src: &str) -> (String, Option<(usize, usize)>) {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let e = Interpreter::new().run(&program, None).err().expect("expected runtime error");
+    let at = e.span.as_ref().map(|s| (s.line, s.col));
+    (e.msg, at)
+}
+
 /// Run `f` on a thread with the same large stack the `dmc` binary gives the
 /// interpreter (`main.rs`'s `INTERP_STACK_SIZE`). The tree-walking interpreter
 /// consumes deep native stack per demoniC call frame, so any test exercising
@@ -1091,10 +1102,17 @@ fn grad_capture_is_scoped_to_the_fns_own_module_398() {
     // A flat cross-module name list made an unrelated module's `let !alpha`
     // enough to turn THIS module's immutable `alpha` into a `Grads` field —
     // a differentiable input no checker rule ever admitted (the checker does
-    // not even put an imported `pub let !` in scope under its bare name).
-    // `g.alpha` must simply not exist here.
+    // not put an imported module's file-private `let !` in scope under its
+    // bare name at all). `g.alpha` must simply not exist here.
+    //
+    // lib.dmc's `alpha` is deliberately file-private, not `pub`: #596 made
+    // `pub let` a compile-time error (SPEC.md §6.7 exports only `pub fn` /
+    // `pub model` / `pub type`), so a `pub let !alpha` fixture no longer
+    // type-checks. The flat-name-list bug this guards never turned on
+    // visibility anyway — only on the name and the `!` — so a private
+    // `let !alpha` exercises the same path.
     let v = run_multi(&[
-        ("lib.dmc", "pub let !alpha = 9.0f64\npub fn touch() -> f64 { alpha }"),
+        ("lib.dmc", "let !alpha = 9.0f64\npub fn touch() -> f64 { alpha }"),
         ("main.dmc", r#"use "lib.dmc"
 let alpha = 3.0f64
 @grad fn loss(!w: Tensor[f64,[3]]) -> f64 { sum(w .* w) * alpha }
@@ -1115,8 +1133,12 @@ fn grad_own_module_capture_still_works_alongside_an_import_398() {
     // not cost the module its OWN captures. `beta` is main's `let !`, and it
     // keeps its gradient with lib.dmc's unrelated `!alpha` in the graph.
     // dL/dbeta = sum(w .* w) = 14.
+    //
+    // lib.dmc's `alpha` is file-private for the same reason as the sibling
+    // test above: #596 made `pub let` a compile-time error, so the fixture
+    // can no longer spell it `pub`.
     let v = run_multi(&[
-        ("lib.dmc", "pub let !alpha = 9.0f64\npub fn touch() -> f64 { alpha }"),
+        ("lib.dmc", "let !alpha = 9.0f64\npub fn touch() -> f64 { alpha }"),
         ("main.dmc", r#"use "lib.dmc"
 let !beta = 2.0f64
 @grad fn loss(!w: Tensor[f64,[3]]) -> f64 { sum(w .* w) * beta }
@@ -2283,6 +2305,601 @@ fn null6_question_mark_on_non_tuple_errors_loudly() {
             "expected type error for ? on int, got: {}", msg);
 }
 
+// ── `?`'s error path returns `(default[T], e)` (#628) ────────────────────────
+//
+// SPEC §4.9: `x?` is sugar for `let (x, e) = ...; if e != nil { return
+// (default[T], e) }`, where `default[T]` is the zero value of the ENCLOSING
+// function's `T` — 0 / 0.0 / false / nil / zero-tensor.
+//
+// The interpreter used to early-return the CALLEE's whole tuple, so the
+// caller's success slot carried whatever the callee had put in its own error
+// path. `null6_question_mark_propagates_error` above could not see it because
+// its callee returned `(0, err)` — the default by coincidence. Every probe
+// below therefore uses a NON-ZERO callee value, so the old behaviour cannot
+// pass any of them. The expected values are the JIT's, probe for probe
+// (`jit.rs`'s `lower_query` / `default_value_for`, PR #625).
+
+#[test]
+fn query_error_path_returns_the_callers_default_not_the_callees_value() {
+    // The headline case: the callee's error-path `777` must not reach the
+    // caller's success slot. `0`, the zero of the caller's `i64`, must.
+    let v = run(r#"
+        fn callee() -> (i64, str) { (777, "odd") }
+        fn caller() -> (i64, str) {
+            let v = callee()?
+            (v + 1, nil)
+        }
+        fn main() -> str {
+            let (v, e) = caller()
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "0|odd");
+}
+
+#[test]
+fn query_default_is_the_zero_of_the_enclosing_t_for_every_scalar() {
+    // i64 → 0, f32 → 0.0, bool → false, str → nil. `default[str]` is `nil`,
+    // not `""`: SPEC §4.9's enumeration has no empty string in it, and the JIT
+    // gives a `str` slot the NULL pointer, which is `nil`.
+    let v = run(r#"
+        fn c_i() -> (i64, str)  { (42, "boom") }
+        fn c_f() -> (f32, str)  { (2.5, "boom") }
+        fn c_b() -> (bool, str) { (true, "boom") }
+        fn c_s() -> (str, str)  { ("hi", "boom") }
+        fn p_i() -> (i64, str)  { let v = c_i()?
+                                  (v, nil) }
+        fn p_f() -> (f32, str)  { let v = c_f()?
+                                  (v, nil) }
+        fn p_b() -> (bool, str) { let v = c_b()?
+                                  (v, nil) }
+        fn p_s() -> (str, str)  { let v = c_s()?
+                                  (v, nil) }
+        fn main() -> str {
+            let (a, ea) = p_i()
+            let (b, eb) = p_f()
+            let (c, ec) = p_b()
+            let (d, ed) = p_s()
+            to_str(a) + " / " + to_str(b) + " / " + to_str(c) + " / " + to_str(d)
+        }
+    "#);
+    assert_eq!(as_str(&v), "0 / 0 / false / nil");
+}
+
+#[test]
+fn query_default_for_a_tensor_t_is_a_zero_tensor() {
+    // The callee's error path hands back a tensor of ONES; the caller's slot
+    // must hold its own zero tensor, so the sum is 0 and not 2.
+    let v = run(r#"
+        fn c_t() -> (Tensor[f32, [2]], str) { (forge.ones[f32, [2]], "boom") }
+        fn p_t() -> (Tensor[f32, [2]], str) {
+            let v = c_t()?
+            (v, nil)
+        }
+        fn main() -> f32 {
+            let (t, e) = p_t()
+            sum(t)
+        }
+    "#);
+    assert!(as_float(&v).abs() < 1e-9, "expected a zero tensor, got sum {:?}", v);
+}
+
+#[test]
+fn query_default_for_a_shape_parametric_tensor_t_resolves_its_dims() {
+    // `-> (Tensor[f32, [N]], Err)`: `N` is a shape param of the propagating
+    // function, so `default[T]` has to be built while that function's scope is
+    // still standing. Built after the scope pops, `N` is unbound.
+    let v = run(r#"
+        fn c_n[N]() -> (Tensor[f32, [N]], str) { (forge.ones[f32, [N]], "boom") }
+        fn p_n[N](probe: Tensor[f32, [N]]) -> (Tensor[f32, [N]], str) {
+            let v = c_n[N]()?
+            (v, nil)
+        }
+        fn main() -> f32 {
+            let probe = forge.zeros[f32, [3]]
+            let (t, e) = p_n(probe)
+            sum(t)
+        }
+    "#);
+    assert!(as_float(&v).abs() < 1e-9, "expected a zero tensor, got sum {:?}", v);
+}
+
+#[test]
+fn query_in_a_loop_returns_the_default() {
+    let v = run(r#"
+        fn c99() -> (i64, str) { (99, "boom") }
+        fn in_loop() -> (i64, str) {
+            let !acc = 0
+            for i in 0..3 {
+                acc = acc + c99()?
+            }
+            (acc, nil)
+        }
+        fn main() -> str {
+            let (a, e) = in_loop()
+            to_str(a) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "0|boom");
+}
+
+#[test]
+fn query_in_a_nested_block_returns_the_default() {
+    // The `?` sits inside an `if` body, one block below the function's own.
+    // The early return still belongs to the FUNCTION, so the default is the
+    // function's — the block's value is never produced.
+    let v = run(r#"
+        fn c55() -> (i64, str) { (55, "boom") }
+        fn in_nested() -> (i64, str) {
+            if true {
+                let v = c55()?
+                (v, nil)
+            } else {
+                (0, nil)
+            }
+        }
+        fn main() -> str {
+            let (b, e) = in_nested()
+            to_str(b) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "0|boom");
+}
+
+#[test]
+fn query_twice_in_one_expression_returns_the_default() {
+    // The first `?` to trip wins; the second is never evaluated.
+    let v = run(r#"
+        fn c55() -> (i64, str) { (55, "boom") }
+        fn twice() -> (i64, str) {
+            (c55()? + c55()?, nil)
+        }
+        fn main() -> str {
+            let (c, e) = twice()
+            to_str(c) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "0|boom");
+}
+
+#[test]
+fn query_default_is_the_callers_type_when_the_two_ts_differ() {
+    // The callee's `T` is `str` and the caller's is `i64`. Returning the
+    // callee's tuple did not merely give the wrong VALUE — it put a `str` in a
+    // slot declared `i64`. `as_int` is the assertion: it panics on a `Str`.
+    let v = run(r#"
+        fn c_s() -> (str, str) { ("payload", "boom") }
+        fn caller() -> (i64, str) {
+            let s = c_s()?
+            (7, nil)
+        }
+        fn main() -> i64 {
+            let (v, e) = caller()
+            v
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+#[test]
+fn query_default_refuses_a_model_t() {
+    // SPEC §4.9 defines `default[T]` as "0 / 0.0 / false / nil / zero-tensor".
+    // A model is in none of those, so there is nothing to construct and the
+    // interpreter refuses rather than inventing one — the same call the JIT's
+    // `default_value_for` makes ("cannot construct"). The JIT refuses while
+    // lowering; the interpreter, having no lowering pass, refuses when the
+    // error path is taken.
+    let msg = run_err(r#"
+        model P { x: f32 }
+        fn c_m() -> (P, str) {
+            let p = P { x: 3.5 }
+            (p, "boom")
+        }
+        fn p_m() -> (P, str) {
+            let v = c_m()?
+            (v, nil)
+        }
+        fn main() -> f32 {
+            let (m, e) = p_m()
+            m.x
+        }
+    "#);
+    assert!(msg.contains("needs a default value for `P`"),
+            "expected a `cannot construct default[P]` refusal, got: {}", msg);
+}
+
+#[test]
+fn query_success_path_is_unchanged() {
+    // The whole fix lives on the error path: `(T, nil)` still unwraps to `T`,
+    // and nothing downstream of it moves.
+    let v = run(r#"
+        fn ok() -> (i64, str) { (7, nil) }
+        fn use_it() -> (i64, str) {
+            let v = ok()?
+            (v * 3, nil)
+        }
+        fn main() -> str {
+            let (v, e) = use_it()
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "21|nil");
+}
+
+// ── `?` inside a lambda: `call_lambda`'s own catch (#628 follow-up) ──────────
+//
+// `check.rs`'s `PostfixOp::Query` validates a `?` against `current_fn_ret` —
+// the LEXICALLY enclosing NAMED fn's declared return type — regardless of
+// whether the `?` sits directly in that fn's body or inside a lambda literal
+// nested in it (`FnLit`'s own check never touches `current_fn_ret`). A lambda
+// with its own `-> (T, Err)` is validated the very same way: even a properly
+// typed lambda is refused if the enclosing NAMED fn is not itself `(T, Err)`
+// (confirmed against `dmc --check` directly: a `fn() -> (i64, str) { c()? }`
+// sitting inside `fn main() -> str` is a type error citing `main`, not the
+// lambda). `call_lambda`'s own `finish_query_propagation` call has to agree.
+
+#[test]
+fn query_typed_lambda_uses_its_own_declared_type_not_the_enclosing_fns() {
+    // The lambda declares `-> (i64, str)`; the enclosing NAMED fn `outer`
+    // declares `-> (str, str)` — a different `T`. `default[T]` must come from
+    // the LAMBDA's own `i64` (giving `0`), not from `outer`'s `str` (which
+    // would give `nil` and a type mismatch `to_str` would choke on).
+    let v = run(r#"
+        fn c() -> (i64, str) { (777, "boom") }
+        fn outer() -> (str, str) {
+            let g = fn() -> (i64, str) { let v = c()?
+                                         (v, nil) }
+            let (v, e) = g()
+            (to_str(v) + "|" + to_str(e), nil)
+        }
+        fn main() -> str {
+            let (v, e) = outer()
+            v
+        }
+    "#);
+    assert_eq!(as_str(&v), "0|boom");
+}
+
+#[test]
+fn query_untyped_lambda_falls_back_to_the_enclosing_named_fns_type() {
+    // The lambda has NO declared return type at all. Before this fix,
+    // `call_lambda` had no `T` to build `default[T]` from and refused at
+    // runtime ("`<lambda>` returns `nothing`") even though `dmc --check`
+    // accepts the program — it validates the `?` against `f`'s `(str, str)`,
+    // not the lambda's (absent) one. Verified directly against `dmc --check`:
+    // this program passes with no type errors, and `dmc run` (pre-fix, on
+    // `main`) produced `777:boom`; this pins the CORRECT reading instead —
+    // `default[str]` is `nil` (SPEC §4.9: `str`'s zero value has no empty
+    // string in the enumeration), so the lambda call's own early return is
+    // the tuple `(nil, "boom")` — not unwrapped, because nothing in `f` put a
+    // `?` on the lambda CALL itself, only inside the lambda's body.
+    let v = run(r#"
+        fn c() -> (i64, str) { (777, "boom") }
+        fn f() -> (str, str) {
+            let g = fn() { let v = c()?
+                           to_str(v) }
+            (g(), nil)
+        }
+        fn main() -> str {
+            let (v, e) = f()
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "(nil, \"boom\")|nil");
+}
+
+#[test]
+fn query_in_a_lambda_outside_any_err_fn_is_refused() {
+    // `dmc --check` already refuses this program (confirmed directly): `main`
+    // returns `str`, not `(T, Err)`, so the checker rejects the `?` inside
+    // `g`'s body regardless of what `g` itself declares. This test exercises
+    // the INTERPRETER's own defense at the same boundary, independent of
+    // `check.rs` (this harness never runs the checker) — `named_fn_ret_stack`
+    // falls back to `main`'s declared type, which is not a `(T, Err)` tuple,
+    // so `finish_query_propagation` refuses exactly as it would for a plain
+    // named fn in the same position.
+    let msg = run_err(r#"
+        fn c() -> (i64, str) { (777, "boom") }
+        fn main() -> str {
+            let g = fn() { let v = c()?
+                           to_str(v) }
+            g()
+        }
+    "#);
+    assert!(msg.contains("is only legal inside a function returning") && msg.contains("<lambda>"),
+            "expected a `?`-outside-(T,Err) refusal citing the lambda, got: {}", msg);
+}
+
+// ── `query_default_value`'s tensor-shape axes must evaluate STRICTLY ─────────
+
+#[test]
+fn query_default_tensor_shape_refuses_an_unresolvable_dim_instead_of_guessing_4() {
+    // This path evaluates a `?`'s default-tensor shape inline rather than
+    // through `eval_dim` (see the `#628 follow-up` comment beside it): it
+    // wants its own message and its own span (the `?`'s, not the failing
+    // sub-expression's). `default[T]`'s zero tensor has to have the shape
+    // `T` actually declares. `N - 6` at `N = 2` evaluates to `-4`; a naive
+    // default-on-error (the bug `eval_dim` itself had until #839) would have
+    // silently built a 4-element zero tensor with no diagnostic at all.
+    //
+    // `c[N]()` itself allocates a harmless `[1]`-shaped tensor — NOT `[N-6]`
+    // — so the only place `N - 6` is ever evaluated is `p`'s own `?`
+    // early-return default. Before #839, `c`'s body could get away with
+    // constructing `[N-6]` directly (`eval_dim` silently substituted 4 for
+    // the negative dim), which is what let this test reach the early-return
+    // path at all; now that `eval_dim` itself refuses a negative dim, doing
+    // that in `c` would raise there first and never exercise the code this
+    // test targets.
+    let msg = run_err(r#"
+        fn c[N]() -> (Tensor[f32, [N-6]], str) { (forge.ones[f32, [1]], "boom") }
+        fn p[N](probe: Tensor[f32, [N]]) -> (Tensor[f32, [N-6]], str) {
+            let v = c[N]()?
+            (v, nil)
+        }
+        fn main() -> f32 {
+            let probe = forge.zeros[f32, [2]]
+            let (t, e) = p(probe)
+            sum(t)
+        }
+    "#);
+    assert!(msg.contains("concrete non-negative dimension"),
+            "expected a loud refusal of the negative dim, got: {}", msg);
+}
+
+// ── #839: a constructor's shape expression propagates its error instead of
+// substituting a 4-element tensor ────────────────────────────────────────────
+//
+// `eval_dim` used to substitute a bare `4` on ANY error out of the shape
+// expression it was evaluating — so `forge.zeros[f32, [n()]]` with a raising
+// `n()` silently built a 4-element tensor and the program carried on with no
+// diagnostic. Three flavors of "`n()` raises", each pinned to a located error
+// rather than a successful 4-element (or, coincidentally-sized) tensor.
+
+#[test]
+fn shape_fn_runtime_error_propagates_839() {
+    // The shape expression is a call whose body hits an ordinary runtime
+    // error (an out-of-bounds tensor index) that `--check` cannot fold away
+    // statically because the index is a parameter, not a literal.
+    let (msg, at) = run_err_at(r#"
+        fn n(k: i64) -> i64 {
+            let !t = forge.zeros[f32, [2]]
+            t[k] as i64
+        }
+        fn main() -> f32 {
+            let t = forge.zeros[f32, [n(10)]]
+            sum(t)
+        }
+    "#);
+    assert!(msg.contains("out of bounds"), "expected the index error, got: {}", msg);
+    assert!(at.is_some(), "the propagated error must be located: {}", msg);
+}
+
+#[test]
+fn shape_fn_forge_exhaustion_propagates_839() {
+    // The shape expression's own body exhausts a deliberately tiny `--forge`
+    // budget. Before #839 this silently built the outer tensor at shape [4]
+    // and kept running; now `forge.zeros[f32, [n()]]` never returns a value.
+    let src = r#"
+        fn n() -> i64 {
+            let !t = forge.zeros[f32, [2000]]
+            4
+        }
+        fn main() -> f32 {
+            let t = forge.zeros[f32, [n()]]
+            sum(t)
+        }
+    "#;
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut interp = Interpreter::new();
+    interp.set_arena_limits(crate::arena::ArenaLimits { forge: Some(4096), vault: None });
+    let e = interp.run(&program, None).err().expect("expected a runtime error");
+    assert!(e.msg.contains("forge arena exhausted"), "message: {}", e.msg);
+    assert!(e.span.is_some(), "the propagated error must be located: {}", e.msg);
+}
+
+#[test]
+fn shape_fn_budget_stale_propagates_839() {
+    // The shape expression's own body reads a tensor out of a budget it has
+    // already reaped — `budget-stale` (the arena-budgets design, §2.3), the
+    // same tag `examples/tenant_budgets.dmc` exercises via `forge.carve`/`forge.reap`.
+    let (msg, at) = run_err_at(r#"
+        fn n() -> i64 {
+            let b = forge.carve(forge.root, 4096)
+            let !t = forge.zeros[f32, [4]] in b
+            forge.reap(b)
+            t[0] as i64
+        }
+        fn main() -> f32 {
+            let t = forge.zeros[f32, [n()]]
+            sum(t)
+        }
+    "#);
+    assert!(msg.starts_with("budget-stale:"), "message: {}", msg);
+    assert!(at.is_some(), "the propagated error must be located: {}", msg);
+}
+
+// ── `default[T]` at the declared scalar width (#473/#540) ────────────────────
+
+#[test]
+fn query_default_wraps_at_the_declared_scalar_width() {
+    // `default[u8]` is `0`; `0 - 1` must wrap to `255` the same way any other
+    // `u8` arithmetic does, which only happens if the `0` `finish_query_propagation`
+    // builds is actually tagged `u8` and not a width-less/`i64` zero.
+    let v = run(r#"
+        fn c() -> (u8, str) { (200 as u8, "boom") }
+        fn p() -> (u8, str) {
+            let v = c()?
+            (v, nil)
+        }
+        fn main() -> str {
+            let (v, e) = p()
+            to_str(v - 1) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "255|boom");
+}
+
+// ── `default[T]` refuses what SPEC §4.9 gives no zero value for ─────────────
+
+#[test]
+fn query_default_refuses_a_tuple_t() {
+    // A nested tuple is not in SPEC §4.9's enumeration ("0 / 0.0 / false /
+    // nil / zero-tensor") any more than a model is — same refusal, same
+    // reason `query_default_refuses_a_model_t` above pins for models.
+    let msg = run_err(r#"
+        fn c() -> ((i64, i64), str) { ((1, 2), "boom") }
+        fn p() -> ((i64, i64), str) {
+            let v = c()?
+            (v, nil)
+        }
+        fn main() -> i64 {
+            let (v, e) = p()
+            let (a, b) = v
+            a
+        }
+    "#);
+    assert!(msg.contains("needs a default value for"),
+            "expected a `default[(i64,i64)]` refusal, got: {}", msg);
+}
+
+#[test]
+fn query_default_refusal_spells_fp8_e4m3() {
+    // #833: `type_label` (this refusal's type-namer) used to Debug-format
+    // the `ScalarType` and lowercase it — `Fp8E4M3` -> `fp8e4m3`, dropping
+    // the underscore the source spelling and `docs/SPEC.md` §3.1 both
+    // require. It now routes through the canonical `fmt::scalar_type_str`
+    // table, the same one `check.rs`'s cast diagnostic and the JIT's own
+    // refusals (below) share.
+    let msg = run_err(r#"
+        fn c() -> ((fp8_e4m3, i64), str) { ((1.0 as fp8_e4m3, 2), "boom") }
+        fn p() -> ((fp8_e4m3, i64), str) {
+            let v = c()?
+            (v, nil)
+        }
+        fn main() -> i64 {
+            let (v, e) = p()
+            let (a, b) = v
+            b
+        }
+    "#);
+    assert!(msg.contains("needs a default value for `(fp8_e4m3, i64)`"),
+            "expected the tuple's fp8_e4m3 element spelled with its underscore, got: {}", msg);
+}
+
+#[test]
+fn query_default_refuses_an_enum_t() {
+    let msg = run_err(r#"
+        enum Color { Red, Green, Blue }
+        fn c() -> (Color, str) { (Color.Red, "boom") }
+        fn p() -> (Color, str) {
+            let v = c()?
+            (v, nil)
+        }
+        fn main() -> i64 {
+            let (v, e) = p()
+            v as i64
+        }
+    "#);
+    assert!(msg.contains("needs a default value for `Color`"),
+            "expected a `default[Color]` refusal, got: {}", msg);
+}
+
+// ── #628 × #639: two carriers, one channel ──────────────────────────────────
+//
+// Both signals ride `RuntimeError` because `eval_expr` has no other channel,
+// and they are caught at DIFFERENT boundaries: a `?` signal (`propagate`) at
+// the function-call boundary (`finish_query_propagation`), a block escape
+// (`flow`) at the nearest statement or block boundary (`catch_flow`), one
+// frame below. Each catch guards on its own field, so the other must ride
+// through untouched. Confuse them and a `?` inside a block gets swallowed as
+// the block's control flow, or a `return` inside a `(T, Err)` fn gets rebuilt
+// as a `(default[T], e)` early return it never was.
+
+#[test]
+fn query_error_path_survives_a_block_between_it_and_the_fn_boundary() {
+    // The `?` trips inside a `forge` block, then inside a plain block. #639
+    // made both of those catching boundaries for the OTHER carrier; neither
+    // may eat this one. Correct on both: the block never produces a value, the
+    // signal reaches `caller`'s own boundary, and the answer is `caller`'s
+    // `default[i64]` (0) with the callee's `777` dropped — not the block's
+    // value, not nil, and not 778.
+    let forged = run(r#"
+        fn callee() -> (i64, str) { (777, "odd") }
+        fn caller() -> (i64, str) {
+            let v = forge { callee()? }
+            (v + 1, nil)
+        }
+        fn main() -> str {
+            let (v, e) = caller()
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&forged), "0|odd");
+
+    let plain = run(r#"
+        fn callee() -> (i64, str) { (777, "odd") }
+        fn caller() -> (i64, str) {
+            let v = { callee()? }
+            (v + 1, nil)
+        }
+        fn main() -> str {
+            let (v, e) = caller()
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&plain), "0|odd");
+}
+
+#[test]
+fn a_block_escape_inside_an_err_fn_is_control_flow_not_a_query_early_return() {
+    // The mirror image. `caller` is a `(T, Err)` fn — the one shape whose
+    // boundary rebuilds a `?` — but a `return` / `break` out of a block there
+    // is #639's carrier, not #628's, and must reach the fn (or the loop) as
+    // written rather than being rewritten into `(default[T], e)`.
+    //
+    // `return (42, "early")` returns the fn's OWN tuple: `42`, not `default
+    // [i64]`'s 0, and `"early"` is the value the program wrote, not an error
+    // the `?` machinery produced.
+    let returned = run(r#"
+        fn callee() -> (i64, str) { (5, nil) }
+        fn caller(x: i64) -> (i64, str) {
+            forge { if x > 0 { return (42, "early") } }
+            let v = callee()?
+            (v + 1, nil)
+        }
+        fn main() -> str {
+            let (v, e) = caller(1)
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&returned), "42|early");
+
+    // A `break` out of a block inside a loop in the same fn, on an iteration
+    // AFTER a `?` took its success path — so both carriers have crossed the
+    // same frame in one run. The `break` leaves the loop and nothing else:
+    // i stops at 3, s = 0+1+2 = 3, so `s * 100 + i` is 303 with no error.
+    let broke = run(r#"
+        fn ok(n: i64) -> (i64, str) { (n, nil) }
+        fn caller() -> (i64, str) {
+            let !i = 0
+            let !s = 0
+            while i < 10 {
+                let v = ok(i)?
+                forge { if v > 2 { break } }
+                s = s + v
+                i = i + 1
+            }
+            (s * 100 + i, nil)
+        }
+        fn main() -> str {
+            let (v, e) = caller()
+            to_str(v) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&broke), "303|nil");
+}
+
 #[test]
 fn null8_kv_stream_append_extends_axis() {
     // Null 8: KV[~] <- appends along the last (streaming) axis.
@@ -2368,7 +2985,7 @@ fn null10_comptime_evaluates_static_expr() {
     // static analysis (JIT phase)". #505 made that false: `comptime.rs` folds
     // the block before either backend runs, under a step budget, so a
     // non-terminating body is a `comptime-budget` compile error
-    // (COMPTIME_V1.md §6) rather than a hang.
+    // (the evaluator's step budget is exhausted) rather than a hang.
     //
     // This file's `run` helper deliberately does NOT fold: it drives the
     // interpreter straight off the parsed tree, so these tests keep covering
@@ -4600,6 +5217,383 @@ fn cast_u8_then_stream_append() {
     assert_eq!(as_int(&v), 2); // appended exactly 2 bytes
 }
 
+// ─── #598: `@cast(Model) { bytes }` overlay ─────────────────────────────────
+//
+// `cast_to_struct` (interp.rs) materializes a model's fields from a raw byte
+// tensor in declaration order. Under SPEC.md §3.10's field-order-only wire
+// guarantee, a field is laid out exactly when its own type fixes a byte extent
+// — a scalar of known width, or a tensor of such scalars at a static shape
+// (count × width, row-major). Every admitted field decodes back INTO its
+// DECLARED type: #598's signature was that they did not, so a `bool` or an
+// `f32` field came back an `Int`. Fields with no extent (`str`, a nested
+// model, a symbolic tensor shape) fail loudly instead of silently reading as
+// `Int(0)`. `--check` refuses the same programs before they reach the
+// interpreter (see check_tests.rs); these tests call the interpreter directly,
+// bypassing the checker, so they also cover the interpreter's own backstop.
+//
+// Byte order is little-endian, ratified by #606 (`SPEC.md §3.10`) — see
+// `le_bytes_to_i64`'s note.
+
+#[test]
+fn cast_model_overlay_decodes_first_scalar_field() {
+    let v = run(r#"
+        model DirEntry {
+            inode_id: u64
+            mode: i32
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            buf[7] = 7
+            let d = @cast(DirEntry) { buf }
+            d.inode_id as i64
+        }
+    "#);
+    // The u64 field spans bytes 0..8, least significant byte first (#606):
+    // byte 7 is its most significant, so 7 << 56.
+    assert_eq!(as_int(&v), 7i64 << 56);
+}
+
+#[test]
+fn cast_model_overlay_decodes_field_at_nonzero_offset() {
+    let v = run(r#"
+        model DirEntry {
+            inode_id: u64
+            mode: i32
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            buf[8] = 42
+            let d = @cast(DirEntry) { buf }
+            d.mode as i64
+        }
+    "#);
+    // `mode` starts at byte offset 8 (after the 8-byte `inode_id`); byte 8
+    // is its first, least-significant byte under the little-endian rule
+    // (#606).
+    assert_eq!(as_int(&v), 42);
+}
+
+#[test]
+fn cast_model_overlay_narrow_int_field_keeps_its_declared_width() {
+    // An `i8` field is an `i8`, so the all-ones byte is -1, not 255 — the
+    // decode wraps into the declared width instead of widening every field to
+    // i64 the way the single i64 path used to.
+    let v = run(r#"
+        model M { a: i8 }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[0] = 255
+            let m = @cast(M) { buf }
+            m.a as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -1);
+    // …and its unsigned twin over the same byte is 255.
+    let v = run(r#"
+        model M { a: u8 }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[0] = 255
+            let m = @cast(M) { buf }
+            m.a as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 255);
+    // An `i16` over two all-ones bytes is likewise -1.
+    let v = run(r#"
+        model M { a: i16 }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[0] = 255
+            buf[1] = 255
+            let m = @cast(M) { buf }
+            m.a as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), -1);
+}
+
+#[test]
+fn cast_model_overlay_decodes_bool_field_as_a_bool() {
+    let src = r#"
+        model Flags { on: bool }
+        fn main() -> bool {
+            let !buf = forge.zeros[u8, [4]]
+            buf[0] = BYTE
+            let f = @cast(Flags) { buf }
+            f.on
+        }
+    "#;
+    let v = run(&src.replace("BYTE", "1"));
+    assert!(matches!(v, Value::Bool(true)), "expected Bool(true), got {:?}", v);
+    let v = run(&src.replace("BYTE", "0"));
+    assert!(matches!(v, Value::Bool(false)), "expected Bool(false), got {:?}", v);
+    // A byte that is neither 0 nor 1 follows the interpreter's ONE bool rule
+    // (`apply_cast`'s `Bool` arm): any nonzero number is `true`. The overlay
+    // does not invent a second, stricter rule for the same conversion.
+    let v = run(&src.replace("BYTE", "2"));
+    assert!(matches!(v, Value::Bool(true)), "expected Bool(true) for byte 2, got {:?}", v);
+    let v = run(&src.replace("BYTE", "255"));
+    assert!(matches!(v, Value::Bool(true)), "expected Bool(true) for byte 255, got {:?}", v);
+}
+
+#[test]
+fn cast_model_overlay_decodes_f32_field_from_its_bit_pattern() {
+    // 1.5f32 is 0x3FC00000; little-endian (#606), so its most significant
+    // byte (0x3F) lands last and its next byte (0xC0) just before it.
+    let v = run(r#"
+        model M { x: f32 }
+        fn main() -> f32 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[3] = 63
+            buf[2] = 192
+            let m = @cast(M) { buf }
+            m.x
+        }
+    "#);
+    assert!(matches!(v, Value::Float(x, FW::F32) if x == 1.5),
+        "expected an f32 1.5, got {:?}", v);
+}
+
+#[test]
+fn cast_model_overlay_decodes_f64_field_from_its_bit_pattern() {
+    // 1.5f64 is 0x3FF8000000000000; little-endian (#606) puts its most
+    // significant byte (0x3F) at offset 7 and the next (0xF8) at offset 6.
+    let v = run(r#"
+        model M { x: f64 }
+        fn main() -> f64 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[7] = 63
+            buf[6] = 248
+            let m = @cast(M) { buf }
+            m.x
+        }
+    "#);
+    assert!(matches!(v, Value::Float(x, FW::F64) if x == 1.5),
+        "expected an f64 1.5, got {:?}", v);
+}
+
+#[test]
+fn cast_model_overlay_decodes_narrow_float_fields_at_their_storage_width() {
+    // bf16 is binary32's top 16 bits, so 1.5 is 0x3FC0 — two bytes, not four.
+    // Little-endian (#606): the most significant byte (0x3F) lands at offset
+    // 1, the least significant (0xC0) at offset 0.
+    let v = run(r#"
+        model M { x: bf16 }
+        fn main() -> f32 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[1] = 63
+            buf[0] = 192
+            let m = @cast(M) { buf }
+            m.x
+        }
+    "#);
+    assert!(matches!(v, Value::Float(x, FW::F32) if x == 1.5),
+        "expected a bf16 1.5, got {:?}", v);
+    // IEEE binary16 1.5 is 0x3E00; little-endian puts its nonzero byte
+    // (0x3E) at offset 1, leaving offset 0 (already zero) as the LSB.
+    let v = run(r#"
+        model M { x: f16 }
+        fn main() -> f32 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[1] = 62
+            let m = @cast(M) { buf }
+            m.x
+        }
+    "#);
+    assert!(matches!(v, Value::Float(x, FW::F32) if x == 1.5),
+        "expected an f16 1.5, got {:?}", v);
+}
+
+#[test]
+fn cast_model_overlay_decodes_a_fixed_shape_tensor_field() {
+    // The 32-byte block #598 was filed against: a `u64` plus 24 bytes of
+    // name. The tensor field's extent is element count × element width, and
+    // its elements keep the declared `u8` type.
+    let v = run(r#"
+        model DirEntry {
+            inode_id: u64
+            name: Tensor[u8, [24]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            buf[0] = 9
+            buf[8] = 65
+            buf[31] = 90
+            let d = @cast(DirEntry) { buf }
+            (d.inode_id as i64) * 10000 + (d.name[0] as i64) * 100 + (d.name[23] as i64)
+        }
+    "#);
+    // Little-endian (#606): `inode_id`'s least significant byte is offset 0,
+    // not its last offset 7. `name`'s elements are single bytes, so their
+    // order is unaffected.
+    assert_eq!(as_int(&v), 9 * 10000 + 65 * 100 + 90);
+}
+
+#[test]
+fn cast_model_overlay_tensor_field_is_row_major() {
+    // Element order is the spec's row-major convention: byte k of the field
+    // is element [k / 3, k % 3] of a [2, 3] tensor.
+    let v = run(r#"
+        model Grid { cells: Tensor[u8, [2, 3]] }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[0] = 10
+            buf[1] = 11
+            buf[2] = 12
+            buf[3] = 13
+            buf[4] = 14
+            buf[5] = 15
+            let g = @cast(Grid) { buf }
+            (g.cells[0, 2] as i64) * 100 + (g.cells[1, 0] as i64)
+        }
+    "#);
+    assert_eq!(as_int(&v), 12 * 100 + 13);
+}
+
+#[test]
+fn cast_model_overlay_tensor_field_keeps_its_element_type() {
+    // A `Tensor[f32, [2]]` field decodes two IEEE binary32 patterns, not two
+    // integers: 0x3FC00000 is 1.5 and 0x40000000 is 2.0. Little-endian
+    // (#606): element 0 (bytes 0..4) takes its most significant byte at
+    // offset 3, next at offset 2; element 1 (bytes 4..8) takes its sole
+    // nonzero byte at offset 7 (its most significant).
+    let v = run(r#"
+        model M { xs: Tensor[f32, [2]] }
+        fn main() -> f32 {
+            let !buf = forge.zeros[u8, [8]]
+            buf[3] = 63
+            buf[2] = 192
+            buf[7] = 64
+            let m = @cast(M) { buf }
+            m.xs[0] + m.xs[1]
+        }
+    "#);
+    assert!(matches!(v, Value::Float(x, FW::F32) if x == 3.5),
+        "expected an f32 3.5, got {:?}", v);
+}
+
+#[test]
+fn cast_model_overlay_matches_dataset_network_driver_ethertype_under_le_order() {
+    // `dataset/dmc_sources/network.dmc`'s `NetworkDriver.handle_rx!` overlays
+    // a 14-byte `EthHeader { dest_mac: Tensor[u8,[6]], src_mac:
+    // Tensor[u8,[6]], eth_type: u16 }` onto an incoming packet and branches
+    // on `eth_type` (IPv4 = 0x0800, ARP = 0x0806). `compiler/tests/*.rs`
+    // never reads outside the crate (and no gate covers `dataset/` at all —
+    // it is not `examples/`), so this inlines that file's model and its mock
+    // packet bytes rather than exercising the dataset file directly. The
+    // driver sets `packet_buffer[12] = 0x08, packet_buffer[13] = 0x00` to
+    // mean "IPv4" — true only under the OLD big-endian decode
+    // (`0x0800`). Under #606's ratified little-endian order the same two
+    // bytes decode as `0x0008 = 8`: neither `0x0800` nor `0x0806`, so the
+    // driver's own `if`/`else` chain falls to its "unknown EtherType" arm.
+    // This is the exact silent regression the #606 ruling flagged — no gate
+    // over `dataset/` would have caught it without this test. `network.dmc` itself is
+    // unchanged by this PR: fixing its probe bytes is separate follow-up
+    // work, not this decode change.
+    let v = run(r#"
+        model EthHeader {
+            dest_mac: Tensor[u8, [6]]
+            src_mac:  Tensor[u8, [6]]
+            eth_type: u16
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [14]]
+            buf[12] = 8
+            buf[13] = 0
+            let h = @cast(EthHeader) { buf }
+            h.eth_type as i64
+        }
+    "#);
+    let decoded = as_int(&v);
+    assert_eq!(decoded, 8, "little-endian decode of bytes [0x08, 0x00] is 0x0008");
+    assert_ne!(decoded, 0x0800, "no longer the old big-endian IPv4 reading");
+    assert_ne!(decoded, 0x0806, "and not ARP either — the driver's mock bytes decode to neither");
+}
+
+#[test]
+fn cast_model_overlay_short_buffer_errors_at_the_declaration() {
+    // No field is ever read here: the overlay sizes every field up front, so a
+    // buffer too short for the model fails at the `@cast` itself rather than
+    // at some later field access.
+    let msg = run_err(r#"
+        model DirEntry {
+            inode_id: u64
+            mode: i32
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            let d = @cast(DirEntry) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("mode") && msg.contains("offset 8") && msg.contains("8 byte(s) available"),
+        "expected a short-buffer error naming `mode`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_str_field_errors_loudly() {
+    let msg = run_err(r#"
+        model DirEntry {
+            inode_id: u64
+            name: str
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let d = @cast(DirEntry) { buf }
+            d.inode_id as i64
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("name")
+            && msg.contains("DIRECTIVES.md §4.1"),
+        "expected an overlay-layout error, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_nested_model_field_errors_loudly() {
+    let msg = run_err(r#"
+        model Inner { x: i64 }
+        model Outer {
+            head: u32
+            inner: Inner
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let o = @cast(Outer) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("inner"),
+        "expected an overlay-layout error naming `inner`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_symbolic_tensor_shape_errors_loudly() {
+    // A dim that is not a static constant has no extent, and guessing one
+    // would mis-size every field after it.
+    let msg = run_err(r#"
+        model Frame[N] {
+            payload: Tensor[u8, [N]]
+        }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [32]]
+            let f = @cast(Frame) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("payload")
+            && msg.contains("static shape"),
+        "expected a static-shape error naming `payload`, got: {}", msg
+    );
+}
+
 // ── Group 1: Regex ───────────────────────────────────────────────────────────
 
 #[test]
@@ -6504,11 +7498,19 @@ fn main() -> nil { test_add() }
 
 // ─── Module system tests ─────────────────────────────────────────────────────
 
-/// Write source files to a temp dir and run the main file through the full
-/// resolver → typechecker → interpreter pipeline (matching `dmc run` behavior).
-fn run_multi(files: &[(&str, &str)], main: &str) -> Value {
+/// Shared implementation behind `run_multi` and `run_multi_with_limits`
+/// (below, near #794's tests): resolve → typecheck → load every dependency
+/// exactly once → run the main file exactly once, with an optional arena
+/// budget installed the way `--forge=`/`--vault=` would install it. Kept as
+/// one function so the two harnesses cannot drift from `main.rs`'s `run` arm
+/// independently.
+fn run_multi_impl(
+    files: &[(&str, &str)],
+    main: &str,
+    limits: Option<crate::arena::ArenaLimits>,
+) -> Result<Value, String> {
     use super::check::{Checker, ModuleEnv};
-    use super::ast::collect_public_items;
+    use super::ast::{collect_public_items, collect_top_level_let_names};
     let dir = tempfile::tempdir().expect("tempdir");
     for (name, src) in files {
         std::fs::write(dir.path().join(name), src).expect("write dep");
@@ -6525,24 +7527,39 @@ fn run_multi(files: &[(&str, &str)], main: &str) -> Value {
         checker.checked_modules = checked_modules.clone();
         checker.check_program(prog, Some(p));
         assert!(checker.errors.is_empty(), "type errors: {:?}", checker.errors);
-        let mod_env = ModuleEnv { env: checker.env.clone(), aliases: checker.aliases.clone(), public_items: collect_public_items(prog) };
+        let mod_env = ModuleEnv { env: checker.env.clone(), aliases: checker.aliases.clone(), resolved_aliases: checker.resolved_aliases.clone(), public_items: collect_public_items(prog), top_level_let_names: collect_top_level_let_names(prog), transitive_import_lets: checker.import_private_lets.clone() };
         checked_modules.insert(p.clone(), mod_env);
     }
-    // interpret
+    // interpret. The main file is skipped here and loaded and run exactly
+    // once below, by `interp.run` — matching the `dmc run` CLI's #794 fix (the
+    // main file's own top-level items must not be evaluated twice; every
+    // dependency still loads here, exactly once each).
     let mut interp = Interpreter::new();
+    if let Some(limits) = limits {
+        interp.set_arena_limits(limits);
+    }
     for p in &resolver.sorted_paths {
+        if *p == canonical {
+            continue;
+        }
         let prog = resolver.files.get(p).unwrap();
         interp.load_program(prog, Some(p)).expect("load");
         let env = interp.get_module_env();
         interp.interp_modules.insert(p.clone(), env);
     }
     let main_prog = resolver.files.get(&canonical).expect("main prog");
-    interp.run(main_prog, Some(&canonical)).expect("run")
+    interp.run(main_prog, Some(&canonical)).map_err(|e| e.msg)
+}
+
+/// Write source files to a temp dir and run the main file through the full
+/// resolver → typechecker → interpreter pipeline (matching `dmc run` behavior).
+fn run_multi(files: &[(&str, &str)], main: &str) -> Value {
+    run_multi_impl(files, main, None).expect("run")
 }
 
 fn run_multi_err(files: &[(&str, &str)], main: &str) -> String {
     use super::check::{Checker, ModuleEnv};
-    use super::ast::collect_public_items;
+    use super::ast::{collect_public_items, collect_top_level_let_names};
     let dir = tempfile::tempdir().expect("tempdir");
     for (name, src) in files {
         std::fs::write(dir.path().join(name), src).expect("write dep");
@@ -6563,12 +7580,16 @@ fn run_multi_err(files: &[(&str, &str)], main: &str) -> String {
         if !checker.errors.is_empty() {
             return checker.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
         }
-        let mod_env = ModuleEnv { env: checker.env.clone(), aliases: checker.aliases.clone(), public_items: collect_public_items(prog) };
+        let mod_env = ModuleEnv { env: checker.env.clone(), aliases: checker.aliases.clone(), resolved_aliases: checker.resolved_aliases.clone(), public_items: collect_public_items(prog), top_level_let_names: collect_top_level_let_names(prog), transitive_import_lets: checker.import_private_lets.clone() };
         checked_modules.insert(p.clone(), mod_env);
     }
-    // interpret — expect runtime error
+    // interpret — expect runtime error. Same #794 fix as `run_multi`: the
+    // main file is skipped here and loaded and run exactly once below.
     let mut interp = Interpreter::new();
     for p in &resolver.sorted_paths {
+        if *p == canonical {
+            continue;
+        }
         let prog = resolver.files.get(p).unwrap();
         if let Err(e) = interp.load_program(prog, Some(p)) {
             return e.msg;
@@ -6660,6 +7681,295 @@ pub fn fb() -> i64 { 2 }"#),
 fn main() -> i64 { 0 }"#),
     ], "main.dmc");
     assert!(e.contains("circular"), "expected circular import error, got: {e}");
+}
+
+// ─── SPEC §6.7: a body resolves names against its own file ──────────────────
+
+#[test]
+fn module_private_fn_resolves_in_own_file() {
+    // Two files each declare a file-private `helper`. The later-loaded file
+    // must not take over the earlier one's slot: 1122, not 2222.
+    let v = run_multi(&[
+        ("m1.dmc", "pub fn f() -> i64 { helper() }\nfn helper() -> i64 { 11 }"),
+        ("m2.dmc", "pub fn g() -> i64 { helper() }\nfn helper() -> i64 { 22 }"),
+        ("main.dmc", r#"use "m1.dmc"
+use "m2.dmc"
+fn main() -> i64 { f() * 100 + g() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1122);
+}
+
+#[test]
+fn module_pub_fn_under_alias_keeps_its_own_helper() {
+    // Both files export `helper`; main disambiguates with an alias. The
+    // aliased file's `g` still calls the `helper` written next to it.
+    let v = run_multi(&[
+        ("m1.dmc", "pub fn helper() -> i64 { 11 }\npub fn f() -> i64 { helper() }"),
+        ("m2.dmc", "pub fn helper() -> i64 { 22 }\npub fn g() -> i64 { helper() }"),
+        ("main.dmc", r#"use "m1.dmc"
+use "m2.dmc" as z
+fn main() -> i64 { f() * 100 + z.g() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1122);
+}
+
+#[test]
+fn module_private_fn_is_not_shadowed_by_another_files_pub() {
+    // m1's private `helper` and m2's `pub helper` coexist: main sees m2's,
+    // m1's `f` keeps its own.
+    let v = run_multi(&[
+        ("m1.dmc", "pub fn f() -> i64 { helper() }\nfn helper() -> i64 { 11 }"),
+        ("m2.dmc", "pub fn helper() -> i64 { 22 }"),
+        ("main.dmc", r#"use "m1.dmc"
+use "m2.dmc"
+fn main() -> i64 { f() * 100 + helper() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1122);
+}
+
+#[test]
+fn module_private_model_dispatches_its_own_methods() {
+    // Two file-private models named `P`; an instance built in m1 must run
+    // m1's method, not the last-loaded `P`'s.
+    let v = run_multi(&[
+        ("m1.dmc", "model P { x: i64  fn val(self) -> i64 { self.x + 1 } }\npub fn f() -> i64 { let p = P { x: 10 }  p.val() }"),
+        ("m2.dmc", "model P { x: i64  fn val(self) -> i64 { self.x + 2 } }\npub fn g() -> i64 { let p = P { x: 20 }  p.val() }"),
+        ("main.dmc", r#"use "m1.dmc"
+use "m2.dmc"
+fn main() -> i64 { f() * 100 + g() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1122);
+}
+
+#[test]
+fn module_pub_model_under_two_spellings_is_one_model() {
+    // The same `pub model` imported bare and under an alias: both literals
+    // tag the instance with the declaring file's key, so both dispatch.
+    let v = run_multi(&[
+        ("math.dmc", "pub model P { x: i64  fn dbl(self) -> i64 { self.x * 2 } }"),
+        ("main.dmc", r#"use "math.dmc" as m
+use "math.dmc"
+fn main() -> i64 { let a = m.P { x: 1 }  let b = P { x: 10 }  a.dbl() + b.dbl() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 22);
+}
+
+#[test]
+fn module_closure_resolves_in_defining_file() {
+    // A closure written in m1 and called from main still reaches m1's
+    // private `helper`, not the `helper` of whichever file loaded last.
+    let v = run_multi(&[
+        ("m1.dmc", "fn helper() -> i64 { 11 }\npub fn mk() -> fn() -> i64 { fn() -> i64 { helper() } }"),
+        ("m2.dmc", "fn helper() -> i64 { 22 }\npub fn g() -> i64 { helper() }"),
+        ("main.dmc", r#"use "m1.dmc"
+use "m2.dmc"
+fn main() -> i64 { let c = mk()  c() * 100 + g() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1122);
+}
+
+#[test]
+fn module_dependency_main_is_not_the_entry_point() {
+    // A non-`pub fn main` in a dependency is that file's private item; the
+    // entry file's `main` runs.
+    let v = run_multi(&[
+        ("dep.dmc", "fn main() -> i64 { 1 }\npub fn one() -> i64 { 1 }"),
+        ("main.dmc", r#"use "dep.dmc"
+fn main() -> i64 { one() + 1 }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 2);
+}
+
+// ─── SPEC §6.7 review follow-ups (#652) ─────────────────────────────────────
+
+#[test]
+fn module_cast_model_overlay_resolves_the_model_name() {
+    // The `@cast` guard tested the SOURCE name against `model_fields`, which
+    // is keyed by the declaring file's key — so it never matched, the overlay
+    // fell through to the dtype cast, and `h` came back as the raw byte tensor
+    // rather than a struct. Every `cast_model_overlay_*` case above rides on
+    // this; this one names the resolution directly.
+    let v = run(r#"
+        model Hdr { a: i64, b: i64 }
+        fn main() -> i64 {
+            let bytes = @cast(u8) { "ABCDEFGHIJKLMNOP" }
+            let h = @cast(Hdr) { bytes }
+            h.b
+        }
+    "#);
+    // `b` is bytes 8..16 of "ABCDEFGHIJKLMNOP" (`IJKLMNOP` = 49 4A 4B 4C 4D
+    // 4E 4F 50). Little-endian (#606) reverses that byte sequence into the
+    // decoded i64: 0x504F4E4D4C4B4A49.
+    assert_eq!(as_int(&v), 0x504F4E4D4C4B4A49, "`h.b` reads a decoded field, not a tensor");
+}
+
+#[test]
+fn module_cast_overlays_the_model_of_the_overlaying_file() {
+    // Two files each declare a file-private `Hdr` of DIFFERENT arity. Each
+    // overlay must lay out its own file's fields: the flat table would have
+    // given both the last-loaded `Hdr`.
+    let v = run_multi(&[
+        ("a.dmc", r#"model Hdr { a: i64, b: i64 }
+pub fn one() -> i64 { let bytes = @cast(u8) { "ABCDEFGHIJKLMNOP" }  let h = @cast(Hdr) { bytes }  h.b }"#),
+        ("b.dmc", r#"model Hdr { a: i64 }
+pub fn two() -> i64 { let bytes = @cast(u8) { "ABCDEFGH" }  let h = @cast(Hdr) { bytes }  h.a }"#),
+        ("main.dmc", r#"use "a.dmc"
+use "b.dmc"
+fn main() -> i64 { one() - two() }"#),
+    ], "main.dmc");
+    // `one()`'s `b` (`IJKLMNOP`) and `two()`'s `a` (`ABCDEFGH`), both
+    // little-endian decoded (#606): 0x504F4E4D4C4B4A49 - 0x4847464544434241.
+    assert_eq!(as_int(&v), 0x504F4E4D4C4B4A49 - 0x4847464544434241);
+}
+
+#[test]
+fn module_cast_overlays_an_imported_pub_model() {
+    // The importer spells the model by the name `use` gave it; the overlay
+    // resolves that spelling to the declaring file's key, which is what
+    // `model_fields` is registered under.
+    let v = run_multi(&[
+        ("hdr.dmc", "pub model Hdr { a: i64, b: i64 }"),
+        ("main.dmc", r#"use "hdr.dmc"
+fn main() -> i64 {
+    let bytes = @cast(u8) { "ABCDEFGHIJKLMNOP" }
+    let h = @cast(Hdr) { bytes }
+    h.a
+}"#),
+    ], "main.dmc");
+    // `a` is bytes 0..8 of "ABCDEFGHIJKLMNOP" (`ABCDEFGH`), little-endian
+    // decoded (#606): 0x4847464544434241.
+    assert_eq!(as_int(&v), 0x4847464544434241);
+}
+
+#[test]
+fn module_private_enums_do_not_cross_talk() {
+    // Two files each declare a private `enum E` with different variants. One
+    // flat `enums` map let the last-loaded declaration decide `E`'s variants
+    // everywhere, so `E.Gamma` in the file that declares it failed with
+    // `undefined identifier E` once the two-variant `E` had overwritten it.
+    let v = run_multi(&[
+        ("ea.dmc", r#"enum E { Alpha, Beta, Gamma }
+pub fn ea() -> i64 { match E.Gamma { E.Alpha => 1, E.Beta => 2, E.Gamma => 3 } }"#),
+        ("eb.dmc", r#"enum E { Alpha, Beta }
+pub fn eb() -> i64 { match E.Beta { E.Alpha => 10, E.Beta => 20 } }"#),
+        ("main.dmc", r#"use "ea.dmc"
+use "eb.dmc"
+fn main() -> i64 { ea() * 100 + eb() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 320);
+}
+
+#[test]
+fn module_enum_ordinal_is_read_from_the_declaring_file() {
+    // The reverse load order of the pair above: the ordinal a variant carries
+    // must come from the enum its OWN file declares, whichever file loaded
+    // last. `Gamma` is 2 in `ea`'s three-variant `E` and does not exist in
+    // `eb`'s.
+    let v = run_multi(&[
+        ("eb.dmc", "enum E { Alpha, Beta }\npub fn eb() -> i64 { E.Beta as i64 }"),
+        ("ea.dmc", r#"use "eb.dmc"
+enum E { Alpha, Beta, Gamma }
+pub fn ea() -> i64 { E.Gamma as i64 }"#),
+        ("main.dmc", r#"use "ea.dmc"
+use "eb.dmc"
+fn main() -> i64 { ea() * 10 + eb() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 21);
+}
+
+#[test]
+fn module_imported_alias_beats_an_unimported_files_declaration() {
+    // #623 scoped a `type` alias by LOAD ORDER (`module <= alias_module`,
+    // highest wins), which admitted a declaration from any file loaded
+    // earlier — imported or not. `other.dmc` declares a private `Role` and
+    // loads after `lib.dmc`, so that rule handed `main` the i64 and printed
+    // 256. Registering aliases on import — the rule `fns` and `models`
+    // already follow, and the one SPEC §9 states for all three — gives `main`
+    // the `u8` it actually imported, which wraps to 0.
+    let v = run_multi(&[
+        ("lib.dmc", "pub type Role = u8\npub fn one() -> i64 { 1 }"),
+        ("other.dmc", "type Role = i64\npub fn two() -> i64 { 2 }"),
+        ("main.dmc", r#"use "lib.dmc"
+use "other.dmc"
+fn main() -> i64 {
+    let r: Role = 255
+    ((r + 1) as i64) * 10 + one() + two()
+}"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 3, "the imported u8 governs, so `r + 1` is 0");
+}
+
+#[test]
+fn module_pub_model_method_calls_its_own_files_private_fn() {
+    // A `pub model`'s method body is its file's code: it reaches that file's
+    // private `secret`, not the importer's or another library's, whether the
+    // instance was built by the importer's own literal or by the library's
+    // constructor.
+    let v = run_multi(&[
+        ("lib.dmc", r#"fn secret() -> i64 { 77 }
+pub model W { a: i64
+  fn calc(self) -> i64 { self.a + secret() }
+}
+pub fn mkw(a: i64) -> W { W { a: a } }"#),
+        ("lib2.dmc", "fn secret() -> i64 { -1000 }\npub fn other() -> i64 { secret() }"),
+        ("main.dmc", r#"use "lib.dmc"
+use "lib2.dmc"
+fn secret() -> i64 { 5 }
+fn main() -> i64 {
+    let w = W { a: 1 }
+    let v = mkw(2)
+    w.calc() * 1000000 + v.calc() * 10000 + (other() + 1000) * 10 + secret()
+}"#),
+    ], "main.dmc");
+    // 78 · 1e6 + 79 · 1e4 + 0 + 5
+    assert_eq!(as_int(&v), 78_790_005);
+}
+
+#[test]
+fn module_private_fn_shadows_a_builtin_only_in_its_own_file() {
+    // A file-private `fn abs` shadows the builtin inside that file and
+    // nowhere else: the importer's bare `abs` is still the builtin.
+    let v = run_multi(&[
+        ("a.dmc", "fn abs(x: i64) -> i64 { 999 }\npub fn ba() -> i64 { abs(-3) }"),
+        ("main.dmc", r#"use "a.dmc"
+fn main() -> i64 { ba() * 10 + abs(-3) }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 9993);
+}
+
+#[test]
+fn module_private_models_of_the_same_name_keep_their_own_fields() {
+    // Stronger than the same-shape pair above: the two private `Node`s
+    // declare DIFFERENT field sets, so a method dispatched to the wrong
+    // model would read a field that does not exist there.
+    let v = run_multi(&[
+        ("a.dmc", r#"model Node { v: i64
+    fn get(self) -> i64 { self.v + 100 }
+}
+pub fn ma() -> i64 { let n = Node { v: 7 }  n.get() }"#),
+        ("b.dmc", r#"model Node { w: i64, z: i64
+    fn get(self) -> i64 { self.w * 1000 + self.z }
+}
+pub fn mb() -> i64 { let n = Node { w: 3, z: 4 }  n.get() }"#),
+        ("main.dmc", r#"use "a.dmc"
+use "b.dmc"
+fn main() -> i64 { ma() * 10000 + mb() }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1_073_004);
+}
+
+#[test]
+fn module_mutual_recursion_across_a_pub_boundary_still_resolves() {
+    // `even` is `pub` and its private partner is not; the recursion crosses
+    // the visibility line in the declaring file, which is where both names
+    // live.
+    let v = run_multi(&[
+        ("a.dmc", r#"pub fn even(n: i64) -> i64 { if n == 0 { 1 } else { odd_helper(n - 1) } }
+fn odd_helper(n: i64) -> i64 { if n == 0 { 0 } else { even(n - 1) } }"#),
+        ("main.dmc", r#"use "a.dmc"
+fn main() -> i64 { even(10) * 10 + even(7) }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 10);
 }
 
 // ─── #65: model method calls ─────────────────────────────────────────────────
@@ -7908,6 +9218,57 @@ fn main() -> i64 {
     assert_eq!(as_int(&v), 445, "forward-desugar must write back `!` tensor params too");
 }
 
+// ── Issue #671: `!` tensor params on a BRACKETED method call alias too ──────
+//
+// #475 fixed the writeback for `recv.method(args)`, but a call with an
+// explicit shape bracket (`recv.method![K](args)`) goes through
+// `call_bracketed_method`, a third dispatch path that returned straight out
+// of `call_fn_with_shapes` without it — same silent loss, one bracket over.
+
+#[test]
+fn mut_tensor_param_on_bracketed_method_call_671() {
+    // Same shape as the design doc's q13 probe: a plain method call on a model
+    // writes back (`fill!`), and its bracketed sibling (`fillg![K]`) must too.
+    let v = run(r#"
+model Buf[N] {
+    !vals: Tensor[i64, [N]]
+    fn fill!(self, !out: Tensor[i64, [4]]) -> i64 { out[0] = 7  out[0] }
+    fn fillg![K](self, !out: Tensor[i64, [4]]) -> i64 { out[0] = 7  out[0] }
+}
+fn main() -> i64 {
+    let !b = Buf[4] { vals: forge.zeros[i64, [4]] }
+    let !o1 = forge.zeros[i64, [4]]
+    let r1 = b.fill!(o1)
+    let !o2 = forge.zeros[i64, [4]]
+    let r2 = b.fillg![2](o2)
+    r1 * 1000 + o1[0] * 100 + r2 * 10 + o2[0]
+}
+"#);
+    // r1=7, o1[0]=7, r2=7, o2[0]=7 — the bracketed call must write back
+    // exactly like the plain one, not leave o2[0] at its zero-initialized 0.
+    assert_eq!(as_int(&v), 7777, "a bracketed method call must write back a `!` tensor param");
+}
+
+#[test]
+fn non_mut_tensor_param_on_bracketed_method_call_not_written_back_671() {
+    // The fix must not make every bracketed method parameter alias: without
+    // `!` the callee still works on a copy.
+    let v = run(r#"
+model Buf[N] {
+    !vals: Tensor[i64, [N]]
+    fn touchg![K](self, out: Tensor[i64, [4]]) -> i64 { out[0] = 99  out[0] }
+}
+fn main() -> i64 {
+    let !b = Buf[4] { vals: forge.zeros[i64, [4]] }
+    let !x = forge.zeros[i64, [4]]
+    x[0] = 1
+    let r = b.touchg![2](x)
+    r * 10 + x[0]
+}
+"#);
+    assert_eq!(as_int(&v), 991, "a non-`!` tensor param on a bracketed method must NOT write back");
+}
+
 // ── Issue #476: model arrays held in a model field ───────────────────────────
 
 #[test]
@@ -8745,6 +10106,458 @@ fn f64_tensor_store_keeps_full_precision() {
         }
     "#);
     assert_eq!(as_float(&v), 0.1f64);
+}
+
+// ─── #689: indexed tensor stores mutate in place instead of cloning ────────
+//
+// `t[i] = v` used to route through `lookup`, which deep-clones a `Value::
+// Tensor`'s backing `ArrayD` (unlike `Value::List`, a tensor is not `Rc`-
+// wrapped), so every element store copied the whole tensor and filling N
+// elements cost O(N²). The fix mutates the scope slot's `ArrayD` through
+// `&mut` instead of lookup-clone-reassign.
+
+#[test]
+fn indexed_tensor_store_is_not_quadratic_689() {
+    // Complexity guard: 1,000,000 stores takes well under a second when each
+    // store mutates in place (~0.6s measured); at the pre-fix O(N^2) per-store
+    // clone this extrapolates to ~370s, so the 20s bound below is a size
+    // proof, not a timing assertion, and it discriminates cleanly — it isn't
+    // flaky under system load.
+    let start = std::time::Instant::now();
+    let v = run(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64, [1000000]]
+            let !i = 0
+            while i < 1000000 {
+                t[i] = (i as f64)
+                i = i + 1
+            }
+            sum(t)
+        }
+    "#);
+    let elapsed = start.elapsed();
+    // sum(0..1000000) = 1000000 * 999999 / 2
+    assert_eq!(as_float(&v), 499_999_500_000.0);
+    assert!(elapsed.as_secs() < 20,
+        "1M indexed tensor stores took {:?} — the per-store clone regressed", elapsed);
+}
+
+#[test]
+fn indexed_tensor_multi_index_store_is_in_place_689() {
+    // `t[i, j] = v` resolves through the same fast path (multiple `IndexElem`s
+    // in one `PostfixOp::Index`) — must still land correctly, not just fast.
+    let v = run(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64, [2, 3]]
+            let !i = 0
+            while i < 2 {
+                let !j = 0
+                while j < 3 {
+                    t[i, j] = (i * 3 + j) as f64
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            t[1, 2]
+        }
+    "#);
+    assert_eq!(as_float(&v), 5.0);
+}
+
+#[test]
+fn tensor_field_alias_sees_indexed_store_689() {
+    // SPEC §3.4: `let !y = m.t` is a live alias (`Value::FieldRef`), not a
+    // snapshot — `y[i] = v` must still reach `m.t`. The #689 fast path only
+    // fires for a plain `Value::Tensor` binding; the FieldRef arm (untouched
+    // by that change) must still carry the write through.
+    let v = run(r#"
+        model M { !t: Tensor[f64, [4]] }
+        fn main() -> f64 {
+            let !m = M { t: forge.zeros[f64, [4]] }
+            let !y = m.t
+            y[2] = 9.0
+            m.t[2]
+        }
+    "#);
+    assert_eq!(as_float(&v), 9.0);
+}
+
+#[test]
+fn tensor_value_copy_does_not_see_indexed_store_689() {
+    // SPEC §3.4: `let !y = x` on a plain (non-field) tensor binding is a
+    // value copy — mutating `y` through the #689 in-place store path must
+    // never reach `x`.
+    let v = run(r#"
+        fn main() -> f64 {
+            let !x = forge.zeros[f64, [4]]
+            x[0] = 1.0
+            let !y = x
+            y[0] = 2.0
+            x[0]
+        }
+    "#);
+    assert_eq!(as_float(&v), 1.0);
+}
+
+#[test]
+fn indexed_store_errors_when_index_expr_retypes_the_binding_689() {
+    // The #689 fast path peeks `Some(Value::Tensor(_))` on `name` before
+    // evaluating the index — but the index expression is evaluated *after*
+    // that peek (see the #443 comment just above it), so it can itself
+    // reassign `name` to a non-tensor before the store lands. `wreck()`
+    // does exactly that to a module-level tensor: `g = 1` retypes the
+    // binding the peek already approved. This used to hit `Some(_) => break`
+    // silently — the store vanished with no error, and the follow-on `g[0]`
+    // read whatever the retyped value indexes to. It must now error the same
+    // way the FieldRef/other arms do for a non-tensor indexed target.
+    let msg = run_err(r#"
+        let !g = forge.zeros[f64, [4]]
+        fn wreck() -> i64 {
+            g = 1
+            0
+        }
+        fn main() -> f64 {
+            g[wreck()] = 5.0
+            g[0]
+        }
+    "#);
+    assert_eq!(msg, "indexed assignment requires a tensor, got int");
+}
+
+#[test]
+fn indexed_store_errors_when_block_index_expr_retypes_the_binding_689() {
+    // Local-binding form of the same hazard: a block index expression
+    // reassigns the very tensor being indexed to a scalar mid-evaluation.
+    let msg = run_err(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64, [4]]
+            t[{ t = 1
+                0 }] = 5.0
+            t[0]
+        }
+    "#);
+    assert_eq!(msg, "indexed assignment requires a tensor, got int");
+}
+
+#[test]
+fn indexed_store_survives_a_same_tensor_write_during_index_eval_689() {
+    // Parity fix, not new behavior added by #689's perf change itself: a
+    // write into the *same* tensor performed while evaluating the index
+    // expression now survives instead of being clobbered by the outer
+    // store. Before #689, `t[i] = v` read the whole tensor through
+    // `lookup` (a clone), evaluated the index against that snapshot, and
+    // then reassigned `t` to the mutated clone — discarding whatever the
+    // index expression itself had written into the live `t` along the way.
+    // The #689 fast path evaluates the index first (`eval_index_elems`,
+    // which mutates the real scope slot if it takes the same fast path)
+    // and only then borrows the scope slot to apply the outer store, so a
+    // same-tensor write made during index evaluation now sticks. The
+    // FieldRef arm (~4922) was never affected — it already evaluates the
+    // index before borrowing the struct, so it already gave the answer
+    // this test expects.
+    let v = run(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64, [4]]
+            t[{ t[0] = 7.0
+                1 }] = 5.0
+            t[0] * 100.0 + t[1]
+        }
+    "#);
+    assert_eq!(as_float(&v), 705.0);
+}
+
+// ─── #693: compound assignment to an indexed tensor element ────────────────
+//
+// `t[i] += v` (and `-=`, `*=`, `/=`) had no match arm at all: it fell to the
+// catch-all "evaluate lhs for side effects, no-op" arm. `--check` accepted
+// the form, `dmc run` printed the tensor's OLD value back (0 where 5 was
+// expected), and `dmc jit` refused it outright (`jit unsupported: compound
+// assignment to tensor elements`) — the interpreter was the only backend
+// claiming to accept a form it did not execute. The fix reads the element
+// out dtype-aware, combines through `apply_binop` (the same function the
+// scalar `x += v` arm calls), and stores back through
+// `assign_to_tensor_resolved` (#689's in-place path), which applies the same
+// f32-quantize a plain `t[i] = v` store does — so this arm's f32 answer
+// matches the plain indexed store and the JIT, not the SCALAR `x += v` arm,
+// which skips that store-time rounding (a pre-existing interp/jit
+// divergence, filed as #713, not reproduced or fixed here).
+
+#[test]
+fn indexed_tensor_compound_add_computes_and_stores_693() {
+    // The issue's exact repro: `t[0] += 5` used to print 0.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !t = forge.zeros[i64,[4]]
+            t[0] += 5
+            t[0]
+        }
+    "#);
+    assert_eq!(as_int(&v), 5);
+}
+
+#[test]
+fn indexed_tensor_compound_sub_mul_div_all_compute_693() {
+    let v = run(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64,[1]]
+            t[0] += 5.0
+            t[0] -= 1.0
+            t[0] *= 3.0
+            t[0] /= 2.0
+            t[0]
+        }
+    "#);
+    // (0 + 5 - 1) * 3 / 2 = 6.0
+    assert_eq!(as_float(&v), 6.0);
+}
+
+#[test]
+fn indexed_tensor_compound_multi_index_693() {
+    // `t[i, j] op= v` — multiple `IndexElem`s in one `PostfixOp::Index`,
+    // same as the plain #689 multi-index store.
+    let v = run(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64, [2, 3]]
+            t[1, 2] += 5.0
+            t[1, 2]
+        }
+    "#);
+    assert_eq!(as_float(&v), 5.0);
+}
+
+#[test]
+fn indexed_tensor_compound_through_field_reaches_the_field_693() {
+    // `m.t[0] += 5.0` — SPEC §3.4 is explicit that the field's own element
+    // writes and compound assignments both reach it; this went through the
+    // `PostfixOp::Field` base-expr arm, not the `Ident` one.
+    let v = run(r#"
+        model M { !t: Tensor[f64, [4]] }
+        fn main() -> f64 {
+            let !m = M { t: forge.zeros[f64, [4]] }
+            m.t[0] += 5.0
+            m.t[0]
+        }
+    "#);
+    assert_eq!(as_float(&v), 5.0);
+}
+
+#[test]
+fn indexed_tensor_compound_through_live_alias_reaches_the_field_693() {
+    // SPEC §3.4: `let !y = m.t` is a live alias (`Value::FieldRef`), not a
+    // snapshot. `y[i] += v` must reach `m.t`, same as `y[i] = v` (#689).
+    let v = run(r#"
+        model M { !t: Tensor[f64, [4]] }
+        fn main() -> f64 {
+            let !m = M { t: forge.zeros[f64, [4]] }
+            let !y = m.t
+            y[0] += 5.0
+            m.t[0]
+        }
+    "#);
+    assert_eq!(as_float(&v), 5.0);
+}
+
+#[test]
+fn indexed_tensor_compound_i32_wraps_at_its_own_width_693() {
+    // Dtype-aware numeric semantics: an i32 element wraps at 32 bits, same
+    // as the scalar `x += v` path and the plain indexed store (#571).
+    let v = run(r#"
+        fn main() -> i64 {
+            let !t = forge.zeros[i32,[1]]
+            t[0] = 2147483647
+            t[0] += 1
+            t[0]
+        }
+    "#);
+    assert_eq!(as_int(&v), -2147483648);
+}
+
+#[test]
+fn indexed_tensor_compound_f32_rounds_per_op_693() {
+    // An f32 tensor element rounds per-op, matching #241/#226's store-time
+    // rounding rule for a plain assignment — 0.1f32 + 0.2f32, not the f64 sum.
+    let v = run(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f32,[1]]
+            t[0] = 0.1
+            t[0] += 0.2
+            t[0]
+        }
+    "#);
+    assert_eq!(as_float(&v), (0.1f32 + 0.2f32) as f64);
+}
+
+#[test]
+fn indexed_tensor_compound_errors_on_non_tensor_target_693() {
+    // A model-array (List) element has no compound-arithmetic meaning.
+    // Before #693 this silently dropped the store; now it names the type
+    // and refuses, same wording the plain indexed-store arm already uses.
+    let msg = run_err(r#"
+        model Cell { !n: i64 }
+        fn main() -> i64 {
+            let !cs = forge.uninit[Cell, [2]]
+            cs[0] = Cell { n: 1 }
+            cs[0] += 5
+            0
+        }
+    "#);
+    assert_eq!(msg, "indexed assignment requires a tensor, got list");
+}
+
+#[test]
+fn indexed_tensor_compound_errors_on_slice_target_693() {
+    // `t[0] += v` on a 2-D tensor with a single (partial) index would target
+    // a whole row, not one element — compound assignment to a slice is a
+    // different, broader feature this fix does not add. Must error, not
+    // silently no-op or guess at a broadcast semantics nobody specified.
+    let msg = run_err(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64,[2,3]]
+            t[0] += 1.0
+            t[0, 0]
+        }
+    "#);
+    assert!(msg.contains("compound assignment to a tensor slice is not supported"),
+        "unexpected message: {}", msg);
+}
+
+#[test]
+fn indexed_tensor_compound_errors_when_index_expr_retypes_the_binding_693() {
+    // Same #443/#689 hazard as the plain indexed store: the index expression
+    // is evaluated between the tensor peek and the store, so it can itself
+    // retype the very binding being indexed.
+    let msg = run_err(r#"
+        fn main() -> f64 {
+            let !t = forge.zeros[f64, [4]]
+            t[{ t = 1
+                0 }] += 5.0
+            t[0]
+        }
+    "#);
+    assert_eq!(msg, "indexed assignment requires a tensor, got int");
+}
+
+#[test]
+fn direct_field_compound_assign_computes_and_stores_693() {
+    // #693 audit, follow-up: `m.field += v` with NO index also had no match
+    // arm and fell to the same catch-all no-op; a first pass named the
+    // operator with `{:?}` and refused outright ("assignment `PlusEq` to a
+    // struct field is not supported" — leaking the Rust enum name).
+    // Coordinator decision on review: compute it instead, mirroring the
+    // `(Eq, Postfix{Field})` arm, same as the indexed case already does.
+    let v = run(r#"
+        model M { !x: i64 }
+        fn main() -> i64 {
+            let !m = M { x: 1 }
+            m.x += 5
+            m.x
+        }
+    "#);
+    assert_eq!(as_int(&v), 6);
+}
+
+#[test]
+fn direct_field_compound_assign_all_four_ops_693() {
+    let v = run(r#"
+        model M { !x: f64 }
+        fn main() -> f64 {
+            let !m = M { x: 0.0 }
+            m.x += 5.0
+            m.x -= 1.0
+            m.x *= 3.0
+            m.x /= 2.0
+            m.x
+        }
+    "#);
+    // (0 + 5 - 1) * 3 / 2 = 6.0
+    assert_eq!(as_float(&v), 6.0);
+}
+
+#[test]
+fn direct_field_compound_assign_f32_rounds_per_op_693() {
+    // Same #241/#226 store-time rounding rule the indexed-element case gets
+    // (via `coerce_declared`, not `assign_to_tensor_resolved` — different
+    // storage, same rule): 0.1f32 + 0.2f32, not the f64 sum.
+    let v = run(r#"
+        model M { x: f32 }
+        fn main() -> f64 {
+            let !m = M { x: 0.1 }
+            m.x += 0.2
+            m.x as f64
+        }
+    "#);
+    assert_eq!(as_float(&v), (0.1f32 + 0.2f32) as f64);
+}
+
+#[test]
+fn direct_field_compound_assign_through_alias_binding_693() {
+    // SPEC §3.4: a compound assignment through an alias binding must reach
+    // the field. Unlike a tensor local, a plain struct binding already
+    // aliases the same `Rc<RefCell<..>>` by default (`let !y = m` shares
+    // it, no `FieldRef` indirection needed) — `y.x += 1` mutates the same
+    // storage `m.x` reads.
+    let v = run(r#"
+        model M { !x: i64 }
+        fn main() -> i64 {
+            let !m = M { x: 1 }
+            let !y = m
+            y.x += 1
+            m.x
+        }
+    "#);
+    assert_eq!(as_int(&v), 2);
+}
+
+#[test]
+fn direct_field_compound_assign_nested_field_693() {
+    // `o.i.n += 1` — `base_expr` is itself a `Postfix{Field}` chain
+    // (`o.i`), resolved the same recursive way `eval_expr` resolves any
+    // other nested field access; no special-casing needed for depth.
+    let v = run(r#"
+        model Inner { !n: i64 }
+        model Outer { i: Inner }
+        fn main() -> i64 {
+            let !o = Outer { i: Inner { n: 5 } }
+            o.i.n += 1
+            o.i.n
+        }
+    "#);
+    assert_eq!(as_int(&v), 6);
+}
+
+#[test]
+fn direct_field_compound_assign_whole_tensor_field_693() {
+    // A tensor-typed field with a whole-tensor RHS is the same elementwise
+    // replace the plain-ident `y += tensor` arms already do (#524) — no
+    // per-element loop needed, `apply_binop`'s `DotAdd` handles the tensor
+    // pair directly.
+    let v = run(r#"
+        model M { w: Tensor[f32,[2]] }
+        fn main() -> f64 {
+            let !m = M { w: forge.zeros[f32,[2]] }
+            m.w += forge.ones[f32,[2]]
+            m.w[0] as f64 + m.w[1] as f64
+        }
+    "#);
+    assert_eq!(as_float(&v), 2.0);
+}
+
+#[test]
+fn direct_field_compound_assign_tensor_field_with_scalar_rhs_errors_693() {
+    // A tensor field combined with a non-tensor RHS has no established
+    // broadcast semantics for a whole-field compound assign — refuse with a
+    // clear message naming the operator via `assignop_str` (`+=`), not the
+    // `{:?}`-leaked `PlusEq` the pre-follow-up code used elsewhere.
+    let msg = run_err(r#"
+        model M { w: Tensor[f32,[2]] }
+        fn main() -> f64 {
+            let !m = M { w: forge.zeros[f32,[2]] }
+            m.w += 5.0
+            m.w[0] as f64
+        }
+    "#);
+    assert!(msg.contains("+=") && !msg.contains("PlusEq"),
+        "unexpected message: {}", msg);
 }
 
 #[test]
@@ -10017,7 +11830,8 @@ fn vault_budget(bytes: u64) -> crate::arena::ArenaLimits {
 
 #[test]
 fn allocation_within_the_forge_budget_runs() {
-    // 64 f64 elements = 512 bytes, comfortably inside 4 KiB.
+    // 64 f32 elements = 256 bytes at the declared width (#781), comfortably
+    // inside 4 KiB.
     let v = run_with_limits(r#"
         fn main() -> i64 {
             let t = forge.zeros[f32, [8, 8]]
@@ -10041,14 +11855,15 @@ fn allocation_past_the_forge_budget_is_a_runtime_error() {
 
 #[test]
 fn the_forge_budget_accumulates_across_allocations() {
-    // Two 512-byte tensors fit in 2 KiB; the third does not.
+    // Each `[8, 8]` f32 tensor is 256 bytes at its declared width (#781).
+    // Two fit in a 700-byte budget (512); the third does not (768).
     let ok = run_with_limits(r#"
         fn main() -> i64 {
             let a = forge.zeros[f32, [8, 8]]
             let b = forge.ones[f32, [8, 8]]
             1
         }
-    "#, forge_budget(1024));
+    "#, forge_budget(700));
     assert!(ok.is_ok(), "{:?}", ok.err());
 
     let e = run_with_limits(r#"
@@ -10058,7 +11873,7 @@ fn the_forge_budget_accumulates_across_allocations() {
             let c = forge.zeros[f32, [8, 8]]
             1
         }
-    "#, forge_budget(1024)).expect_err("third allocation should not fit");
+    "#, forge_budget(700)).expect_err("third allocation should not fit");
     assert!(e.contains("forge arena exhausted"), "{}", e);
 }
 
@@ -10068,8 +11883,9 @@ fn a_forge_block_does_not_rewind_the_budget_on_exit() {
     // to the block's entry watermark, on the theory that §3's bump-pointer
     // reset gives the bytes back — but the interpreter has no bump pointer and
     // reclaims nothing, so the rewind was a lie that let a program hold every
-    // "reset" tensor at once. Ten 512-byte tensors against a 1 KiB budget must
-    // therefore run out, exactly as they do unwrapped.
+    // "reset" tensor at once. Ten 256-byte tensors (#781: declared f32 width)
+    // against a 1 KiB budget must therefore run out, exactly as they do
+    // unwrapped.
     let e = run_with_limits(r#"
         fn main() -> i64 {
             let !n = 0
@@ -10097,7 +11913,7 @@ fn a_forge_block_does_not_rewind_the_budget_on_exit() {
             }
             n
         }
-    "#, forge_budget(10 * 512)).expect("ten 512-byte tensors fit a 5 KiB budget");
+    "#, forge_budget(10 * 512)).expect("ten 256-byte tensors comfortably fit a 5 KiB budget");
     assert_eq!(as_int(&v), 10);
 }
 
@@ -10204,6 +12020,1179 @@ fn a_kv_allocation_is_stream_not_forge() {
         }
     "#, forge_budget(64)).expect("kv must not charge the forge budget");
     assert_eq!(as_int(&v), 1);
+}
+
+// ─── #781: requested-byte metering, intermediates included ──────────────────
+//
+// #674 §7 slice 1. Every tensor
+// the interpreter materializes is charged at its DECLARED element width, not
+// the f64 width it actually stores — and an implicit intermediate (a matmul
+// or dotted-op result, a tensor literal, a transpose, a slice that copies)
+// is charged the same as an explicit `vault.*`/`forge.*` constructor, where
+// none was charged before. These pin the exact minimums measured by a set of
+// internal arena-budget probe programs — bisected against the release
+// binary, not derived from the formula in this comment.
+
+#[test]
+fn explicit_constructors_charge_declared_width_not_f64_m6() {
+    // m6: `[81920]` f32 is 320 KiB of elements — half what the old f64-per-
+    // element charge billed (640 KiB), which is why two used to collide in a
+    // 1 MiB budget (`MEMORY.md §1.1`'s stale example, pre-#781).
+    let ok = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [81920]]
+            1
+        }
+    "#, forge_budget(320 * 1024));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [81920]]
+            1
+        }
+    "#, forge_budget(320 * 1024 - 1)).expect_err("320 KiB is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+    assert!(e.contains("320 KiB"), "the request itself is 320 KiB: {}", e);
+}
+
+#[test]
+fn two_forge_blocks_of_m6_shape_both_fit_a_1mib_budget() {
+    // The full m6 shape: two `forge { }` blocks, `[81920]` f32 each. At the
+    // corrected 320 KiB/block charge, both fit `--forge=1M` (640 KiB total)
+    // — before #781 the second block was refused (640 KiB/block, 1.25 MiB
+    // cumulative).
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            forge {
+                let a = forge.zeros[f32, [81920]]
+            }
+            forge {
+                let b = forge.zeros[f32, [81920]]
+            }
+            1
+        }
+    "#, forge_budget(1024 * 1024)).expect("both m6 blocks fit at the declared width");
+    assert_eq!(as_int(&v), 1);
+}
+
+#[test]
+fn an_implicit_matmul_intermediate_is_charged_p1_imp() {
+    // p1_imp: `let c = a @ b`, both `[64, 64]` f32. `a` and `b` are 16 384 B
+    // each at the declared width (#781, not the old 32 768 B f64 charge);
+    // `c` is a third, equally-sized, implicit intermediate — 49 152 B total,
+    // where the pre-#781 interpreter charged only the first two (32 768 B,
+    // `MEMORY.md §1.1`'s old "intermediates are not charged").
+    let ok = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [64, 64]]
+            let b = forge.zeros[f32, [64, 64]]
+            let c = a @ b
+            c[0, 0] as i64
+        }
+    "#, forge_budget(49152));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [64, 64]]
+            let b = forge.zeros[f32, [64, 64]]
+            let c = a @ b
+            c[0, 0] as i64
+        }
+    "#, forge_budget(49151)).expect_err("49 152 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+
+    // The baseline this prices the intermediate against: `a` and `b` alone
+    // (no `let c`) need only 32 768 B — p1_base, the two explicit
+    // constructors at their declared width.
+    let base = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [64, 64]]
+            let b = forge.zeros[f32, [64, 64]]
+            1
+        }
+    "#, forge_budget(32768));
+    assert!(base.is_ok(), "{:?}", base.err());
+}
+
+#[test]
+fn two_thousand_matmul_intermediates_accumulate_p2_loop() {
+    // p2_loop: the same `a @ b` inside a 2000-iteration loop. Each iteration
+    // materializes its own `c`, uncharged before #781 — 2000 × 16 384 B on
+    // top of the 32 768 B for `a`/`b`, exactly matching `dmc jit`'s
+    // per-iteration charge for this shape (the two backends' TOTAL minimums
+    // still differ — `dmc jit` carries its own, separately-filed #640
+    // over-charge on `a`/`b` — but the per-intermediate charge agrees).
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [64, 64]]
+            let b = forge.zeros[f32, [64, 64]]
+            let !s = 0.0
+            for i in 0..2000 {
+                let c = a @ b
+                s = s + c[0, 0]
+            }
+            s as i64
+        }
+    "#, forge_budget(32768 + 2000 * 16384));
+    assert!(v.is_ok(), "{:?}", v.err());
+
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [64, 64]]
+            let b = forge.zeros[f32, [64, 64]]
+            let !s = 0.0
+            for i in 0..2000 {
+                let c = a @ b
+                s = s + c[0, 0]
+            }
+            s as i64
+        }
+    "#, forge_budget(32768 + 2000 * 16384 - 1)).expect_err("one byte under the minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_tensor_literal_is_charged_at_its_default_f32_width() {
+    // p3_lit: a plain `[1.0, 2.0, …]` literal has no `vault.`/`forge.`
+    // spelling, but it still materializes a tensor — DType's own doc: "F32
+    // is the default float tag — tensor literals … are f32". Eight elements
+    // × 4 B = 32 B.
+    let ok = run_with_limits(r#"
+        fn main() -> i64 {
+            let t = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+            t[0] as i64
+        }
+    "#, forge_budget(32));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let t = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+            t[0] as i64
+        }
+    "#, forge_budget(31)).expect_err("32 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn an_rng_draw_is_charged_to_forge_at_its_declared_width() {
+    // p4_rng: `r.normal[f32, [N]]` has no `forge.`/`vault.` spelling either
+    // — its base is the `Rng` value — but it still materializes a fresh f32
+    // tensor, charged to Forge the same as any other implicit intermediate.
+    let ok = run_with_limits(r#"
+        fn main() -> i64 {
+            let !r = Rng.seed(1)
+            let (r2, t) = r.normal[f32, [8]]
+            r = r2
+            t[0] as i64
+        }
+    "#, forge_budget(32));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(r#"
+        fn main() -> i64 {
+            let !r = Rng.seed(1)
+            let (r2, t) = r.normal[f32, [8]]
+            r = r2
+            t[0] as i64
+        }
+    "#, forge_budget(31)).expect_err("32 B (8 f32 elements) is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #781 reviewer rework: two double/over-charge defects, and coverage ─────
+//
+// Fixed against PR #790's reviewer findings. (1) a nested tensor literal
+// recursed through the SAME `Expr::TensorLit` arm for each row, so a row's
+// own `charge_intermediate` call fired, and then the assembled outer array's
+// call fired again — double-billing every nested literal. (2) a bracket
+// list read as a `.reshape` SHAPE ARGUMENT (`a.reshape[[4096]]`) is not a
+// tensor a program can ever observe — it is consumed for its integers and
+// discarded — but it went through the same arm and was charged anyway, 8 B
+// the JIT never charges. Both are fixed by `lit_charge_suppressed`
+// (`eval_expr_lit_charge_suppressed`): held true while evaluating a row or a
+// shape argument, so only the OUTERMOST literal's own charge survives.
+
+#[test]
+fn a_nested_tensor_literal_is_charged_once_not_per_row() {
+    // 4 rows of 16 f32 elements — 256 B at the declared width. Before the
+    // fix each row's own recursive `Expr::TensorLit` charge stacked on top
+    // of the assembled `[4, 16]` array's charge: 512 B, double the real
+    // 256 B the JIT bills for the same literal.
+    const ROW: &str = "1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0";
+    let src = format!(r#"
+        fn main() -> i64 {{
+            let t = [[{ROW}],[{ROW}],[{ROW}],[{ROW}]]
+            t[0, 0] as i64
+        }}
+    "#);
+    let ok = run_with_limits(&src, forge_budget(256));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(&src, forge_budget(255))
+        .expect_err("256 B is the exact minimum — a double charge would need 512 B");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+    assert!(e.contains("256 B"), "the request itself is 256 B, not 512 B: {}", e);
+}
+
+#[test]
+fn a_reshape_shape_argument_literal_is_not_charged() {
+    // `a.reshape[[4096]]`: `a` (16 384 B f32) reshaped to its own shape.
+    // Reshape's OUTPUT is a real implicit intermediate and stays charged
+    // (another 16 384 B) — only the `[4096]` shape-argument list itself,
+    // consumed for its one integer and never returned to the program, must
+    // NOT add its own 8 B (an i64-tagged 1-element literal) on top.
+    let src = r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [4096]]
+            let b = a.reshape[[4096]]
+            b[0] as i64
+        }
+    "#;
+    let ok = run_with_limits(src, forge_budget(32768));
+    assert!(ok.is_ok(), "{:?}", ok.err());
+
+    let e = run_with_limits(src, forge_budget(32767))
+        .expect_err("32 768 B (16 384 + 16 384) is the exact minimum, not 32 776");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #781 reviewer rework: builtin-dispatch coverage via `call_builtin`'s
+//     choke point ───────────────────────────────────────────────────────────
+//
+// `softmax`, `sum_along`, `argmax`, `rms_norm` and `embed` all materialize a
+// fresh tensor on the interpreter and were completely uncharged — the JIT
+// charges every one of them. Fixed by charging the ONE choke point every
+// builtin dispatch passes through (`call_builtin`'s `charge_builtin_result`),
+// rather than patching each builtin individually.
+
+#[test]
+fn softmax_result_is_charged() {
+    // x: 4 f32 elements (16 B). softmax(x) materializes a same-shaped
+    // output — another 16 B, uncharged before this fix.
+    let src = r#"
+        fn main() -> i64 {
+            let x = forge.zeros[f32, [4]]
+            let s = softmax(x)
+            s[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(32)).is_ok());
+    let e = run_with_limits(src, forge_budget(31)).expect_err("32 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn sum_along_result_is_charged() {
+    // w: [2, 3] f32 (24 B). sum_along(w, 1) reduces axis 1 → [2] f32 (8 B).
+    let src = r#"
+        fn main() -> i64 {
+            let w = forge.zeros[f32, [2, 3]]
+            let s = sum_along(w, 1)
+            s[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(32)).is_ok());
+    let e = run_with_limits(src, forge_budget(31)).expect_err("32 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn argmax_result_is_charged() {
+    // x: [2, 3] f32 (24 B). argmax(x, 1) drops axis 1 → [2] f32 (8 B, #272:
+    // a multi-axis result stays a tensor, unlike the scalar collapse case).
+    let src = r#"
+        fn main() -> i64 {
+            let x = forge.zeros[f32, [2, 3]]
+            let a = argmax(x, 1)
+            a[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(32)).is_ok());
+    let e = run_with_limits(src, forge_budget(31)).expect_err("32 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn rms_norm_result_is_charged() {
+    // x, g: [4] f32 (16 B each). rms_norm(x, g, eps) → [4] f32 (16 B).
+    let src = r#"
+        fn main() -> i64 {
+            let x = forge.zeros[f32, [4]]
+            let g = forge.zeros[f32, [4]]
+            let n = rms_norm(x, g, 0.00001)
+            n[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(48)).is_ok());
+    let e = run_with_limits(src, forge_budget(47)).expect_err("48 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn embed_result_is_charged() {
+    // vocab: [2, 4] f32 (32 B). ids: [2] f32 (8 B). embed(vocab, ids) → [2,
+    // 4] f32 (32 B) — 72 B total, where before this fix only the two
+    // explicit constructors (40 B) were charged.
+    let src = r#"
+        fn main() -> i64 {
+            let vocab = forge.zeros[f32, [2, 4]]
+            let ids = forge.zeros[f32, [2]]
+            let out = embed(vocab, ids)
+            out[0, 0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(72)).is_ok());
+    let e = run_with_limits(src, forge_budget(71)).expect_err("72 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #804: a string produced by `+` is charged like any materialization ───
+//
+// `apply_binop`'s string-concatenation arm (`s + "x"`, `"lit" + other`) lives
+// outside `call_builtin`, so #802's `charge_builtin_result` never saw it —
+// `dmc jit` bump-allocates and charges the fresh forge string every `+`
+// produces, `dmc run` charged nothing at all. Fixed by giving
+// `charge_intermediate` (the same choke point `Expr::BinOp` already calls
+// after every `apply_binop`, tensors included) a `Value::Str` arm, at the
+// fresh string's UTF-8 byte length.
+
+#[test]
+fn str_plus_result_is_charged_at_its_byte_length() {
+    // "ab" + "cd" -> "abcd", 4 bytes. Before this fix: 0 B (ran at any budget,
+    // including 0 — rejected only because `--forge=0` itself is invalid).
+    let src = r#"
+        fn main() -> i64 {
+            let s = "ab" + "cd"
+            len(s)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(4)).is_ok());
+    let e = run_with_limits(src, forge_budget(3)).expect_err("4 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn str_plus_non_str_operand_result_is_charged() {
+    // `"lit" + to_str(f)` (#803 review's case): to_str(3.5f32) -> "3.5" (3 B,
+    // already charged by #802's `charge_builtin_result`); the `+` result,
+    // "lit3.5" (6 B), was the uncharged half before this fix. 9 B total.
+    let src = r#"
+        fn main() -> i64 {
+            let f: f32 = 3.5
+            let s = "lit" + to_str(f)
+            len(s)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(9)).is_ok());
+    let e = run_with_limits(src, forge_budget(8)).expect_err("9 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn str_concat_loop_charges_the_cumulative_byte_length() {
+    // #804's own repro: `let !s = ""  for i in 0..1000 { s = s + "x" }`. Each
+    // iteration's `s + "x"` materializes a string one byte longer than the
+    // last (lengths 1..1000), so the cumulative charge is
+    // 1 + 2 + ... + 1000 = 500 500 B — where before this fix `dmc run` ran
+    // this loop at any positive budget at all.
+    let src = r#"
+        fn main() -> i64 {
+            let !s = ""
+            for i in 0..1000 {
+                s = s + "x"
+            }
+            len(s)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(500_500)).is_ok());
+    let e = run_with_limits(src, forge_budget(500_499))
+        .expect_err("500 500 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn to_str_loop_charge_is_unchanged_by_this_fix() {
+    // `to_str` materializes through `call_builtin`, so #802 already charged
+    // it — this loop's minimum must be unaffected by #804's `apply_binop`
+    // fix. `let !s = to_str(i)` overwrites `s` every iteration rather than
+    // growing it, so the cumulative charge is the sum of each `to_str(i)`
+    // result's decimal-digit length for i in 0..1000: ten 1-digit numbers
+    // (10 B) + ninety 2-digit numbers (180 B) + nine hundred 3-digit numbers
+    // (2700 B) = 2890 B.
+    let src = r#"
+        fn main() -> i64 {
+            let !s = ""
+            for i in 0..1000 {
+                s = to_str(i)
+            }
+            len(s)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(2890)).is_ok());
+    let e = run_with_limits(src, forge_budget(2889))
+        .expect_err("2890 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── PR #815 review: a builtin's string result must not inherit
+//     `lit_charge_suppressed` from the literal element that reached it ────
+//
+// #804 routed `charge_builtin_result`'s `Value::Str` arm through
+// `charge_intermediate`, which early-returns while `lit_charge_suppressed`
+// is held — a flag meant only to stop a tensor literal's OWN rows from
+// double-billing (`eval_expr_lit_charge_suppressed`). A builtin call reached
+// from INSIDE a suppressed literal element (a fn the element calls, which
+// itself calls a string-producing builtin) is not a row of that literal at
+// all, and its fresh string still costs real bytes under `dmc jit`
+// (`forge_str_from_rust`), so this silently zeroed a real charge. Fixed by
+// having that arm call `charge_arena` directly again, unconditionally — see
+// `charge_builtin_result`'s doc.
+
+#[test]
+fn a_builtin_string_result_inside_a_suppressed_literal_element_is_still_charged() {
+    // `noisy()` runs the #804 `to_str` loop above (2890 B cumulative) and
+    // returns its length as an int. `[noisy()]` is a single-element tensor
+    // literal, so `Expr::TensorLit` evaluates that one element through
+    // `eval_expr_lit_charge_suppressed` unconditionally (regardless of the
+    // element's type) — the suppressed context this fix must reach through.
+    // The literal itself (one i64 element, the untyped-integer default
+    // width, #571) adds another 8 B: 2898 B total. Before this fix: 8 B —
+    // the entire `to_str` loop vanished into the suppression.
+    let src = r#"
+        fn noisy() -> i64 {
+            let !s = ""
+            for i in 0..1000 {
+                s = to_str(i)
+            }
+            len(s)
+        }
+        fn main() -> i64 {
+            let t = [noisy()]
+            t[0]
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(2898)).is_ok());
+    let e = run_with_limits(src, forge_budget(2897))
+        .expect_err("2898 B is the exact minimum — the suppressed-literal bug left this at 8 B");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #781 reviewer rework: `!`-param and `let !` private-copy charges ──────
+//
+// #650 and SPEC §3.4: a `!` parameter and a `let !y = x` binding are
+// PRIVATE, independently mutable copies, not aliases — the JIT copies the
+// bytes, so `dmc run` must charge the copy too, to stay in parity.
+
+#[test]
+fn a_mutating_param_charges_the_copy_in_and_not_the_copy_out() {
+    // x: [8] f32 (32 B). `fill(x)` binds a private copy for `!t` — the
+    // copy-IN, another 32 B, allocated at the call site on both backends —
+    // for 64 B total, where before #781 only `x` itself (32 B) was charged.
+    //
+    // #791: the copy-OUT adds nothing. It writes back into the buffer the
+    // caller already owns and already paid for (the JIT emits a `memcpy`
+    // into the incoming pointer, not a second allocation), so 96 B — what an
+    // earlier pass of #781 asserted here — double-billed every `!`-param
+    // call.
+    let src = r#"
+        fn fill(!t: Tensor[f32, [8]]) -> nil {
+            t[0] = 9.0
+            nil
+        }
+        fn main() -> i64 {
+            let !x = forge.zeros[f32, [8]]
+            fill(x)
+            x[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(64)).is_ok());
+    let e = run_with_limits(src, forge_budget(63)).expect_err("64 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn let_bang_from_a_bare_identifier_charges_the_private_copy() {
+    // x: [8] f32 (32 B). `let !y = x` binds an independently mutable copy —
+    // another 32 B — where before this fix only `x` was charged.
+    let src = r#"
+        fn main() -> i64 {
+            let !x = forge.zeros[f32, [8]]
+            let !y = x
+            y[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(64)).is_ok());
+    let e = run_with_limits(src, forge_budget(63)).expect_err("64 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn let_bang_from_a_fresh_intermediate_is_not_double_charged() {
+    // `let !y = a + b` — the binop's result is ALREADY a fresh intermediate
+    // charged by `Expr::BinOp`'s own `charge_intermediate` call; it must not
+    // be charged again just because the binding happens to be `!`. a, b:
+    // [4] f32 (16 B each); the sum: another 16 B — 48 B total, not 64 B.
+    let src = r#"
+        fn main() -> i64 {
+            let a = forge.zeros[f32, [4]]
+            let b = forge.zeros[f32, [4]]
+            let !y = a .+ b
+            y[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(48)).is_ok());
+    let e = run_with_limits(src, forge_budget(47)).expect_err("48 B is the exact minimum, not 64 B");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── PR #815 review: a private STRING copy is not charged ─────────────────
+//
+// #650 / SPEC §3.4 charge a `!` binding's private copy for parity
+// with what the JIT actually copies. For a `Value::Tensor` that is real
+// bytes on both backends (the tests above). For a `Value::Str` it is not: a
+// `str` is a pointer on the JIT, so `let !y = x` / a `!` param binds a
+// second pointer to the SAME bytes there, requesting 0 B. The three sites
+// above (`Stmt::Let`, `eval_top_level_item`'s `Item::Let`, and the `!` param
+// loop) used to charge the string's length anyway — a copy neither backend
+// makes — via a false comment ("so the JIT charges the copy") that did not
+// hold for this value kind. `charge_private_copy` excludes `Value::Str` at
+// all three; these tests pin that a string's length is charged exactly
+// once, at the point that actually materializes it, no matter how many
+// private copies of it are bound afterward.
+
+#[test]
+fn let_bang_from_a_bare_str_identifier_is_not_charged() {
+    // `to_str(123456789)` -> "123456789", 9 B, charged once at the builtin
+    // choke point (#802/#804). Three private `let !` copies of that same
+    // string must add nothing. Before this fix: 9 + 9*3 = 36 B.
+    let src = r#"
+        fn main() -> i64 {
+            let c = to_str(123456789)
+            let !t1 = c
+            let !t2 = c
+            let !t3 = c
+            len(t3) as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(9)).is_ok());
+    let e = run_with_limits(src, forge_budget(8))
+        .expect_err("9 B is the exact minimum — the three private copies must add nothing");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_mutating_str_param_is_not_charged_for_the_copy() {
+    // Mirrors `a_mutating_param_charges_the_copy_in_and_not_the_copy_out`
+    // above, but for a `!str` param: unlike a tensor's copy-in, a string's
+    // copy-in must add nothing.
+    let src = r#"
+        fn touch(!t: str) -> nil {
+            nil
+        }
+        fn main() -> i64 {
+            let c = to_str(123456789)
+            touch(c)
+            len(c) as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(9)).is_ok());
+    let e = run_with_limits(src, forge_budget(8))
+        .expect_err("9 B is the exact minimum — the `!str` param copy must add nothing");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_top_level_let_bang_from_a_bare_str_identifier_is_not_charged() {
+    // Mirrors `let_bang_from_a_bare_str_identifier_is_not_charged` above at
+    // module scope (`eval_top_level_item`'s `Item::Let`, not `Stmt::Let`).
+    let src = r#"
+        let c = to_str(123456789)
+        let !g = c
+        fn main() -> i64 {
+            len(g) as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(9)).is_ok());
+    let e = run_with_limits(src, forge_budget(8))
+        .expect_err("9 B is the exact minimum — the top-level private copy must add nothing");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #781 / #791: a compiler temporary returns its charge ─────────────────
+//
+// `MEMORY.md §1.1`: a materialization the COMPILER inserts and the compiler
+// itself reclaims gives its charge back on both backends. The two rows below
+// are #674's own g1 probes, verbatim, at the shapes and trip count
+// `tools/jit_probes.py` runs them at — pinned here so the interpreter's
+// per-step slope cannot drift away from the JIT's again without a unit test
+// saying so. Each names the JIT's bisected minimum for the same source and
+// the residual against it, and each residual is a CONSTANT (independent of
+// the trip count), which is the property that matters: the two backends now
+// charge the same bytes PER STEP.
+
+#[test]
+fn a_forward_only_grad_call_returns_its_activations() {
+    // #674's `g1_fwd`: 200 forward-only calls of a `@grad fn` with a
+    // `!` tensor param. Per call the JIT allocates the `!W` private copy at
+    // the CALL SITE (16 384 B, outside its own rewind, so monotonic) and
+    // reclaims everything the body materialized — `h = x @ W` and `h .* h`,
+    // 16 384 B each — through the `InternalMark` its forward-only entry
+    // takes. The interpreter now does the same, so both backends charge
+    // 16 384 B per call rather than the interpreter's former 65 536 B.
+    //
+    // Minimum: 200 × 16 384 (the copies) + 32 768 (one call's two live
+    // activations at the peak) = 3 309 568 B.
+    //
+    // `dmc jit` bisects to 3 375 104 B on this source. The 65 536 B residual
+    // is not an autodiff or call-scope difference at all: it is `main`'s two
+    // `vault.zeros` constructors, which the JIT meters against `--forge`
+    // (it has one arena) and doubles under the separately filed
+    // let-bound-constructor over-charge, while the interpreter meters them
+    // against `--vault`. Re-spelled with `forge.zeros`, the residual is
+    // exactly that over-charge (32 768 B) and nothing else.
+    let src = r#"
+        @grad fn loss(!W: Tensor[f32, [64, 64]], x: Tensor[f32, [64, 64]]) -> f32 {
+            let h = x @ W
+            sum(h .* h)
+        }
+        fn main() -> i64 {
+            vault {
+                let !W = vault.zeros[f32, [64, 64]]
+                let x = vault.zeros[f32, [64, 64]]
+                let !last = 0
+                for step in 0..200 {
+                    let l = loss(W, x)
+                    last = step
+                }
+                last
+            }
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(3_309_568)).is_ok());
+    let e = run_with_limits(src, forge_budget(3_309_567))
+        .expect_err("3 309 568 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_fwd_bwd_step_returns_everything_but_its_published_gradients() {
+    // #674's `g1`: the same fn driven 200 times through `.fwd_bwd`,
+    // which takes the tape evaluator rather than the ordinary expression
+    // path. Before #791 that path materialized its activations and every
+    // adjoint uncharged — the whole loop ran at `--forge=1`. Now the pass is
+    // metered while it is live and released at the AD boundary, leaving only
+    // what the caller keeps: one published gradient per step (16 384 B), the
+    // same thing the JIT's `capture_grad` leaves standing outside
+    // `grad_call_epilogue`'s rewind.
+    //
+    // Minimum: 200 × 16 384 (the published gradients) + 81 920 (one step's
+    // peak: two forward activations plus the four adjoints the backward
+    // pass publishes) = 3 358 720 B.
+    //
+    // `dmc jit` bisects to 3 473 408 B. Of the 114 688 B residual, 65 536 B
+    // is the `vault.zeros` term described in the test above; the remaining
+    // 49 152 B is scratch INSIDE the backward pass — the transposes a matmul
+    // VJP takes, the buffer an accumulating `+=` produces — which the two
+    // backends' backward implementations simply do not agree on op by op.
+    // The interpreter meters the adjoints the pass PUBLISHES, a set both
+    // backends do agree on; see `docs/MEMORY.md §1.1`.
+    let src = r#"
+        @grad fn loss(!W: Tensor[f32, [64, 64]], x: Tensor[f32, [64, 64]]) -> f32 {
+            let h = x @ W
+            sum(h .* h)
+        }
+        fn main() -> i64 {
+            vault {
+                let !W = vault.zeros[f32, [64, 64]]
+                let x = vault.zeros[f32, [64, 64]]
+                let !last = 0
+                for step in 0..200 {
+                    let (l, g) = loss.fwd_bwd(W, x)
+                    last = step
+                }
+                last
+            }
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(3_358_720)).is_ok());
+    let e = run_with_limits(src, forge_budget(3_358_719))
+        .expect_err("3 358 720 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #781 (PR #790 rework): an escaping constructor stays charged ─────────
+//
+// The forward-only `@grad` mark, and the `.fwd_bwd` epilogue, are entitled
+// to reclaim the COMPILER's own intermediates (`MEMORY.md §1.1`) — not a
+// tensor the program spelled out. A `forge.*` constructor written inside
+// such a body can escape it and stay live, so its bytes survive the rewind.
+//
+// Each row below is 40 calls of a `@grad fn` whose body constructs one
+// 64×64 f32 tensor (16 384 B) and lets it escape by one of the three
+// routes, with the same source minus `@grad` as the control: the twin's
+// minimum is HIGHER (it keeps the body's activations too), and what matters
+// is that the marked version keeps the constructor term rather than
+// collapsing to one call's worth. Before this fix each `@grad` row bisected
+// to 65 536 B — the whole 40-call constructor series un-charged while live.
+//
+// There is no JIT parity to preserve on any of them: `dmc jit` refuses all
+// three outright (a non-tensor `!` param on a `@grad fn`; a non-differentiable
+// postfix op; a top-level non-constant `let`), measured at the same commit.
+
+#[test]
+fn a_constructor_escaping_through_a_mut_model_param_stays_charged() {
+    // `m.w = forge.zeros[…]` inside a forward-only `@grad` body: the tensor
+    // leaves through the `!` model param, which is the caller's instance.
+    // 40 × 16 384 (the constructors) + 16 384 (`m`'s initial `w`) + 16 384
+    // (`x`) + 16 384 (one call's live `x .* x`) = 704 512 B.
+    let src = r#"
+        model Holder { w: Tensor[f32, [64, 64]] }
+        @grad fn touch(!m: Holder, x: Tensor[f32, [64, 64]]) -> f32 {
+            m.w = forge.zeros[f32, [64, 64]]
+            sum(x .* x)
+        }
+        fn main() -> i64 {
+            let !m = Holder { w: forge.zeros[f32, [64, 64]] }
+            let x = forge.zeros[f32, [64, 64]]
+            let !last = 0
+            for step in 0..40 {
+                let l = touch(m, x)
+                last = step
+            }
+            last
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(704_512)).is_ok());
+    let e = run_with_limits(src, forge_budget(704_511))
+        .expect_err("704 512 B is the exact minimum, not the 65 536 B a full rewind left");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn the_control_twin_without_grad_charges_the_same_constructors_and_more() {
+    // The same source minus `@grad`: no mark, so the body's `x .* x` stays
+    // charged too — 704 512 + 39 × 16 384 = 1 343 488 B. The constructor
+    // term is identical in both, which is the point of the pair.
+    let src = r#"
+        model Holder { w: Tensor[f32, [64, 64]] }
+        fn touch(!m: Holder, x: Tensor[f32, [64, 64]]) -> f32 {
+            m.w = forge.zeros[f32, [64, 64]]
+            sum(x .* x)
+        }
+        fn main() -> i64 {
+            let !m = Holder { w: forge.zeros[f32, [64, 64]] }
+            let x = forge.zeros[f32, [64, 64]]
+            let !last = 0
+            for step in 0..40 {
+                let l = touch(m, x)
+                last = step
+            }
+            last
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(1_343_488)).is_ok());
+    let e = run_with_limits(src, forge_budget(1_343_487))
+        .expect_err("1 343 488 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_constructor_escaping_through_a_mut_tensor_param_stays_charged() {
+    // `t = forge.zeros[…]` rebinds the private copy; the copy-OUT then
+    // carries it back to the caller. 40 × (16 384 copy-in + 16 384
+    // constructor) + 16 384 (`t`) + 16 384 (`x`) + 16 384 (one live
+    // `x .* x`) = 1 359 872 B.
+    let src = r#"
+        @grad fn touch(!t: Tensor[f32, [64, 64]], x: Tensor[f32, [64, 64]]) -> f32 {
+            t = forge.zeros[f32, [64, 64]]
+            sum(x .* x)
+        }
+        fn main() -> i64 {
+            let !t = forge.zeros[f32, [64, 64]]
+            let x = forge.zeros[f32, [64, 64]]
+            let !last = 0
+            for step in 0..40 {
+                let l = touch(t, x)
+                last = step
+            }
+            last
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(1_359_872)).is_ok());
+    let e = run_with_limits(src, forge_budget(1_359_871))
+        .expect_err("1 359 872 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_constructor_escaping_into_a_module_level_mut_binding_stays_charged() {
+    // `g = forge.zeros[…]` writes a module-level `let !`, which outlives
+    // every call. 40 × 16 384 (the constructors) + 16 384 (`g`'s initial
+    // value) + 16 384 (`x`) + 16 384 (one live `x .* x`) = 704 512 B.
+    //
+    // Before #794, the `dmc run` CLI bisected 16 384 B higher here: `main.rs`
+    // called `load_program` over every resolved path (including the main
+    // file) and then `Interpreter::run` loaded the main file again, so a
+    // module-level `let`'s initializer was evaluated — and its constructor
+    // charged — twice. #794 skips the main file in that pre-load pass (it is
+    // loaded and run exactly once, by `Interpreter::run`), so the CLI now
+    // agrees with this test's budget exactly; this test drives the
+    // interpreter directly and always saw the single charge.
+    let src = r#"
+        let !g = forge.zeros[f32, [64, 64]]
+        @grad fn touch(x: Tensor[f32, [64, 64]]) -> f32 {
+            g = forge.zeros[f32, [64, 64]]
+            sum(x .* x)
+        }
+        fn main() -> i64 {
+            let x = forge.zeros[f32, [64, 64]]
+            let !last = 0
+            for step in 0..40 {
+                let l = touch(x)
+                last = step
+            }
+            last
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(704_512)).is_ok());
+    let e = run_with_limits(src, forge_budget(704_511))
+        .expect_err("704 512 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_fwd_bwd_body_keeps_a_tensor_valued_escape_too() {
+    // The `.fwd_bwd` epilogue takes the same carve-out. 40 × 16 384 (the
+    // `!W` copy-ins) + 40 × 16 384 (the published gradients) + 39 × 16 384
+    // (the escaping constructors, the 40th being inside the last step's
+    // peak) + 16 384 × 3 (`g`, `W`, `x`) + one step's peak = 2 080 768 B.
+    // A rewind that released the constructor series bisected to 1 441 792 B.
+    // (Before #794, the `dmc run` CLI reported both 16 384 B higher, for the
+    // module-level double-load reason the test above records; the CLI now
+    // agrees with these numbers too.)
+    let src = r#"
+        let !g = forge.zeros[f32, [64, 64]]
+        @grad fn loss(!W: Tensor[f32, [64, 64]], x: Tensor[f32, [64, 64]]) -> f32 {
+            g = forge.zeros[f32, [64, 64]]
+            let h = x @ W
+            sum(h .* h)
+        }
+        fn main() -> i64 {
+            let !W = forge.zeros[f32, [64, 64]]
+            let x = forge.zeros[f32, [64, 64]]
+            let !last = 0
+            for step in 0..40 {
+                let (l, gr) = loss.fwd_bwd(W, x)
+                last = step
+            }
+            last
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(2_080_768)).is_ok());
+    let e = run_with_limits(src, forge_budget(2_080_767))
+        .expect_err("2 080 768 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+// ─── #794: the main file's top-level `let`s are evaluated exactly once ────
+//
+// `main.rs`'s `run` (and `pipeline`) arms used to pre-load every resolved
+// path, including the main file itself, and then call `Interpreter::run` on
+// the main file a second time — so the main file's own top-level `let`
+// initializers ran twice: any side effect inside one (a `print`, an `Rng`
+// draw, a port call, a Forge allocation) happened twice too. Fixed by
+// skipping the main file in that pre-load pass — it is loaded and run
+// exactly once, by `Interpreter::run` — in `main.rs`'s `run` and `pipeline`
+// arms, and here in `run_multi`/`run_multi_err`, which mirror them.
+//
+// An imported dependency's top-level `let`s were never double-run this way
+// (the old code only loaded the *entry* path twice); the third test below
+// pins that the fix leaves that alone.
+
+/// `run_multi` plus arena limits, installed the way `--forge=`/`--vault=`
+/// would be by the CLI. `run_with_limits` (above) is single-file only and so
+/// cannot see this bug: it calls `Interpreter::run` directly, with no
+/// pre-load pass to duplicate — only the multi-path `resolve → pre-load →
+/// run` pipeline `run_multi` mirrors can.
+fn run_multi_with_limits(
+    files: &[(&str, &str)],
+    main: &str,
+    limits: crate::arena::ArenaLimits,
+) -> Result<Value, String> {
+    run_multi_impl(files, main, Some(limits))
+}
+
+#[test]
+fn main_files_top_level_forge_alloc_is_charged_exactly_once() {
+    // The issue's own repro: one 16 384 B `forge.zeros[f32,[4096]]` at the
+    // main file's top level. Before #794 this needed a 32 768 B budget (two
+    // charges, one per evaluation of the initializer); it now needs exactly
+    // 16 384 B — one.
+    let src = r#"
+        let G = forge.zeros[f32, [4096]]
+        fn main() -> i64 { 1 }
+    "#;
+    let files = [("main.dmc", src)];
+    assert!(run_multi_with_limits(&files, "main.dmc", forge_budget(16_384)).is_ok());
+    let e = run_multi_with_limits(&files, "main.dmc", forge_budget(16_383))
+        .expect_err("16 384 B is the exact minimum — one allocation, not two");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn main_files_top_level_let_initializer_runs_exactly_once() {
+    // A side effect in the main file's own top-level `let` initializer must
+    // fire once, not twice. An earlier version of this test kept the counter
+    // (`let !count = 0`) in the main file alongside the initializer under
+    // test — but the main file's own top-level `let`s are (re-)loaded fresh
+    // by every call into this harness, so `count` started back at 0
+    // whichever pass evaluated it, and the assertion read 1 whether the
+    // initializer ran once or twice: the test passed even with the #794 fix
+    // reverted (confirmed by reverting the three `if *p == canonical`
+    // guards in scratch — see the PR description). Routing the counter
+    // through an imported module (`dep.dmc`), and bumping it from the main
+    // file's top-level `let X = bump()`, makes a double run visible: `get()`
+    // reads back 2 with the fix reverted, 1 with it in place.
+    let v = run_multi(&[
+        (
+            "dep.dmc",
+            "let !count = 0\n\
+             pub fn bump() -> i64 { count = count + 1  count }\n\
+             pub fn get() -> i64 { count }\n",
+        ),
+        (
+            "main.dmc",
+            "use \"dep.dmc\"\nlet X = bump()\nfn main() -> i64 { get() }\n",
+        ),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1, "main file's top-level initializer ran more than once");
+}
+
+#[test]
+fn an_imported_files_top_level_let_initializer_still_runs_exactly_once() {
+    // The counterpart: an imported dependency's top-level `let` initializer
+    // was never double-run by the old code (only the entry path was loaded
+    // a second time) — pins that the #794 fix leaves this alone.
+    let v = run_multi(&[
+        (
+            "dep.dmc",
+            "let !count = 0\n\
+             let Y = { count = count + 1  1 }\n\
+             pub fn get_count() -> i64 { count }\n",
+        ),
+        (
+            "main.dmc",
+            "use \"dep.dmc\"\nfn main() -> i64 { get_count() }\n",
+        ),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 1, "imported file's top-level initializer ran more than once");
+}
+
+// ─── #781 (PR #790 rework): a `!` writeback survives a `?` early return ───
+
+#[test]
+fn a_mut_param_writeback_survives_a_query_early_return() {
+    // SPEC §4.9: `?` desugars to `return (default[T], e)`. That reaches
+    // `call_fn_in_module` as an `Err` carrying the propagation marker, so a
+    // writeback capture gated on `result.is_ok()` drops it — the caller's
+    // tensor stayed at 0 under `dmc run` while `dmc jit`, which emits the
+    // copy-out on every exit path, answered 7. The meter rewind is the only
+    // thing that gate belongs on.
+    let v = run_with_limits(r#"
+        fn always_fails() -> (i64, Err) {
+            (0, "no")
+        }
+        fn write_then_bail(!a: Tensor[i64, [1]]) -> (i64, Err) {
+            a[0] = 7
+            let k = always_fails()?
+            (k, nil)
+        }
+        fn main() -> i64 {
+            let !t = forge.zeros[i64, [1]]
+            let (r, e) = write_then_bail(t)
+            t[0]
+        }
+    "#, forge_budget(1024)).expect("should fit the budget");
+    assert_eq!(as_int(&v), 7);
+}
+
+// ─── #781 reviewer rework: uncharged on both backends today (JIT refuses) ──
+//
+// Tensor `as` cast, `.split` and `<-` concat on an ordinary (non-KV) tensor
+// all materialize a new backing array on the interpreter and were
+// completely uncharged; the JIT has no lowering for any of them yet and
+// refuses the program outright, so there is nothing to stay in parity with
+// — these charges get ahead of the JIT lowering them.
+
+#[test]
+fn a_tensor_as_cast_is_charged() {
+    // x: [8] f64 (64 B). `x as f32` narrows to [8] f32 (32 B) — 96 B total.
+    let src = r#"
+        fn main() -> i64 {
+            let x = forge.zeros[f64, [8]]
+            let y = x as f32
+            y[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(96)).is_ok());
+    let e = run_with_limits(src, forge_budget(95)).expect_err("96 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn tensor_split_pieces_are_each_charged() {
+    // x: [8] f32 (32 B). `.split[2]` copies out two [4] f32 pieces (16 B
+    // each) — 64 B total, where before this fix only `x` was charged.
+    let src = r#"
+        fn main() -> i64 {
+            let x = forge.zeros[f32, [8]]
+            let (a, b) = x.split[2]
+            a[0] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(64)).is_ok());
+    let e = run_with_limits(src, forge_budget(63)).expect_err("64 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn stream_arrow_concat_on_an_ordinary_tensor_is_charged() {
+    // `buf` is a PLAIN forge tensor (no declared `capacity` — not a Stream
+    // arena / `forge.kv` binding), so `<-` growing it is an ordinary Forge
+    // concat, not the by-design-uncharged Stream append. buf: [4] f32
+    // (16 B); the appendee literal: [4] f32 (16 B, charged the same as any
+    // other tensor literal, unrelated to this fix); the grown [8] f32
+    // result: 32 B, uncharged before this fix. 64 B total.
+    let src = r#"
+        fn main() -> i64 {
+            let !buf = forge.zeros[f32, [4]]
+            buf <- [1.0, 2.0, 3.0, 4.0]
+            buf[4] as i64
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(64)).is_ok());
+    let e = run_with_limits(src, forge_budget(63)).expect_err("64 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_kv_bindings_stream_arrow_stays_uncharged() {
+    // Regression guard alongside `a_kv_allocation_is_stream_not_forge`: a
+    // DECLARED-capacity `forge.kv` binding's `<-` must stay exempt (MEMORY.md
+    // §1: the Stream arena is bounded by its own `capacity`, not `--forge`)
+    // even now that a PLAIN tensor's `<-` is charged.
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let !c = forge.kv[f32, [~]](capacity = 4096)
+            c <- [1.0f32]
+            c <- [2.0f32]
+            1
+        }
+    "#, forge_budget(16)).expect("a kv binding's <- must not charge the forge budget");
+    assert_eq!(as_int(&v), 1);
+}
+
+// ─── PR #815 review: an `as str` cast and a str method both charge their
+//     fresh result, through the same choke point as everything above ──────
+//
+// `charge_intermediate`'s doc used to say `apply_binop`'s `+` was "the one
+// string-producing form that lives outside `call_builtin`" — wrong twice.
+// `apply_cast`'s `as str` (`Expr::Cast`) already flowed through the same
+// `charge_intermediate` call every cast takes (correct behavior, just
+// undocumented — see `MEMORY.md §1.1`). `call_str_method`
+// (`.trim`/`.upper`/`.lower`/`.replace`/`.split`/`.lines`) did NOT flow
+// through anything: it returned straight out of the method-call arm in
+// `eval_expr`'s `Expr::Call` handling, so every one of these materialized a
+// fresh string (or, for `.split`/`.lines`, a fresh list of them) at 0 B on
+// `dmc run` — the JIT refuses all of these but `.starts_with` today, so
+// there was no parity to preserve, only a real allocation going uncounted.
+// Fixed by charging the result through `charge_builtin_result` at the call
+// site, which already recurses into a `List`.
+
+#[test]
+fn an_as_str_cast_result_is_charged() {
+    // `x as str` on an int: `to_str`'s own family, but reached through
+    // `Expr::Cast`/`apply_cast` rather than `call_builtin` — the OTHER
+    // string-producing form `charge_intermediate`'s doc names now.
+    // 123456789 as str -> "123456789", 9 B.
+    let src = r#"
+        fn main() -> i64 {
+            let x = 123456789
+            let s = x as str
+            len(s)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(9)).is_ok());
+    let e = run_with_limits(src, forge_budget(8)).expect_err("9 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_str_trim_result_is_charged() {
+    // "  hi  ".trim() -> "hi", 2 B, uncharged before this fix (any budget,
+    // including 0, ran — rejected only because `--forge=0` itself is
+    // invalid).
+    let src = r#"
+        fn main() -> i64 {
+            let s = "  hi  "
+            let t = s.trim()
+            len(t)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(2)).is_ok());
+    let e = run_with_limits(src, forge_budget(1)).expect_err("2 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_str_replace_result_is_charged() {
+    // "aaa".replace("a", "bb") -> "bbbbbb", 6 B.
+    let src = r#"
+        fn main() -> i64 {
+            let s = "aaa"
+            let t = s.replace("a", "bb")
+            len(t)
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(6)).is_ok());
+    let e = run_with_limits(src, forge_budget(5)).expect_err("6 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_str_split_results_charge_every_piece() {
+    // "a,bb,ccc".split(",") -> ["a", "bb", "ccc"]: 1 + 2 + 3 = 6 B, the sum
+    // of every piece — `charge_builtin_result` recurses into the `List`.
+    let src = r#"
+        fn main() -> i64 {
+            let s = "a,bb,ccc"
+            let parts = s.split(",")
+            len(parts[2])
+        }
+    "#;
+    assert!(run_with_limits(src, forge_budget(6)).is_ok());
+    let e = run_with_limits(src, forge_budget(5)).expect_err("6 B is the exact minimum");
+    assert!(e.contains("forge arena exhausted"), "{}", e);
+}
+
+#[test]
+fn a_str_method_returning_a_non_str_is_still_uncharged() {
+    // `.find()` / `.starts_with()` return an Int/Bool, not a fresh string —
+    // `charge_builtin_result` is a no-op for those, exactly as it is for
+    // any other builtin's non-tensor, non-string result. `s` itself is an
+    // uncharged literal (`lit_value_hinted`, no `charge_intermediate` call
+    // wraps it), so the whole program charges 0 B — it must run under the
+    // tightest budget the arena accepts.
+    let v = run_with_limits(r#"
+        fn main() -> i64 {
+            let s = "hello"
+            if s.starts_with("he") { s.find("l") } else { -1 }
+        }
+    "#, forge_budget(1)).expect("charges nothing — .find/.starts_with are not fresh strings");
+    assert_eq!(as_int(&v), 2);
 }
 
 // ─── #540: fixed-width integer arithmetic wraps at the declared width ────────
@@ -10789,4 +13778,2779 @@ fn static_slice_bounds_still_clamp_unchanged() {
         }
     "#);
     assert!((as_float(&v) - 3.0).abs() < 1e-6, "expected clamp to full axis (sum 3.0), got {:?}", v);
+}
+
+// ── #639: `return` / `break` / `continue` leave a block ─────────────────────
+//
+// A block — plain `{ … }`, `forge { … }` / `vault { … }`, or a directive block
+// — is a scope, not a function boundary and not a loop boundary. SPEC.md §4
+// gives a block's VALUE (its tail) and §5.1 lists `forge` beside `if` / `for` /
+// `while` as a nested *scope*; nothing makes one a control-flow boundary, so a
+// `return` inside it belongs to the enclosing fn and a `break` / `continue` to
+// the enclosing loop. The interpreter used to collapse the escaping `Flow` —
+// `return` became the block's value, `break` and `continue` became nil — while
+// the JIT propagated it, so the two backends silently disagreed. The three
+// programs below are the issue's own, with the JIT's answers.
+
+#[test]
+fn issue_639_return_leaves_the_arena_block_and_the_function() {
+    // `dmc run` answered 7 (the tail): the `return` stopped at the `forge`
+    // block and its value was discarded. `dmc jit` answered 42.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            forge { if x > 0 { return 42 } }
+            7
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&v), 42);
+}
+
+#[test]
+fn issue_639_return_not_taken_still_yields_the_tail() {
+    // The other half of the same rule: no flow escapes, so the function's
+    // value is its own tail and the block changes nothing.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            forge { if x > 0 { return 42 } }
+            7
+        }
+        fn main() -> i64 { f(-1) }
+    "#);
+    assert_eq!(as_int(&v), 7);
+}
+
+#[test]
+fn issue_639_break_leaves_the_arena_block_and_the_while_loop() {
+    // `dmc run` answered 10 (the loop ran to its condition): the `break` became
+    // nil at the block boundary. `dmc jit` answered 3.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !i = 0
+            while i < 10 {
+                forge { if i > 2 { break } }
+                i = i + 1
+            }
+            i
+        }
+    "#);
+    assert_eq!(as_int(&v), 3);
+}
+
+#[test]
+fn issue_639_continue_leaves_the_arena_block_and_skips_the_iteration() {
+    // `dmc run` answered 15 (1+2+3+4+5 — the `continue` was swallowed, so no
+    // iteration was skipped). `dmc jit` answered 13, i.e. without i == 2.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !i = 0
+            let !s = 0
+            while i < 5 {
+                i = i + 1
+                forge { if i == 2 { continue } }
+                s = s + i
+            }
+            s
+        }
+    "#);
+    assert_eq!(as_int(&v), 13);
+}
+
+#[test]
+fn issue_639_plain_block_return_leaves_the_function() {
+    // Nothing arena-specific about it: a plain `{ … }` in statement position
+    // swallowed the `return` the same way, and the function fell through to
+    // its tail (1).
+    let v = run(r#"
+        fn g() -> i64 { { return 9 }  1 }
+        fn main() -> i64 { g() }
+    "#);
+    assert_eq!(as_int(&v), 9);
+}
+
+#[test]
+fn issue_639_break_in_an_arena_block_inside_a_for_loop() {
+    // `for` reaches the loop body through the same `eval_block`, so the arena
+    // block's `break` must stop the iteration at i == 4 (four increments run).
+    let v = run(r#"
+        fn main() -> i64 {
+            let !n = 0
+            for i in 0..10 {
+                forge { if i == 4 { break } }
+                n = n + 1
+            }
+            n
+        }
+    "#);
+    assert_eq!(as_int(&v), 4);
+}
+
+#[test]
+fn issue_639_continue_climbs_out_of_nested_blocks() {
+    // Two block boundaries between the `continue` and its loop: the flow has
+    // to survive both, not just the innermost. 0 + 1 + 3 + 4 = 8.
+    let v = run(r#"
+        fn main() -> i64 {
+            let !s = 0
+            for i in 0..5 {
+                { { if i == 2 { continue } } }
+                s = s + i
+            }
+            s
+        }
+    "#);
+    assert_eq!(as_int(&v), 8);
+}
+
+#[test]
+fn issue_639_block_tail_is_used_and_the_conditional_return_is_not_taken() {
+    // The value rule and the flow rule in one program. The `return` is not
+    // reached, so the block is worth its tail (5) and the function answers 6 —
+    // this is the half that must NOT move, and both backends already agreed.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            let y = { if x > 0 { return 42 }  5 }
+            y + 1
+        }
+        fn main() -> i64 { f(-1) }
+    "#);
+    assert_eq!(as_int(&v), 6);
+}
+
+#[test]
+fn issue_639_block_tail_is_used_and_the_conditional_return_is_taken() {
+    // Same program, other branch. `dmc run` bound y = 42 and answered 43;
+    // `dmc jit` returned 42 from the function. This shape lowers on both
+    // backends, so it is also a `tools/jit_probes.py` entry.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            let y = { if x > 0 { return 42 }  5 }
+            y + 1
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&v), 42);
+}
+
+#[test]
+fn issue_639_return_inside_a_block_inside_a_match_arm() {
+    // A match arm body is an expression position, and the arm runs in a scope
+    // of its own — the escaping flow has to leave that scope cleanly, or every
+    // later `pop_scope` is off by one frame.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            let y = match x { 1 => { return 42 }, _ => 5 }
+            y + 100
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&v), 42);
+}
+
+#[test]
+fn issue_639_match_arm_without_the_return_is_unchanged() {
+    // The arm that takes no early exit must still bind its value normally —
+    // the guard that the scope bookkeeping above did not disturb the ordinary
+    // path. 5 + 100.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            let y = match x { 1 => { return 42 }, _ => 5 }
+            y + 100
+        }
+        fn main() -> i64 { f(2) }
+    "#);
+    assert_eq!(as_int(&v), 105);
+}
+
+#[test]
+fn issue_639_return_leaves_a_directive_block() {
+    // A `@cast(…) { … }` block is a block. In statement position it discarded
+    // the flow outright (the function answered its tail, 7); in expression
+    // position it turned the `return` into the block's value (43).
+    let stmt_pos = run(r#"
+        fn f(x: i64) -> i64 {
+            @cast(i64) { if x > 0 { return 42 }  5 }
+            7
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&stmt_pos), 42);
+
+    let expr_pos = run(r#"
+        fn f(x: i64) -> i64 {
+            let y = @cast(i64) { if x > 0 { return 42 }  5 }
+            y + 1
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&expr_pos), 42);
+}
+
+#[test]
+fn issue_639_a_block_with_no_escaping_flow_is_still_its_tail() {
+    // The regression guard for the value rule: a block that no `return` /
+    // `break` / `continue` leaves evaluates to its tail expression, nested
+    // blocks included, exactly as SPEC.md §4 says. 2 * 3 + 1.
+    let v = run(r#"
+        fn main() -> i64 {
+            let y = { let a = 2  { a * 3 } }
+            y + 1
+        }
+    "#);
+    assert_eq!(as_int(&v), 7);
+}
+
+#[test]
+fn issue_639_break_out_of_a_block_in_a_loop_leaves_the_loop_not_the_function() {
+    // `break` stops at the nearest LOOP, not at the function: the code after
+    // the loop still runs. Without that the answer would be nil, not 100.
+    let v = run(r#"
+        fn f() -> i64 {
+            let !n = 0
+            while true {
+                { break }
+            }
+            n = n + 100
+            n
+        }
+        fn main() -> i64 { f() }
+    "#);
+    assert_eq!(as_int(&v), 100);
+}
+
+#[test]
+fn issue_639_a_return_inside_a_range_bound_is_not_absorbed_into_the_bound() {
+    // A range bound tolerates an expression that is not an integer and reads
+    // it as 0 — that tolerance is for VALUES. An escaping `return` is not a
+    // bad bound, it is the function's control flow passing through, so it
+    // keeps travelling instead of leaving a `0..0` behind.
+    let v = run(r#"
+        fn f() -> i64 {
+            let !s = 0
+            for i in 0..{ return 5 } { s = s + i }
+            s
+        }
+        fn main() -> i64 { f() }
+    "#);
+    assert_eq!(as_int(&v), 5);
+}
+
+#[test]
+fn issue_639_a_match_guard_can_carry_the_escaping_flow_out() {
+    // The guard runs inside the arm's scope, before the body. A `return` that
+    // leaves a block there has to unwind that scope on the way out — the arm
+    // is never entered, and the enclosing function answers 42.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            let y = match x { n if n > 0 => { return 42 }, _ => 5 }
+            y + 100
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&v), 42);
+}
+
+#[test]
+fn issue_639_a_block_in_a_call_argument_still_returns_from_the_caller() {
+    // Argument position is an expression position like any other: the `return`
+    // belongs to `f`, not to the block and not to `print`.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            print({ if x > 0 { return 42 }  1 })
+            7
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&v), 42);
+}
+
+// ── #639, second pass: the two entry points that bypass `eval_block` ────────
+//
+// "A carrier can never cross a call frame" holds only where a function body
+// goes through `eval_block`. Two entries do not: a `@pp` fn's `stage K:` bodies
+// (evaluated one expression at a time) and a `@grad` fn's taped body (whose
+// walker hands a block to plain `eval_expr`). Both are function boundaries, so
+// both catch the carrier themselves; without that, a check-clean program
+// silently ran the CALLER's control flow.
+
+#[test]
+fn issue_639_return_in_a_pp_stage_returns_from_the_pp_fn_not_the_caller() {
+    // The `return` belongs to `pipeline`, so `probe` still adds its 7 and
+    // `main` its 10000. Uncaught it left `pipeline` AND `probe` (10099).
+    let v = run(r#"
+        @pp(stages=2)
+        fn pipeline(x: i64) -> i64 {
+            stage 0: { if x > 0 { return 99 }  x + 1 }
+            stage 1: _ * 2
+        }
+        fn probe() -> i64 {
+            let a = pipeline(5)
+            let b = 7
+            a + b
+        }
+        fn main() -> i64 { probe() + 10000 }
+    "#);
+    assert_eq!(as_int(&v), 10106);
+}
+
+#[test]
+fn issue_639_a_pp_stage_that_takes_no_early_exit_is_unchanged() {
+    // The other half: no escape, so the stages chain through `_` as always.
+    // (5 + 1) * 2 = 12.
+    let v = run(r#"
+        @pp(stages=2)
+        fn pipeline(x: i64) -> i64 {
+            stage 0: { if x < 0 { return 99 }  x + 1 }
+            stage 1: _ * 2
+        }
+        fn main() -> i64 { pipeline(5) }
+    "#);
+    assert_eq!(as_int(&v), 12);
+}
+
+#[test]
+fn issue_639_break_in_a_pp_stage_does_not_break_the_callers_loop() {
+    // A `@pp` stage is not a loop, so a `break` with no loop inside the stage
+    // is the same backstop `call_fn` already raises on an ordinary body.
+    // Uncaught, this broke `main`'s `while` and answered 500.
+    let (msg, at) = run_err_at(r#"
+        @pp(stages=1)
+        fn p(x: i64) -> i64 {
+            stage 0: { if x > 0 { break }  x }
+        }
+        fn main() -> i64 {
+            let !n = 0
+            while n < 5 {
+                let z = p(1)
+                n = n + 1
+            }
+            n + 500
+        }
+    "#);
+    assert!(msg.contains("break/continue outside loop"), "got: {msg}");
+    assert!(at.is_some(), "the backstop must point at the `break`, got no span");
+}
+
+#[test]
+fn issue_639_continue_in_a_pp_stage_does_not_continue_the_callers_loop() {
+    // Same rule for `continue`, which uncaught skipped the rest of every
+    // iteration of `main`'s loop (200 escapes, `s` never incremented).
+    let msg = run_err(r#"
+        @pp(stages=1)
+        fn p(x: i64) -> i64 {
+            stage 0: { if x > 0 { continue }  x }
+        }
+        fn main() -> i64 {
+            let !n = 0
+            let !s = 0
+            while n < 200 {
+                n = n + 1
+                let z = p(1)
+                s = s + 1
+            }
+            n * 1000 + s
+        }
+    "#);
+    assert!(msg.contains("break/continue outside loop"), "got: {msg}");
+}
+
+#[test]
+fn issue_639_an_escaping_pp_stage_pops_its_scope_every_time() {
+    // Scope balance. The old `prev = self.eval_expr(body)?` skipped the
+    // `pop_scope` on the escape path, so each call left its frame — with the
+    // stage's own parameter still bound in it — on the stack. `carry` is the
+    // `@pp` fn's parameter name AND a `main` local: after 200 leaked frames a
+    // read of `carry` finds the stage's 1 instead of `main`'s 100.
+    let v = run(r#"
+        @pp(stages=2)
+        fn stage_ret(carry: i64) -> i64 {
+            stage 0: { if carry > 0 { return 3 }  carry + 1 }
+            stage 1: _ * 2
+        }
+        fn main() -> i64 {
+            let !carry = 100
+            let !n = 0
+            let !s = 0
+            while n < 200 {
+                n = n + 1
+                s = s + stage_ret(1)
+            }
+            carry + s
+        }
+    "#);
+    assert_eq!(as_int(&v), 700);
+}
+
+#[test]
+fn issue_639_return_on_a_non_gradient_path_of_a_grad_body_is_refused() {
+    // The block is a bare STATEMENT — off the gradient path entirely, so #615's
+    // rule never fires and the program is check-clean. Uncaught, the `return`
+    // rode out of `call_grad` and returned from `main`, which answered 3 where
+    // it used to answer 1006. It is refused instead of honoured: the carrier
+    // holds a value, not a tape node, so nothing about it is differentiable.
+    let (msg, at) = run_err_at(r#"
+        @grad fn gl(!w: f32, x: f32) -> f32 {
+            { if x > 0.0 { return w } }
+            w * x
+        }
+        fn main() -> i64 {
+            let (l, g) = gl.fwd_bwd(3.0, 2.0)
+            (l as i64) + 1000
+        }
+    "#);
+    assert!(msg.contains("@grad `gl`") && msg.contains("`return`"), "got: {msg}");
+    assert!(msg.contains("not supported"), "got: {msg}");
+    assert!(at.is_some(), "the refusal must point at the `return`, got no span");
+}
+
+#[test]
+fn issue_639_the_615_gradient_path_block_error_is_unchanged() {
+    // A block ON the gradient path (#615): its value is not traced, so the loss
+    // does not participate in the graph. That is a different diagnostic and it
+    // must keep its own wording — the `@grad` catch above must not capture it.
+    let msg = run_err(r#"
+        @grad fn gl(!w: f32, x: f32) -> f32 {
+            let a = { w * x }
+            a * a
+        }
+        fn main() -> i64 {
+            let (l, g) = gl.fwd_bwd(3.0, 2.0)
+            (l as i64) + 1000
+        }
+    "#);
+    assert!(msg.contains("must produce a scalar derived from a differentiable input"),
+        "the #615 diagnostic must be untouched, got: {msg}");
+}
+
+#[test]
+fn issue_639_fwd_still_runs_a_grad_body_that_returns() {
+    // `.fwd` needs no tape and goes through `call_fn`, so the same body runs
+    // normally there: the `return` hands back `w` (3.0) and nothing is refused.
+    let v = run(r#"
+        @grad fn gl(!w: f32, x: f32) -> f32 {
+            { if x > 0.0 { return w } }
+            w * x
+        }
+        fn main() -> i64 {
+            let l = gl.fwd(3.0, 2.0)
+            (l as i64) + 1000
+        }
+    "#);
+    assert_eq!(as_int(&v), 1003);
+}
+
+#[test]
+fn issue_639_a_grad_body_with_no_escaping_flow_still_differentiates() {
+    // The regression guard: an ordinary `@grad` body is untouched by the catch.
+    // L = w * x = 6.0, dL/dw = x = 2.0.
+    let v = run(r#"
+        @grad fn gl(!w: f32, x: f32) -> f32 { w * x }
+        fn main() -> f32 {
+            let (l, g) = gl.fwd_bwd(3.0, 2.0)
+            l + g.w
+        }
+    "#);
+    assert!((as_float(&v) - 8.0).abs() < 1e-6, "got {:?}", v);
+}
+
+#[test]
+fn issue_639_a_return_inside_a_split_piece_count_leaves_the_function() {
+    // `.split` reports its own diagnostic for a piece count that is not a
+    // positive integer. That tolerance swallowed the carrier, so a `return`
+    // written in the bracket was reported as a bad piece count instead of
+    // leaving `f`.
+    let v = run(r#"
+        fn f(x: i64) -> i64 {
+            let t = forge.zeros[f32, [6]]
+            let (a, b, c) = t.split[{ if x > 0 { return 42 }  3 }, axis=-1]
+            7
+        }
+        fn main() -> i64 { f(1) }
+    "#);
+    assert_eq!(as_int(&v), 42);
+}
+
+#[test]
+fn issue_639_a_split_piece_count_that_is_simply_bad_still_says_so() {
+    // The other half: an ordinary failure in the same position keeps `.split`'s
+    // own message — only the carrier is exempt from being absorbed.
+    let msg = run_err(r#"
+        fn main() -> i64 {
+            let t = forge.zeros[f32, [6]]
+            let (a, b) = t.split[0, axis=-1]
+            7
+        }
+    "#);
+    assert!(msg.contains("`.split` requires a positive integer piece count"), "got: {msg}");
+}
+
+#[test]
+fn issue_639_a_return_inside_a_model_shape_argument_leaves_the_function() {
+    // `M[expr] { … }`: a shape argument that does not evaluate is simply not
+    // recorded. The carrier is not "does not evaluate" — uncaught, `f` fell
+    // through to its own tail (7) instead of returning 42.
+    let v = run(r#"
+        model M[N] {
+            v: i64
+        }
+        fn f(x: i64) -> i64 {
+            let m = M[{ if x > 0 { return 42 }  3 }] { v: 7 }
+            m.v
+        }
+        fn main() -> i64 { f(1) + 1000 }
+    "#);
+    assert_eq!(as_int(&v), 1042);
+}
+
+#[test]
+fn issue_639_a_model_shape_argument_still_binds_on_the_ordinary_path() {
+    // The regression guard for the same site: a shape argument that evaluates
+    // is still recorded and still visible to the model's methods.
+    let v = run(r#"
+        model M[N] {
+            v: i64
+            fn n(self) -> i64 { N }
+        }
+        fn main() -> i64 {
+            let m = M[5] { v: 7 }
+            m.n() * 10 + m.v
+        }
+    "#);
+    assert_eq!(as_int(&v), 57);
+}
+
+#[test]
+fn issue_639_the_backstop_diagnostic_carries_the_keywords_span() {
+    // A module-level `let` is the one expression position with no enclosing
+    // statement to catch the carrier, so the backstop message is what the user
+    // sees. It used to print bare `runtime error:` with no `file:line:col`;
+    // now the escaping keyword's own span rides along. All three wordings are
+    // reachable from here — the per-keyword `break` / `continue` messages are
+    // NOT dead, they are simply out of reach *inside* a fn, where `call_fn`'s
+    // own "break/continue outside loop" gets there first.
+    let (msg, at) = run_err_at("let G = { return 5 }\nfn main() -> i64 { G + 1 }\n");
+    assert!(msg.contains("`return` outside a function"), "got: {msg}");
+    assert_eq!(at, Some((1, 11)), "expected the `return`'s own line:col");
+
+    let (msg, at) = run_err_at("let G = { break }\nfn main() -> i64 { 1 }\n");
+    assert!(msg.contains("`break` outside loop"), "got: {msg}");
+    assert_eq!(at, Some((1, 11)));
+
+    let (msg, at) = run_err_at("let G = { continue }\nfn main() -> i64 { 1 }\n");
+    assert!(msg.contains("`continue` outside loop"), "got: {msg}");
+    assert_eq!(at, Some((1, 11)));
+}
+
+// ─── Type aliases are transparent at every width-origin site (SPEC §6.6, §3.1) ───
+//
+// The checker resolves `type Role = u8` to the scalar `u8` for type-checking,
+// so `let r: Role = 255` and `let r: u8 = 255` are the same program to
+// `dmc --check`. The interpreter's width coercion used to match on the raw
+// AST `Type::Scalar` and so never saw through the alias: the aliased `r`
+// stayed a full i64 and `r + 1` was 256 where the direct spelling wraps to 0.
+// `tests/alias_narrow_width.rs` drives the same cases through the binary.
+
+/// The repro: a typed `let` whose width is spelled through an alias wraps.
+#[test]
+fn alias_typed_let_narrows_like_the_direct_spelling() {
+    let v = run(r#"
+        type Role = u8
+        fn main() -> i64 {
+            let r: Role = 255
+            (r + 1) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// A typed parameter and a declared return are width origins too (SPEC §3.1);
+/// through an alias each must narrow exactly as the direct spelling does.
+#[test]
+fn alias_typed_param_and_return_narrow() {
+    // parameter: `r` arrives as a u8, so `r + 1` is u8 arithmetic
+    let v = run(r#"
+        type Role = u8
+        fn wide(r: Role) -> i64 { (r + 1) as i64 }
+        fn main() -> i64 { wide(255) }
+    "#);
+    assert_eq!(as_int(&v), 0, "aliased parameter");
+    // return: the declared `-> Role` narrows the untyped `255 + 1` (256)
+    let v = run(r#"
+        type Role = u8
+        fn bump() -> Role { 255 + 1 }
+        fn main() -> i64 { bump() as i64 }
+    "#);
+    assert_eq!(as_int(&v), 0, "aliased return");
+    // signed alias, so the wrap is two's-complement, not unsigned
+    let v = run(r#"
+        type Small = i8
+        fn bump(r: Small) -> Small { r + 1 }
+        fn main() -> i64 { bump(127) as i64 }
+    "#);
+    assert_eq!(as_int(&v), -128, "signed aliased param+return");
+}
+
+/// A fn literal's typed parameter and declared return are the same sites.
+#[test]
+fn alias_typed_lambda_param_and_return_narrow() {
+    let v = run(r#"
+        type Role = u8
+        fn main() -> i64 {
+            let f = fn(r: Role) -> Role { r + 1 }
+            f(255) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// An `as` cast to an alias wraps as a cast to the target does (SPEC §3.1:
+/// `5000000000 as i32` is `705032704`; `300 as Role` is `44`).
+#[test]
+fn alias_cast_target_wraps() {
+    let v = run(r#"
+        type Role = u8
+        fn main() -> i64 { (300 as Role) as i64 }
+    "#);
+    assert_eq!(as_int(&v), 44);
+}
+
+/// A declared model field type through an alias narrows at construction and
+/// on a later field write, like a direct `u8` field (#473's sites).
+#[test]
+fn alias_typed_model_field_narrows() {
+    let v = run(r#"
+        type Role = u8
+        model M { r: Role }
+        fn main() -> i64 {
+            let !m = M { r: 255 }
+            let a = (m.r + 1) as i64
+            m.r = 254
+            a + ((m.r + 2) as i64)
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// An alias of an alias resolves all the way down.
+#[test]
+fn alias_chain_resolves_to_the_scalar() {
+    let v = run(r#"
+        type Role = u8
+        type Rank = Role
+        fn main() -> i64 {
+            let r: Rank = 255
+            (r + 1) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// The float half of the same rule (#473): `type Prob = f32` quantizes a
+/// typed `let` to f32 exactly as `let q: f32` does.
+#[test]
+fn alias_typed_f32_let_quantizes() {
+    let v = run(r#"
+        type Prob = f32
+        fn main() -> bool {
+            let p: Prob = 0.1
+            let q: f32 = 0.1
+            (p as f64) == (q as f64)
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(true)), "got {:?}", v);
+    let v = run(r#"
+        type Prob = f32
+        fn main() -> bool {
+            let p: Prob = 0.1
+            (p as f64) == 0.1
+        }
+    "#);
+    assert!(matches!(v, Value::Bool(false)), "an f32-aliased let must not keep the f64 literal, got {:?}", v);
+}
+
+// ─── An alias is scoped to the module that declared it (SPEC §6.6) ───────────
+//
+// The checker runs per module, leaf-first, so inside an imported module's fn
+// bodies its OWN `type Role` governs. The interpreter kept one flat alias
+// table across every file the dependency graph loaded, so the last file loaded
+// — the importer — silently re-typed the library it imported: `libbump(255)`
+// against `pub type Role = i64` ran as the importer's `u8` and answered 0
+// where the checker had type-checked it as i64 and meant 256. The alias table
+// is now tagged by module the way `fn_module` / `mut_globals` are, and a fn
+// body resolves its annotations in the module it was declared in.
+
+/// The importer's narrower alias must not reach into the library's fn bodies.
+#[test]
+fn an_importers_alias_does_not_retype_the_module_it_imported() {
+    let v = run_multi(&[
+        ("lib.dmc", "pub type Role = i64\npub fn libbump(r: Role) -> Role { r + 1 }\n"),
+        ("main.dmc", r#"use "lib.dmc"
+type Role = u8
+fn main() -> i64 { libbump(255) }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 256, "`libbump`'s `Role` is its own module's i64");
+
+    // The importer's own alias still governs the importer's own body.
+    let v = run_multi(&[
+        ("lib.dmc", "pub type Role = i64\npub fn libbump(r: Role) -> Role { r + 1 }\n"),
+        ("main.dmc", r#"use "lib.dmc"
+type Role = u8
+fn main() -> i64 {
+    let r: Role = 255
+    (r + 1) as i64
+}"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 0, "`main`'s `Role` is the importer's u8");
+}
+
+/// The reverse orientation: the library is the narrow one, and its width must
+/// survive an importer that widens the same name. The flat table printed 256
+/// here — the wrap the checker had accepted, dropped.
+#[test]
+fn an_imported_modules_narrow_alias_survives_a_wider_importer() {
+    let v = run_multi(&[
+        ("lib.dmc", "pub type Role = u8\npub fn libbump(r: Role) -> Role { r + 1 }\n"),
+        ("main.dmc", r#"use "lib.dmc"
+type Role = i64
+fn main() -> i64 { libbump(255) as i64 }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 0, "`libbump`'s `Role` is its own module's u8");
+}
+
+/// A qualified import carries the same home-module tag onto the `l.f` name, so
+/// `l.libbump` resolves its aliases exactly as the unqualified `libbump` does.
+#[test]
+fn a_qualified_imports_fn_resolves_aliases_in_its_own_module() {
+    let v = run_multi(&[
+        ("lib.dmc", "pub type Role = i64\npub fn libbump(r: Role) -> Role { r + 1 }\n"),
+        ("main.dmc", r#"use "lib.dmc" as l
+type Role = u8
+fn main() -> i64 { l.libbump(255) }"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 256);
+}
+
+/// An alias the importing module never redeclares is still visible to it —
+/// that is what `use` imported. Scoping must narrow the lookup, not break it.
+#[test]
+fn an_imported_alias_is_visible_to_the_importer() {
+    let v = run_multi(&[
+        ("lib.dmc", "pub type Role = u8\n"),
+        ("main.dmc", r#"use "lib.dmc"
+fn main() -> i64 {
+    let r: Role = 255
+    (r + 1) as i64
+}"#),
+    ], "main.dmc");
+    assert_eq!(as_int(&v), 0);
+}
+
+// ─── A shape-generic alias over a scalar is still a width ────────────────────
+
+/// `type W[N] = u8` is a `u8` however many shape args it is spelled with: a
+/// shape argument cannot change a scalar's width. The checker resolves it and
+/// the JIT (#622) refuses it; the interpreter used to run it as a full i64 and
+/// print 256, which was the same hole one indirection further out.
+#[test]
+fn a_shape_generic_alias_over_a_scalar_narrows() {
+    let v = run(r#"
+        type W[N] = u8
+        fn main() -> i64 {
+            let r: W[3] = 255
+            (r + 1) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 0, "typed let through a shape-generic scalar alias");
+    let v = run(r#"
+        type W[N] = u8
+        fn bump(r: W[3]) -> W[3] { r + 1 }
+        fn main() -> i64 { bump(255) as i64 }
+    "#);
+    assert_eq!(as_int(&v), 0, "param and return through a shape-generic scalar alias");
+}
+
+/// A shape-generic alias over a SHAPED type is still left alone: substituting
+/// its shape argument in the interpreter is separate work, and no run-time
+/// width hides behind it. It must keep working, not start resolving.
+#[test]
+fn a_shape_generic_alias_over_a_tensor_still_runs() {
+    let v = run(r#"
+        type Batch[B] = Tensor[f32, [B, 2]]
+        fn total(t: Batch[3]) -> f32 { sum(t) }
+        fn main() -> f64 { total(forge.zeros[f32, [3, 2]]) as f64 }
+    "#);
+    assert!(matches!(v, Value::Float(x, _) if x == 0.0), "got {:?}", v);
+}
+
+// ─── Aliases against the other named-type namespaces ─────────────────────────
+
+/// An alias of an ENUM stays an enum: `resolve_alias_ty` hands back the enum's
+/// name, `coerce_scalar_width` sees a `Named` and coerces nothing, and the
+/// variant keeps its ordinal.
+#[test]
+fn an_alias_of_an_enum_is_not_a_width() {
+    let v = run(r#"
+        enum Color { Red, Green, Blue }
+        type Hue = Color
+        fn pick(h: Hue) -> Hue { h }
+        fn main() -> i64 {
+            let c: Hue = Color.Green
+            pick(c) as i64
+        }
+    "#);
+    assert_eq!(as_int(&v), 1);
+}
+
+/// An alias of a MODEL stays a model, and the model's own field annotation is
+/// what narrows — the alias does not swallow the struct.
+#[test]
+fn an_alias_of_a_model_keeps_the_models_field_widths() {
+    let v = run(r#"
+        model Box { v: u8 }
+        type Crate = Box
+        fn open(b: Crate) -> i64 { (b.v + 1) as i64 }
+        fn main() -> i64 { open(Box { v: 255 }) }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// A `type` item is collected in the same forward-reference pass as `fn` and
+/// `model`, so an alias declared BELOW the fn that uses it still narrows.
+#[test]
+fn an_alias_declared_after_its_use_still_narrows() {
+    let v = run(r#"
+        fn wide(r: Role) -> i64 { (r + 1) as i64 }
+        type Role = u8
+        fn main() -> i64 { wide(255) }
+    "#);
+    assert_eq!(as_int(&v), 0);
+}
+
+/// The `Port[L]` half of the same resolution: `type Py = Port[python]` names a
+/// runtime exactly as the direct spelling does, so an aliased `Port[lua]`
+/// parameter refuses a python handle. `L` was decoration in both spellings
+/// before this change — an untested behaviour change worth pinning.
+#[test]
+fn an_aliased_port_annotation_checks_the_runtime() {
+    if !crate::ports::have_python() { eprintln!("skipped: python3 not on PATH"); return; }
+    // The alias names the runtime the handle actually has: accepted.
+    let v = run(r#"
+        type Py = Port[python]
+        fn use_it(p: Py) -> i64 { 7 }
+        fn main() -> i64 {
+            let (p, e) = port_open("python")
+            let n = use_it(p)
+            let (_, _) = port_close(p)
+            n
+        }
+    "#);
+    assert_eq!(as_int(&v), 7, "a python handle satisfies an aliased Port[python]");
+    // The alias names a different runtime: refused, with the shared wording.
+    let msg = run_err(r#"
+        type Lua = Port[lua]
+        fn use_it(p: Lua) -> i64 { 7 }
+        fn main() -> i64 {
+            let (p, e) = port_open("python")
+            let n = use_it(p)
+            let (_, _) = port_close(p)
+            n
+        }
+    "#);
+    assert!(msg.contains("port lang mismatch") && msg.contains("`Port[lua]`"),
+            "expected the Port[lua]/python mismatch, got: {msg}");
+}
+
+// ─── #628 × #652: `?`'s `default[T]` resolves in the SIGNATURE's module ──────
+//
+// `default[T]` is built from the propagating function's own declared `T`, and
+// `T` may be spelled as a top-level `type` alias — which SPEC §6.6 scopes to
+// the module that declared it. So the rebuild has to happen while `cur_module`
+// still names the file whose signature it is: `call_fn_with_shapes` restores
+// `cur_module` only after `call_fn_in_module` (which ends with
+// `finish_query_propagation`) returns, and `call_lambda` restores it after its
+// own rebuild rather than before. Restore either one early and the alias is
+// looked up in the CALLER's table, where it is either absent (a refusal) or,
+// worse, a same-named alias of a different width (a silently wrong zero).
+//
+// Each pair below is run in both orientations, so neither passes by accident
+// on an i64-shaped default: the library's declaration governs whichever way
+// round the two widths are.
+
+#[test]
+fn query_default_resolves_a_type_alias_t() {
+    // Single file first: `default[Slot]` is the `u8` zero, so `0 - 1` wraps to
+    // 255. Before the alias was resolved here, this program did not merely get
+    // the width wrong — it was refused outright ("needs a default value for
+    // `Slot`") for a name one indirection away from a perfectly good scalar.
+    let v = run(r#"
+        type Slot = u8
+        fn boom() -> (Slot, Err) { (200 as Slot, "boom") }
+        fn f() -> (Slot, Err) {
+            let v = boom()?
+            (v, nil)
+        }
+        fn main() -> str {
+            let (v, e) = f()
+            to_str(v - 1) + "|" + to_str(e)
+        }
+    "#);
+    assert_eq!(as_str(&v), "255|boom");
+}
+
+#[test]
+fn query_default_uses_the_libs_alias_not_the_importers() {
+    // The library and the importer each declare `Slot` at a DIFFERENT width.
+    // The `?` is in the library's `f`, so `default[Slot]` is the library's.
+    const LIB: &str = r#"pub type Slot = %W%
+pub fn boom() -> (Slot, Err) { (200 as Slot, "lib-boom") }
+pub fn f() -> (Slot, Err) {
+    let v = boom()?
+    (v, nil)
+}"#;
+    const MAIN: &str = r#"use "lib.dmc"
+type Slot = %W%
+fn main() -> str {
+    let (v, e) = f()
+    to_str(v - 1) + "|" + to_str(e)
+}"#;
+    // Library `u8`, importer `i64`: the u8 zero wraps to 255.
+    let v = run_multi(&[
+        ("lib.dmc", &LIB.replace("%W%", "u8")),
+        ("main.dmc", &MAIN.replace("%W%", "i64")),
+    ], "main.dmc");
+    assert_eq!(as_str(&v), "255|lib-boom", "`f`'s `Slot` is its own module's u8");
+
+    // Reversed, so the assertion above cannot be passing on an i64-shaped
+    // default that never consulted the alias table at all.
+    let v = run_multi(&[
+        ("lib.dmc", &LIB.replace("%W%", "i64")),
+        ("main.dmc", &MAIN.replace("%W%", "u8")),
+    ], "main.dmc");
+    assert_eq!(as_str(&v), "-1|lib-boom", "`f`'s `Slot` is its own module's i64");
+}
+
+#[test]
+fn query_in_an_importer_fn_uses_the_importers_own_t() {
+    // The other direction of the same boundary: the `?` is in the IMPORTER's
+    // fn and the erroring call crosses into the library, so `default[T]` is
+    // the importer's — `cur_module` is back by the time this signature is
+    // rebuilt against. `MSlot` is `i32`, so the zero minus one is -1.
+    let v = run_multi(&[
+        ("lib.dmc", r#"pub type Slot = u8
+pub fn boom() -> (Slot, Err) { (200 as Slot, "lib-boom") }
+pub fn blocky() -> (Slot, Err) {
+    if true {
+        let v = boom()?
+        (v, nil)
+    } else {
+        (1 as Slot, nil)
+    }
+}
+pub fn libname() -> str { "lib" }"#),
+        ("main.dmc", r#"use "lib.dmc"
+type Slot = i64
+type MSlot = i32
+fn mainname() -> str { "main" }
+fn wrap() -> (MSlot, Err) {
+    let v = blocky()?
+    ((v as i32) + 1, nil)
+}
+fn main() -> str {
+    let (a, ea) = blocky()
+    let (b, eb) = wrap()
+    to_str(a - 1) + "|" + to_str(b - 1) + "|" + mainname() + "+" + libname()
+}"#),
+    ], "main.dmc");
+    // `a`: the library's u8 zero (255 after -1) — and the `?` sat inside an
+    // `if` block, so #639's carrier crossed the same frame without eating it.
+    // `b`: the importer's i32 zero (-1 after -1).
+    // `main+lib`: both files' own names still resolve after the calls, so
+    // `cur_module` was restored on the way out of each.
+    assert_eq!(as_str(&v), "255|-1|main+lib");
+}
+
+#[test]
+fn query_in_a_lambda_written_in_another_module_resolves_that_modules_alias() {
+    // The lambda literal is written in the library and CALLED from the
+    // importer, so `call_lambda`'s own `cur_module` save is the only thing
+    // standing between `default[Slot]` and the importer's same-named alias.
+    // Restoring `cur_module` before the rebuild (rather than after) puts the
+    // importer's width in the library's slot.
+    const LIB: &str = r#"pub type Slot = %W%
+pub fn boom() -> (Slot, Err) { (200 as Slot, "lib-boom") }
+pub fn mk() -> (fn() -> (Slot, Err), Err) {
+    let c = fn() -> (Slot, Err) { let v = boom()?
+                                  (v, nil) }
+    (c, nil)
+}"#;
+    const MAIN: &str = r#"use "lib.dmc"
+type Slot = %W%
+fn main() -> str {
+    let (c, me) = mk()
+    let (v, e) = c()
+    to_str(v - 1) + "|" + to_str(e)
+}"#;
+    let v = run_multi(&[
+        ("lib.dmc", &LIB.replace("%W%", "u8")),
+        ("main.dmc", &MAIN.replace("%W%", "i64")),
+    ], "main.dmc");
+    assert_eq!(as_str(&v), "255|lib-boom", "the lambda's `Slot` is the file it was written in");
+
+    let v = run_multi(&[
+        ("lib.dmc", &LIB.replace("%W%", "i64")),
+        ("main.dmc", &MAIN.replace("%W%", "u8")),
+    ], "main.dmc");
+    assert_eq!(as_str(&v), "-1|lib-boom", "and it is that file's width either way round");
+}
+
+#[test]
+fn a_failed_shape_harvest_leaves_the_scope_stack_where_it_found_it() {
+    // `harvest_shape_params` is an exit out of `call_fn_in_module` that sits
+    // between `push_scope` and every `pop_scope` — it was a bare `?` on main,
+    // so the callee's scope stayed on the stack forever. Nothing observed it
+    // while every error out of it was fatal; `?`'s rework put two non-errors
+    // on the same channel, so the exit is now spelled like its neighbours.
+    //
+    // The checker accepts this program (two shape-generic parameters, two
+    // tensors of different lengths), so the disagreement is a RUNTIME one:
+    // exactly the path in question.
+    let msg = run_err(r#"
+        fn twoargs[N](a: Tensor[f32, [N]], b: Tensor[f32, [N]]) -> f32 { sum(a) + sum(b) }
+        fn main() -> f32 {
+            let x = forge.zeros[f32, [3]]
+            let y = forge.zeros[f32, [4]]
+            twoargs(x, y)
+        }
+    "#);
+    assert!(msg.contains("would need to be both 3 and 4"),
+            "expected the inconsistent-shape refusal, got: {msg}");
+}
+
+
+// ── #674 slice 3a/3d: arena budgets — well-formedness at `enter` / `in` ─────
+// These bypass `dmc run`'s own `--check` pass (this harness's `run_err_at`
+// goes straight from the parser to `Interpreter::run`), so a program that
+// would fail `--check` for an unrelated reason (a bogus `Budget` operand)
+// still exercises the interpreter's OWN located refusal directly.
+//
+// All four operations are real now: `forge.carve`/`forge.reap`/`forge.root`
+// from slice 3b, `forge.enter`/`in b` from slice 3d. What 3a's two
+// placeholder refusals leave behind is the WELL-FORMEDNESS half — a
+// `forge.enter` whose operand is not a `Budget` — which is a located
+// runtime error in the shape `forge.carve`/`forge.reap` already use for
+// their own arguments, and deliberately NOT a new tag: the arena-budget
+// design's refusal-class table counts exactly three refusal CLASSES plus one
+// runtime error, and a `budget-enter` tag would make it four.
+
+#[test]
+fn forge_enter_over_a_non_budget_refuses_located_and_does_not_run_674_s4() {
+    // Probe s4's own shape with a bogus integer in place of the budget, so
+    // the interpreter's OWN `BudgetBlock` refusal is what fires. The block
+    // body must NOT run — that was #610's silent-no-op defect, and it stays
+    // closed for an operand that never names a budget at all.
+    //
+    // Pinned by construction: an undefined-fn call in the body. If the body
+    // ran, evaluating that call would surface `undefined identifier` (from
+    // `eval_ident`) instead — so the assert below can only pass if the body
+    // was never reached. The positive control,
+    // `undefined_ident_call_errors_positive_control_674`, confirms the same
+    // call does error when actually reached.
+    let (msg, at) = run_err_at(
+        "fn main() -> nil { forge.enter(5) { undefined_fn_674() } \n nil }");
+    assert!(msg.starts_with("forge.enter: the budget operand must be a `Budget`"),
+            "message: {msg}");
+    assert!(at.is_some(), "expected a located error");
+}
+
+#[test]
+fn alloc_in_evaluates_its_budget_operand_674_s3() {
+    // The mirror image of 3a's version of this test, and the behaviour
+    // change slice 3d makes: `<ctor> in b` EVALUATES its budget operand now
+    // (3a refused before touching it), so an undefined call there surfaces
+    // its own `undefined identifier` rather than a `budget-alloc-in`
+    // placeholder. The operand is evaluated BEFORE the register is pushed —
+    // it is not part of the allocation it names.
+    let (msg, at) = run_err_at(
+        "fn main() -> nil { let t = forge.zeros[f32, [4]] in undefined_fn_674() \n nil }");
+    assert!(msg.contains("undefined"), "message: {msg}");
+    assert!(msg.contains("undefined_fn_674"), "message: {msg}");
+    assert!(at.is_some(), "expected a located error");
+}
+
+#[test]
+fn alloc_in_over_a_non_budget_refuses_located_674() {
+    // The well-formedness half of `in b`, the twin of
+    // `forge_enter_over_a_non_budget_refuses_located_and_does_not_run_674_s4`
+    // above: one shared `open_budget` produces both, so neither can drift.
+    let (msg, at) = run_err_at(
+        "fn main() -> nil { let t = forge.zeros[f32, [4]] in 5 \n nil }");
+    assert!(msg.starts_with("`in`: the budget operand must be a `Budget`"),
+            "message: {msg}");
+    assert!(at.is_some(), "expected a located error");
+}
+
+#[test]
+fn undefined_ident_call_errors_positive_control_674() {
+    // Positive control for the two non-execution probes above: the same
+    // undefined call, reached directly (nothing refuses first), does error —
+    // proving it is not silently a no-op that would make either probe above
+    // pass regardless of whether the guarded body/operand actually ran.
+    let msg = run_err("fn main() -> nil { undefined_fn_674() \n nil }");
+    assert!(msg.contains("undefined"), "message: {msg}");
+    assert!(msg.contains("undefined_fn_674"), "message: {msg}");
+}
+
+// ── #674 slice 3b: the interpreter's budget table ───────────────────────────
+//
+// `forge.carve`/`forge.reap`/`forge.root` are for real, and since slice 3d
+// so are `forge.enter`/`in b`. The hole-table cases below keep driving the
+// mechanism directly through the `#[cfg(test)]` harness `Interpreter` exposes for
+// exactly this purpose (`eval_expr_for_test`/`bind_for_test`/
+// `with_budget_for_test`/`budget_index_for_test`) rather than through
+// `forge.enter`: each row needs a tensor stamped under `b` and then a
+// SPECIFIC retrieval site — a parked receiver, a writeback, a tape node —
+// which surface syntax cannot aim at. `with_budget_for_test` is
+// `BudgetGuard`, the same RAII `Expr::BudgetBlock` opens, so what these
+// exercise IS 3d's mechanism and not a stand-in for it.
+
+use super::arena::ArenaLimits;
+
+fn parse_e(src: &str) -> Expr {
+    let tokens = Lexer::new(src).tokenize().expect("lex expr");
+    Parser::new(tokens).parse_expr().expect("parse expr")
+}
+
+fn parse_program_674(src: &str) -> super::ast::Program {
+    let tokens = Lexer::new(src).tokenize().expect("lex program");
+    Parser::new(tokens).parse_program().expect("parse program")
+}
+
+fn err_msg(r: EvalResult<Value>) -> String {
+    r.err().expect("expected an error").msg
+}
+
+use super::ast::{Expr, PostfixOp};
+use super::interp::EvalResult;
+
+/// `--forge=1 MiB`, `forge.root` bound to `root`, a 64 KiB child carved from
+/// it and bound to `b`. Returns the child's table index for
+/// `with_budget_for_test`.
+fn budget_setup_674(interp: &mut Interpreter) -> usize {
+    interp.set_arena_limits(ArenaLimits { forge: Some(1 << 20), vault: None });
+    let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+    interp.bind_for_test("root", root);
+    let b = interp.eval_expr_for_test(&parse_e("forge.carve(root, 65536)")).unwrap();
+    let idx = Interpreter::budget_index_for_test(&b);
+    interp.bind_for_test("b", b);
+    idx
+}
+
+fn reap_b_674(interp: &mut Interpreter) {
+    interp.eval_expr_for_test(&parse_e("forge.reap(b)")).unwrap();
+}
+
+/// `budget-stale`, and **located**. `MEMORY.md`'s LOC invariant — and
+/// §3.2's whole case for M1 over M2 — is that the refusal names the retrieval
+/// that hit it, so a test that only matched the tag would have passed on an
+/// unlocated `RuntimeError::msg` (PR #821 review).
+fn assert_stale(r: EvalResult<Value>) {
+    let e = r.err().expect("expected an error");
+    assert!(e.msg.starts_with("budget-stale:"), "message: {}", e.msg);
+    assert!(e.span.is_some(), "`budget-stale` must be located: {}", e.msg);
+}
+
+// ── §3.1 algebra: carve / reap / PRE / R1 / R2 / INV / LOC / NN ─────────────
+
+#[test]
+fn budget_674_carve_returns_a_budget_value() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        assert_ne!(idx, 0, "the child must not be entry 0 (root)");
+    });
+}
+
+#[test]
+fn budget_674_forge_root_is_a_budget_value() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let v = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        assert!(matches!(v, Value::Budget(0)), "expected Value::Budget(0), got {:?}", v);
+    });
+}
+
+#[test]
+fn budget_674_root_unbounded_carve_always_succeeds() {
+    // §4.1: no `--forge` means free(root) = infinity — (PRE) is vacuous.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let r = interp.eval_expr_for_test(&parse_e("forge.carve(root, 999999999)"));
+        assert!(r.is_ok(), "{:?}", r.err().map(|e| e.msg));
+    });
+}
+
+#[test]
+fn budget_674_ac_inv_root_capacity_is_sum_of_children_extents() {
+    // ac_inv: --forge=256K, four 64 KiB carves succeed, a fifth is refused —
+    // whatever each child has allocated.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(256 * 1024), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let carve = parse_e("forge.carve(root, 65536)");
+        for i in 0..4 {
+            let r = interp.eval_expr_for_test(&carve);
+            assert!(r.is_ok(), "carve {i} should succeed: {:?}", r.err().map(|e| e.msg));
+        }
+        let fifth = interp.eval_expr_for_test(&carve);
+        let msg = err_msg(fifth);
+        assert!(msg.starts_with("budget-carve:"), "message: {msg}");
+    });
+}
+
+#[test]
+fn budget_674_ac_loc_reap_credits_the_whole_extent_not_the_remainder() {
+    // ac_loc: reap one 64 KiB child that has SPENT part of its own extent;
+    // the credit back to the parent is the whole 64 KiB, not the unspent
+    // remainder (#674 criterion 2).
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(256 * 1024), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let carve = parse_e("forge.carve(root, 65536)");
+        let mut kids = Vec::new();
+        for _ in 0..4 {
+            kids.push(interp.eval_expr_for_test(&carve).unwrap());
+        }
+        assert!(interp.eval_expr_for_test(&carve).is_err(), "root should be fully carved");
+        // Spend part of kids[0]'s own extent before reaping it.
+        let k0_idx = Interpreter::budget_index_for_test(&kids[0]);
+        let t = interp.with_budget_for_test(k0_idx, |i| {
+            i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4096]]")) // 16 384 B
+        });
+        assert!(t.is_ok(), "{:?}", t.err().map(|e| e.msg));
+        interp.bind_for_test("k0", kids[0].clone());
+        reap_via_ident_674(&mut interp, "k0");
+        // The credit is the WHOLE 64 KiB extent, not the ~48 KiB unspent
+        // remainder: 64 KiB + 1 is refused, exactly 64 KiB succeeds.
+        let too_big = interp.eval_expr_for_test(&parse_e("forge.carve(root, 65537)"));
+        assert!(too_big.is_err(), "64 KiB + 1 should be refused after crediting only 64 KiB back");
+        let exact = interp.eval_expr_for_test(&carve);
+        assert!(exact.is_ok(), "exactly 64 KiB should now succeed: {:?}", exact.err().map(|e| e.msg));
+    });
+}
+
+fn reap_via_ident_674(interp: &mut Interpreter, name: &str) {
+    let r = interp.eval_expr_for_test(&parse_e(&format!("forge.reap({name})")));
+    r.unwrap();
+}
+
+#[test]
+fn budget_674_ac_pre_nested_carve_past_parents_free_refused_at_the_carve() {
+    // ac_pre: a nested carve past the parent's free capacity is refused AT
+    // THE CARVE with `budget-carve`, not at a later allocation (#674
+    // criterion 3).
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(8192), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let b = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)")).unwrap();
+        interp.bind_for_test("b", b);
+        let over = interp.eval_expr_for_test(&parse_e("forge.carve(b, 4097)"));
+        let msg = err_msg(over);
+        assert!(msg.starts_with("budget-carve:"), "message: {msg}");
+        assert!(msg.contains("parent budget"), "message: {msg}");
+        let exact = interp.eval_expr_for_test(&parse_e("forge.carve(b, 4096)"));
+        assert!(exact.is_ok(), "{:?}", exact.err().map(|e| e.msg));
+    });
+}
+
+#[test]
+fn budget_674_ac_nn_reap_then_recarve_cycles_leave_capacity_unchanged() {
+    // ac_nn: 64 reap-then-recarve cycles leave the root's capacity exactly
+    // where it started; cycle 65 still succeeds, one byte over still fails.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(4096), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        for cycle in 0..64 {
+            let b = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)"));
+            assert!(b.is_ok(), "cycle {cycle} carve: {:?}", b.as_ref().err().map(|e| e.msg.clone()));
+            interp.bind_for_test("b", b.unwrap());
+            reap_b_674(&mut interp);
+        }
+        let ok = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)"));
+        assert!(ok.is_ok(), "cycle 65: {:?}", ok.as_ref().err().map(|e| e.msg.clone()));
+        interp.bind_for_test("b", ok.unwrap());
+        reap_b_674(&mut interp);
+        let over = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4097)"));
+        assert!(over.is_err(), "one byte over the root's original capacity should still fail");
+    });
+}
+
+#[test]
+fn budget_674_r2_reap_refuses_a_budget_with_a_live_child() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(8192), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let p = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)")).unwrap();
+        interp.bind_for_test("p", p);
+        let _c = interp.eval_expr_for_test(&parse_e("forge.carve(p, 1024)")).unwrap();
+        let r = interp.eval_expr_for_test(&parse_e("forge.reap(p)"));
+        let msg = err_msg(r);
+        assert!(msg.starts_with("budget-reap:"), "message: {msg}");
+        assert!(msg.contains("live child"), "message: {msg}");
+    });
+}
+
+#[test]
+fn budget_674_reap_refuses_the_root() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let r = interp.eval_expr_for_test(&parse_e("forge.reap(root)"));
+        let msg = err_msg(r);
+        assert!(msg.starts_with("budget-reap:"), "message: {msg}");
+    });
+}
+
+#[test]
+fn budget_674_stale_handle_refused_at_a_second_reap() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(8192), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let b = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)")).unwrap();
+        interp.bind_for_test("b", b);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("forge.reap(b)"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn budget_674_stale_handle_refused_as_a_carve_parent() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(8192), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let b = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)")).unwrap();
+        interp.bind_for_test("b", b);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("forge.carve(b, 10)"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn budget_674_reused_index_never_matches_the_old_handles_generation() {
+    // §6 Q8: an index is reused, its generation never wraps back to match an
+    // old handle. Reap `b` (index N), carve a NEW child (reusing index N),
+    // then the OLD `b` handle must still read stale against the new
+    // occupant, not alias it.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(1 << 16), vault: None });
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let b_old = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)")).unwrap();
+        let old_idx = Interpreter::budget_index_for_test(&b_old);
+        interp.bind_for_test("b", b_old.clone());
+        reap_b_674(&mut interp);
+        let b_new = interp.eval_expr_for_test(&parse_e("forge.carve(root, 4096)")).unwrap();
+        assert_eq!(Interpreter::budget_index_for_test(&b_new), old_idx,
+            "the freed slot should be reused");
+        let descriptor = |v: &Value| match v { Value::Budget(d) => *d, other => panic!("expected Budget, got {:?}", other) };
+        assert_ne!(descriptor(&b_old), descriptor(&b_new), "the OLD descriptor must not equal the new one");
+        interp.bind_for_test("b_old", b_old);
+        let r = interp.eval_expr_for_test(&parse_e("forge.reap(b_old)"));
+        assert_stale(r);
+    });
+}
+
+// ── Well-formedness (checker's job in the full pipeline; the interpreter's
+// own defensive check when `--check` is bypassed, as these tests do) ───────
+
+#[test]
+fn budget_674_carve_refuses_a_non_budget_first_arg() {
+    let (msg, at) = run_err_at("fn main() -> nil { forge.carve(5, 4) \n nil }");
+    assert!(msg.contains("Budget"), "message: {msg}");
+    assert!(at.is_some());
+}
+
+#[test]
+fn budget_674_reap_refuses_a_non_budget_arg() {
+    let (msg, at) = run_err_at("fn main() -> nil { forge.reap(5) \n nil }");
+    assert!(msg.contains("Budget"), "message: {msg}");
+    assert!(at.is_some());
+}
+
+// ── §3.2 hole table: one case per row, against a budget carved off the root
+// (no `forge.enter`/`in b` needed — see the module doc above) ──────────────
+
+#[test]
+fn hole_table_674_row1_scope_ident_retrieval() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        assert_stale(interp.eval_expr_for_test(&parse_e("t")));
+    });
+}
+
+#[test]
+fn hole_table_674_row1_compound_assign() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("{ t += forge.zeros[f32, [4]] \n nil }"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row1_indexed_write() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("{ t[0] = 1.0f32 \n nil }"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row1_indexed_compound_assign() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("{ t[0] += 1.0f32 \n nil }"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row2_mutating_param_argument_read_refuses_before_the_writeback() {
+    // Row 2's closure is "`apply_writebacks` moves storage-to-storage into
+    // `scopes`; the value is read again through row 1" — and the name says
+    // which of the two this test reaches (PR #821 review). It is row 1, and
+    // it is row 1 *first*: the call's own argument evaluation is expression
+    // position, so a stale `t` never survives to be copied into the param.
+    //
+    // The writeback itself cannot carry a stale tensor into `scopes` in the
+    // other direction either: `!x`'s private copy re-stamps to the budget
+    // current at the call (§6 Q5, root here), so what comes back is a
+    // root-stamped tensor that no reap of `b` can invalidate. That is why
+    // there is no second test here pinning `apply_writebacks` directly —
+    // the path does not exist, rather than being untested.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let prog = parse_program_674("fn touch(!x: Tensor[f32, [4]]) -> nil { nil }");
+        interp.load_program(&prog, None).expect("load touch()");
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        // The call's own private-copy charge/re-stamp happens at the budget
+        // CURRENT at the call (root here) — the writeback then hands back a
+        // tensor already stale at its SOURCE read (row 1), which is what the
+        // call's own argument evaluation hits first.
+        let r = interp.eval_expr_for_test(&parse_e("touch(t)"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row3_parked_receiver_is_checked_at_the_take() {
+    // Row 3's *take* path, pinned with nothing in front of it (PR #821
+    // review). The old spelling here was `t.shape()`, which has no shape
+    // bracket, so `call_bracketed_method` never ran, nothing was ever parked,
+    // and the refusal came from row 1's read of `t` — the test passed
+    // without touching the row it was named for.
+    //
+    // Reaching the take through surface syntax cannot isolate it either:
+    // `call_bracketed_method` evaluates the receiver itself, which is
+    // expression position, so an already-stale tensor is refused there. The
+    // window row 3 owns is a receiver parked LIVE and taken STALE, so the
+    // park is done directly and the reap runs in between.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        // `t.shape` — a Field postfix whose base node is what gets parked.
+        let e = parse_e("t.shape");
+        let Expr::Postfix { expr: recv, .. } = &e else {
+            panic!("expected a Postfix, got {:?}", e)
+        };
+        interp.park_receiver_for_test(recv.as_ref(), t);
+        // Parked live, reaped after: no read of `t` stands between the park
+        // and the take, so only the take's own check can refuse this.
+        reap_b_674(&mut interp);
+        assert_stale(interp.eval_expr_for_test(&e));
+    });
+}
+
+#[test]
+fn hole_table_674_row3_shape_bracketed_non_method_receiver_parks_and_is_refused() {
+    // The other half: the surface form that actually parks. `t.blit![2](…)`
+    // parses as Call(Index(Field(t, "blit!"), [2]), […]) — the shape bracket
+    // sits between the name and the call, so `call_bracketed_method` runs,
+    // finds a tensor rather than a model instance, and parks the receiver
+    // (#474). Its own receiver read is expression position, so a tensor
+    // already stale is refused there, before the park — which is the reason
+    // the test above has to park by hand to reach the take.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        let e = parse_e("t.blit![2](1.0f32)");
+        // Pin the parse shape the park depends on, so this stays a test of
+        // the bracketed route and not of whatever `t.blit![2](…)` happens to
+        // parse as later: Call(Index(Field(t, "blit!"), [2]), […]).
+        let Expr::Postfix { expr: callee, op: PostfixOp::Call(_), .. } = &e else {
+            panic!("expected a Call, got {:?}", e)
+        };
+        let Expr::Postfix { expr: bracketed, op: PostfixOp::Index(_), .. } = callee.as_ref() else {
+            panic!("expected an Index under the call, got {:?}", callee)
+        };
+        assert!(matches!(bracketed.as_ref(), Expr::Postfix { op: PostfixOp::Field(_), .. }),
+            "expected a Field under the bracket, got {:?}", bracketed);
+        assert_stale(interp.eval_expr_for_test(&e));
+    });
+}
+
+#[test]
+fn hole_table_674_row4_grad_backward_pass_over_a_reaped_activation() {
+    // "`forge.reap` inside `@grad` is legal" — the backward pass over a
+    // reaped activation fails with `budget-stale`, located at the `@grad`
+    // call site, not at the carve/reap.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(1 << 20), vault: None });
+        let prog = parse_program_674(
+            "@grad fn f(x: Tensor[f32, [4]]) -> f32 { let y = x + x \n sum(y) }"
+        );
+        interp.load_program(&prog, None).expect("load f()");
+        let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+        interp.bind_for_test("root", root);
+        let b = interp.eval_expr_for_test(&parse_e("forge.carve(root, 65536)")).unwrap();
+        let idx = Interpreter::budget_index_for_test(&b);
+        interp.bind_for_test("b", b);
+        let x = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("x", x);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("f.fwd_bwd(x)"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row5_struct_field_read() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let prog = parse_program_674("model M { w: Tensor[f32, [4]] }");
+        interp.load_program(&prog, None).expect("load M");
+        let w = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("w", w);
+        let m = interp.eval_expr_for_test(&parse_e("M { w: w }")).unwrap();
+        interp.bind_for_test("m", m);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("m.w"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row6_field_ref_alias_read() {
+    // `let !y = m.w` binds `y` as a `Value::FieldRef` into `m`'s shared
+    // storage (`eval_stmt_inner`'s `Stmt::Let` mutating-alias arm) — built
+    // here directly on the Rust side (rather than via a `{ let !y = m.w }`
+    // block, whose own pushed scope would drop `y` at the block's exit)
+    // since `Value::Struct`'s inner `Rc<RefCell<..>>` is reachable from
+    // `interp_tests` like any other `Value` variant field.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let prog = parse_program_674("model M { w: Tensor[f32, [4]] }");
+        interp.load_program(&prog, None).expect("load M");
+        let w = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("w", w);
+        let m = interp.eval_expr_for_test(&parse_e("M { w: w }")).unwrap();
+        if let Value::Struct(rc) = &m {
+            interp.bind_for_test("y", Value::FieldRef { rc: rc.clone(), field: "w".to_string() });
+        } else {
+            panic!("expected Value::Struct, got {:?}", m);
+        }
+        interp.bind_for_test("m", m);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("y"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row7_list_index_get() {
+    // `list(t)` — a bracket literal `[t]` builds a TENSOR here (demoniC is
+    // tensor-first: `[...]` is `Expr::TensorLit`), not a dynamic `List`.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        let xs = interp.eval_expr_for_test(&parse_e("list(t)")).unwrap();
+        interp.bind_for_test("xs", xs);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("xs[0]"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row8_tuple_index_get() {
+    // Tuple element access is by pattern destructuring, not `.0`/`.1`
+    // indexing (there is no dot-index postfix over `Value::Tuple`) — a
+    // second `let` unpacks the constructed pair, exercising the SAME `Tuple`
+    // route (`eval_stmt_inner`'s `Pattern::Tuple` bind, `interp.rs` ~6935).
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        let xs = interp.eval_expr_for_test(&parse_e("(t, 1)")).unwrap();
+        interp.bind_for_test("xs", xs);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("{ let (a, _n) = xs \n a }"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row9_map_get() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        let m = interp.eval_expr_for_test(&parse_e("map_set(map(), \"k\", t)")).unwrap();
+        interp.bind_for_test("m", m);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("map_get(m, \"k\")"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row10_lambda_captured_env() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        let lam = interp.eval_expr_for_test(&parse_e("fn() -> f32 { sum(t) }")).unwrap();
+        interp.bind_for_test("lam", lam);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("lam()"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row11_print_renders_a_reaped_tensor_as_a_marker() {
+    // A `fmt` has no error channel and needs none: a stale tensor inside a
+    // container `print`s as a marker rather than stale bytes — the walker
+    // renders, it does not raise.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("__t", t);
+        let xs = interp.eval_expr_for_test(&parse_e("list(__t)")).unwrap();
+        interp.bind_for_test("xs", xs);
+        reap_b_674(&mut interp);
+        // `print` itself has no return value worth asserting on; assert the
+        // rendering directly through `Debug`'s own text via `format`.
+        let rendered = interp.eval_expr_for_test(&parse_e("format(\"{}\", xs)"));
+        let s = as_str(&rendered.unwrap()).to_string();
+        assert!(s.contains("Tensor<reaped>"), "rendered: {s}");
+    });
+}
+
+#[test]
+fn hole_table_674_row12_json_encode_of_a_reaped_tensor_is_null() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"))).unwrap();
+        let m = interp.with_budget_for_test(0, |i| { i.bind_for_test("__t", t); i.eval_expr_for_test(&parse_e("map_set(map(), \"w\", __t)")) }).unwrap();
+        interp.bind_for_test("m", m);
+        reap_b_674(&mut interp);
+        let encoded = interp.eval_expr_for_test(&parse_e("json_encode(m)"));
+        let s = as_str(&encoded.unwrap()).to_string();
+        assert_eq!(s, "{\"w\":null}", "a stale tensor field must encode null, not stale numbers");
+    });
+}
+
+#[test]
+fn hole_table_674_row13_stream_append_slot_read_plain_binding() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [1, 4]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(
+            &parse_e("{ t <- forge.zeros[f32, [1, 4]] \n nil }"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row13_stream_append_slot_read_struct_field() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let prog = parse_program_674("model M { cache: Tensor[f32, [1, 4]] }");
+        interp.load_program(&prog, None).expect("load M");
+        let c = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("forge.zeros[f32, [1, 4]]"))).unwrap();
+        interp.bind_for_test("c", c);
+        let m = interp.eval_expr_for_test(&parse_e("M { cache: c }")).unwrap();
+        interp.bind_for_test("m", m);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(
+            &parse_e("{ m.cache <- forge.zeros[f32, [1, 4]] \n nil }"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row14_builtin_result_list_of_budgeted_tensors_goes_stale() {
+    // `charge_builtin_result`'s `List` arm / its `charge_intermediate`
+    // callers keep `&Value` — the stamp is at the construction chokepoint,
+    // not the charge — so a builtin returning a LIST of budgeted tensors
+    // still goes stale per-element after the reap.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let xs = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e(
+                "list_map(list(1, 2), fn(_: i64) -> Tensor[f32, [4]] { forge.zeros[f32, [4]] })"
+            ))).unwrap();
+        interp.bind_for_test("xs", xs);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("xs[0]"));
+        assert_stale(r);
+    });
+}
+
+#[test]
+fn hole_table_674_row15_suppressed_literal_inside_a_budget_still_stamps() {
+    // A tensor-literal row's charge is suppressed (`lit_charge_suppressed`)
+    // while its OWN materialization is not — the stamp is not the charge and
+    // does not inherit its suppression, so a nested literal built under a
+    // budget is stamped `b` and goes stale after `reap(b)` same as any other
+    // constructor.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let t = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("[[1.0f32, 2.0f32], [3.0f32, 4.0f32]]"))).unwrap();
+        interp.bind_for_test("t", t);
+        reap_b_674(&mut interp);
+        assert_stale(interp.eval_expr_for_test(&parse_e("t")));
+    });
+}
+
+#[test]
+fn hole_table_674_row19_vault_ctor_inside_a_budget_is_not_stamped() {
+    // §3.2 row 19 / §3.5: `vault.zeros[…]` charges `vault_used`, never any
+    // budget — even while a budget is "current" (simulated here via
+    // `with_budget_for_test`, the same push `forge.enter`/`in b` will use in
+    // 3d), a Vault construction must NOT inherit that budget's tag: it must
+    // stay LIVE after the budget is reaped.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let v = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("vault.zeros[f32, [4]]"))).unwrap();
+        interp.bind_for_test("v", v);
+        reap_b_674(&mut interp);
+        let r = interp.eval_expr_for_test(&parse_e("v"));
+        assert!(r.is_ok(), "a vault.* tensor must survive the reap of whatever \
+            budget happened to be current at its construction: {:?}", r.err().map(|e| e.msg));
+    });
+}
+
+// ── The Vault-arm exemption composes with a normal Forge stamp in the same
+// expression ─────────────────────────────────────────────────────────────
+
+#[test]
+fn budget_674_vault_ctor_restores_the_ambient_tag_after_returning() {
+    // The `VaultTagGuard` must restore the PREVIOUS tag on every exit, not
+    // just clear it permanently — a `forge.*` construction evaluated right
+    // after a `vault.*` one, still under the same pushed budget, must still
+    // be stamped and go stale.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let idx = budget_setup_674(&mut interp);
+        let pair = interp.with_budget_for_test(idx, |i| {
+            i.eval_expr_for_test(&parse_e("(vault.zeros[f32, [4]], forge.zeros[f32, [4]])"))
+        }).unwrap();
+        interp.bind_for_test("pair", pair);
+        reap_b_674(&mut interp);
+        let v = interp.eval_expr_for_test(&parse_e("{ let (v, _f) = pair \n v }"));
+        assert!(v.is_ok(), "the vault half must stay live: {:?}", v.err().map(|e| e.msg));
+        let f = interp.eval_expr_for_test(&parse_e("{ let (_v, f) = pair \n f }"));
+        assert_stale(f);
+    });
+}
+
+// ── §3.5's other half: the constructor's ARGUMENTS are not the constructor
+// ───────────────────────────────────────────────────────────────────────────
+//
+// §3.5 exempts a `vault.*` constructor's OWN allocation from the entered
+// budget — row 19 above. Its ARGUMENTS are not exempt: a shape expression or
+// a fill is ordinary code running inside `forge.enter(b) { … }`, so whatever
+// it allocates is `b`'s, charged to `b` and stamped `b`.
+//
+// The guard that implements the exemption used to be opened before those
+// arguments were evaluated and held for the rest of the call, which split
+// the two meters: `charge_arena` reads `cur_budget` and charged `b`, while
+// `TensorVal::new` reads the cleared `CUR_BUDGET_TAG` and stamped ROOT. A
+// tensor allocated in a vault constructor's argument therefore had its bytes
+// die at `reap(b)` while it still read as live — the interpreter's form of
+// the same seam the JIT had at the emit site (PR #835 review). The guard is
+// now opened at the constructor's own charge-and-build sites only.
+//
+// `mk` writes its `!` parameter back, which is what lets the argument's
+// tensor outlive the call and be retrieved after the reap; without an escape
+// there is nothing to ask about.
+const VAULT_ARG_MK_674: &str =
+    "fn mk(!t: Tensor[f32, [4096]]) -> i64 { t = forge.ones[f32, [4096]] \n 4 }";
+
+/// `--forge=1 MiB`, `forge.root` as `root`, a child of `extent` as `b`,
+/// `mk` loaded, and a root-allocated `scratch` bound. Returns `b`'s index.
+fn vault_arg_setup_674(interp: &mut Interpreter, extent: usize) -> usize {
+    interp.set_arena_limits(ArenaLimits { forge: Some(1 << 20), vault: None });
+    let root = interp.eval_expr_for_test(&parse_e("forge.root")).unwrap();
+    interp.bind_for_test("root", root);
+    let b = interp.eval_expr_for_test(&parse_e(
+        &format!("forge.carve(root, {extent})"))).unwrap();
+    let idx = Interpreter::budget_index_for_test(&b);
+    interp.bind_for_test("b", b);
+    interp.load_program(&parse_program_674(VAULT_ARG_MK_674), None).expect("load mk()");
+    // Allocated at the ROOT, before anything is entered: `scratch` is stale
+    // after the reap only if the WRITEBACK re-stamped it from inside `b`.
+    let scratch = interp.eval_expr_for_test(&parse_e("forge.zeros[f32, [4096]]")).unwrap();
+    interp.bind_for_test("scratch", scratch);
+    idx
+}
+
+#[test]
+fn budget_674_vault_ctor_argument_allocation_is_stamped_the_entered_budget() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        // 32 KiB is exactly what the argument costs `b`: 16 KiB for the `!`
+        // parameter's copy-in (the #650 copy-in/copy-out rule, charged at
+        // the budget current at the call) and 16 KiB for `mk`'s own
+        // `forge.ones`. The sibling test below carves one byte less and
+        // watches the flip, which is the bisected form of "charged to `b`".
+        let idx = vault_arg_setup_674(&mut interp, 32768);
+        let v = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("vault.ones[f32, [mk(scratch)]]"))).unwrap();
+        interp.bind_for_test("v", v);
+        assert!(
+            matches!(interp.eval_expr_for_test(&parse_e("(scratch[0] as i64)")).unwrap(),
+                     Value::Int(1, _)),
+            "`mk` did not write its `!` parameter back, so there is nothing here to \
+             ask about staleness",
+        );
+        reap_b_674(&mut interp);
+        // The CONSTRUCTOR's own bytes are the root's (§3.5, row 19) — live.
+        let r = interp.eval_expr_for_test(&parse_e("v"));
+        assert!(r.is_ok(), "the `vault.*` tensor must survive the reap: {:?}",
+            r.err().map(|e| e.msg));
+        // Its ARGUMENT's bytes are `b`'s — stale, and located.
+        assert_stale(interp.eval_expr_for_test(&parse_e("scratch")));
+    });
+}
+
+#[test]
+fn budget_674_vault_ctor_argument_allocation_is_charged_to_the_entered_budget() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        // One byte under what the argument needs. `b`'s ceiling refuses the
+        // allocation, so `mk` itself raises `forge arena exhausted` — before
+        // #839 that error never reached the caller: `eval_dim` swallowed ANY
+        // error out of a shape expression and substituted a bare 4, so the
+        // constructor silently completed at shape [4] and the only visible
+        // symptom was the missing writeback (a pair of runs, not one
+        // `assert`). Now the error propagates, located at `mk(scratch)`
+        // itself, so the constructor call is the assertion directly: it
+        // never returns a value, and `scratch` — never reached by `mk`'s
+        // writeback — is still the root tensor it started as, live and
+        // reading 0 after the reap.
+        let idx = vault_arg_setup_674(&mut interp, 32767);
+        let r = interp.with_budget_for_test(idx,
+            |i| i.eval_expr_for_test(&parse_e("vault.ones[f32, [mk(scratch)]]")));
+        let e = r.err().expect(
+            "`mk` allocated after all — the argument was not charged to the entered \
+             budget, or its extent is not the boundary this test thinks it is");
+        assert!(e.msg.contains("forge arena exhausted"), "message: {}", e.msg);
+        assert!(e.span.is_some(), "the propagated error must be located: {}", e.msg);
+        assert!(
+            matches!(interp.eval_expr_for_test(&parse_e("(scratch[0] as i64)")).unwrap(),
+                     Value::Int(0, _)),
+            "`mk` allocated after all — the argument was not charged to the entered \
+             budget, or its extent is not the boundary this test thinks it is",
+        );
+        reap_b_674(&mut interp);
+        assert!(interp.eval_expr_for_test(&parse_e("scratch")).is_ok(),
+            "nothing was ever allocated in `b` for `scratch`, so it cannot be stale");
+    });
+}
+
+// ── Must NOT change (slice 3b's compatibility gate, §3.1 / §5) ─────────────
+
+#[test]
+fn budget_674_entry_0_exhaustion_sentence_is_byte_identical_to_pre_3b() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(8), vault: None });
+        let r = interp.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"));
+        let msg = err_msg(r);
+        assert_eq!(
+            msg,
+            "forge arena exhausted: this allocation needs 16 B, but only 8 B \
+             of the 8 B --forge budget is free",
+            "entry 0's exhaustion sentence must be byte-identical to pre-3b's"
+        );
+    });
+}
+
+#[test]
+fn budget_674_ordinary_program_never_carving_runs_unchanged() {
+    // §3.1 / §3.6 s1's own claim, re-affirmed under a real `--forge`: a
+    // program that never carves behaves exactly as before slice 3b.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(64), vault: None });
+        let ok = interp.eval_expr_for_test(&parse_e("forge.zeros[f32, [4]]"));
+        assert!(ok.is_ok());
+        let refused = interp.eval_expr_for_test(&parse_e("forge.zeros[f32, [16]]"));
+        assert!(err_msg(refused).starts_with("forge arena exhausted:"));
+    });
+}
+
+// ── Cost pin: `b1`/`b2`-style minima under `dmc run` are unchanged (§6 Q5) ──
+
+#[test]
+fn budget_674_cost_pin_b1_plain_rebind_costs_zero_bytes() {
+    // #790's own probe, re-run under slice 3b's charging path: one
+    // 4096-element f32 ctor (16 384 B) plus three plain `let y = x`
+    // rebinds bisects to exactly 16 384 B (1.00×) — a plain rebind costs
+    // 0 B, and one byte under refuses.
+    with_big_stack(|| {
+        let src = "fn main() -> nil {
+                let x = forge.zeros[f32, [4096]]
+                let y = x
+                let z = y
+                let w = z
+                nil
+            }";
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(16_384), vault: None });
+        let r = interp.run(&parse_program_674(src), None);
+        assert!(r.is_ok(), "16 384 B must be enough for one ctor plus three plain rebinds: {:?}", r.err().map(|e| e.msg));
+
+        let mut interp2 = Interpreter::new();
+        interp2.set_arena_limits(ArenaLimits { forge: Some(16_383), vault: None });
+        let refused = interp2.run(&parse_program_674(src), None);
+        assert!(refused.is_err(), "one byte under 16 384 must refuse even the bare ctor");
+    });
+}
+
+#[test]
+fn budget_674_cost_pin_b2_private_copy_is_charged() {
+    // #790's `b2`, in this test's own exact terms: one 4096-element f32 ctor
+    // (16 384 B) plus one `let !y = x` private copy (16 384 B more) bisects
+    // to exactly 32 768 B (2.00×) — the private copy IS charged, and the
+    // copy's origin re-stamp (§6 Q5) does not change the byte count, only
+    // the copy's `origin` tag.
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(32_768), vault: None });
+        let ok = interp.run(&parse_program_674(
+            "fn main() -> nil { let x = forge.zeros[f32, [4096]] \n let !y = x \n nil }"
+        ), None);
+        assert!(ok.is_ok(), "{:?}", ok.err().map(|e| e.msg));
+
+        let mut interp2 = Interpreter::new();
+        interp2.set_arena_limits(ArenaLimits { forge: Some(32_767), vault: None });
+        let refused = interp2.run(&parse_program_674(
+            "fn main() -> nil { let x = forge.zeros[f32, [4096]] \n let !y = x \n nil }"
+        ), None);
+        assert!(refused.is_err(), "one byte under 32 768 must still refuse the private copy");
+    });
+}
+
+#[test]
+fn budget_674_value_size_pin_is_128_bytes() {
+    // The arena-budget design's own size pin ("Built, the price was not
+    // 0.20 %"): the whole measured interpreter cost of M1 is `Value` growing
+    // 120 → 128 B for the one-word `origin`. Pin it so a two-word relapse
+    // (136 B, +34–66 %) or a
+    // silent return to 120 B is a visible change, not an accident.
+    assert_eq!(std::mem::size_of::<Value>(), 128);
+    assert_eq!(std::mem::size_of::<super::interp::TensorVal>(), 128);
+}
+
+// ── #674 slice 3d: `forge.enter(b) { … }` and `<ctor> in b` ─────────────────
+//
+// The arena-budget design's own B5 rule: the block "pushes `b` as the entered
+// budget and pops it on EVERY exit edge — normal exit, `return`, `break`,
+// `continue`, a `?` early return", and its slice-3d test requirements ask for
+// one case per edge plus one where the body raises.
+//
+// Every case below asserts BOTH halves, because either alone is weak:
+//
+//   * the REGISTER, read after the program finished
+//     (`Interpreter::cur_budget_for_test`). Zero means the guard dropped.
+//     On its own it would also pass for a block that never pushed at all.
+//   * the CHARGE, bisected. The block runs inside a 4 KiB budget and the
+//     allocation AFTER it needs 16 KiB, which fits the root and cannot fit
+//     `b` — so it errors iff the register leaked. On its own it would not
+//     distinguish a leak that is repaired later.
+//
+// The pairing is what makes them a gate: a missed edge mis-charges the rest
+// of the program with no diagnostic, which is the silent-wrong-number class
+// B6 exists to close.
+
+/// Run `src` under an explicit `--forge` ceiling and hand back the result
+/// together with the entered-budget register AS IT STOOD when the program
+/// finished. Nothing else can read that register from outside a running
+/// program, and B5's whole claim is about it.
+fn run_forge_674(src: &str, forge: u64) -> (Result<Value, super::interp::RuntimeError>, usize) {
+    let tokens = Lexer::new(src).tokenize().expect("lex failed");
+    let program = Parser::new(tokens).parse_program().expect("parse failed");
+    let mut interp = Interpreter::new();
+    interp.set_arena_limits(ArenaLimits { forge: Some(forge), vault: None });
+    let r = interp.run(&program, None);
+    (r, Interpreter::cur_budget_for_test())
+}
+
+/// The shared assertion for the five edge cases: the program answers `want`,
+/// and the register is back at the root.
+fn assert_edge_restores_674(src: &str, want: i64) {
+    let (r, reg) = run_forge_674(src, 1 << 20);
+    let v = r.unwrap_or_else(|e| panic!("expected the program to answer: {}", e.msg));
+    assert_eq!(as_int(&v), want, "value: {:?}", v);
+    assert_eq!(reg, 0, "the entered-budget register did not come back to the root");
+}
+
+#[test]
+fn budget_674_enter_pops_on_the_normal_edge() {
+    assert_edge_restores_674(
+        "fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   forge.enter(b) { let u = forge.zeros[f32, [64]] }\n\
+         \x20   let t = forge.zeros[f32, [4096]]\n\
+         \x20   1\n\
+         }", 1);
+}
+
+#[test]
+fn budget_674_enter_pops_on_the_return_edge() {
+    // The `return` leaves the extent AND the function. `=> 7` rather than
+    // `3` is what says the `return` is the edge that fired.
+    assert_edge_restores_674(
+        "fn f(b: Budget) -> i64 {\n\
+         \x20   forge.enter(b) { let u = forge.zeros[f32, [64]]\n return 7 }\n\
+         \x20   3\n\
+         }\n\
+         fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   let k = f(b)\n\
+         \x20   let t = forge.zeros[f32, [4096]]\n\
+         \x20   k\n\
+         }", 7);
+}
+
+#[test]
+fn budget_674_enter_pops_on_the_break_edge() {
+    assert_edge_restores_674(
+        "fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   for i in 0..3 {\n\
+         \x20       forge.enter(b) { let u = forge.zeros[f32, [64]]\n break }\n\
+         \x20   }\n\
+         \x20   let t = forge.zeros[f32, [4096]]\n\
+         \x20   1\n\
+         }", 1);
+}
+
+#[test]
+fn budget_674_enter_pops_on_the_continue_edge() {
+    // Three iterations, so a `continue` that failed to pop would also nest
+    // three deep — the register assert catches the depth, the 16 KiB
+    // allocation after the loop catches the mis-charge.
+    assert_edge_restores_674(
+        "fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   for i in 0..3 {\n\
+         \x20       forge.enter(b) { let u = forge.zeros[f32, [64]]\n continue }\n\
+         \x20   }\n\
+         \x20   let t = forge.zeros[f32, [4096]]\n\
+         \x20   1\n\
+         }", 1);
+}
+
+#[test]
+fn budget_674_enter_pops_on_the_query_edge() {
+    // The edge the design names as the trap: `Expr::ArenaBlock`'s own arm
+    // writes `self.eval_block(&ab.body)?`, and a restore line after that `?`
+    // is skipped on exactly this path. `=> 1` is `?`'s propagated
+    // `(default[T], e)` reaching `main`, not `(5, nil)`.
+    assert_edge_restores_674(
+        "fn g() -> (i64, Err) { (0, \"boom\") }\n\
+         fn f(b: Budget) -> (i64, Err) {\n\
+         \x20   forge.enter(b) {\n\
+         \x20       let u = forge.zeros[f32, [64]]\n\
+         \x20       let y = g()?\n\
+         \x20       let v = forge.zeros[f32, [64]]\n\
+         \x20   }\n\
+         \x20   (5, nil)\n\
+         }\n\
+         fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   let (v, e) = f(b)\n\
+         \x20   let t = forge.zeros[f32, [4096]]\n\
+         \x20   v + 1\n\
+         }", 1);
+}
+
+#[test]
+fn budget_674_enter_pops_when_the_body_raises() {
+    // The sixth case the design's Tests line asks for, and the one the
+    // straight-line restore gets wrong most obviously: the body errors, the
+    // error propagates out of `eval_expr` on the `?`, and the register must
+    // still be back at the root by the time anyone can observe it.
+    let (r, reg) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   forge.enter(b) { undefined_fn_674() }\n\
+         \x20   1\n\
+         }", 1 << 20);
+    let e = r.err().expect("the body's undefined call must raise");
+    assert!(e.msg.contains("undefined_fn_674"), "message: {}", e.msg);
+    assert_eq!(reg, 0, "the register leaked out of a raising `forge.enter` body");
+}
+
+#[test]
+fn budget_674_nested_enter_restores_the_outer_budget_not_the_root() {
+    // B5: an `enter` nested inside an `enter` pops to what it SHADOWED. The
+    // root is left with 4 KiB free after the two carves, so the 16 KiB
+    // allocation between the inner block's exit and the outer block's can
+    // only be served by `outer` — a pop-to-root would refuse it, and a
+    // pop-to-nothing (still `inner`, 4 KiB) would refuse it too. Same
+    // numbers as `compiler/tests/jit_budgets_3d.rs`'s own nesting case, so
+    // the two backends are asserted against one arrangement rather than two.
+    let src = "fn main() -> i64 {\n\
+         \x20   let outer = forge.carve(forge.root, 262144)\n\
+         \x20   let inner = forge.carve(forge.root, 4096)\n\
+         \x20   forge.enter(outer) {\n\
+         \x20       forge.enter(inner) { let a = forge.zeros[f32, [64]] }\n\
+         \x20       let big = forge.zeros[f32, [4096]]\n\
+         \x20   }\n\
+         \x20   1\n\
+         }";
+    let (r, reg) = run_forge_674(src, 270336);
+    assert!(r.is_ok(), "expected the outer budget to serve it: {:?}",
+            r.err().map(|e| e.msg));
+    assert_eq!(reg, 0);
+
+    // The control that makes the case above discriminating: the same 16 KiB
+    // allocation OUTSIDE both extents, where the root has only 4 KiB free.
+    let (r2, _) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let outer = forge.carve(forge.root, 262144)\n\
+         \x20   let inner = forge.carve(forge.root, 4096)\n\
+         \x20   let big = forge.zeros[f32, [4096]]\n\
+         \x20   1\n\
+         }", 270336);
+    let e = r2.err().expect("the root has only 4 KiB free after both carves");
+    assert!(e.msg.contains("forge arena exhausted"), "message: {}", e.msg);
+}
+
+#[test]
+fn budget_674_alloc_in_charges_the_named_budget_not_the_entered_one() {
+    // B3: `… in b` OVERRIDES the entered budget for that one constructor.
+    // Inside `forge.enter(small)`, a 16 KiB constructor written `in big`
+    // must charge `big` — `small` could not hold it, so the program answers
+    // only if the override took effect.
+    let (r, reg) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let small = forge.carve(forge.root, 4096)\n\
+         \x20   let big = forge.carve(forge.root, 65536)\n\
+         \x20   forge.enter(small) {\n\
+         \x20       let t = forge.zeros[f32, [4096]] in big\n\
+         \x20   }\n\
+         \x20   1\n\
+         }", 1 << 20);
+    assert!(r.is_ok(), "the `in big` override did not take: {:?}",
+            r.err().map(|e| e.msg));
+    assert_eq!(reg, 0);
+
+    // The control: the identical program WITHOUT the override charges the
+    // entered budget and is refused at its ceiling. Without this, the case
+    // above would pass on an `in b` that did nothing at all.
+    let (r2, _) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let small = forge.carve(forge.root, 4096)\n\
+         \x20   let big = forge.carve(forge.root, 65536)\n\
+         \x20   forge.enter(small) {\n\
+         \x20       let t = forge.zeros[f32, [4096]]\n\
+         \x20   }\n\
+         \x20   1\n\
+         }", 1 << 20);
+    let e = r2.err().expect("16 KiB cannot fit the entered 4 KiB budget");
+    assert!(e.msg.contains("the entered budget's 4 KiB extent"), "message: {}", e.msg);
+}
+
+#[test]
+fn budget_674_alloc_in_restores_the_entered_budget_after_the_constructor() {
+    // The override is for ONE constructor (B3). The allocation after it goes
+    // back to the entered budget — asserted the only way there is, by making
+    // the entered budget too small for it.
+    let (r, reg) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let small = forge.carve(forge.root, 4096)\n\
+         \x20   let big = forge.carve(forge.root, 65536)\n\
+         \x20   forge.enter(small) {\n\
+         \x20       let t = forge.zeros[f32, [4096]] in big\n\
+         \x20       let u = forge.zeros[f32, [4096]]\n\
+         \x20   }\n\
+         \x20   1\n\
+         }", 1 << 20);
+    let e = r.err().expect("the second constructor must charge `small` again");
+    assert!(e.msg.contains("the entered budget's 4 KiB extent"), "message: {}", e.msg);
+    assert_eq!(reg, 0, "the register must still come back after the refusal");
+}
+
+#[test]
+fn budget_674_enter_over_a_reaped_budget_is_budget_stale() {
+    // §2.3's table lists `budget-stale` at "carve / reap / enter / `in b`" —
+    // one tag, four sites, and `enter`/`in b` are the two this slice adds.
+    let (r, reg) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   forge.reap(b)\n\
+         \x20   forge.enter(b) { let u = forge.zeros[f32, [64]] }\n\
+         \x20   1\n\
+         }", 1 << 20);
+    let e = r.err().expect("a reaped handle must refuse at `enter`");
+    assert!(e.msg.starts_with("budget-stale:"), "message: {}", e.msg);
+    assert!(e.span.is_some(), "`budget-stale` must be located");
+    assert_eq!(reg, 0);
+}
+
+#[test]
+fn budget_674_alloc_in_over_a_reaped_budget_is_budget_stale() {
+    let (r, _) = run_forge_674(
+        "fn main() -> i64 {\n\
+         \x20   let b = forge.carve(forge.root, 4096)\n\
+         \x20   forge.reap(b)\n\
+         \x20   let t = forge.zeros[f32, [4]] in b\n\
+         \x20   1\n\
+         }", 1 << 20);
+    let e = r.err().expect("a reaped handle must refuse at `in b`");
+    assert!(e.msg.starts_with("budget-stale:"), "message: {}", e.msg);
+    assert!(e.span.is_some(), "`budget-stale` must be located");
+}
+
+#[test]
+fn budget_674_a_tensor_built_inside_an_enter_goes_stale_at_the_reap() {
+    // The other half of what `enter` wires up: `TensorVal::new` reads the
+    // same thread-local the guard pushes, so a tensor built INSIDE the
+    // extent carries `b`'s stamp and B6's invalidation reaches it — through
+    // surface syntax now, where slice 3b could only reach it through the
+    // `#[cfg(test)]` harness.
+    let (r, _) = run_forge_674(
+        "fn main() -> f32 {\n\
+         \x20   let b = forge.carve(forge.root, 65536)\n\
+         \x20   let t = forge.enter(b) { forge.zeros[f32, [4]] }\n\
+         \x20   forge.reap(b)\n\
+         \x20   t[0]\n\
+         }", 1 << 20);
+    let e = r.err().expect("the tensor was allocated in `b`, which was reaped");
+    assert!(e.msg.starts_with("budget-stale:"), "message: {}", e.msg);
+}
+
+// ─── #834: `arena_ctor_dtype` is a total, correctly-metered table ──────────
+//
+// Before this fix, `arena_ctor_dtype` had no entry at all for `fp8_e4m3`/
+// `fp8_e5m2` and silently fell back to `DType::F32`'s FOUR-byte width for
+// both — a `forge.zeros[fp8_e4m3, [4096]]` was metered as a 16 384 B f32
+// tensor, four times its declared SPEC §3.1 one-byte width. These pin the
+// #790 cost-pin style against the fp8 fix (a 4096-element ctor bisects to
+// exactly its declared byte count) and the constructed tensor's actual
+// `DType` tag — never silently `DType::F32` again for the two fp8 kinds.
+//
+// A separate regression, caught in review and fixed in the same pass: an
+// intermediate version of `arena_ctor_dtype` anchored on `pos[0]` and turned
+// ANY `Ident` there that `ScalarType::from_ctor_name` does not recognize —
+// a bogus name (`qqq_not_a_type`), `str`/`nil` (`from_ctor_name` never
+// admits either as ctor spellings; #817 is an open ruling on whether they
+// have a tensor-element representation at all, and `check.rs`'s
+// `ctor_tensor_ty` still admits them in constructor position, so this
+// function must not preempt that ruling), or a generic dim `Ident`
+// (`forge.trit[R, C]`'s `R`) — into a fatal internal error. Base's
+// pre-#834 behavior was to fall back to `DType::F32` for all of these, and
+// that fallback is restored below.
+use super::interp::DType;
+
+#[test]
+fn arena_ctor_dtype_834_fp8_e4m3_meters_one_byte_per_element() {
+    // #790's own cost-pin shape: a 4096-element ctor at its declared width
+    // (1 B for fp8_e4m3) bisects to exactly 4096 B (1.00x) — one byte under
+    // must refuse even the bare ctor.
+    with_big_stack(|| {
+        let src = "fn main() -> nil {
+                let x = forge.zeros[fp8_e4m3, [4096]]
+                nil
+            }";
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(4096), vault: None });
+        let r = interp.run(&parse_program_674(src), None);
+        assert!(r.is_ok(), "4096 B must be enough for a 4096-element fp8_e4m3 \
+                 ctor (1 B/elem): {:?}", r.err().map(|e| e.msg));
+
+        let mut interp2 = Interpreter::new();
+        interp2.set_arena_limits(ArenaLimits { forge: Some(4095), vault: None });
+        let refused = interp2.run(&parse_program_674(src), None);
+        assert!(refused.is_err(), "one byte under 4096 must refuse the bare fp8_e4m3 ctor");
+    });
+}
+
+#[test]
+fn arena_ctor_dtype_834_fp8_e5m2_meters_one_byte_per_element() {
+    with_big_stack(|| {
+        let src = "fn main() -> nil {
+                let x = forge.zeros[fp8_e5m2, [4096]]
+                nil
+            }";
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(4096), vault: None });
+        let r = interp.run(&parse_program_674(src), None);
+        assert!(r.is_ok(), "4096 B must be enough for a 4096-element fp8_e5m2 \
+                 ctor (1 B/elem): {:?}", r.err().map(|e| e.msg));
+
+        let mut interp2 = Interpreter::new();
+        interp2.set_arena_limits(ArenaLimits { forge: Some(4095), vault: None });
+        let refused = interp2.run(&parse_program_674(src), None);
+        assert!(refused.is_err(), "one byte under 4096 must refuse the bare fp8_e5m2 ctor");
+    });
+}
+
+#[test]
+fn arena_ctor_dtype_834_fp8_e4m3_tag_is_dtype_fp8e4m3() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let v = interp.eval_expr_for_test(&parse_e("forge.zeros[fp8_e4m3, [4]]"));
+        match v {
+            Ok(Value::Tensor(t)) => assert_eq!(
+                t.dtype, DType::Fp8E4M3,
+                "the constructed tensor must be tagged `Fp8E4M3`, not a silent `F32`"
+            ),
+            Ok(_) => panic!("expected a tensor value"),
+            Err(e) => panic!("expected Ok(Tensor), got Err: {}", e.msg),
+        }
+    });
+}
+
+#[test]
+fn arena_ctor_dtype_834_fp8_e5m2_tag_is_dtype_fp8e5m2() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let v = interp.eval_expr_for_test(&parse_e("forge.zeros[fp8_e5m2, [4]]"));
+        match v {
+            Ok(Value::Tensor(t)) => assert_eq!(
+                t.dtype, DType::Fp8E5M2,
+                "the constructed tensor must be tagged `Fp8E5M2`, not a silent `F32`"
+            ),
+            Ok(_) => panic!("expected a tensor value"),
+            Err(e) => panic!("expected Ok(Tensor), got Err: {}", e.msg),
+        }
+    });
+}
+
+/// An `Ident` at `pos[0]` that `ScalarType::from_ctor_name` does not
+/// recognize (with the checker bypassed, exactly what this harness does by
+/// evaluating the expression directly rather than through `dmc run`'s
+/// `--check`-first pipeline) falls back to `DType::F32` — base's behavior,
+/// restored after review found an intermediate version of this fix turning
+/// it into a fatal internal error instead (breaking generic dims and
+/// `forge.zeros[str, ...]`, both #834-rework regressions).
+#[test]
+fn arena_ctor_dtype_834_unrecognized_name_falls_back_to_f32_not_internal_error() {
+    with_big_stack(|| {
+        let mut interp = Interpreter::new();
+        let r = interp.eval_expr_for_test(&parse_e("forge.zeros[qqq_not_a_type, [4]]"));
+        match r {
+            Ok(Value::Tensor(t)) => assert_eq!(
+                t.dtype, DType::F32,
+                "an unrecognized ctor element-type name must fall back to F32, as base did"
+            ),
+            Ok(_) => panic!("expected a tensor value"),
+            Err(e) => panic!("expected Ok(Tensor), got Err: {}", e.msg),
+        }
+    });
+}
+
+/// `str` is not a `ScalarType::from_ctor_name` spelling at all (`nil` isn't
+/// either), so `forge.zeros[str, [1024]]` takes the same F32 fallback path
+/// as the previous test, not the `dtype_for_scalar_elem`-returns-`None`
+/// path. #817 (whether `str`/`nil` have a real tensor-element
+/// representation) stays open; `check.rs`'s `ctor_tensor_ty` still admits
+/// both in constructor position, and this function must not decide that
+/// question by refusing them here. Meters as a 1024-element f32 tensor: 4
+/// KiB, matching base.
+#[test]
+fn arena_ctor_dtype_834_str_ctor_falls_back_to_f32_meters_4kib() {
+    with_big_stack(|| {
+        let src = "fn main() -> nil {
+                let x = forge.zeros[str, [1024]]
+                nil
+            }";
+        let mut interp = Interpreter::new();
+        interp.set_arena_limits(ArenaLimits { forge: Some(4096), vault: None });
+        let r = interp.run(&parse_program_674(src), None);
+        assert!(r.is_ok(), "4096 B must be enough for forge.zeros[str, [1024]] \
+                 (F32 fallback, 4 B/elem): {:?}", r.err().map(|e| e.msg));
+
+        let mut interp2 = Interpreter::new();
+        interp2.set_arena_limits(ArenaLimits { forge: Some(4095), vault: None });
+        let refused = interp2.run(&parse_program_674(src), None);
+        assert!(refused.is_err(), "one byte under 4096 must refuse forge.zeros[str, [1024]]");
+    });
+}
+
+/// A generic dim `Ident` at `pos[0]` (`forge.trit[R, C]`'s `R`, where `R`/`C`
+/// are the function's own generic-int params, not type names) must not be
+/// treated as a bogus type name — `trit`'s own ctor hardcodes `DType::Trit`
+/// and never consults `arena_ctor_dtype`'s return, so this only has to not
+/// blow up.
+#[test]
+fn arena_ctor_dtype_834_generic_dim_ident_does_not_error() {
+    with_big_stack(|| {
+        let src = "fn build[R, C]() -> nil {
+                let t = forge.trit[R, C]
+                nil
+            }
+            fn main() -> nil { build[4, 3]() }";
+        let mut interp = Interpreter::new();
+        let r = interp.run(&parse_program_674(src), None);
+        assert!(r.is_ok(), "a generic dim ident at pos[0] must not be a fatal \
+                 internal error: {:?}", r.err().map(|e| e.msg));
+    });
+}
+
+// ─── #834 rework: `tape_index_read` must widen the same way `value_is_
+//     differentiable` did ──────────────────────────────────────────────────
+//
+// `value_is_differentiable` was widened (this issue) to declare fp8 tensors
+// differentiable, but `tape_index_read` — the function that traces a
+// subscript read (`w[0]`) onto the tape — still bailed out for any dtype
+// other than `F32`/`F64`. For an fp8 tensor that meant `w[0]` fell OFF the
+// tape (`tape_index_read` returns `Ok(None)`, and the caller re-evaluates
+// the read as an untraced plain value), so a term reading an fp8 element
+// directly picked up no gradient at all — silently wrong, not refused.
+//
+// `f(!w: Tensor[fp8_e4m3,[2]]) = sum(w) + w[0]*w[0]` at w=[3,4]:
+// d/dw[0] = 1 (from sum) + 2*w[0] (from w[0]*w[0]) = 1 + 6 = 7
+// d/dw[1] = 1 (from sum only) = 1
+// Before this fix the PR's g0 came back as 1 (only the `sum` term's
+// contribution — the `w[0]*w[0]` term's read of `w[0]` was untraced, so its
+// contribution to g0 was silently dropped); g1 was already correct since it
+// is only ever read through `sum`, not indexed.
+
+#[test]
+fn tape_index_read_834_fp8_indexed_term_g0_matches_base() {
+    let v = run(r#"
+        @grad fn f(!w: Tensor[fp8_e4m3, [2]]) -> fp8_e4m3 { sum(w) + w[0]*w[0] }
+        fn main() -> fp8_e4m3 {
+            let !w = forge.zeros[fp8_e4m3, [2]]
+            w[0] = 3.0
+            w[1] = 4.0
+            let (_l, g) = f.fwd_bwd(w)
+            g.w[0]
+        }
+    "#);
+    assert_eq!(as_float(&v), 7.0, "g0 must be 7 (1 from `sum` + 6 from `w[0]*w[0]`); \
+               1 is the pre-fix bug (the `w[0]*w[0]` read fell off the tape)");
+}
+
+#[test]
+fn tape_index_read_834_fp8_summed_only_term_g1_matches_base() {
+    let v = run(r#"
+        @grad fn f(!w: Tensor[fp8_e4m3, [2]]) -> fp8_e4m3 { sum(w) + w[0]*w[0] }
+        fn main() -> fp8_e4m3 {
+            let !w = forge.zeros[fp8_e4m3, [2]]
+            w[0] = 3.0
+            w[1] = 4.0
+            let (_l, g) = f.fwd_bwd(w)
+            g.w[1]
+        }
+    "#);
+    assert_eq!(as_float(&v), 1.0, "g1 must be 1 (only read through `sum`, never indexed)");
+}
+
+// ─── #852: `overlay_elem_dtype` is an exhaustive match over `ScalarType` ────
+//
+// `overlay_elem_dtype` (interp.rs) is the tensor-FIELD arm's dtype table for
+// a `@cast(Model)` overlay (a scalar field decodes through
+// `decode_overlay_scalar` instead, which has its own separate catch-all —
+// out of scope here, since #852 named `overlay_elem_dtype` specifically).
+// Before this fix its trailing `_ => DType::Int(scalar_int_width(st).
+// unwrap_or(IW::I64))` would have decoded a `tf32`/`fp8_e4m3`/`fp8_e5m2`
+// TENSOR field as an 8-byte integer — but its ONLY call site checks
+// `est.overlay_byte_width()` (`ast.rs`) is `Some` first, and that table
+// answers `None` for exactly seven kinds: `str`, `nil`, `trit`, `int4`, and
+// the f32-backed `tf32`/`fp8_e4m3`/`fp8_e5m2`. `DIRECTIVES.md §4.1` states
+// this exclusion UNCONDITIONALLY — "`@cast(Model)` is defined for a model
+// whose fields are scalars with byte storage (not `str`, `nil`, `trit`,
+// `int4`, or the f32-backed `tf32`/`fp8` kinds)" — so the wrong-width
+// fallback was never reachable through a real program: confirmed below both
+// by construction (the field-level tests, which never reach
+// `overlay_elem_dtype` at all) and directly (the table tests, via the
+// `#[cfg(test)]` wrapper `overlay_elem_dtype_for_test`).
+//
+// This is a SETTLED design question, not #817's OPEN one (whether `str`/
+// `nil` have a tensor-ELEMENT representation elsewhere in the interpreter,
+// e.g. `dtype_for_scalar_elem`) — `DIRECTIVES.md §4.1` excludes `str`/`nil`
+// from the OVERLAY specifically, in the same sentence as the exotic floats,
+// with no open question attached. The fix is therefore NOT to invent a
+// byte-decode rule for `tf32`/`fp8_*` overlay fields (that would contradict
+// the settled exclusion) but to make `overlay_elem_dtype` exhaustive — no
+// `_ =>` — so a future `ScalarType` variant is a compile error here, the
+// same two-table guard #834 built for `dtype_for_scalar_elem`/
+// `arena_ctor_dtype`.
+
+use super::ast::ScalarType;
+use super::interp::{overlay_elem_dtype_for_test, IW};
+
+#[test]
+fn cast_model_overlay_852_fp8_e4m3_scalar_field_refused_not_8_byte_int() {
+    let msg = run_err(r#"
+        model M { x: fp8_e4m3 }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            let m = @cast(M) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("x")
+            && msg.contains("DIRECTIVES.md §4.1"),
+        "expected an overlay-layout refusal naming `x`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_852_fp8_e5m2_scalar_field_refused_not_8_byte_int() {
+    let msg = run_err(r#"
+        model M { x: fp8_e5m2 }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            let m = @cast(M) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("x")
+            && msg.contains("DIRECTIVES.md §4.1"),
+        "expected an overlay-layout refusal naming `x`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_852_tf32_scalar_field_refused_not_a_4_byte_f32_decode() {
+    let msg = run_err(r#"
+        model M { x: tf32 }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [8]]
+            let m = @cast(M) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("x")
+            && msg.contains("DIRECTIVES.md §4.1"),
+        "expected an overlay-layout refusal naming `x`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_852_fp8_e4m3_tensor_field_refused_before_overlay_elem_dtype() {
+    // The tensor-field arm — `overlay_elem_dtype`'s only call site — checks
+    // `est.overlay_byte_width()` before ever calling it, so this exercises
+    // the same guard as the scalar case above at the OTHER call site (the
+    // one #852 actually named).
+    let msg = run_err(r#"
+        model M { xs: Tensor[fp8_e4m3, [4]] }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [4]]
+            let m = @cast(M) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("xs"),
+        "expected an overlay-layout refusal naming `xs`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_852_fp8_e5m2_tensor_field_refused_before_overlay_elem_dtype() {
+    let msg = run_err(r#"
+        model M { xs: Tensor[fp8_e5m2, [4]] }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [4]]
+            let m = @cast(M) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("xs"),
+        "expected an overlay-layout refusal naming `xs`, got: {}", msg
+    );
+}
+
+#[test]
+fn cast_model_overlay_852_tf32_tensor_field_refused_before_overlay_elem_dtype() {
+    let msg = run_err(r#"
+        model M { xs: Tensor[tf32, [1]] }
+        fn main() -> i64 {
+            let !buf = forge.zeros[u8, [4]]
+            let m = @cast(M) { buf }
+            0
+        }
+    "#);
+    assert!(
+        msg.contains("no overlay layout") && msg.contains("xs"),
+        "expected an overlay-layout refusal naming `xs`, got: {}", msg
+    );
+}
+
+#[test]
+fn overlay_elem_dtype_852_admitted_kinds_keep_their_declared_width() {
+    // The 14 kinds `ScalarType::overlay_byte_width` answers `Some` for —
+    // unchanged by this fix, asserted directly against the function (the
+    // field-level tests above already cover a representative few end to end
+    // through a real overlay program; `cast_model_overlay_*` tests earlier
+    // in this file cover the rest, e.g. bool/f32/f64/bf16/f16/narrow ints).
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::Bool).unwrap(), DType::Bool);
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::F64).unwrap(), DType::F64);
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::F32).unwrap(), DType::F32);
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::F16).unwrap(), DType::F32);
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::Bf16).unwrap(), DType::F32);
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::I8).unwrap(), DType::Int(IW::I8));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::Int8).unwrap(), DType::Int(IW::I8));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::I16).unwrap(), DType::Int(IW::I16));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::I32).unwrap(), DType::Int(IW::I32));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::I64).unwrap(), DType::Int(IW::I64));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::U8).unwrap(), DType::Int(IW::U8));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::U16).unwrap(), DType::Int(IW::U16));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::U32).unwrap(), DType::Int(IW::U32));
+    assert_eq!(overlay_elem_dtype_for_test(&ScalarType::U64).unwrap(), DType::Int(IW::U64));
+}
+
+#[test]
+fn overlay_elem_dtype_852_excluded_kinds_are_an_internal_error_not_a_silent_int64() {
+    // The 7 kinds `overlay_byte_width` answers `None` for — provably
+    // unreachable through a real overlay program (the field-level tests
+    // above), reached HERE only through the `#[cfg(test)]` wrapper to prove
+    // the new guard itself fires (a catchable internal error naming the
+    // type) instead of silently returning `DType::Int(IW::I64)`, the #852 bug.
+    for st in [ScalarType::Str, ScalarType::Nil, ScalarType::Trit, ScalarType::Int4,
+               ScalarType::Tf32, ScalarType::Fp8E4M3, ScalarType::Fp8E5M2] {
+        let err = overlay_elem_dtype_for_test(&st).err()
+            .unwrap_or_else(|| panic!("{:?} must be an internal error, not a value", st));
+        assert!(err.msg.contains("internal error") && err.msg.contains("#852"),
+            "expected #852's internal-error wording for {:?}, got: {}", st, err.msg);
+    }
+}
+
+#[test]
+fn overlay_elem_dtype_852_agrees_with_overlay_byte_width_for_every_scalar_type() {
+    // The two tables that must never disagree again: `ScalarType::
+    // overlay_byte_width` (ast.rs, gates every `@cast(Model)` call site) and
+    // `overlay_elem_dtype` (interp.rs, decides the admitted field's tensor
+    // dtype). Iterated over every `ScalarType` variant so a new one that
+    // updates only one of the two tables fails this test rather than
+    // silently drifting (#852). `wire_dtype_of` (the Port wire protocol's
+    // OWN, unrelated table, answering "how does an already-constructed
+    // tensor cross a Port wire") is deliberately not part of this
+    // agreement — it operates on already-tagged runtime `DType`s, not on
+    // whether raw overlay BYTES may be decoded into one in the first place,
+    // and folding it in would force `overlay_byte_width` to admit `tf32`/
+    // `fp8_*` fields, contradicting `DIRECTIVES.md §4.1`'s settled exclusion.
+    let all = [
+        ScalarType::I8, ScalarType::I16, ScalarType::I32, ScalarType::I64,
+        ScalarType::U8, ScalarType::U16, ScalarType::U32, ScalarType::U64,
+        ScalarType::Int4, ScalarType::Int8,
+        ScalarType::F16, ScalarType::Bf16, ScalarType::Tf32, ScalarType::F32, ScalarType::F64,
+        ScalarType::Fp8E4M3, ScalarType::Fp8E5M2,
+        ScalarType::Trit,
+        ScalarType::Bool, ScalarType::Str, ScalarType::Nil,
+    ];
+    for st in all {
+        let admitted_by_width = st.overlay_byte_width().is_some();
+        let admitted_by_elem_dtype = overlay_elem_dtype_for_test(&st).is_ok();
+        assert_eq!(admitted_by_width, admitted_by_elem_dtype,
+            "{:?}: overlay_byte_width() admits it ({admitted_by_width}) but \
+             overlay_elem_dtype() admits it ({admitted_by_elem_dtype}) — the \
+             two tables disagree", st);
+    }
 }

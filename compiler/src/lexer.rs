@@ -1,4 +1,4 @@
-/// demoniC lexer — spec 0.0.4-draft
+/// demoniC lexer — spec 0.0.5-draft
 ///
 /// Companion to: GRAMMAR.ebnf §Lexical, SPEC.md §2, TOKENIZER.md
 ///
@@ -564,8 +564,29 @@ impl<'src> Lexer<'src> {
             .take_while(|c| c.is_ascii_digit() || *c == '_')
             .filter(|c| *c != '_')
             .collect();
-        let v: i64 = clean.parse().map_err(|_| self.err("integer literal out of range"))?;
-        let v = v.checked_mul(size_mult).ok_or_else(|| self.err("integer literal out of range"))?;
+        // #597: a DECIMAL literal carrying an explicit `u64` suffix is parsed
+        // in the unsigned range and kept as its 64-bit two's-complement
+        // pattern — the same "the literal is a bit pattern" rule the `0x`/`0b`
+        // arms above have had since #282. Without it the three spellings of
+        // `u64::MAX` disagreed: `0xffffffffffffffffu64` and its binary twin
+        // lexed, while `18446744073709551615u64` — the spelling anyone reaches
+        // for first — was rejected as "integer literal out of range".
+        //
+        // The suffix is what unlocks it, deliberately. The lexer cannot see the
+        // annotation on the binding, and `check_int_literal_range` treats any
+        // bare literal at a 64-bit target as a pattern, so widening the parse
+        // for UNSUFFIXED decimals would silently turn `let x: i64 =
+        // 18446744073709551615` into `-1` instead of the error it is today.
+        let v = if suffix.as_deref() == Some("u64") {
+            let u: u64 = clean.parse().map_err(|_| self.err("integer literal out of range"))?;
+            let u = u
+                .checked_mul(size_mult as u64)
+                .ok_or_else(|| self.err("integer literal out of range"))?;
+            u as i64
+        } else {
+            let v: i64 = clean.parse().map_err(|_| self.err("integer literal out of range"))?;
+            v.checked_mul(size_mult).ok_or_else(|| self.err("integer literal out of range"))?
+        };
         Ok(TokenKind::IntLit(v, suffix))
     }
 

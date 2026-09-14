@@ -1,0 +1,17 @@
+# Probe 59 (control) — SPEC §6.7 (#15): `p59_multifile_diamond.dmc`'s four files
+# concatenated by hand, imports dropped. This is what the whole-program merge
+# builds, and it compiles and runs under BOTH backends today — which is the
+# measurement that makes multi-file JIT a delivery problem rather than a codegen
+# one. A cross-file `pub model` held as a field needs nothing new: merged, it is
+# one more `Item::Model`.
+model Point { x: i64, y: i64 }
+fn mk(x: i64, y: i64) -> Point { Point { x: x, y: y } }
+model Boxed { p: Point, tag: i64 }
+fn boxed(x: i64, y: i64) -> Boxed { Boxed { p: mk(x, y), tag: 1 } }
+fn sum_pt(p: Point) -> i64 { p.x + p.y }
+fn main() -> nil {
+    let bx = boxed(4, 5)
+    let total = sum_pt(bx.p) + bx.tag
+    if total == 10 { print("Run OK") } else { print("FAIL: flattened diamond") }
+    nil
+}

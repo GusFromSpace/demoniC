@@ -130,6 +130,23 @@ fn test_floats() {
     }
 
     #[test]
+    fn fmt_roundtrip_fp8_ctor_type_arg_818() {
+        // #818: the float-suffix spelling above went through a different
+        // parser path (`try_eat_float_suffix`) than a constructor's
+        // type-arg position (`forge.zeros[fp8_e4m3, [4]]`), which parses the
+        // dtype as an ordinary expression token and used to lose the
+        // underscore there. fmt just prints back whatever the parser built,
+        // so this pins fmt indirectly: a regression in the parser's fix
+        // reappears here as `fp8e4m3` in the formatted output.
+        let src = "fn test_fp8_ctor() {\n    let t = forge.zeros[fp8_e4m3, [4]]\n    let u = forge.zeros[fp8_e5m2, [4]]\n}\n";
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains("forge.zeros[fp8_e4m3, [4]]"), "got: {}", formatted);
+        assert!(formatted.contains("forge.zeros[fp8_e5m2, [4]]"), "got: {}", formatted);
+        parse_program(&formatted).expect("re-parse of formatted output failed");
+    }
+
+    #[test]
     fn fmt_roundtrip_match_expr() {
         let src = r#"
 fn classify(n: i64) -> i64 {
@@ -467,7 +484,7 @@ fn t[S](x: Tensor[f32, [2, S, 768]]) -> nil {
 
     #[test]
     fn fmt_roundtrip_colon_slices_501() {
-        // GRAMMAR_SWEEP N1: the printer emitted `..` for `IndexElem::Slice`,
+        // Grammar-sweep fix N1: the printer emitted `..` for `IndexElem::Slice`,
         // so `a[0:100:2]` came back out as `a[0..100::2]` — a range in the
         // start bound, i.e. the invalid mixed form the parser now rejects.
         // Both slicing families are permanent surface (OPERATORS §9), so the
@@ -491,6 +508,51 @@ fn t[S](x: Tensor[f32, [2, S, 768]]) -> nil {
         }
         let reparsed = parse_program(&formatted)
             .expect("re-parse of formatted slice output failed");
+        assert_eq!(pretty_print_program(&reparsed), formatted);
+    }
+
+    #[test]
+    fn fmt_roundtrip_budget_block_674() {
+        let src = "fn f(b: Budget) -> nil { let x = forge.enter(b) { 5 }\n nil }";
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains("forge.enter(b)"),
+            "fmt must preserve `forge.enter(b)`, got:\n{formatted}");
+        let reparsed = parse_program(&formatted)
+            .expect("re-parse of formatted budget-block output failed");
+        assert_eq!(pretty_print_program(&reparsed), formatted);
+    }
+
+    #[test]
+    fn fmt_roundtrip_nested_budget_forms_674() {
+        // #674 slice 3d: both forms lower now, and they nest — an `in b2`
+        // override inside a `forge.enter(b1)` extent is the shape §5's
+        // "charges the named budget, not the current one" rule turns on.
+        // `expr_to_string` has no wildcard arm, so a new nesting that fell
+        // through would be a build error, not a formatting one; what this
+        // pins is that the round trip is IDEMPOTENT through both arms at
+        // once.
+        let src = "fn f(b1: Budget, b2: Budget) -> nil { \
+                     forge.enter(b1) { let t = forge.zeros[f32, [4]] in b2\n nil }\n \
+                     nil }";
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains("forge.enter(b1)"), "got:\n{formatted}");
+        assert!(formatted.contains("forge.zeros[f32, [4]] in b2"), "got:\n{formatted}");
+        let reparsed = parse_program(&formatted)
+            .expect("re-parse of formatted nested budget output failed");
+        assert_eq!(pretty_print_program(&reparsed), formatted);
+    }
+
+    #[test]
+    fn fmt_roundtrip_alloc_in_674() {
+        let src = "fn f(b: Budget) -> nil { let t = forge.zeros[f32, [4]] in b\n nil }";
+        let prog = parse_program(src).expect("parse failed");
+        let formatted = pretty_print_program(&prog);
+        assert!(formatted.contains("forge.zeros[f32, [4]] in b"),
+            "fmt must preserve `... in b`, got:\n{formatted}");
+        let reparsed = parse_program(&formatted)
+            .expect("re-parse of formatted alloc-in output failed");
         assert_eq!(pretty_print_program(&reparsed), formatted);
     }
 }

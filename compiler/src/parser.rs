@@ -1,4 +1,4 @@
-/// demoniC parser — spec 0.0.4-draft
+/// demoniC parser — spec 0.0.5-draft
 ///
 /// Companion to: GRAMMAR.ebnf, SPEC.md
 ///
@@ -317,6 +317,7 @@ impl Parser {
         Ok(FnDecl {
             directives, name, mutates_self, shape_params, params, ret_type, body,
             span: self.span_from(&start),
+            module: 0,
         })
     }
 
@@ -496,6 +497,42 @@ impl Parser {
         Ok(ArenaBlock { kind, body, span: self.span_from(&start) })
     }
 
+    /// `forge.enter(b) { … }` (#674, the arena-budget grammar's `budget_block`
+    /// rule) — beside `parse_arena_block`, but its own
+    /// production: `enter` is a `Dot`+`Ident` away from the bare arena
+    /// keyword, so callers guard on that shape (`TokenKind::Forge` followed
+    /// by `.` `enter` `(`) before ever calling this, and this fn does not
+    /// re-derive that guard itself.
+    fn parse_budget_block(&mut self) -> ParseResult<BudgetBlock> {
+        let start = self.peek_span();
+        self.expect(&TokenKind::Forge, "in budget block")?;
+        self.expect(&TokenKind::Dot, "in budget block")?;
+        let name = self.expect_ident("in budget block")?;
+        if name != "enter" {
+            return Err(self.err(format!(
+                "expected `enter` after `forge.` in a budget block, found `{name}`")));
+        }
+        self.expect(&TokenKind::LParen, "before budget block operand")?;
+        self.skip_newlines();
+        let operand = self.parse_expr()?;
+        self.skip_newlines();
+        self.expect(&TokenKind::RParen, "after budget block operand")?;
+        let body = self.parse_block()?;
+        Ok(BudgetBlock { operand: Box::new(operand), body, span: self.span_from(&start) })
+    }
+
+    /// True when the upcoming tokens spell `forge.enter(` — the one shape
+    /// that distinguishes a `budget_block` from a plain `forge { … }` arena
+    /// block (which instead needs an immediate `{`, `TokenKind::LBrace`, at
+    /// `peek_at(1)`). Shared by `try_parse_keyword_stmt` and `parse_primary`
+    /// so the two guards cannot drift onto different lookahead depths.
+    fn peek_is_budget_block(&self) -> bool {
+        matches!(self.peek(), TokenKind::Forge)
+            && matches!(self.peek_at(1), TokenKind::Dot)
+            && matches!(self.peek_at(2), TokenKind::Ident(s) if s == "enter")
+            && matches!(self.peek_at(3), TokenKind::LParen)
+    }
+
     // ─── Directives ───────────────────────────────────────────────────────
 
     fn parse_directive(&mut self) -> ParseResult<Directive> {
@@ -611,6 +648,19 @@ impl Parser {
                     None
                 } else { Some(self.parse_expr()?) };
                 Some(Stmt::Return { value, span: self.span_from(&start) })
+            }
+            // #674 slice 3a: `forge.enter(b) { … }` as a statement — checked
+            // BEFORE the plain-arena-block arm below so `forge.enter(...)`
+            // is never read as `forge` (a bare keyword-as-value expression)
+            // followed by an unconditionally-run `{ … }` block (#610's
+            // shape, probe `s4`).
+            TokenKind::Forge if self.peek_is_budget_block() => {
+                let bb = self.parse_budget_block()?;
+                Some(Stmt::Expr {
+                    lhs: Expr::BudgetBlock(bb),
+                    assign: None,
+                    span: self.span_from(&start),
+                })
             }
             TokenKind::Vault | TokenKind::Forge | TokenKind::Stream
                 if matches!(self.peek_at(1), TokenKind::LBrace) =>
@@ -1616,6 +1666,74 @@ impl Parser {
                     let type_args = extract_ctor_type_args(&expr);
                     expr = Expr::StructLit { name, type_args, fields, span: self.span_from(&start) };
                 }
+                // #674 (the arena-budget grammar's override rule): the
+                // budget-override postfix, `<ctor_spine> in <budget>` — legal
+                // ONLY when `expr` (the accumulated postfix chain so far) is
+                // itself an arena-constructor spine (`is_arena_ctor_spine`),
+                // the grammar's side condition. Deliberately at the SAME
+                // level as the `LBracket`/`Dot` arms above, matched on
+                // `self.peek()` with NO `skip_newlines()` first: this loop
+                // already ends the postfix chain at a bare `NEWLINE` (no arm
+                // here skips one before testing), and the `in` arm must not
+                // become the one exception — `in` on its own line after a
+                // constructor statement is today's `z2` (an unrelated
+                // discarded-value statement), and a `skip_newlines()` here
+                // would silently reparse it as this postfix instead.
+                TokenKind::Ident(s) if s == "in" && is_arena_ctor_spine(&expr) => {
+                    self.advance();
+                    // The operand is a `postfix_expr`, not a general `expr`:
+                    // `b`, `r.budget`, `bs[i]`, `forge.root`, `mk()` all
+                    // parse; `b + 1` does not (§2.1 point 3 — there is no
+                    // `Budget` arithmetic to want).
+                    let budget = self.parse_postfix()?;
+                    expr = Expr::AllocIn {
+                        expr: Box::new(expr),
+                        budget: Box::new(budget),
+                        span: self.span_from(&start),
+                    };
+                    break;
+                }
+                // #674 slice 3a (PR #814 review): `forge.kv[…](capacity=N) in
+                // b` — a trailing call is ordinary postfix syntax, so by the
+                // time this loop reaches `in`, that call has already wrapped
+                // the spine (`expr` is `Postfix{ expr: <the [...] spine>, op:
+                // Call(...) }`), which is why `is_arena_ctor_spine(&expr)`
+                // above is false: the OUTER node is the call, not the index.
+                // The user DID write an arena constructor here, they just put
+                // something between the `[…]` and `in` — the generic "`in`
+                // applies only to an arena constructor" message below would
+                // be wrong (and confusing) in this specific shape, so name
+                // the actual mistake instead.
+                TokenKind::Ident(s) if s == "in"
+                    && matches!(&expr, Expr::Postfix { expr: base, .. }
+                        if is_arena_ctor_spine(base))
+                => {
+                    return Err(self.err(
+                        "the `in` tail must follow the `[…]` directly \
+                         (`forge.zeros[…] in b`, not `forge.zeros[…](…) in b`)"
+                    ));
+                }
+                // #674 slice 3a fix (`docs/GRAMMAR.ebnf` ~165's side
+                // condition, restated in the production itself): `in` in
+                // expression position is legal ONLY as the budget-override
+                // tail of an arena-constructor spine (arm above). Before
+                // this fix a non-spine postfix_expr followed by `in` fell
+                // through to `_ => break`, ending the expression one token
+                // early and leaving `in` to be reparsed as its own
+                // (undefined) identifier statement — `forge.reshape[…] in
+                // b` produced `undefined identifier `in`` plus a
+                // discarded-value warning instead of naming the actual
+                // mistake. `for` loop headers are unaffected
+                // (`parse_for_stmt` consumes its own `in` directly, never
+                // reaching this loop) and neither is `let in = 5` (`in` is
+                // parsed there as a pattern ident, never as a postfix
+                // continuation).
+                TokenKind::Ident(s) if s == "in" => {
+                    return Err(self.err(
+                        "`in` applies only to an arena constructor \
+                         (`forge.zeros[…] in b`)"
+                    ));
+                }
                 _ => break,
             }
         }
@@ -1757,11 +1875,17 @@ impl Parser {
             TokenKind::Ident(s) if s == "_" => { self.advance(); Ok(Expr::Underscore(self.span_from(&start))) }
             TokenKind::Ident(s) => { self.advance(); Ok(Expr::Ident(s, self.span_from(&start))) }
             // Scalar type names can appear as expressions in cast/type-arg contexts
+            // (e.g. the `fp8_e4m3` in `forge.zeros[fp8_e4m3, [4]]`). #818: this
+            // used to rebuild the name by Debug-formatting the token kind and
+            // lowercasing it (`Fp8E4M3` -> `fp8e4m3`), which drops the
+            // underscore for `fp8_e4m3`/`fp8_e5m2` since their token-kind
+            // names aren't just a case-folded version of the source spelling.
+            // Route through the same canonical `ScalarType -> &str` table
+            // `scalar_from_kind` already feeds type position, so both
+            // positions spell every scalar type identically.
             k if Self::is_scalar_type_kind(&k) => {
                 self.advance();
-                let name = format!("{:?}", k).to_lowercase()
-                    .replace("kind::", "")
-                    .replace("tokenkind::", "");
+                let name = crate::fmt::scalar_type_str(&Self::scalar_from_kind(&k)).to_string();
                 Ok(Expr::Ident(name, self.span_from(&start)))
             }
             TokenKind::SelfKw => { self.advance(); Ok(Expr::Ident("self".to_string(), self.span_from(&start))) }
@@ -1833,6 +1957,10 @@ impl Parser {
                 } else {
                     Err(self.err("expected `{`, `match`, or `if` after directive(s) in expression position"))
                 }
+            }
+            // #674 slice 3a: see the twin guard in `try_parse_keyword_stmt`.
+            TokenKind::Forge if self.peek_is_budget_block() => {
+                Ok(Expr::BudgetBlock(self.parse_budget_block()?))
             }
             TokenKind::Vault | TokenKind::Forge | TokenKind::Stream
                 if matches!(self.peek_at(1), TokenKind::LBrace) =>

@@ -106,7 +106,7 @@ python3 tools/numpy_oracle.py                       # level 3, external
   oracle's op list and tolerances are in `tools/numpy_oracle.py`.
 - **Float comparisons are tolerance-based.** The oracle uses explicit
   rtol/atol; bit-exactness is promised only inside `@deterministic`
-  (`docs/SPEC.md §7.3`) and only on the same host.
+  (`docs/SPEC.md §7.5`) and only on the same host.
 - **The JIT covers a subset.** Skipped-as-outside-subset counts are printed
   by `dmc test --jit` and the differential tools; a refusal is working as
   designed, a divergence never is.

@@ -1,13 +1,13 @@
 # demoniC — Numerics Contract
 
-**Companion to:** `docs/SPEC.md §7.2b` (Float accumulation contract), `§7.3`
+**Companion to:** `docs/SPEC.md §7.4b` (Float accumulation contract), `§7.5`
 (Determinism contract (`@deterministic`)); `docs/PORTS.md §3.2`;
 `docs/DIRECTIVES.md §1`; `docs/STABILITY.md` (§1's promises fall under that
 document's change procedure).
 
 This document is normative.
 
-`docs/SPEC.md §7.2b` and `§7.3` each state one accumulation or reproducibility
+`docs/SPEC.md §7.4b` and `§7.5` each state one accumulation or reproducibility
 rule. This document collects what those rules add up to across the whole
 language and states each as a promise or a non-promise.
 
@@ -22,7 +22,7 @@ so nobody depends on it by accident.
 
 ### 1.1 Per-op accumulation, not blanket bit-exactness
 
-`docs/SPEC.md §7.2b` fixes the accumulation of specific ops, not float
+`docs/SPEC.md §7.4b` fixes the accumulation of specific ops, not float
 arithmetic in general:
 
 - f32 **reductions** (`sum`, `mean`, `variance`, `*_along`) accumulate at f32
@@ -34,7 +34,7 @@ arithmetic in general:
 
 These are two different, individually-fixed primitives. Matmul is not
 required to agree with a hand-written reduction loop over the same values,
-because it is not shorthand for that loop (§7.2b says so directly). The
+because it is not shorthand for that loop (§7.4b says so directly). The
 promise is *per op*: each one named above has one answer, stable across hosts
 and across the two backends, and a future release may add a rule for a new op
 without touching these two.
@@ -50,7 +50,7 @@ Float programs are tolerance-matched, not bit-exact. `tools/numpy_oracle.py`'s
 `rtol`/`atol` are the calibrated bound both backends are held to today;
 closing the remaining gap is ongoing work, not a promise this document makes.
 
-Inside `@deterministic` (`docs/SPEC.md §7.3`): bit-exact, given identical
+Inside `@deterministic` (`docs/SPEC.md §7.5`): bit-exact, given identical
 inputs and `Rng` state, on the same host with the same rank count and mesh
 configuration. This is the strongest reproducibility promise the language
 makes; reach for it when an exact repeat matters more than which kernel runs
@@ -126,7 +126,7 @@ does not narrow §2.1 and is not a step toward narrowing it. It replaces
 demoniC's summation order with *a* blocked one, not with NumPy's; two blocked
 orders disagree as readily as a blocked and a sequential one.
 
-`@host`'s contract (`docs/SPEC.md §7.2` (Hardware dispatch (`@host`))) is that
+`@host`'s contract (`docs/SPEC.md §7.4` (Hardware dispatch (`@host`))) is that
 the compiled-in arm is authoritative and different arms may have different
 numerics by design. The detection this path uses is exposed there as the host
 feature `accelerate`, so `@host match { .accelerate => … }` asks the same
@@ -162,7 +162,7 @@ beyond pointing at it.
 ## 3. Versioning discipline
 
 Section 1 is append-only: a new op gets its own stated accumulation rule,
-here or directly in `docs/SPEC.md §7.2b`, and an existing rule is not
+here or directly in `docs/SPEC.md §7.4b`, and an existing rule is not
 silently redefined or narrowed once shipped. Section 2 shrinks over time as
 its items land: a non-promise becoming a promise moves into Section 1 with a
 dated note and a `CHANGELOG.md` entry, never as a silent change in behavior

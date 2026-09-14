@@ -1,6 +1,6 @@
 # demoniC Package Manifests
 
-**Companion to:** `docs/SPEC.md §6.6` (Modules and imports). Normative.
+**Companion to:** `docs/SPEC.md §6.7` (Modules and imports). Normative.
 
 **Status:** Draft. This is a manifest format, not a package manager.
 

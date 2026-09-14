@@ -147,8 +147,10 @@ The rules:
 - **One module.** A capture is resolved in the `@grad fn`'s **own**
   module, and to the module binding itself — never to a same-named local
   in whatever frame happened to call the `@grad fn`. An imported
-  `pub let !x` is not a capture (it is not in scope under its bare name);
-  reach it through its module alias, or take it as a `!` parameter.
+  module's file-private `let !x` is not a capture (it is not in scope
+  under its bare name); take it as a `!` parameter instead. A `pub let`
+  is not the alternative — it is itself a compile-time error
+  (`docs/SPEC.md §6.7`, Modules and imports).
 - **Define-by-run** (§6.1) applies as it does to parameters: a capture
   read only on the branch that did *not* execute contributes nothing,
   so its gradient is a zero of its own shape — the correct `∂L/∂x = 0`,

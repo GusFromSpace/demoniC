@@ -4,6 +4,232 @@ This file tracks releases of the public demoniC repository. Releases are
 periodic snapshots of ongoing development, so each entry batches multiple
 changes rather than corresponding to a single commit.
 
+## 2026-09-13 — compiler: per-tenant arena budgets, memory-safety fixes, located diagnostics
+
+### Added
+
+- **Per-tenant arena budgets.** A `Budget` is a host-lifetime handle on a
+  region of Forge. `forge.root` names the process-wide budget that `--forge`
+  sizes; `forge.carve(parent, bytes)` takes a child out of a parent's free
+  capacity; `forge.reap(b)` releases a budget's region and credits its whole
+  extent — spent and unspent alike — back to the meter it was carved from;
+  `forge.enter(b) { … }` pushes `b` as the entered budget for a lexical
+  extent and pops it on every exit edge, including `return`, `break`,
+  `continue` and `?`, reaping nothing; and a trailing `in b` on a single
+  constructor (`forge.zeros[f32, [N]] in b`) overrides the entered budget for
+  that constructor only. All of it lowers on **both** backends. The refusals
+  are named: `budget-carve` (a carve past the parent's free capacity) and
+  `budget-reap` (a reap with a live child) are runtime refusals, because
+  `--forge` is a runtime flag and no static parent capacity exists at check
+  time; `budget-arena` is the check-time class for an allocation whose bytes
+  no budget can own — `forge.kv`/`stream.kv` inside a budgeted extent, and
+  `vault.<ctor>[…] in b`. The reap message conjugates identically on both
+  backends. The complement is what makes a tenant's weights work: a
+  `vault.*` constructor with **no** `in b`, written inside
+  `forge.enter(b) { … }`, charges the root and therefore survives
+  `forge.reap(b)`. A program that never carves runs on the root budget and
+  behaves exactly as it did before. Specified in `docs/MEMORY.md §3.2` and
+  `docs/SPEC.md §6.3` (Arenas as scopes); the acceptance program is
+  `examples/tenant_budgets.dmc`, whose every figure is a refusal boundary
+  bisected on both backends, with the refused half of each section pinned in
+  `tools/jit_probes.py` and the two-sided bracket in
+  `compiler/tests/budgets_acceptance.rs`.
+- **`tools/rss_gate.py` — a peak-resident-memory gate**, and it now runs in
+  public CI. Every other gate in this repository pins bytes *charged* or
+  program *output*, so an allocator change that touches every page of a chunk
+  while charging the same number passes all of them; this one measures the
+  peak resident set of three tiny runs against generous ceilings. It caught
+  exactly that: an intermediate page-aligned chunk allocator eagerly touched
+  all 512 MiB of its default chunk, taking an unflagged `dmc jit` run from
+  ~10 MB to ~547 MB while every existing gate stayed green.
+- **A large tranche of JIT lowering.** Methods on models lower as free
+  functions, one symbol per instantiation for shape-generic models, and
+  `m(x)` reaches `m.forward(x)` through the same rewrite. Multi-file programs
+  are merged into one unit before lowering, so imports resolve the way
+  `--check` resolves them instead of failing as a check error. Arena blocks
+  lower as lexical scopes, and a block in statement position lowers for
+  effect. Also lowered: `?` propagation and the `(T, Err)` nil idiom; `!`
+  mutating parameters outside `@grad fn`; `u8`/`u32`/`u64` tensor element
+  types; the math constants; whole-field scalar stores on model bindings;
+  `write_file`, `read_file`, `append_file` and `file_exists` as host calls;
+  `map_get`/`map_set`/`len` over maps; a `View` parameter binding its shape
+  from a `Tensor` or `KV` argument; and top-level type aliases, which are
+  transparent rather than refused.
+- `dmc test --fail-empty` exits 1 on a suite that ran zero tests, so a
+  filter that matches nothing is a failure rather than a silent pass.
+- New examples for the newly specified behavior: `tenant_budgets.dmc`,
+  `u64_semantics.dmc`, `u64_unsigned_order.dmc`, `mut_params.dmc`,
+  `mut_param_type_conventions.dmc`, `cast_model_overlay_byte_order.dmc`, and
+  `generic_model_shape_spellings.dmc`.
+- `docs/STDLIB.md` gains `len`'s signature and checked domain, a section on
+  the unsigned scalar builtins (`abs`, `min`, `max`, `clamp` read a `u64`
+  operand unsigned), and a File I/O section covering the four file builtins
+  on both backends.
+
+### Changed
+
+- **`u64` is read unsigned wherever the answer depends on signedness.** Both
+  backends hold an integer in 64 bits, so a `u64` carries the same
+  two's-complement pattern an `i64` does — but `/`, `%`, `>>` and the
+  ordering comparisons now re-interpret that pattern as unsigned, and so does
+  printing: `0u64 - 1u64` divides, shifts, compares and prints as
+  18446744073709551615, not as -1. `+ - * << & | ^` need no
+  re-interpretation, which is why they already agreed. `as i64` remains a
+  reinterpretation. All three literal spellings above `i64::MAX` are accepted
+  with the `u64` suffix — decimal, hex and binary — and `-1u64` is a checker
+  error rather than a wrap.
+- **Every fixed-width integer kind now compiles in the JIT**, and integer
+  elementwise tensor ops lower there at every element width that is a whole
+  number of bytes: the integer kernel is the scalar op run per element, so it
+  is the same code and the same answers. What the JIT still refuses rather
+  than answering differently: `.^` on integer elements, integer tensor
+  comparisons, a broadcast between differently-shaped integer tensors, and
+  any op on the sub-byte `int4` element.
+- **The `@cast(Model)` overlay's byte layout is normative** (`docs/SPEC.md
+  §3.10`, Models): successive byte offsets in field order, no padding, no
+  alignment, multi-byte scalars little-endian, fixed-shape tensor fields
+  row-major. The admissible field domain is enforced at `--check` and names
+  the offending field.
+- **`!` parameter conventions are normative per type** (`docs/SPEC.md
+  §3.4.1`, Mutating parameters): a tensor parameter is copied in and written back through the
+  argument's place, so it may be rebound; a model or `KV` parameter *is* the
+  caller's instance and must not be rebound; every other type is a
+  compile-time error. A `!` argument must be a place, and a `!`-param
+  function is not usable as an `fn(...) -> R` value. Exclusivity is not
+  adopted. Alongside it, `let mut x = m.field` snapshots a **tensor** field
+  where `let !x = m.field` aliases it — a model-typed field aliases under
+  both spellings, and a model instance is never copied by either.
+- **A plain `let` no longer reaches a `!` tensor or view parameter.** A `!`
+  parameter writes through its argument, and a plain `let` binds immutable
+  data (`docs/SPEC.md §3.4`, Mutability), so passing one is now a
+  compile-time error that names the binding and the fix: *passing `x` to a
+  `!` parameter writes through it; `x` needs `let !x`*. The fix is one word
+  at the binding — `let !x = …`, or the long form `let mut x = …`. It reaches
+  a tensor field through a plain `let` model too, so `let m = M { … }` then
+  `bump(m.w)` is refused for the same reason `m.w[0] = 42.0` already was.
+  Unaffected: a **model** or **`KV`** argument, which may be any place
+  because the parameter *is* the caller's instance; and a `@grad fn`, where
+  `!` marks a differentiable input rather than a mutation. Specified in
+  `docs/SPEC.md §3.4.1` (Mutating parameters), ¶Argument form.
+- **A `pub let` is a compile-time error**, not a silent no-op, and an
+  importer cannot read an imported module's top-level `let` at all;
+  constants cross a module boundary as a `pub fn` accessor.
+- A type-arg-less annotation of a shape-parameterized model (`type B = Buf`,
+  `fn f(b: Buf)`, `forge.zeros[Surface, [N]]`) is refused in every position,
+  not just a literal's field slot. It is a warning in this draft and becomes
+  an error in the next — one version of warning, not zero, not more.
+- A tensor's, view's, or `KV`'s element type must be one of the scalar types;
+  a model there is a located checker error instead of a silent acceptance.
+- Every bound of a range or slice — start, end and step, in either spelling
+  — is an integer expression; a bound with a known non-integer type is a
+  check-time error.
+- A named dimension in a type alias's body or in any other annotation
+  resolves against a top-level literal `let` of that name, on both sides of
+  the compiler and in method annotations as well as function ones. A mutable
+  top-level binding is never a dimension.
+- **The arena meters are hierarchical, not monotonic**, and both backends now
+  meter **requested** bytes at the declared element width: an implicit
+  intermediate, a builtin's fresh result, a `!` parameter's copy-in and an
+  `@grad` pass's activations are all charged, where the interpreter
+  previously charged only explicit constructors at its own f64 storage width.
+  A fresh string is charged at its UTF-8 byte length wherever one
+  materializes, including `+`'s concatenation arm, which was previously
+  charged by the JIT and not at all by the interpreter — an unbounded
+  divergence. `forge.restore(mark)` rewinds the bump cursor and returns
+  nothing to the meter, on both backends. The JIT's chunk commitment asks the
+  meter for the allocation's own need and is not itself the meter, so the
+  refusal decision and the "free" figure in an exhaustion message are read
+  off the requested-byte meter alone. `docs/MEMORY.md §1.1` carries the
+  measured residuals that remain between the two backends.
+- `dmc test --jit --all` collects every refusal in a file rather than
+  stopping at the first, and reports per-file blocker depth.
+- The interpreter-vs-JIT whole-example differential treats a timeout as a
+  failure with its own bucket rather than folding it into a skip, so the gate
+  reports one number under load instead of a different one per run. Public CI
+  passes an explicit `--timeout 900` to suit the slowest machine the corpus
+  meets.
+
+### Fixed
+
+- **A map value was reinterpreted as a pointer.** The JIT's coercion path
+  turned an optional integer — what `map_get` yields — into a pointer when
+  the context wanted one, so a program that compared or used an absent map
+  value dereferenced an integer. Coercion now refuses instead of
+  reinterpreting; comparing an absent map value answers the way the
+  interpreter answers, and every other use is a located error.
+- **Three JIT traps escaped their error envelope.** The chunk-allocation
+  fatal wrote straight to stderr and exited, and the nil and match traps
+  bypassed the `--json` envelope, so a tool consuming machine-readable
+  diagnostics got a truncated stream and a raw message instead of a
+  diagnostic. All three now go out through the same out-of-band path.
+- **A bare model argument against a shape-parameterized callee read out of
+  bounds** instead of refusing, and a model's shape arguments are now
+  compared the way a tensor's are. A tensor-field read through a
+  type-arg-less generic receiver refuses cleanly rather than dying inside the
+  code generator.
+- **A shape expression's error built a 4-element tensor.** An error raised
+  while evaluating a shape expression was swallowed and the constructor
+  proceeded with a default extent; it propagates now.
+- **The constructor dtype table is total.** `fp8_e4m3`/`fp8_e5m2` now meter
+  at one byte per element rather than silently falling through to f32, an
+  unknown type name is an error instead of quietly becoming f32, and the
+  lexer keeps the underscore in `fp8_e4m3`/`fp8_e5m2` when they appear as a
+  constructor type argument. Overlay decoding reads `fp8` and `tf32` at their
+  own widths, and the element-type table is exhaustive.
+- **The `@cast(Model)` overlay decoded multi-byte scalars in the wrong byte
+  order.** It is little-endian, matching the one byte order this language
+  fixes.
+- **A flat `let` of an arena constructor allocated twice under the JIT** and
+  once under the interpreter (`let t = forge.ones[…]`). The JIT now lands the
+  tensor once, like the block form, so the two backends' minimums agree.
+- **Import failures are located.** A missing or cyclic import is a `resolve`
+  diagnostic reported at the `use` — `import-unresolved` and `import-cycle` —
+  instead of a bare message with no span, on both the resolver and JIT paths.
+- **`dmc test`'s tally no longer zeroes on a file-level failure.** A file
+  that failed to load reset the passed count for the whole run, so a real
+  suite reported fewer passes than it had.
+- Interpreter control flow and storage: `return`, `break` and `continue`
+  propagate out of a block instead of being swallowed; a `let` inside a block
+  is scoped to that block; the main file's top-level `let`s evaluate once;
+  compound assignment to an indexed tensor element computes and stores in
+  place; a tensor element store no longer clones the whole tensor;
+  write-backs apply on bracketed method calls; `?` returns
+  `(default[T], e)` on the error path as specified; a `type` alias is
+  transparent at every run-time width origin; and every top-level name
+  resolves against the file that mentions it.
+- Checker coverage that was silently missing: the stream-iteration aliasing
+  lint reaches call arguments and into `in b` operands; range bounds must be
+  integers; a map-tailed function must declare `-> map`; `nil` is not a map
+  key; map builtins carry a `str` key parameter type; and a method annotation
+  resolves a top-level constant dimension the way a function's does, while a
+  mutable `let` is never a dimension.
+- Diagnostics spell types the way the parser accepts them — one canonical
+  spelling table for every user-facing scalar type, and `TyType` renders
+  every type in a form that can be pasted back into source.
+- Folded shape dimensions go through the same integer arithmetic as
+  everything else, so wrap and division by zero have one rule rather than two.
+- A coerced tuple whose bytes do not change reuses its slot instead of
+  allocating a fresh one.
+- Byte-size formatting truncates at a unit boundary rather than rounding up,
+  so an exhaustion message never claims a budget is larger than it is.
+- The `extern fn` pre-flight tests resolve `libm`/`libc` symbols rather than
+  the test binary's own exports, which resolved on macOS and not on Linux.
+
+### Documentation
+
+- `docs/SPEC.md`, `docs/MEMORY.md`, `docs/STDLIB.md`, `docs/OPERATORS.md`,
+  `docs/DIRECTIVES.md`, `docs/AUTODIFF.md`, `docs/PORTS.md` and
+  `docs/GRAMMAR.ebnf` are brought level with the behavior above. The spec
+  draft is `0.0.5-draft`.
+- `docs/GRAMMAR.ebnf` gains `budget_block` and the arena-constructor spine
+  that carries the `in` tail, with the side condition written into the
+  production rather than left in prose: `in` is admissible only after a
+  constructor spine, and its operand is a postfix expression, never general
+  arithmetic.
+- `docs/AUTODIFF.md`'s capture rule no longer points at `pub let !x`, which
+  is now itself an error; an imported module's file-private `let !x` is not
+  a capture, and a `!` parameter is the way to reach one.
+
 ## 2026-09-04 — compiler: the real Rust floor, `@comptime` folding, backend-parity fixes
 
 ### Changed
@@ -23,14 +249,14 @@ changes rather than corresponding to a single commit.
   fails the compile as `comptime-budget` rather than hanging it. Previously
   `dmc run` evaluated the block and warned while `dmc jit` refused the same
   program outright, so a program that ran was a program that would not
-  compile. Specified in `docs/SPEC.md §7.5` (Comptime evaluation), catalogued
+  compile. Specified in `docs/SPEC.md §7.8` (Comptime evaluation), catalogued
   in `docs/DIRECTIVES.md §1` and `§3`.
 - `extern fn` is enforced, not just specified. A parameter or return type the
   boundary does not admit is `extern-boundary`; a call from `@grad fn`,
   `@fuse`, or `@deterministic` is `extern-context`; a symbol the process
   cannot resolve is a `jit-extern` refusal naming the declaration, where it
   previously panicked inside the code generator with no span. `docs/SPEC.md
-  §6.7` gains the tensor-to-`*T` materialization rule and the pointer's
+  §6.8` gains the tensor-to-`*T` materialization rule and the pointer's
   call-scoped lifetime.
 - JIT refusals are classified more accurately: 64 sites that reported an
   unclassified `jit error` are lowering gaps and now say so, across five new
@@ -50,7 +276,7 @@ changes rather than corresponding to a single commit.
   not move silently: a breaking change to the table in §2 requires a
   deprecation window, changelog entries, and a test that pins the
   replacement.
-- `docs/SPEC.md §7.2b` — the float accumulation contract, which both
+- `docs/SPEC.md §7.4b` — the float accumulation contract, which both
   backends have honored all along and no section stated: f32 reductions
   accumulate at f32 width in index order, and f32 matmul accumulates
   ascending over the inner dimension with one fused multiply-add per step,

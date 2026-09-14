@@ -22,6 +22,10 @@ mod interp;
 mod ports;
 mod fmt;
 mod resolver;
+// #15: fold a resolved import DAG into
+// one `Program` the JIT can compile as a single unit. JIT-only — the
+// interpreter keeps per-module semantics (#652) and never sees a merged name.
+mod merge;
 mod jit;
 mod selftest;
 mod assimilate;
@@ -59,6 +63,12 @@ mod diag_tests;
 #[cfg(test)]
 #[path = "manifest_tests.rs"]
 mod manifest_tests;
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod usage_tests;
+#[cfg(test)]
+#[path = "merge_tests.rs"]
+mod merge_tests;
 
 use std::path::{Path, PathBuf};
 use lexer::{Lexer, TokenKind};
@@ -68,30 +78,55 @@ use interp::Interpreter;
 use fmt::pretty_print_program;
 use jit::Jit;
 
+/// The usage banner, one entry per line.
+///
+/// A `const` rather than a run of `eprintln!`s so `usage_tests.rs` can hold
+/// exactly what the user sees against the flags the argument parser actually
+/// accepts. The banner had drifted: `--gpu` and `--blas` were parsed, wired
+/// and named in the README while `dmc` with no arguments never mentioned
+/// them (#534 — a rule whose behavior was never demonstrated is not a rule).
+const USAGE_LINES: &[&str] = &[
+    "usage:",
+    "  dmc <file.dmc>                    run the full pipeline (lex + parse + check + execute)",
+    "  dmc --lex <file.dmc>              dump the token stream",
+    "  dmc --parse <file.dmc>            dump the AST tree",
+    "  dmc --check <file.dmc>            type-check, report diagnostics",
+    "  dmc run <file.dmc>                execute the program (tree-walking interpreter)",
+    "  dmc jit <file.dmc>                JIT (Cranelift, scalars + control flow)",
+    "  dmc test <file-or-dir>            run zero-arg test_* functions (interpreter)",
+    "  dmc test --jit <file-or-dir>      also run each test_* under the JIT (parity gate; skips files outside the JIT subset)",
+    "  dmc test --fail-empty <file-or-dir>",
+    "                                    exit 1 (instead of 0) when zero tests ran across the given path",
+    "  dmc selftest [opts]               interp-vs-JIT differential fuzzer over generated scalar programs",
+    "                                    opts: --iters N --seed S --repro SEED --floats / --no-floats --meta-test --verbose --timeout SECS",
+    "  dmc fmt <file.dmc>                pretty-print with canonical formatting (to stdout)",
+    "  dmc assimilate <desc.json> [-o f] generate port-wrapper bindings from a descriptor (ASSIMILATE.md)",
+    "  dmc assimilate python:<module>    introspect a live runtime into a draft descriptor (add --bindings for wrappers)",
+    "  dmc --profile <file.dmc>          run with op-count profiling (emits summary to stderr)",
+    "  dmc --profile run <file.dmc>      run mode with profiling",
+    "  dmc --demon <file.dmc>            demon mode: release the safe-mode lints (raw, no guardrails)",
+    "  dmc jit --gpu <file.dmc>          experimental Metal backend (`dmc jit` only); honored only on a macOS",
+    "                                    `--features gpu` build, ignored (`gpu-unavailable`) anywhere else.",
+    "  dmc jit --blas <file.dmc>         route a large f32 matmul to the host BLAS `cblas_sgemm` (`dmc jit`",
+    "                                    only). Opt-in: BLAS accumulates in its own blocked order, so the",
+    "                                    last bits can differ from the Cranelift kernel. Ignored",
+    "                                    (`blas-unavailable`) where `cblas_sgemm` does not resolve in this",
+    "                                    process, and never selected inside `@deterministic`.",
+    "  dmc run <file.dmc> --vault=16G --forge=2G",
+    "                                    arena byte budgets (MEMORY.md §1.1); B/K/M/G/T suffixes,",
+    "                                    exhausting one is a runtime error. `--vault` is `dmc run` only.",
+    "  dmc --check --json <file.dmc>     diagnostics as JSON Lines on stderr (schema 1)",
+    "  dmc jit --json <file.dmc>         same, including machine-coded JIT-ineligibility refusals",
+    "  dmc test --json <file-or-dir>     same, streaming one `test` object per test (with `--jit`, the parity verdict rides along)",
+    "  dmc jit --json --all <file.dmc>   report every refusal in the program instead of stopping at the first",
+    "  dmc test --jit --all <file-or-dir>",
+    "                                    per-file blocker-depth count (`| blocker depth: F files, D blockers`); JSON adds it per test too",
+];
+
 fn print_usage() {
-    eprintln!("usage:");
-    eprintln!("  dmc <file.dmc>                    run the full pipeline (lex + parse + check + execute)");
-    eprintln!("  dmc --lex <file.dmc>              dump the token stream");
-    eprintln!("  dmc --parse <file.dmc>            dump the AST tree");
-    eprintln!("  dmc --check <file.dmc>            type-check, report diagnostics");
-    eprintln!("  dmc run <file.dmc>                execute the program (tree-walking interpreter)");
-    eprintln!("  dmc jit <file.dmc>                JIT (Cranelift, scalars + control flow)");
-    eprintln!("  dmc test <file-or-dir>            run zero-arg test_* functions (interpreter)");
-    eprintln!("  dmc test --jit <file-or-dir>      also run each test_* under the JIT (parity gate; skips files outside the JIT subset)");
-    eprintln!("  dmc selftest [opts]               interp-vs-JIT differential fuzzer over generated scalar programs");
-    eprintln!("                                    opts: --iters N --seed S --repro SEED --floats --meta-test --verbose --timeout SECS");
-    eprintln!("  dmc fmt <file.dmc>                pretty-print with canonical formatting (to stdout)");
-    eprintln!("  dmc assimilate <desc.json> [-o f] generate port-wrapper bindings from a descriptor (ASSIMILATE.md)");
-    eprintln!("  dmc assimilate python:<module>    introspect a live runtime into a draft descriptor (add --bindings for wrappers)");
-    eprintln!("  dmc --profile <file.dmc>          run with op-count profiling (emits summary to stderr)");
-    eprintln!("  dmc --profile run <file.dmc>      run mode with profiling");
-    eprintln!("  dmc --demon <file.dmc>            demon mode: release the safe-mode lints (raw, no guardrails)");
-    eprintln!("  dmc run <file.dmc> --vault=16G --forge=2G");
-    eprintln!("                                    arena byte budgets (MEMORY.md §1.1); B/K/M/G/T suffixes,");
-    eprintln!("                                    exhausting one is a runtime error. `--vault` is `dmc run` only.");
-    eprintln!("  dmc --check --json <file.dmc>     diagnostics as JSON Lines on stderr (schema 1)");
-    eprintln!("  dmc jit --json <file.dmc>         same, including machine-coded JIT-ineligibility refusals");
-    eprintln!("  dmc test --json <file-or-dir>     same, streaming one `test` object per test (with `--jit`, the parity verdict rides along)");
+    for line in USAGE_LINES {
+        eprintln!("{}", line);
+    }
 }
 
 /// A checker diagnostic in `--json` form. The `code` is the kebab-case tag the
@@ -119,7 +154,7 @@ fn check_diag(
 }
 
 /// #505: fold every `@comptime` block in a resolved program set, before any
-/// checker runs (`COMPTIME_V1.md §3`).
+/// checker runs.
 ///
 /// The pass rewrites the AST in place — a closed block becomes an integer or
 /// boolean literal — so every consumer downstream of here, both backends
@@ -130,7 +165,7 @@ fn check_diag(
 /// time anything reports them.
 ///
 /// `dmc fmt` deliberately does not call this, so `@comptime` source
-/// round-trips through the formatter unfolded (`COMPTIME_V1.md §7`).
+/// round-trips through the formatter unfolded.
 fn fold_comptime_all(
     r: &mut resolver::Resolver,
 ) -> std::collections::HashMap<std::path::PathBuf, Vec<check::TypeError>> {
@@ -144,6 +179,85 @@ fn fold_comptime_all(
         }
     }
     out
+}
+
+/// One module of a resolved program, after the checker has run on it.
+///
+/// Kept per file rather than merged, so a caller attributes a diagnostic to the
+/// module it came from and not to the file named on the command line.
+struct CheckedModule {
+    path: std::path::PathBuf,
+    errors: Vec<check::TypeError>,
+    warnings: Vec<check::TypeError>,
+    items: usize,
+}
+
+/// Type-check every module of an already-resolved, already-folded import DAG,
+/// leaf-first, threading each module's public environment into the files that
+/// import it (`SPEC.md §6.7`: only `pub` items are exported, and files are
+/// checked leaf-first over the import DAG).
+///
+/// That threading is the whole of what makes a `use` check: `check.rs` reports
+/// `imported module not found / checked yet` for any import whose `ModuleEnv`
+/// is absent from `checked_modules` when the importing file is checked, and
+/// `Resolver::sorted_paths` is the topological order that guarantees it is
+/// present.
+fn check_resolved(
+    r: &resolver::Resolver,
+    folded: &std::collections::HashMap<std::path::PathBuf, Vec<check::TypeError>>,
+    demon: bool,
+) -> Vec<CheckedModule> {
+    let mut checked_modules = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(r.sorted_paths.len());
+    for p in &r.sorted_paths {
+        let prog = r.files.get(p).unwrap();
+        let mut checker = Checker::new();
+        checker.errors = folded.get(p).cloned().unwrap_or_default();
+        checker.demon = demon;
+        checker.checked_modules = checked_modules.clone();
+        checker.check_program(prog, Some(p));
+        let mod_env = check::ModuleEnv {
+            env: checker.env.clone(),
+            aliases: checker.aliases.clone(),
+            resolved_aliases: checker.resolved_aliases.clone(),
+            public_items: ast::collect_public_items(prog),
+            top_level_let_names: ast::collect_top_level_let_names(prog),
+            transitive_import_lets: checker.import_private_lets.clone(),
+        };
+        checked_modules.insert(p.clone(), mod_env);
+        out.push(CheckedModule {
+            path: p.clone(),
+            errors: checker.errors,
+            warnings: checker.warnings,
+            items: prog.items.len(),
+        });
+    }
+    out
+}
+
+/// Resolve the import DAG rooted at `path`, fold `@comptime` across all of it,
+/// and type-check it. The single front end `dmc --check`, `dmc run` and
+/// `dmc jit` share.
+///
+/// `dmc jit` used to lex and parse only the file named on the command
+/// line and hand that one `Program` to a `Checker` with an empty module table.
+/// A program with a `use` therefore died at `imported module not found /
+/// checked yet` — a `check` diagnostic, and a false one, since `--check` and
+/// `run` resolved the very same import — and the JIT's own `jit-import`
+/// refusal (`jit.rs`, the `Item::Use` arm of `collect_fns`) was unreachable:
+/// nothing ever got as far as asking the backend whether it could lower the
+/// program. Sharing this path means a multi-file program is refused by the
+/// backend, with the `use`'s span and the `jit-import` class, or lowered —
+/// never rejected by an artifact of which subcommand was typed.
+fn resolve_and_check(
+    path: &Path,
+    demon: bool,
+) -> Result<(resolver::Resolver, Vec<CheckedModule>), resolver::ResolveError> {
+    let mut r = resolver::Resolver::new();
+    r.resolve_all(path)?;
+    let folded = fold_comptime_all(&mut r);
+    let modules = check_resolved(&r, &folded, demon);
+    Ok((r, modules))
 }
 
 /// A `JitError` in `--json` form. A refusal (`JitErrorKind::Unsupported`) is
@@ -167,9 +281,58 @@ fn jit_diag(e: &jit::JitError, file: &Path) -> diag::Diagnostic {
     d
 }
 
-/// A module-resolution failure in `--json` form. The located halves are the
-/// same `lex` / `parse` diagnostics `dmc jit` reports; the rest (I/O, a bad
-/// import path, a cycle) has no span and stays `unstructured`.
+/// A failed whole-program merge in `--json` form.
+///
+/// A `MergeError` is the JIT declining to lower a *multi-file* program — two
+/// files whose declarations cannot be given one name apiece in the single flat
+/// symbol table the backend has. That is exactly what the `jit-import` class
+/// has always meant, "a `use` the JIT could not lower", so the merge's failures
+/// are reported under it rather than under a new code: `DIAGNOSTICS.md §6`
+/// makes refusal codes append-only, and this is the same fact arriving one pass
+/// later. It is `jit-ineligible`, never `jit-error` — the program is outside
+/// the lowered subset, and `dmc run` has the full semantics for it.
+///
+/// The span is the `use` that pulled the second declaration in, or the
+/// declaration that could not be reconciled; either way it is measured in the
+/// file `MergeError::file` names, which is why the two are read together.
+///
+/// Of `MergeError`'s three non-`EntryNotResolved` variants (`EntryNotResolved`
+/// itself cannot reach here either — `resolve_and_check`, called just above in
+/// the `jit` arm, is what populates the resolver `merge_program` reads),
+/// `ExternMismatch` is the only one a real program can actually surface
+/// through this function. `Ambiguous` is the shape `check.rs` independently
+/// rejects as `ambiguous import` — and `resolve_and_check` runs before
+/// `merge_program` on every path that calls `merge_diag` — so a program that
+/// would trigger it never gets this far. `DuplicateMerged` is design §4.1(e)'s
+/// backstop assertion, not a diagnosable program shape: if the rename rule
+/// above it is correct, no merge ever reaches it. Both stay reachable from
+/// `merge_program` directly (see `merge_tests.rs`, which calls it unchecked)
+/// precisely so that assertion has a test.
+fn merge_diag(e: &merge::MergeError, fallback: &Path) -> diag::Diagnostic {
+    let mut d = diag::Diagnostic::new(
+        diag::Kind::JitIneligible,
+        diag::Severity::Error,
+        format!("{}; use `dmc run` for full semantics", e),
+    )
+    .code(jit::Refusal::Import.code())
+    .file(e.file().unwrap_or(fallback));
+    if let Some(s) = e.span() {
+        d = d.at(s.line, s.col).bytes(s.start, s.end);
+    }
+    d
+}
+
+/// A module-resolution failure in `--json` form, shared by `--check`, `run`
+/// and `jit` alike. `Lex` and `Parse` carry a span and use the same `lex` /
+/// `parse` kinds a diagnostic from lexing or parsing the entry file directly
+/// would use. A `use` that cannot be resolved, or that closes a cycle, is
+/// `resolve`, located at the `use` in the importing file (with its byte span)
+/// and classed by its `code` (`DIAGNOSTICS.md §5.4`) — the class comes from
+/// the variant, not from the prose, so the human sentence is untouched. Only
+/// a per-file I/O failure under `dmc test`, with no importing `use` to blame
+/// it on, has no span and stays `unstructured`; an I/O failure on the actual
+/// entry file is caught earlier, in `main`, before the resolver ever runs,
+/// and is `cli`.
 fn resolve_diag(e: &resolver::ResolveError) -> diag::Diagnostic {
     match e {
         resolver::ResolveError::Lex { file, msg, line, col } => {
@@ -182,12 +345,26 @@ fn resolve_diag(e: &resolver::ResolveError) -> diag::Diagnostic {
                 .file(file)
                 .at(*line, *col)
         }
+        resolver::ResolveError::Import { file, msg, line, col, start, end } => {
+            diag::Diagnostic::new(diag::Kind::Resolve, diag::Severity::Error, msg.clone())
+                .code("import-unresolved")
+                .file(file)
+                .at(*line, *col)
+                .bytes(*start, *end)
+        }
+        resolver::ResolveError::Cycle { file, msg, line, col, start, end } => {
+            diag::Diagnostic::new(diag::Kind::Resolve, diag::Severity::Error, msg.clone())
+                .code("import-cycle")
+                .file(file)
+                .at(*line, *col)
+                .bytes(*start, *end)
+        }
         resolver::ResolveError::Other(s) => diag::Diagnostic::unstructured(s.clone()),
     }
 }
 
-/// Report a diagnostic whose category schema 1 does not model yet — resolver
-/// prose, a JIT runtime trap — and exit 1. Without `--json` this is the
+/// Report a diagnostic whose category schema 1 does not model yet — a JIT
+/// runtime trap — and exit 1. Without `--json` this is the
 /// unchanged human line.
 fn fail_unstructured(em: &mut Option<diag::Emitter>, msg: impl std::fmt::Display) -> ! {
     match em.take() {
@@ -427,6 +604,8 @@ fn run_tests(
     path: &Path,
     profile_mode: bool,
     jit_test: bool,
+    fail_empty: bool,
+    all_mode: bool,
     arena_limits: arena::ArenaLimits,
     mut em: Option<diag::Emitter>,
 ) -> i32 {
@@ -445,8 +624,9 @@ fn run_tests(
         }
     }
     // A per-file failure (`FAIL <file>: …`) — not a *test* result, so it has no
-    // `test` object; under `--json` the prose is carried as `unstructured`, and
-    // it still counts into the summary's `failed`, exactly as the human tally.
+    // `test` object; under `--json` the prose is carried as `unstructured` (a
+    // located resolution failure goes through `resolve_diag` instead), and it
+    // still counts into the summary's `failed`, exactly as the human tally.
     fn fail_line(em: &mut Option<diag::Emitter>, msg: String) {
         match em {
             Some(e) => e.emit(&diag::Diagnostic::unstructured(msg)),
@@ -465,10 +645,33 @@ fn run_tests(
 
     let mut total = 0usize;
     let mut failed = 0usize;
+    // #854: a failure before any test in the file is even collected — a
+    // canonicalization/parse/resolve/dependency-check error — is not a test,
+    // so it never touches `total`. It used to share `failed` with the
+    // per-test tally below, and since the summary's "passed" is derived as
+    // `total - failed`, one such file-level failure silently zeroed out every
+    // `ok` a *different*, successfully-resolved file in the same run had
+    // printed. Kept separate here and folded back in only for the printed/
+    // exit-code "failed" count, never for the subtraction that yields
+    // "passed".
+    let mut file_failures = 0usize;
     // #: `--jit` parity counters. Each test_* is additionally run under the JIT;
     // a file the JIT can't compile is skipped (outside its subset), not failed.
     let mut jit_ran = 0usize;
     let mut jit_skipped = 0usize;
+    // #684 R2: `--all`'s blocker-depth aggregate — how many files have at
+    // least one recorded root blocker, and the total DISTINCT root-blocker
+    // count across every measured file (not the raw refusal-site count —
+    // `jit::BlockerCounts::blockers`, not `::sites`). `--jit`-only; stays `0`
+    // (and unprinted) otherwise. Kept the name `blocker_sites` from before R2
+    // split the metric in three, to hold the diff small; it now sums
+    // `jit_blockers`.
+    let mut blocker_files = 0usize;
+    let mut blocker_sites = 0usize;
+    // #684 rework 3: how many measured files had `truncated:true` (a root
+    // `jit-error` cut collection short) — feeds the human line's appended
+    // "(N truncated — floor)", omitted entirely when this stays `0`.
+    let mut blocker_truncated_files = 0usize;
     // #400: a `--forge` budget must mean the same thing here as under
     // `dmc run` — the whole budget, per test. The interpreter gets that for
     // free (a fresh `Interpreter`, hence a fresh meter, is built below for
@@ -484,15 +687,23 @@ fn run_tests(
         let canonical_file = match file.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                failed += 1;
+                file_failures += 1;
                 fail_line(&mut em, format!("FAIL {}: canonicalization failed: {}", file.display(), e));
                 continue;
             }
         };
         let mut resolver = resolver::Resolver::new();
         if let Err(e) = resolver.resolve_all(&canonical_file) {
-            failed += 1;
-            fail_line(&mut em, format!("FAIL {}: resolution failed: {}", file.display(), e));
+            file_failures += 1;
+            // Under `--json` a located failure is the same `lex` / `parse` /
+            // `resolve` object `--check` would emit for this file — it carries
+            // the file itself, so the `FAIL <file>:` prefix has nothing to add.
+            // The span-less remainder keeps the prefixed line, where the file
+            // name is only in the prose.
+            match &mut em {
+                Some(emj) if e.is_located() => emj.emit(&resolve_diag(&e)),
+                _ => fail_line(&mut em, format!("FAIL {}: resolution failed: {}", file.display(), e)),
+            }
             continue;
         }
 
@@ -501,7 +712,7 @@ fn run_tests(
         let program = match resolver.files.get(&canonical_file) {
             Some(prog) => prog.clone(),
             None => {
-                failed += 1;
+                file_failures += 1;
                 fail_line(&mut em, format!("FAIL {}: program not found in resolved files", file.display()));
                 continue;
             }
@@ -511,44 +722,133 @@ fn run_tests(
             continue;
         }
 
-        let mut checked_modules = std::collections::HashMap::new();
+        // The same leaf-first check `dmc --check` and `dmc jit` run. `demon` is
+        // off here: the harness has never enabled safe mode for the files it
+        // runs, and turning it on would be a change to what `dmc test` accepts,
+        // not to how it resolves.
+        //
+        // `check_resolved` walks the whole DAG unconditionally, inserting even
+        // a failing module's `ModuleEnv` for the files that import it — unlike
+        // the inline loop this replaced, which stopped at the first failing
+        // module and never built or inserted an env past that point. Output is
+        // unchanged: the loop below still `break`s on the first module with
+        // errors, and since `sorted_paths` is leaf-first that is the same
+        // root-cause module the old code reported, so a downstream importer's
+        // errors — even ones seeded by a failing module's env — are never
+        // reached. The only cost is checking modules past the first failure,
+        // work the old code skipped and this one now discards after the fact.
         let mut check_failed = false;
-        for p in &resolver.sorted_paths {
-            let prog = resolver.files.get(p).unwrap();
-            let mut checker = Checker::new();
-            checker.errors = folded.get(p).cloned().unwrap_or_default();
-            checker.checked_modules = checked_modules.clone();
-            checker.check_program(prog, Some(p));
-            if !checker.errors.is_empty() {
-                failed += 1;
-                fail_line(&mut em, format!("FAIL {}: type check failed in dependency {:?}", file.display(), p));
-                match &mut em {
-                    // The checker errors themselves are `check` diagnostics with
-                    // spans — the same encoding `dmc --check` gives them.
-                    Some(e) => {
-                        for err in &checker.errors {
-                            e.emit(&check_diag(err, p, diag::Severity::Error));
-                        }
-                    }
-                    None => {
-                        for err in &checker.errors {
-                            eprintln!("{}", err);
-                        }
+        for m in &check_resolved(&resolver, &folded, false) {
+            if m.errors.is_empty() {
+                continue;
+            }
+            file_failures += 1;
+            fail_line(&mut em, format!(
+                "FAIL {}: type check failed in dependency {:?}", file.display(), m.path));
+            match &mut em {
+                // The checker errors themselves are `check` diagnostics with
+                // spans — the same encoding `dmc --check` gives them.
+                Some(e) => {
+                    for err in &m.errors {
+                        e.emit(&check_diag(err, &m.path, diag::Severity::Error));
                     }
                 }
-                check_failed = true;
-                break;
+                None => {
+                    for err in &m.errors {
+                        eprintln!("{}", err);
+                    }
+                }
             }
-            let mod_env = check::ModuleEnv {
-                env: checker.env.clone(),
-                aliases: checker.aliases.clone(),
-                public_items: ast::collect_public_items(prog),
-            };
-            checked_modules.insert(p.clone(), mod_env);
+            check_failed = true;
+            break;
         }
         if check_failed {
             continue;
         }
+
+        // The whole-program merge, the second of the two `compile_program`
+        // call sites: each entry file merges its own import closure, once per
+        // file rather than once per test — the merge is a function of the file
+        // set, not of which `test_*` is being run.
+        //
+        // A merge that cannot be built is scored exactly as a `compile_program`
+        // refusal already is: the file is outside the JIT's subset, so every
+        // test in it is `skip`. That is the verdict the merge design leaves
+        // alone — what changes is only *which* files stop skipping, and a
+        // multi-file entry that lowers now counts as ran.
+        let merged = if jit_test {
+            Some(merge::merge_program(&resolver, &canonical_file).map(std::sync::Arc::new))
+        } else {
+            None
+        };
+
+        // #684: the per-file blocker-depth counts, via collect mode — a
+        // property of the file (the whole program it merges into), computed
+        // once, not once per `test_*` the way `jit_verdict` below is.
+        //
+        // `None` outside `--jit --all`. `Some(None)` (R3) when the merge
+        // built but the JIT engine itself failed to initialize for this file
+        // — distinct from `Some(Some(counts))` with `sites: 0`, a file that
+        // is genuinely fully inside the lowered subset; the old code
+        // collapsed the two onto the same `0`. The merge itself refusing is
+        // not that case — it is already the file's one `jit-import`-class
+        // root blocker, so it is `Some(Some(..))` with one site, like any
+        // other collected root, and collect mode has nothing further to walk.
+        let file_blockers: Option<Option<jit::BlockerCounts>> =
+            if jit_test && all_mode {
+                match merged.as_ref().and_then(|m| m.as_ref().ok()) {
+                    Some(m) => {
+                        jit::reset_forge_arena();
+                        match jit::Jit::new() {
+                            Ok(mut j) => {
+                                j.set_merge(m.clone());
+                                let (refusals, truncated) = j.compile_program_collect(&m.program);
+                                Some(Some(jit::blocker_counts(&refusals, truncated)))
+                            }
+                            Err(_) => Some(None),
+                        }
+                    }
+                    // The merge itself refused — a real, complete root
+                    // blocker (`jit-import`), not a mid-collection abort:
+                    // collect mode never even started, so there is nothing
+                    // past it to have truncated.
+                    None => Some(Some(jit::BlockerCounts {
+                        sites: 1, blockers: 1, cascades: 0,
+                        classes: std::collections::BTreeMap::from([("jit-import", 1u64)]),
+                        truncated: false,
+                    })),
+                }
+            } else {
+                None
+            };
+        if let Some(Some(counts)) = &file_blockers {
+            if counts.blockers > 0 {
+                blocker_files += 1;
+                blocker_sites += counts.blockers;
+            }
+            // `truncated` implies at least one recorded root blocker (the
+            // aborting `jit-error` itself), so this never fires for a file
+            // that skipped the `blocker_files`/`blocker_sites` tally above.
+            if counts.truncated {
+                blocker_truncated_files += 1;
+            }
+        }
+        let file_jit_classes = file_blockers.as_ref()
+            .and_then(|f| f.as_ref())
+            .map(|c| diag::classes_object(&c.classes));
+        let file_jit_blockers: Option<Option<usize>> =
+            file_blockers.as_ref().map(|f| f.as_ref().map(|c| c.blockers));
+        let file_jit_sites: Option<Option<usize>> =
+            file_blockers.as_ref().map(|f| f.as_ref().map(|c| c.sites));
+        let file_jit_cascades: Option<Option<usize>> =
+            file_blockers.as_ref().map(|f| f.as_ref().map(|c| c.cascades));
+        // #684 fixup (F3): whether a root `jit-error` aborted collection
+        // before every item was walked, making the three counts above a
+        // FLOOR rather than the file's true depth. Same `Some(None)`-is-
+        // `null` tri-state as `jit_blockers` et al. (R3) — a file whose JIT
+        // engine failed to initialize has no truncation verdict either.
+        let file_jit_truncated: Option<Option<bool>> =
+            file_blockers.as_ref().map(|f| f.as_ref().map(|c| c.truncated));
 
         for name in tests {
             total += 1;
@@ -564,6 +864,11 @@ fn run_tests(
                 message,
                 jit: None,
                 jit_message: None,
+                jit_blockers: file_jit_blockers,
+                jit_sites: file_jit_sites,
+                jit_cascades: file_jit_cascades,
+                jit_classes: file_jit_classes.clone(),
+                jit_truncated: file_jit_truncated,
             };
             let fn_decl = program.items.iter().find_map(|item| find_fn_decl(item, &name));
             if let Some(f) = fn_decl {
@@ -639,7 +944,12 @@ fn run_tests(
             // is a real interp/JIT divergence → fail.
             let mut jit_verdict: Option<diag::JitVerdict> = None;
             let mut jit_message: Option<String> = None;
-            if jit_test {
+            // `merged` is computed exactly when `jit_test` is set (just above
+            // the loop), so matching on it here — rather than branching on
+            // `jit_test` and separately asserting `merged` is `Some` — makes
+            // that pairing structural: there is no `merged.expect(...)` left
+            // to panic if the two ever drift apart (#661 review finding 7).
+            if let Some(merge_result) = merged.as_ref() {
                 // Fresh arena per test, taken before anything JIT-side exists,
                 // so no pointer handed out by this test's compile or run can
                 // outlive the reset.
@@ -651,8 +961,22 @@ fn run_tests(
                         jit_message = Some(format!("jit init: {}", e.msg));
                         if em.is_none() { eprintln!("FAIL {} [jit]: jit init: {}", label, e.msg); }
                     }
-                    Ok(mut j) => match j.compile_program(&program) {
-                        Err(_) => {
+                    Ok(mut j) => {
+                        // The merged program, not the entry file's own — the
+                        // second of slice 3's two `compile_program` sites. The
+                        // two ways a file can turn out to be outside the JIT's
+                        // subset (the merge cannot be built; the merged program
+                        // does not lower) are collapsed here because they earn
+                        // the same verdict, `skip`.
+                        let compiled = match merge_result {
+                            Err(_) => Err(()),
+                            Ok(m) => {
+                                j.set_merge(m.clone());
+                                j.compile_program(&m.program).map_err(|_| ())
+                            }
+                        };
+                        match compiled {
+                        Err(()) => {
                             jit_skipped += 1;
                             jit_verdict = Some(diag::JitVerdict::Skip);
                         }
@@ -692,7 +1016,8 @@ fn run_tests(
                                 }
                             }
                         }
-                    },
+                        }
+                    }
                 }
             }
 
@@ -710,38 +1035,94 @@ fn run_tests(
     // (`0 tests` exits 0 even after file-level failures), because the exit
     // code must not depend on the flag.
     if total == 0 {
+        // #599: with `--fail-empty`, zero tests ran across the whole given
+        // path is itself a failure — the exit code no longer says "0 tests"
+        // and "everything passed" the same way. Without the flag this branch
+        // is unchanged: `0 tests`, exit 0, even after file-level failures.
+        let exit = if fail_empty { 1 } else { 0 };
         return match em {
             Some(mut e) => {
-                e.set_test_tally(0, failed);
+                // `failed` (the per-test tally) is always 0 here — every path
+                // that increments it also increments `total` first — so
+                // `file_failures` alone is the whole count.
+                e.set_test_tally(0, file_failures);
+                e.set_tests_ran(0);
                 if jit_test { e.set_jit_parity(jit_ran, jit_skipped); }
-                e.finish(0)
+                if jit_test && all_mode { e.set_blocker_depth(blocker_files, blocker_sites); }
+                e.finish(exit)
             }
             None => {
                 println!("0 tests");
-                0
+                // A genuine file-level failure (a `FAIL …` line already printed
+                // above) already earns its own exit; blaming that on the flag
+                // here would be wrong, so the flag's own line is only for the
+                // case it actually explains: zero tests and nothing failed.
+                if fail_empty && file_failures == 0 {
+                    eprintln!("test result: FAILED. 0 tests ran (--fail-empty)");
+                }
+                exit
             }
         };
     }
-    let exit = if failed == 0 { 0 } else { 1 };
+    // #854: `total_failed` is what gets printed and what decides the exit
+    // code — every failure, file-level or per-test, counts as one failure.
+    // `passed` stays `total - failed` (the per-test tally only): a file-level
+    // failure was never part of `total` to begin with, so it must never be
+    // subtracted back out of it, or a red run from one bad file would zero
+    // out every `ok` a different, successfully-resolved file printed.
+    let total_failed = failed + file_failures;
+    let exit = if total_failed == 0 { 0 } else { 1 };
     match em {
         Some(mut e) => {
-            e.set_test_tally(total.saturating_sub(failed), failed);
+            e.set_test_tally(total.saturating_sub(failed), total_failed);
+            e.set_tests_ran(total);
             if jit_test { e.set_jit_parity(jit_ran, jit_skipped); }
+            if jit_test && all_mode { e.set_blocker_depth(blocker_files, blocker_sites); }
             e.finish(exit)
         }
         None => {
+            // #684: `--all` appends the blocker-depth count to the existing
+            // parity note rather than replacing it — the golden gate parses
+            // the line this is built from, and without `--all` this string is
+            // built exactly as it always was (`all_mode` is false, so this
+            // whole branch is dead code for that string).
             let jit_note = if jit_test {
-                format!(" | jit parity: {} ran, {} skipped (outside JIT subset)", jit_ran, jit_skipped)
+                let depth = if all_mode {
+                    // #684 R2: the human line reports DISTINCT ROOT BLOCKERS
+                    // (`blocker_sites` sums each file's `jit_blockers`, not its
+                    // raw `jit_sites` — see the doc comment on `blocker_sites`
+                    // in `diag.rs`), not raw refusal-site count.
+                    //
+                    // #684 rework 3: when at least one measured file's depth
+                    // is a floor (`truncated:true`), name that here too —
+                    // omitted entirely when it's zero, so a corpus with no
+                    // truncated files reproduces the line exactly as before
+                    // this rework. Appended, never inserted mid-line: the
+                    // golden gate (`tools/example_runner.py`'s `JIT_RE`)
+                    // matches `jit parity: (\d+) ran, (\d+) skipped` with no
+                    // trailing anchor, so text appended after it is safe.
+                    let floor_note = if blocker_truncated_files > 0 {
+                        format!(" ({} truncated — floor)", blocker_truncated_files)
+                    } else {
+                        String::new()
+                    };
+                    format!(" | blocker depth: {} files, {} blockers{}",
+                        blocker_files, blocker_sites, floor_note)
+                } else {
+                    String::new()
+                };
+                format!(" | jit parity: {} ran, {} skipped (outside JIT subset){}",
+                    jit_ran, jit_skipped, depth)
             } else {
                 String::new()
             };
-            if failed == 0 {
+            if total_failed == 0 {
                 println!("test result: ok. {} passed; 0 failed{}", total, jit_note);
             } else {
                 eprintln!(
                     "test result: FAILED. {} passed; {} failed{}",
                     total.saturating_sub(failed),
-                    failed,
+                    total_failed,
                     jit_note,
                 );
             }
@@ -784,6 +1165,12 @@ fn real_main() {
     let mut profile_mode = false;
     let mut demon_mode = false;
     let mut jit_test = false;
+    // #599: `dmc test --fail-empty` — a suite that discovered zero `test_*`
+    // functions across the given file or directory exits 1 instead of 0, so a
+    // CI gate that only checks the exit status cannot be fooled by a suite
+    // that verified nothing. Without the flag, behavior is unchanged: `0
+    // tests` still exits 0.
+    let mut fail_empty = false;
     let mut gpu_mode = false;
     // #578: `--blas` routes a large f32 matmul to the host BLAS
     // (`cblas_sgemm`, Accelerate/AMX on macOS) instead of the Cranelift
@@ -795,6 +1182,12 @@ fn real_main() {
     // #485: `--json` re-encodes the diagnostics as JSON Lines on stderr. It
     // changes nothing else — not the set of diagnostics, not the exit code.
     let mut json_mode = false;
+    // #684: `--all` reports every JIT refusal in a program instead of just
+    // the first (`dmc jit`), and gives `dmc test --jit` a per-file
+    // blocker-depth count. Without it, `dmc jit` and `dmc test --jit` output
+    // is unchanged in every particular — the same first-refusal behavior
+    // `tools/jit_probes.py` and the golden gate already parse.
+    let mut all_mode = false;
     // #400: `--vault=<size>` / `--forge=<size>` size the arenas (`MEMORY.md
     // §1.1`). Both spellings are accepted — `--forge=2G` and `--forge 2G`.
     let mut arena_limits = arena::ArenaLimits::default();
@@ -806,9 +1199,11 @@ fn real_main() {
         if a == "--profile" { profile_mode = true; }
         else if a == "--demon" { demon_mode = true; }
         else if a == "--jit" { jit_test = true; }
+        else if a == "--fail-empty" { fail_empty = true; }
         else if a == "--gpu" { gpu_mode = true; }
         else if a == "--blas" { blas_mode = true; }
         else if a == "--json" { json_mode = true; }
+        else if a == "--all" { all_mode = true; }
         else if let Some(which) = arena::flag_arena(a) {
             let value = match a.split_once('=') {
                 Some((_, v)) => v.to_string(),
@@ -886,6 +1281,30 @@ fn real_main() {
             ),
         );
     }
+    // #684: `--all` is wired for `dmc jit` and `dmc test --jit` only. Under
+    // `dmc jit` it has no rendering but the JSON one (requirement 2 never
+    // describes a multi-refusal human line), so it additionally needs
+    // `--json`; under `dmc test` the blocker-depth count is a plain-text
+    // summary-line addition too, so `--json` is not required there.
+    if all_mode && command != "jit" && command != "test" {
+        fail_cli(
+            &mut emitter,
+            "all-unsupported-command",
+            format!(
+                "`--all` reports every JIT refusal instead of the first; it is wired \
+                 for `dmc jit` and `dmc test --jit`, not `{}`",
+                command,
+            ),
+        );
+    }
+    if all_mode && command == "jit" && !json_mode {
+        fail_cli(
+            &mut emitter,
+            "all-requires-json",
+            "`dmc jit --all` only has a JSON rendering today — pass `--json` too, \
+             or drop `--all` for the first-refusal behavior",
+        );
+    }
 
     let (mode, path) = match args[1].as_str() {
         "--lex" => {
@@ -913,7 +1332,7 @@ fn real_main() {
                 fail_cli(&mut emitter, "missing-input", "missing file or directory");
             }
             let code = run_tests(
-                Path::new(&args[2]), profile_mode, jit_test, arena_limits, emitter.take(),
+                Path::new(&args[2]), profile_mode, jit_test, fail_empty, all_mode, arena_limits, emitter.take(),
             );
             std::process::exit(code);
         }
@@ -1004,51 +1423,37 @@ fn real_main() {
             }
         }
         "check" => {
-            let mut resolver = resolver::Resolver::new();
-            if let Err(e) = resolver.resolve_all(&path) {
-                match emitter.take() {
+            let (_resolver, modules) = match resolve_and_check(&path, demon_mode) {
+                Ok(v) => v,
+                Err(e) => match emitter.take() {
                     Some(mut em) => {
                         em.emit(&resolve_diag(&e));
                         std::process::exit(em.finish(1));
                     }
                     None => { eprintln!("{}", e); std::process::exit(1); }
-                }
-            }
-            let folded = fold_comptime_all(&mut resolver);
-            let mut checked_modules = std::collections::HashMap::new();
+                },
+            };
             let mut total_errors = 0;
             let mut items_count = 0;
-            for p in &resolver.sorted_paths {
-                let prog = resolver.files.get(p).unwrap();
-                items_count += prog.items.len();
-                let mut checker = Checker::new();
-                checker.errors = folded.get(p).cloned().unwrap_or_default();
-                checker.demon = demon_mode;
-                checker.checked_modules = checked_modules.clone();
-                checker.check_program(prog, Some(p));
-                total_errors += checker.errors.len();
+            for m in &modules {
+                items_count += m.items;
+                total_errors += m.errors.len();
                 match &mut emitter {
                     Some(em) => {
-                        for err in &checker.errors {
-                            em.emit(&check_diag(err, p, diag::Severity::Error));
+                        for err in &m.errors {
+                            em.emit(&check_diag(err, &m.path, diag::Severity::Error));
                         }
-                        for w in &checker.warnings {
-                            em.emit(&check_diag(w, p, diag::Severity::Warning));
+                        for w in &m.warnings {
+                            em.emit(&check_diag(w, &m.path, diag::Severity::Warning));
                         }
                     }
                     None => {
-                        for err in &checker.errors {
+                        for err in &m.errors {
                             eprintln!("{}", err);
                         }
-                        print_warnings(&checker.warnings);
+                        print_warnings(&m.warnings);
                     }
                 }
-                let mod_env = check::ModuleEnv {
-                    env: checker.env.clone(),
-                    aliases: checker.aliases.clone(),
-                    public_items: ast::collect_public_items(prog),
-                };
-                checked_modules.insert(p.clone(), mod_env);
             }
             if let Some(mut em) = emitter.take() {
                 // The `✅ Check OK — N top-level items` line and the
@@ -1065,34 +1470,17 @@ fn real_main() {
             }
         }
         "run" => {
-            let mut resolver = resolver::Resolver::new();
-            if let Err(e) = resolver.resolve_all(&path) {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-            let folded = fold_comptime_all(&mut resolver);
-            let mut checked_modules = std::collections::HashMap::new();
+            let (resolver, modules) = match resolve_and_check(&path, demon_mode) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            };
             let mut total_errors = 0;
-            for p in &resolver.sorted_paths {
-                let prog = resolver.files.get(p).unwrap();
-                let mut checker = Checker::new();
-                checker.errors = folded.get(p).cloned().unwrap_or_default();
-                checker.demon = demon_mode;
-                checker.checked_modules = checked_modules.clone();
-                checker.check_program(prog, Some(p));
-                if !checker.errors.is_empty() {
-                    for err in &checker.errors {
-                        eprintln!("{}", err);
-                    }
-                    total_errors += checker.errors.len();
+            for m in &modules {
+                for err in &m.errors {
+                    eprintln!("{}", err);
                 }
-                print_warnings(&checker.warnings);
-                let mod_env = check::ModuleEnv {
-                    env: checker.env.clone(),
-                    aliases: checker.aliases.clone(),
-                    public_items: ast::collect_public_items(prog),
-                };
-                checked_modules.insert(p.clone(), mod_env);
+                total_errors += m.errors.len();
+                print_warnings(&m.warnings);
             }
             if total_errors > 0 {
                 eprintln!("\n⚠ {} type error(s) — refusing to run", total_errors);
@@ -1103,6 +1491,14 @@ fn real_main() {
             if profile_mode { interp.enable_profile(); }
             interp.set_argv(args[3..].to_vec());
             for p in &resolver.sorted_paths {
+                // The main file's own top-level items are loaded and evaluated
+                // exactly once, below, by `interp.run` — not here too (#794).
+                // Every dependency still gets this pass (`interp.run` only
+                // loads the one path it is handed), and each still runs its
+                // own top-level `let`s exactly once, here.
+                if p == &path {
+                    continue;
+                }
                 let prog = resolver.files.get(p).unwrap();
                 if let Err(e) = interp.load_program(prog, Some(p)) {
                     eprintln!("{}", e);
@@ -1140,68 +1536,111 @@ fn real_main() {
             print!("{}", pretty_print_program(&program));
         }
         "jit" => {
-            // Single-file JIT path: lex, parse, TYPE-CHECK, lower to Cranelift,
-            // invoke `main`. Multi-file `use` imports are still deferred (issue
-            // #15 slice 1); only one example in the corpus imports at all, and
-            // it is outside the JIT subset.
-            let mut parser = Parser::new(tokens);
-            let mut program = match parser.parse_program() {
-                Ok(p) => p,
+            // As of #661, this arm lowers a
+            // multi-file program by merging its whole import DAG into one
+            // item list (`merge.rs`, slice 1) and handing that to the single
+            // `JITModule` backend — so a `use` is no longer refused just for
+            // existing. `jit-import` still fires, but only when the merge
+            // itself cannot be built (a shape the JIT's subset does not
+            // cover, e.g. `SPEC.md`'s ambiguous-import case); see the
+            // `merge::merge_program` call below. Before slice 3 this arm
+            // lexed and parsed only the one named file and gave it to a
+            // `Checker` with no module table, so an importing program died at
+            // `imported module not found / checked yet` — a check error for
+            // an import `--check` and `run` both resolve — and never reached
+            // the backend that would have refused it properly. The
+            // resolution and the checking are now `resolve_and_check`, the
+            // same call those two make.
+            //
+            // #505 (fold `@comptime` before the checker) and #478 step 1
+            // (`dmc jit` type-checks at all, so `--check` is sufficient in both
+            // directions) both live inside that call now, and so hold across
+            // every module rather than only the entry file.
+            let (resolver, modules) = match resolve_and_check(&path, demon_mode) {
+                Ok(v) => v,
                 Err(e) => match emitter.take() {
                     Some(mut em) => {
-                        let d = diag::Diagnostic::new(
-                            diag::Kind::Parse,
-                            diag::Severity::Error,
-                            e.msg.clone(),
-                        )
-                        .file(&path)
-                        .at(e.line, e.col);
-                        em.emit(&d);
+                        em.emit(&resolve_diag(&e));
                         std::process::exit(em.finish(1));
                     }
                     None => { eprintln!("{}", e); std::process::exit(1); }
                 },
             };
-            // #505: fold `@comptime` before the checker, on this path too. The
-            // single-file JIT route does not go through the resolver, so it
-            // needs its own call — without one, `dmc jit` and `dmc run` would
-            // disagree about a folded program, which is the exact defect the
-            // directive's v1 closes.
-            let comptime_errors = comptime::fold_program(&mut program);
-            // #478 step 1: `dmc jit` type-checks, like `dmc run` already did.
-            // It used to lower raw AST and rely on the JIT's own per-function
-            // validation, so it accepted programs the checker rejects —
-            // `fn main() -> i64 { let z: str = 5  1 }` compiled and ran. That
-            // made `--check` necessary-but-not-sufficient in BOTH directions
-            // and left the JIT unable to trust any property the checker
-            // establishes, which is what a type-directed fix for #478 needs.
-            // Measured at f8affbe: every corpus example passes `--check`, so
-            // this rejects nothing that used to work.
-            let mut checker = Checker::new();
-            checker.errors = comptime_errors;
-            checker.demon = demon_mode;
-            checker.check_program(&program, Some(&path));
-            if !checker.errors.is_empty() {
+            let total_errors: usize = modules.iter().map(|m| m.errors.len()).sum();
+            if total_errors > 0 {
                 if let Some(mut em) = emitter.take() {
-                    for err in &checker.errors {
-                        em.emit(&check_diag(err, &path, diag::Severity::Error));
+                    for m in &modules {
+                        for err in &m.errors {
+                            em.emit(&check_diag(err, &m.path, diag::Severity::Error));
+                        }
                     }
                     std::process::exit(em.finish(1));
                 }
-                for err in &checker.errors {
-                    eprintln!("{}", err);
+                for m in &modules {
+                    for err in &m.errors {
+                        eprintln!("{}", err);
+                    }
                 }
-                eprintln!("\n⚠ {} type error(s) — refusing to run", checker.errors.len());
+                eprintln!("\n⚠ {} type error(s) — refusing to run", total_errors);
                 std::process::exit(1);
             }
             match &mut emitter {
                 Some(em) => {
-                    for w in &checker.warnings {
-                        em.emit(&check_diag(w, &path, diag::Severity::Warning));
+                    for m in &modules {
+                        for w in &m.warnings {
+                            em.emit(&check_diag(w, &m.path, diag::Severity::Warning));
+                        }
                     }
                 }
-                None => print_warnings(&checker.warnings),
+                None => {
+                    for m in &modules {
+                        print_warnings(&m.warnings);
+                    }
+                }
             }
+            let program = match resolver.files.get(&path) {
+                Some(prog) => prog,
+                None => fail_unstructured(
+                    &mut emitter,
+                    format!("error: main program {:?} not found in resolved files", path),
+                ),
+            };
+            // The backend's unit of compilation is
+            // one `Program` inside one `JITModule` with one flat symbol table,
+            // and it has nowhere to put a second file's functions — so what it
+            // gets is not the entry file's own `Program` but the whole import
+            // DAG merged into one item list no two files can collide inside
+            // (`merge.rs`, slice 1). On a single-file program the merge is the
+            // identity and this is the path that always ran.
+            //
+            // A merge that cannot be built is a refusal, not a failure: the
+            // program is outside the JIT's subset and `dmc run` has the full
+            // semantics, which is `jit-ineligible` / `jit-import`, never
+            // `jit-error`.
+            let merged = match merge::merge_program(&resolver, &path).map(std::sync::Arc::new) {
+                Ok(m) => m,
+                Err(e) => match emitter.take() {
+                    Some(mut em) => {
+                        em.emit(&merge_diag(&e, &path));
+                        std::process::exit(em.finish(1));
+                    }
+                    None => {
+                        // The same shape `JitError`'s `Display` gives every
+                        // other refusal — `jit unsupported at L:C: …` — because
+                        // that leading phrase is what the differential tools
+                        // match on to tell a refusal from a defect (#480).
+                        match e.span() {
+                            Some(s) => eprintln!(
+                                "jit unsupported at {}:{}: {}; use `dmc run` for full semantics",
+                                s.line, s.col, e,
+                            ),
+                            None => eprintln!(
+                                "jit unsupported: {}; use `dmc run` for full semantics", e),
+                        }
+                        std::process::exit(1);
+                    }
+                },
+            };
             let mut jit = match Jit::new() {
                 Ok(j) => j,
                 Err(e) => match emitter.take() {
@@ -1250,12 +1689,51 @@ fn real_main() {
                     }
                 }
             }
-            if let Err(e) = jit.compile_program(&program) {
+            // The merged→source map, so a refusal raised inside an imported
+            // item quotes the name the user wrote and reports the file that
+            // declared it — the design's §6 question, answered "the declaring
+            // file". Without it the message would read `util$helper` and blame
+            // whichever file was typed on the command line (§5.2).
+            jit.set_merge(merged.clone());
+            // #684: `--all` collects every refusal instead of stopping at the
+            // first, and is diagnostic-only — it never runs `main`, even when
+            // it finds nothing to report, so the collected count is never in
+            // tension with "did the program actually execute". Argument
+            // parsing already refused `--all` without `--json` for `jit`, so
+            // `emitter` is `Some` here.
+            if all_mode {
+                let (refusals, truncated) = jit.compile_program_collect(&merged.program);
+                let mut em = emitter.take().expect("--all requires --json (checked at arg parsing)");
+                for (i, r) in refusals.iter().enumerate() {
+                    let file = r.file.as_deref().unwrap_or(&path);
+                    em.emit(&jit_diag(&r.error, file).index(i).item(r.item.clone()).cascade_of(r.cascade_of));
+                }
+                // #684 R2: the three headline numbers, computed once and
+                // shared with `dmc test --jit --json --all`'s per-file fields
+                // (`jit::blocker_counts`) — `sites` (raw, unchanged from
+                // before R2), `blockers` (distinct roots, the new headline),
+                // `cascades`, and `classes` now counted over non-cascade
+                // sites only, keyed on `kind` rather than a fabricated `code`
+                // for a `jit-error` (R3, `jit::JIT_ERROR_CLASS_KEY`). F3:
+                // `truncated` says whether those three are a floor — `jit`
+                // (unlike `test --jit`) always has a successfully constructed
+                // `Jit` by this point (a `Jit::new()` failure exits above,
+                // before `--all` collection ever runs), so this is a plain
+                // `bool`, never the `--jit --json --all` per-file tri-state.
+                // `compile_program_collect` returns it explicitly now
+                // (rework 3) — it is no longer inferred from `refusals`.
+                let counts = jit::blocker_counts(&refusals, truncated);
+                em.set_jit_all(counts.sites, counts.blockers, counts.cascades,
+                    diag::classes_object(&counts.classes), counts.truncated);
+                std::process::exit(em.finish(if counts.sites == 0 { 0 } else { 1 }));
+            }
+            if let Err(e) = jit.compile_program(&merged.program) {
                 // The payload #485 exists for: an agent iterating a program
                 // toward JIT eligibility reads `code` and `line`/`col`, not an
                 // English sentence.
+                let file = jit.error_file().unwrap_or(&path).to_path_buf();
                 if let Some(mut em) = emitter.take() {
-                    em.emit(&jit_diag(&e, &path));
+                    em.emit(&jit_diag(&e, &file));
                     std::process::exit(em.finish(1));
                 }
                 eprintln!("{}", e);
@@ -1280,6 +1758,14 @@ fn real_main() {
                         Some(ast::Type::Scalar(ast::ScalarType::Bool, _)) => {
                             println!("=> {}", rc != 0);
                         }
+                        // #597: `u64`'s register can hold a negative `i64`
+                        // pattern (top bit set) naming a value at or above
+                        // 2^63 — reinterpret before printing, matching
+                        // `dmc run`'s interpreter path and the JIT's own
+                        // `print(x)` / `to_str(x)` fix for the same type.
+                        Some(ast::Type::Scalar(ast::ScalarType::U64, _)) => {
+                            println!("=> {}", rc as u64);
+                        }
                         Some(_) => println!("=> {}", rc),
                     }
                 }
@@ -1299,28 +1785,13 @@ fn real_main() {
             println!("✅ Lex OK");
             println!("✅ Parse OK");
             let folded = fold_comptime_all(&mut resolver);
-            let mut checked_modules = std::collections::HashMap::new();
             let mut total_errors = 0;
-            for p in &resolver.sorted_paths {
-                let prog = resolver.files.get(p).unwrap();
-                let mut checker = Checker::new();
-                checker.errors = folded.get(p).cloned().unwrap_or_default();
-                checker.demon = demon_mode;
-                checker.checked_modules = checked_modules.clone();
-                checker.check_program(prog, Some(p));
-                if !checker.errors.is_empty() {
-                    for err in &checker.errors {
-                        eprintln!("{}", err);
-                    }
-                    total_errors += checker.errors.len();
+            for m in &check_resolved(&resolver, &folded, demon_mode) {
+                for err in &m.errors {
+                    eprintln!("{}", err);
                 }
-                print_warnings(&checker.warnings);
-                let mod_env = check::ModuleEnv {
-                    env: checker.env.clone(),
-                    aliases: checker.aliases.clone(),
-                    public_items: ast::collect_public_items(prog),
-                };
-                checked_modules.insert(p.clone(), mod_env);
+                total_errors += m.errors.len();
+                print_warnings(&m.warnings);
             }
             if total_errors > 0 {
                 eprintln!("\n⚠ {} type error(s) — pre-alpha checker", total_errors);
@@ -1331,6 +1802,11 @@ fn real_main() {
             interp.set_arena_limits(arena_limits);
             if profile_mode { interp.enable_profile(); }
             for p in &resolver.sorted_paths {
+                // Same double-evaluation the `run` arm fixes (#794): the main
+                // file loads and runs exactly once, below, via `interp.run`.
+                if p == &path {
+                    continue;
+                }
                 let prog = resolver.files.get(p).unwrap();
                 if let Err(e) = interp.load_program(prog, Some(p)) {
                     eprintln!("⚠ runtime: {}", e);

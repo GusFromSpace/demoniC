@@ -1,0 +1,12 @@
+# Probe 59 (leaf) — SPEC §6.7 (#15, the multi-file merge design): the shared
+# leaf of the import diamond. It exports a `pub model` whose type crosses two
+# file boundaries as a field type in `p59_multifile_boxed.dmc`, and a `pub fn`
+# returning it.
+#
+# Every file in the diamond declares its own `fn main`, which the design flags:
+# `main` is non-`pub` throughout, and before #652 the entry's won only by load
+# order. Under the whole-program merge a dependency's `main` is prefixed, so it
+# can never be the entry.
+pub model Point { x: i64, y: i64 }
+pub fn mk(x: i64, y: i64) -> Point { Point { x: x, y: y } }
+fn main() -> nil { print("Run OK") nil }

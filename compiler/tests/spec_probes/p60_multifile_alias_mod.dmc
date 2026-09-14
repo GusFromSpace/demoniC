@@ -1,0 +1,7 @@
+# Probe 60 (leaf) — SPEC §6.7: the module reached through an alias by
+# `p60_multifile_alias.dmc`. Exports a `pub fn` returning a `pub model`, so both
+# halves of `use "..." as a` — the call and the returned type — cross the
+# boundary.
+pub model Pair { a: i64, b: i64 }
+pub fn mk(a: i64, b: i64) -> Pair { Pair { a: a, b: b } }
+fn main() -> nil { print("Run OK") nil }

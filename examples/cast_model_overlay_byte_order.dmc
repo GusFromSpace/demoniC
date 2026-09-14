@@ -1,0 +1,81 @@
+# cast_model_overlay_byte_order.dmc — the `@cast(Model) { bytes }` overlay's
+# byte layout: little-endian, tightly packed, row-major.
+#
+# SPEC.md's Models section states the rule: a field's offset is the sum of
+# the declared byte widths of the fields before it (no padding, no
+# alignment), a multi-byte scalar is little-endian — the one byte order this
+# language fixes (PORTS.md) — and a fixed-shape tensor field is row-major,
+# element count × element width bytes. DIRECTIVES.md's Exotic-float casts and
+# stdlib builtins section restates the same rule for the `@cast(Model)`
+# directive itself.
+#
+# Two models over the SAME four bytes `01 02 03 04`, so one buffer proves
+# both the offset arithmetic (mixed field widths) and the decode direction
+# (two same-width fields):
+#
+#   MixedWidths { a: u8, b: u16, c: u8 }
+#     a = byte 0            = 1
+#     b = bytes 1..3, LE    = 0x02 | (0x03 << 8) = 0x0302 = 770
+#     c = byte 3            = 4
+#
+#   TwoU16 { a: u16, b: u16 }
+#     a = bytes 0..2, LE    = 0x01 | (0x02 << 8) = 0x0201 = 513
+#     b = bytes 2..4, LE    = 0x03 | (0x04 << 8) = 0x0403 = 1027
+#
+# Little-endian means the LOWEST-addressed byte is the LEAST significant —
+# the opposite of the big-endian decode this overlay used before, which
+# would have read `b` above as `0x0203 = 515` and TwoU16's fields as
+# `0x0102 = 258` / `0x0304 = 772`.
+#
+# JIT: `dmc test --jit` SKIPS this file — measured: "2 passed; 0 failed |
+# jit parity: 0 ran, 2 skipped (outside JIT subset)". `@cast(Model)` is not
+# lowered by the JIT at all — a field read on the overlay result is refused
+# at runtime as "field access on non-model type" — so every `test_*` here
+# falls outside the JIT-runnable subset, same as `dmc jit` on any
+# `@cast(Model)` program. The gap is unchanged by the byte-order ruling; only
+# the interpreter's decode direction moved.
+#
+# Run:
+#   dmc run  examples/cast_model_overlay_byte_order.dmc
+#   dmc test examples/cast_model_overlay_byte_order.dmc
+
+model MixedWidths { a: u8, b: u16, c: u8 }
+model TwoU16 { a: u16, b: u16 }
+
+fn test_mixed_width_overlay_packs_at_successive_byte_offsets() -> bool {
+    let !buf = forge.zeros[u8, [4]]
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    buf[3] = 4
+    let m = @cast(MixedWidths) { buf }
+    (m.a as i64) == 1 && (m.b as i64) == 770 && (m.c as i64) == 4
+}
+
+fn test_two_u16_overlay_decodes_little_endian() -> bool {
+    let !buf = forge.zeros[u8, [4]]
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    buf[3] = 4
+    let m = @cast(TwoU16) { buf }
+    (m.a as i64) == 513 && (m.b as i64) == 1027
+}
+
+fn main() -> nil {
+    let !buf = forge.zeros[u8, [4]]
+    buf[0] = 1
+    buf[1] = 2
+    buf[2] = 3
+    buf[3] = 4
+
+    let mw = @cast(MixedWidths) { buf }
+    print(mw.a as i64)   # 1
+    print(mw.b as i64)   # 770
+    print(mw.c as i64)   # 4
+
+    let tu = @cast(TwoU16) { buf }
+    print(tu.a as i64)   # 513
+    print(tu.b as i64)   # 1027
+    nil
+}

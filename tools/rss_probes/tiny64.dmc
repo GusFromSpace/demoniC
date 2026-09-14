@@ -1,0 +1,16 @@
+# tiny64.dmc — the smallest program that still touches the Forge: one 64-byte,
+# no-flags `forge.zeros` allocation. Fixture for tools/rss_gate.py (#825).
+#
+# #822's first version made a page-aligned `alloc_zeroed` chunk touch all 512
+# MiB of the default chunk eagerly, so EVERY `dmc jit` run — no matter how
+# small its own allocation — paid the full chunk's pages. This program is
+# deliberately trivial: its own live data is 64 bytes, so its peak RSS is
+# almost entirely fixed overhead (binary, runtime, Cranelift/interpreter
+# startup, the chunk itself if the chunk stops being lazy again). That makes
+# it the most sensitive of the three rss_gate probes to exactly the #822
+# class of regression, in contrast to attn_grad_jit.dmc's real fused-attention
+# workload, whose own live tensors are a much larger share of its peak.
+fn main() -> i64 {
+    let t = forge.zeros[u8, [64]]
+    t[0] as i64
+}

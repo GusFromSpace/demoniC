@@ -79,6 +79,10 @@
     "jit_ran": 0,
     "pass": 2
   },
+  "examples/cast_model_overlay_byte_order.dmc": {
+    "jit_ran": 0,
+    "pass": 2
+  },
   "examples/char_demo.dmc": {
     "jit_ran": 0,
     "pass": 9
@@ -195,6 +199,10 @@
     "jit_ran": 10,
     "pass": 10
   },
+  "examples/generic_model_shape_spellings.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
   "examples/generic_shape_values.dmc": {
     "jit_ran": 12,
     "pass": 12
@@ -299,6 +307,14 @@
     "jit_ran": 3,
     "pass": 3
   },
+  "examples/mut_param_type_conventions.dmc": {
+    "jit_ran": 3,
+    "pass": 3
+  },
+  "examples/mut_params.dmc": {
+    "jit_ran": 7,
+    "pass": 7
+  },
   "examples/my_tensor_demo.dmc": {
     "jit_ran": 0,
     "pass": 4
@@ -372,8 +388,8 @@
     "pass": 4
   },
   "examples/shift_ops.dmc": {
-    "jit_ran": 19,
-    "pass": 19
+    "jit_ran": 21,
+    "pass": 21
   },
   "examples/sieve.dmc": {
     "jit_ran": 2,
@@ -415,6 +431,10 @@
     "jit_ran": 0,
     "pass": 25
   },
+  "examples/tenant_budgets.dmc": {
+    "jit_ran": 9,
+    "pass": 9
+  },
   "examples/tests/smoke_test.dmc": {
     "jit_ran": 3,
     "pass": 3
@@ -442,6 +462,14 @@
   "examples/transformer.dmc": {
     "jit_ran": 0,
     "pass": 7
+  },
+  "examples/u64_semantics.dmc": {
+    "jit_ran": 4,
+    "pass": 4
+  },
+  "examples/u64_unsigned_order.dmc": {
+    "jit_ran": 0,
+    "pass": 3
   },
   "examples/xor_net.dmc": {
     "jit_ran": 0,

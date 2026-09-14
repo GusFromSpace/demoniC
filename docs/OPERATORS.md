@@ -73,9 +73,13 @@ parenthesize when in doubt.
 width the way a scalar's does, so `a .+ b` on two `Tensor[i32, [N]]` wraps at
 32 bits, `a ./ b` is integer division (`7 ./ 2` is 3, and division by zero is
 0), and unsigned elements wrap unsigned. `MIN ./ -1` is the same runtime
-error the scalar `/` raises, naming the width. The JIT does not lower integer
-elementwise ops at all today — it refuses them (`elementwise ops are
-f32-only`) rather than computing a second answer.
+error the scalar `/` raises, naming the width. Both backends compute this, at
+every element width that is a whole number of bytes: the JIT's integer kernel
+is the scalar op run per element, so it is the same code and therefore the
+same answers. What it still refuses (`elementwise ops are f32-only`) rather
+than computing a second answer: `.^` on integer elements, integer tensor
+COMPARISONS (`.> .< .>= .<=`), a BROADCAST between differently-shaped integer
+tensors, and any op on the sub-byte `int4` element.
 
 ### 2.4 Scalar math: `+ - * / % **`
 
@@ -182,7 +186,7 @@ neither shift broadcasts over a tensor.
 | ---- | -------------- | -------------------------------------- |
 | `~`  | bitwise NOT    | prefix; integer types only             |
 | `<<` | left shift     | fills zeros on the right               |
-| `>>` | right shift    | **arithmetic**: the sign bit is copied in on the left, so `-8 >> 1` is -4 and `-1 >> n` is -1. It floors; `-7 >> 1` is -4 while `-7 / 2` is -3. |
+| `>>` | right shift    | **arithmetic for a SIGNED operand, logical for an UNSIGNED one.** Signed: the sign bit is copied in on the left, so `-8 >> 1` is -4 and `-1 >> n` is -1. It floors; `-7 >> 1` is -4 while `-7 / 2` is -3. Unsigned: zero-filled on the left, so `(0u64 - 1u64) >> 1` is `0x7fffffffffffffff`, not -1. |
 | `&`  | bitwise AND    |                                        |
 | `^`  | bitwise XOR    | **not** power; power is `**` / `.^`    |
 | `\|` | bitwise OR     |                                        |
@@ -205,8 +209,19 @@ let x = a << n        # -2147483648 — i32::MIN, on both backends
 ```
 
 Both backends answer at the operand's width, so a narrow shift is a parity
-case and not a backend split. `i32` and `i64` are the only integer widths the
-JIT compiles; the narrower kinds are refused outright, never silently widened.
+case and not a backend split. Every fixed-width integer kind `docs/SPEC.md
+§3.1` (Scalar types) lists now compiles in the JIT: `i8`/`i16`/`u8`/`u16`/
+`u32`/`int4`/`int8` lower as masked, i64-backed kinds, and `u64` has its own
+kind — still one i64-backed register, there is no wider one, but tagged so
+that `/ % >>` and the ordering comparisons read it unsigned rather than
+sharing `i64`'s signed ones. None is refused for its width alone.
+
+`>>`'s signed/unsigned split only matters at 64 bits. A narrower unsigned
+kind's zero-extended i64 pattern is already non-negative, so a
+sign-propagating shift on it happens to zero-fill anyway — `u8`, `u16` and
+`u32` never told the two apart. `u64` is the first width with no spare bits to
+hide the sign in, which is exactly why it needed its own kind and nothing
+narrower did.
 
 Compound assignment forms: `&=`, `|=`, `^=`. There is no `<<=` or `>>=`
 compound-assignment form.
@@ -267,8 +282,8 @@ The lexer accepts no-space variants; the formatter normalizes.
 | --------------- | --------------------------------------------------------- |
 | `??`            | `nil` is not a hole in `T`; `?` is the only error sugar   |
 | `=>` in expr    | Lambdas are `fn(x) { ... }`. Explicit.                    |
-| `.` for method  | No user-defined methods outside `model` `fn` slots; but `x.f(args)` desugars to `f(x, args)` via UFCS (`SPEC.md §4.11`, UFCS (method-call sugar)), and strings/`@grad` fns expose built-in method surfaces. |
-| `::`            | Unused; modules ship via `use ... as alias` + dot access (`SPEC.md §6.6`, Modules and imports). |
+| `.` for method  | No user-defined methods outside `model` `fn` slots; but `x.f(args)` desugars to `f(x, args)` via UFCS (`SPEC.md §4.12`, UFCS (method-call sugar)), and strings/`@grad` fns expose built-in method surfaces. |
+| `::`            | Unused; modules ship via `use ... as alias` + dot access (`SPEC.md §6.7`, Modules and imports). |
 | `++` `--`       | Use `+= 1`.                                               |
 | `*` on tensors  | Scalar multiply — gives a type error on tensors. Use `.*` |
 | `>>=` `<<=`     | No compound-assignment form for either shift. Write `x = x >> n`. |

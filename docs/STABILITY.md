@@ -27,7 +27,7 @@ is stability by policy, not by version number.
 | Whole-value int/float wire decision | `docs/PORTS.md §3.1` (ratified 2026-09-02) | Same as the port ABI above. The decision itself is permanent by design (§3.1) — not merely gated, closed. |
 | Assimilation descriptor format | `docs/ASSIMILATE.md §4` | The descriptor reader refuses an unknown or mismatched `schema` field at parse time. That enforces the contract at run time; no check compares the document's prose against the constant. |
 | `demoni.json` manifest | `docs/PACKAGES.md §3, §4` | `tools/validate_manifest.py`, which runs in CI, including a `manifest-schema` error on the wrong `schema` value. |
-| Numerics promises (§1 of `docs/NUMERICS.md`) | `docs/NUMERICS.md §1`; `docs/SPEC.md §7.2b` (Float accumulation contract), `§7.3` (Determinism contract (`@deterministic`)) | `tools/numpy_oracle.py` (tolerance-bound external reference check), `tools/diff_backends.py` and `tools/jit_probes.py` and `dmc selftest` and `tools/diff_fuzz.py` (interpreter-vs-JIT agreement), `tools/example_runner.py` (per-example results pinned). |
+| Numerics promises (§1 of `docs/NUMERICS.md`) | `docs/NUMERICS.md §1`; `docs/SPEC.md §7.4b` (Float accumulation contract), `§7.5` (Determinism contract (`@deterministic`)) | `tools/numpy_oracle.py` (tolerance-bound external reference check), `tools/diff_backends.py` and `tools/jit_probes.py` and `dmc selftest` and `tools/diff_fuzz.py` (interpreter-vs-JIT agreement), `tools/example_runner.py` (per-example results pinned). |
 
 A row whose mechanism is partial is not an excuse to skip the procedure in
 §3 — it means a reviewer has to do by hand what a check would otherwise
