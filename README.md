@@ -17,7 +17,7 @@ and others.
 ## Building
 
 Requires Rust 1.94 or newer — the floor the Cranelift backend's dependencies
-declare, and the version `compiler/Cargo.toml` states.
+declare, and the `rust-version` field in `compiler/Cargo.toml` states.
 
 ```
 cd compiler
