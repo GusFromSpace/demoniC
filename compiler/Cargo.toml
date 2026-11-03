@@ -30,7 +30,7 @@ cranelift = "0.134"
 cranelift-jit = "0.134"
 cranelift-module = "0.134"
 cranelift-native = "0.134"
-zip = "8"
+zip = "9"
 
 # Unix `sysconf` for a total-RAM query, used to reject a tensor allocation that
 # cannot fit before it OOM-kills the process. Already in the tree transitively.
